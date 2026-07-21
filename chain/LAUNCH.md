@@ -98,7 +98,7 @@ The genesis CometBFT validator produces blocks but earns nothing until bonded.
    account as the reward address. The bond needs the validator's consensus key:
    the first 32 bytes of `priv_validator_key.json` (in the cometbft volume) as
    hex, via `VALIDATOR_SEED_HEX`. The product-flow driver does exactly this bond
-   (see README "Validators"), or use the wallet if you have wired bonding there.
+   (see running.md "Validators"), or use the wallet if you have wired bonding there.
 4. Verify: `/staking/validators` lists the validator with its stake, and after
    the first 100-block epoch (about 100 s) `/staking/claimable/<pk>` grows by 14
    ZCRYPT per epoch. The wallet Rewards tab claims it whenever you like.
