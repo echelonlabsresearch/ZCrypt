@@ -9,54 +9,59 @@ Bitcoin, which is the thing to confirm before mainnet.
 Budget ~20–40 minutes: the wallet now waits for real signet confirmations, so each
 direction blocks for a block or two (signet targets ~10-minute blocks).
 
-## 0. Prerequisites
+## 0. Clean state first
 
-- `bitcoind` (Bitcoin Core 25+).
-- A running **ZCrypt devnet** node (so the zBTC decoy-seeding faucet and gas are
-  available): `cd chain && docker compose up -d` gives RPC on `http://localhost:36657`.
-  (Use the devnet build, not the production one — the bridge test is separate from the
-  foundation-launch chain.)
-
-## 1. Start bitcoind on signet (with txindex)
-
-`-txindex` is required so the confirmation poller can see the HTLC/claim txs.
+The ZCrypt side must be a **devnet** build (so zBTC decoy-seeding + the faucet work). If you
+earlier edited `docker-compose.yml` to `ABCI_FEATURES: ""` for the foundation/mainnet test,
+undo that and tear down any running stack so the bridge test starts clean:
 
 ```sh
-cat > ~/.bitcoin/bitcoin.conf <<'EOF'
-signet=1
-txindex=1
-server=1
-[signet]
-rpcuser=zcrypt
-rpcpassword=zcrypt
-rpcport=38332
-fallbackfee=0.0001
-EOF
-bitcoind -daemon
-# wait for it to sync signet headers (fast, a few minutes)
-bitcoin-cli -signet getblockchaininfo | grep -E 'blocks|headers|verificationprogress'
+cd chain
+git checkout docker-compose.yml          # restore ABCI_FEATURES: devnet
+docker compose down                       # stop the single-node stack (keep -v off to keep data)
 ```
 
-## 2. Create + fund the two bridge wallets
+## 1. One command: ZCrypt chain + signet bitcoind
 
-The bridge uses two bitcoind wallets: `demo` (you/Alice) and `bridge` (the LP). Both need
-signet coins. Create them, get an address from each, and fund from a signet faucet.
+The signet overlay swaps the regtest bitcoind for one on **signet** (with `-txindex`, which
+the confirmation poller needs). Everything else (the ZCrypt devnet — needed for zBTC
+registration + decoy seeding) is unchanged.
 
 ```sh
-bitcoin-cli -signet createwallet demo
-bitcoin-cli -signet createwallet bridge
-bitcoin-cli -signet -rpcwallet=demo   getnewaddress   # -> fund this (for shielding)
-bitcoin-cli -signet -rpcwallet=bridge getnewaddress   # -> fund this (for redeeming)
+docker compose -f docker-compose.yml -f docker-compose.signet.yml up -d
+```
+
+This brings up the ZCrypt node (RPC `http://localhost:36657`) and signet bitcoind (RPC
+`http://localhost:38332`). Signet then **syncs once** (~a few minutes, persisted in a volume
+so restarts are instant). Watch it finish:
+
+```sh
+alias BCLI='docker compose -f docker-compose.yml -f docker-compose.signet.yml exec -T bitcoind bitcoin-cli -signet'
+BCLI getblockchaininfo | grep -E '"blocks"|"headers"|verificationprogress'
+# ready when blocks == headers and verificationprogress ~ 1.0
+```
+
+## 2. Create + fund the two bridge wallets (the one manual step)
+
+The bridge uses two bitcoind wallets — `demo` (you) and `bridge` (the LP) — and both need
+real signet coins. Docker can't hand you those; you request them from a faucet. Create the
+wallets, print an address from each, and fund both:
+
+```sh
+BCLI createwallet demo
+BCLI createwallet bridge
+BCLI -rpcwallet=demo   getnewaddress   # fund this — used for shielding (BTC → zBTC)
+BCLI -rpcwallet=bridge getnewaddress   # fund this — used for redeeming (zBTC → BTC)
 ```
 
 Signet faucets (send ~0.01–0.05 tBTC to each address):
 - https://signetfaucet.com
 - https://signet.bc-2.jp
 
-Wait for the faucet payments to confirm:
+Wait for the faucet payments to confirm, then check:
 ```sh
-bitcoin-cli -signet -rpcwallet=demo   getbalance
-bitcoin-cli -signet -rpcwallet=bridge getbalance
+BCLI -rpcwallet=demo   getbalance
+BCLI -rpcwallet=bridge getbalance
 ```
 
 ## 3. Point the wallet's bridge at signet

@@ -1,0 +1,27 @@
+# Signet overlay: runs the bridge's bitcoind on SIGNET (real Bitcoin) instead of regtest.
+# Everything else (ZCrypt abci + cometbft devnet) is unchanged.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.signet.yml up -d
+#
+# Signet data persists in a named volume so it only syncs once (~a few minutes, ~a few
+# hundred MB). You still fund the `demo` and `bridge` wallets from a signet faucet — a
+# real network's coins can't come from docker. RPC is on host port 38332.
+services:
+  bitcoind:
+    command:
+      - -signet=1
+      - -server=1
+      - -txindex=1
+      - -fallbackfee=0.0001
+      - -rpcbind=0.0.0.0
+      - -rpcallowip=0.0.0.0/0
+      - -rpcuser=zcrypt
+      - -rpcpassword=zcrypt
+      - -rpcport=38332
+    ports:
+      - "38332:38332"
+    volumes:
+      - bitcoind-signet:/home/bitcoin/.bitcoin
+
+volumes:
+  bitcoind-signet:
