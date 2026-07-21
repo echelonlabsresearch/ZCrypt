@@ -1169,23 +1169,43 @@ fn shield_pay(
         .collect();
     sel.sort_by_key(|&i| std::cmp::Reverse(w.coins[i].value));
     if sel.is_empty() {
-        // Self-diagnosing error: say EXACTLY what the wallet holds vs. what's on this
-        // chain, so we can see whether it's an asset-id mismatch, an off-chain (stale)
-        // coin, or a genuinely empty balance.
-        let unspent = w.coins.iter().filter(|c| !c.spent && c.coin.asset_id == asset_id).count();
-        let onchain = w
+        // On-chain unspent coins of this asset, INCLUDING the one taken for gas, so we
+        // can tell the single-coin case apart from a genuinely empty/stale balance.
+        let onchain_incl_gas: Vec<u64> = w
             .coins
             .iter()
-            .filter(|c| !c.spent && c.coin.asset_id == asset_id && chain::find_index(leaves, &c.coin.commitment()).is_some())
-            .count();
+            .enumerate()
+            .filter(|(_, c)| !c.spent && c.coin.asset_id == asset_id && c.value <= MAX_COIN
+                && chain::find_index(leaves, &c.coin.commitment()).is_some())
+            .map(|(_, c)| c.value)
+            .collect();
+        // THE single-coin case: sending ZCRYPT with exactly one ZCRYPT coin on-chain.
+        // The gas note (a separate shield tx) consumed it, so the payment has no input
+        // left. A transfer fundamentally needs TWO ZCRYPT coins — one to pay the 0.01
+        // gas, one to fund the payment — and they cannot be the same coin.
+        if asset_id == zcrypt_shield::ASSET_ZCRYPT && onchain_incl_gas.len() == 1 {
+            let bal = onchain_incl_gas[0];
+            return Err(format!(
+                "you have a single ZCRYPT coin ({:.6} ZCRYPT), and a transfer needs a SECOND ZCRYPT \
+                 coin to pay the 0.01 gas fee (gas and the payment are separate coins — the same coin \
+                 can't do both). Get a second coin first: on devnet click Fund again; otherwise receive \
+                 a payment or claim a staking reward, then retry. (A freshly-claimed single reward/vesting \
+                 coin hits exactly this — splitting it into a spendable coin + a gas coin is the fix we're landing.)",
+                bal as f64 / 1e6,
+            ));
+        }
+        // Otherwise: stale coins (from a wiped/other chain) or a genuinely empty balance.
+        let unspent = w.coins.iter().filter(|c| !c.spent && c.coin.asset_id == asset_id).count();
         let mut by_asset: std::collections::BTreeMap<u64, u64> = std::collections::BTreeMap::new();
         for c in w.coins.iter().filter(|c| !c.spent) {
             *by_asset.entry(c.coin.asset_id).or_insert(0) += c.value;
         }
         let held: Vec<String> = by_asset.iter().map(|(a, v)| format!("asset {a} = {v}")).collect();
         return Err(format!(
-            "can't send asset {asset_id}: you hold {unspent} unspent coin(s) of it, but {onchain} are on THIS chain (leaves={}). Your unspent balances: [{}]. \
-             If your GOLD isn't listed with this exact asset id, the Send tab picked a different id; if it's listed but 0 are on-chain, those coins are from an old/other chain — Refresh (drops them) then re-mint on this node.",
+            "no spendable asset-{asset_id} coins on THIS chain (leaves={}). You hold {unspent} unspent \
+             coin(s) of it in the wallet, but 0 are in the current commitment tree — they are from a \
+             wiped or different chain generation. Click Refresh to drop them, then re-fund/re-mint on \
+             this node. Your local unspent balances: [{}].",
             leaves.len(),
             held.join(", ")
         ));
