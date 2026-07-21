@@ -725,16 +725,15 @@ impl Node {
         // coinbase coins so state can never show coins without the matching ledger
         // decrement. Gas is charged only when the resulting coin is later spent.
         self.staking.debit_claimable(&addr, amount, self.current_height)?;
-        let max = zcrypt_shield::MAX_COIN_VALUE;
-        let mut remaining = amount;
+        // First claim for this address reserves a small gas coin so the claimed balance
+        // is immediately spendable (a transfer needs a separate ZCRYPT coin for gas).
+        let first_claim = self.staking.claim_index_of(&addr) == 0;
         let mut coins = Vec::new();
-        while remaining > 0 {
-            let chunk = remaining.min(max);
+        for chunk in crate::keys::claim_chunks(amount, first_claim) {
             let index = self.staking.take_claim_index(&addr);
             let c = crate::keys::reward_commitment(pk, chunk, index);
             self.append_and_record(c);
             coins.push(c);
-            remaining -= chunk;
         }
         Ok(coins)
     }

@@ -1677,15 +1677,16 @@ fn claim_rewards(state: State<AppState>) -> R<ClaimResult> {
     tx.extend_from_slice(&claimable.to_le_bytes());
     chain::broadcast(&url, &tx)?;
 
-    // Reconstruct the minted coins (indices [start, …), split at MAX_COIN) and add
-    // any that landed on-chain to our spendable set.
+    // Reconstruct the minted coins and add any that landed on-chain to our spendable
+    // set. The node splits a claim via `claim_chunks` (reserving a gas coin on the
+    // first claim so the balance is immediately spendable) — we call the SAME function
+    // so our reconstructed coins match the node's exactly.
+    let first_claim = start == 0;
     let leaves = chain::fetch_leaves(&url)?;
     with_wallet(&state, |w| {
-        let mut remaining = claimable;
         let mut index = start;
         let mut n = 0u32;
-        while remaining > 0 {
-            let chunk = remaining.min(MAX_COIN);
+        for chunk in zcrypt_core::keys::claim_chunks(claimable, first_claim) {
             let coin = w.account.reward_coin(chunk, index);
             let com = coin.commitment();
             let already = w.coins.iter().any(|c| c.coin.commitment() == com);
@@ -1699,7 +1700,6 @@ fn claim_rewards(state: State<AppState>) -> R<ClaimResult> {
                 w.push_hist("reward", chunk as i64, "staking reward".into(), zcrypt_shield::ASSET_ZCRYPT);
                 n += 1;
             }
-            remaining -= chunk;
             index += 1;
         }
         Ok(ClaimResult { claimed: claimable, coins: n })

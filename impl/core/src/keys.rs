@@ -344,6 +344,7 @@ impl Account {
     /// Reconstruct the `index`-th reward coin of `value` (atomic units) this
     /// account claimed. The result is a normal spendable coin — its
     /// `commitment()` equals the coinbase commitment the node minted, and its
+    /// `commitment()` equals the coinbase commitment the node minted, and its
     /// `spend_secret` lets you spend it in a shield transaction.
     pub fn reward_coin(&self, value: u64, index: u64) -> Coin {
         Coin {
@@ -478,6 +479,38 @@ pub fn claim_blind(pk: &PubKey, index: u64) -> Blind {
 /// reconstructs from [`Account::reward_coin`].
 pub fn reward_commitment(pk: &PubKey, value: u64, index: u64) -> Commitment {
     zcrypt_shield::commit(value, &claim_blind(pk, index), pk)
+}
+
+/// A small dedicated ZCRYPT gas coin (1 ZCRYPT, ~100 transfers) reserved on an
+/// account's FIRST claim, so a freshly-claimed balance is immediately spendable.
+/// A transfer bundles a separate ZCRYPT gas note, so it needs two ZCRYPT coins
+/// (one to pay the 0.01 gas, one to fund the payment); without this a single
+/// claimed coin (the foundation's liquid tranche, a validator's first reward)
+/// could not be spent at all.
+pub const CLAIM_GAS_COIN: u64 = 100 * crate::emission::MIN_FEE;
+
+/// The coin values a claim of `amount` mints, in index order. On an account's
+/// first claim (`first_claim`) and when the amount comfortably exceeds it, the
+/// first coin is a [`CLAIM_GAS_COIN`] so the claimant can immediately transact;
+/// the remainder is split into `MAX_COIN_VALUE` chunks. Later claims (the account
+/// already holds coins) are not split, avoiding needless fragmentation.
+///
+/// Consensus-critical: the node mints exactly these coins and the wallet
+/// reconstructs them, so both call this one function.
+pub fn claim_chunks(amount: u64, first_claim: bool) -> Vec<u64> {
+    let max = zcrypt_shield::MAX_COIN_VALUE;
+    let mut out = Vec::new();
+    let mut rem = amount;
+    if first_claim && amount >= 2 * CLAIM_GAS_COIN {
+        out.push(CLAIM_GAS_COIN);
+        rem -= CLAIM_GAS_COIN;
+    }
+    while rem > 0 {
+        let chunk = rem.min(max);
+        out.push(chunk);
+        rem -= chunk;
+    }
+    out
 }
 
 /// Deterministic public blind for an HTLC settlement coin — keyed by the unique
@@ -651,6 +684,26 @@ mod tests {
 
     fn seed(n: u8) -> [u8; 32] {
         [n; 32]
+    }
+
+    #[test]
+    fn claim_chunks_reserves_a_gas_coin_on_first_claim_only() {
+        let big = 50_000 * crate::emission::ATOMIC; // 50k ZCRYPT
+        // First claim: [gas coin, rest]; sums to the full amount.
+        let first = claim_chunks(big, true);
+        assert_eq!(first[0], CLAIM_GAS_COIN);
+        assert_eq!(first.iter().sum::<u64>(), big);
+        assert!(first.len() >= 2);
+        // Later claim (already holds coins): a single coin, no gas reserve.
+        let later = claim_chunks(big, false);
+        assert_eq!(later, vec![big]);
+        // A tiny first claim (below the reserve threshold) stays a single coin.
+        let tiny = CLAIM_GAS_COIN; // == 1 ZCRYPT, < 2×reserve
+        assert_eq!(claim_chunks(tiny, true), vec![tiny]);
+        // Every chunk is within the per-coin cap.
+        for &c in &first {
+            assert!(c <= zcrypt_shield::MAX_COIN_VALUE);
+        }
     }
 
     #[test]

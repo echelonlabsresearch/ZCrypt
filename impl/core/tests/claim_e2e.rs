@@ -38,17 +38,21 @@ fn validator_claims_rewards_into_a_reconstructable_coin() {
     let owed = node.claimable(&account.pubkey());
     assert_eq!(owed, emission::epoch_reward(emission::EPOCH)); // 14 ZCRYPT (100 blocks x 0.14)
 
-    // Claim it into a coinbase coin (14 ZCRYPT < MAX_COIN_VALUE ⇒ one coin).
+    // First claim reserves a small gas coin so the balance is immediately spendable,
+    // then the rest: 14 ZCRYPT → [1 ZCRYPT gas coin, 13 ZCRYPT] = 2 coins.
     let minted = node.claim_rewards(&account.pubkey(), owed).unwrap();
-    assert_eq!(minted.len(), 1);
+    let chunks = keys::claim_chunks(owed, true);
+    assert_eq!(minted.len(), chunks.len());
+    assert_eq!(chunks[0], keys::CLAIM_GAS_COIN, "first coin is the gas reserve");
     assert_eq!(node.claimable(&account.pubkey()), 0, "balance fully debited");
 
-    // Reconstruct the coin from the account alone — its commitment must match the
-    // coinbase commitment the node put in the tree, and it must be spend-openable.
-    // Claiming is gasless, so the minted coin is the full reward.
-    let coin = account.reward_coin(owed, 0);
-    assert_eq!(coin.commitment(), minted[0], "owner rebuilds the exact coin");
-    assert_eq!(coin.value, owed);
+    // Reconstruct each minted coin from the account alone — commitments must match the
+    // coinbase commitments the node put in the tree, and together they sum to the reward.
+    for (i, &chunk) in chunks.iter().enumerate() {
+        let coin = account.reward_coin(chunk, i as u64);
+        assert_eq!(coin.commitment(), minted[i], "owner rebuilds minted coin {i}");
+    }
+    assert_eq!(chunks.iter().sum::<u64>(), owed);
 
     // Claiming moved value, it did not create it: issuance is unchanged (one
     // epoch's reward, all to the sole validator; no foundation minted here).
@@ -72,23 +76,35 @@ fn claimed_reward_coins_are_spendable() {
     let per_epoch = emission::epoch_reward(emission::EPOCH);
     assert_eq!(node.claimable(&account.pubkey()), 2 * per_epoch);
 
-    let c0 = node.claim_rewards(&account.pubkey(), per_epoch).unwrap()[0]; // tree idx 0
-    let c1 = node.claim_rewards(&account.pubkey(), per_epoch).unwrap()[0]; // tree idx 1
+    // First claim reserves a gas coin: chunks [gas, reward] at tree indices [0, 1].
+    // Second claim (already holds coins) is a single coin at tree index 2.
+    let claim1 = node.claim_rewards(&account.pubkey(), per_epoch).unwrap();
+    let claim2 = node.claim_rewards(&account.pubkey(), per_epoch).unwrap();
+    let chunks1 = keys::claim_chunks(per_epoch, true);
+    let chunks2 = keys::claim_chunks(per_epoch, false);
+    // (value, tree index) of every minted coin, appended in order.
+    let mut all: Vec<(u64, u64)> = Vec::new();
+    for (i, &v) in chunks1.iter().enumerate() { all.push((v, i as u64)); }
+    for (j, &v) in chunks2.iter().enumerate() { all.push((v, (chunks1.len() + j) as u64)); }
+    let minted: Vec<Commitment> = claim1.iter().chain(claim2.iter()).copied().collect();
+    for (k, &(v, idx)) in all.iter().enumerate() {
+        assert_eq!(account.reward_coin(v, idx).commitment(), minted[k], "rebuild minted coin {k}");
+    }
 
-    // Pad the tree with a handful of coins so the two real coins hide among a
+    // Pad the tree with a handful of coins so the real coins hide among a
     // non-trivial shielded pool.
-    for k in 2..16u64 {
+    for k in (all.len() as u64)..16u64 {
         node.seed_coin(account.own_coin(1_000 + k, [k, k ^ 0x9e37, k.wrapping_add(1), k.wrapping_add(2)]).commitment());
     }
     let pool: Vec<Commitment> = node.commitment_leaves();
-    assert_eq!(pool[0], c0);
-    assert_eq!(pool[1], c1);
 
-    // Reconstruct both coins and spend them: inputs = the two claimed rewards.
-    // Claiming is gasless, so each claimed coin is a full epoch's reward.
-    let cval = per_epoch;
-    let coin0 = account.reward_coin(cval, 0);
-    let coin1 = account.reward_coin(cval, 1);
+    // Spend the two most-valuable claimed coins (the 13 + 14 ZCRYPT reward coins).
+    let (va, ia) = all[all.len() - 2];
+    let (vb, ib) = all[all.len() - 1];
+    let coin0 = account.reward_coin(va, ia);
+    let coin1 = account.reward_coin(vb, ib);
+    assert_eq!(pool[ia as usize], coin0.commitment());
+    assert_eq!(pool[ib as usize], coin1.commitment());
     let mk_spend = |coin: &zcrypt_core::keys::Coin, leaf_idx: usize| {
         let mut t = zcrypt_shield::tree::CommitmentTree::new();
         for &x in &pool {
@@ -104,12 +120,14 @@ fn claimed_reward_coins_are_spendable() {
             path_dirs,
         }
     };
-    let a = mk_spend(&coin0, 0);
-    let b = mk_spend(&coin1, 1);
+    let a = mk_spend(&coin0, ia as usize);
+    let b = mk_spend(&coin1, ib as usize);
 
-    // Outputs: pay the claimed value onward to fresh coins (self, here); a fee is burned.
-    let out0: OutCoin = (cval, keys::random_blind(), account.pubkey(), 0);
-    let out1: OutCoin = (cval - emission::MIN_FEE, keys::random_blind(), account.pubkey(), 0);
+    // Outputs: pay the two coins' combined value onward to fresh coins (self, here); a
+    // fee is burned. Conservation: va + vb == out0 + out1 + fee.
+    let total = va + vb;
+    let out0: OutCoin = (va, keys::random_blind(), account.pubkey(), 0);
+    let out1: OutCoin = (total - va - emission::MIN_FEE, keys::random_blind(), account.pubkey(), 0);
     let notes = vec![vec![0xa1; 8], vec![0xb2; 8]];
     let tx = shield_tx::build(CHAIN, &[a, b], &[out0, out1], emission::MIN_FEE, notes)
         .expect("shield proof over claimed reward coins");
@@ -119,10 +137,10 @@ fn claimed_reward_coins_are_spendable() {
 
     // Double-spending the same claimed coins is rejected (same nullifiers).
     // Rebuild an equivalent tx and confirm the node refuses it.
-    let a2 = mk_spend(&coin0, 0);
-    let b2 = mk_spend(&coin1, 1);
-    let out2: OutCoin = (cval, keys::random_blind(), account.pubkey(), 0);
-    let out3: OutCoin = (cval - emission::MIN_FEE, keys::random_blind(), account.pubkey(), 0);
+    let a2 = mk_spend(&coin0, ia as usize);
+    let b2 = mk_spend(&coin1, ib as usize);
+    let out2: OutCoin = (va, keys::random_blind(), account.pubkey(), 0);
+    let out3: OutCoin = (total - va - emission::MIN_FEE, keys::random_blind(), account.pubkey(), 0);
     let tx2 = shield_tx::build(CHAIN, &[a2, b2], &[out2, out3], emission::MIN_FEE, vec![vec![1; 8], vec![2; 8]])
         .unwrap();
     assert!(node.submit_shield(CHAIN, &tx2).is_err(), "no double-spend of claimed coins");
@@ -145,11 +163,16 @@ fn foundation_claims_vest_on_schedule_end_to_end() {
     // Claiming ahead of the schedule is rejected outright.
     assert!(node.claim_rewards(&foundation.pubkey(), emission::FOUNDATION_LIQUID + 1).is_err());
 
-    // Claim the liquid tranche into a coin the foundation wallet can reconstruct.
+    // Claim the liquid tranche into coins the foundation wallet can reconstruct. As the
+    // FIRST claim it reserves a gas coin so the 50k is immediately spendable:
+    // 50,000 ZCRYPT → [1 ZCRYPT gas coin, 49,999 ZCRYPT].
     let minted = node.claim_rewards(&foundation.pubkey(), emission::FOUNDATION_LIQUID).unwrap();
-    assert_eq!(minted.len(), 1, "50k ZCRYPT fits one coin");
-    let coin = foundation.reward_coin(emission::FOUNDATION_LIQUID, 0);
-    assert_eq!(coin.commitment(), minted[0], "foundation rebuilds the exact coin");
+    let chunks = keys::claim_chunks(emission::FOUNDATION_LIQUID, true);
+    assert_eq!(minted.len(), chunks.len());
+    assert_eq!(chunks[0], keys::CLAIM_GAS_COIN, "first coin is the gas reserve");
+    for (i, &chunk) in chunks.iter().enumerate() {
+        assert_eq!(foundation.reward_coin(chunk, i as u64).commitment(), minted[i], "rebuild coin {i}");
+    }
     assert_eq!(node.claimable(&foundation.pubkey()), 0, "nothing more until the cliff");
     assert!(node.claim_rewards(&foundation.pubkey(), 1).is_err());
 

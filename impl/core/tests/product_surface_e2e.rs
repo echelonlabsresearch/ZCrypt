@@ -115,15 +115,23 @@ fn full_product_surface_happy_path() {
     assert_eq!(owed, emission::epoch_reward(emission::EPOCH));
     eprintln!("[2] bonded + accrued one epoch's block reward: {owed}");
 
-    // ---- 3. Claim (mint) reward into a spendable coinbase coin, then SPEND it ----
-    // Claiming is gasless, so the minted coin is the full reward; the later SPEND pays gas.
-    let reward_idx = node.claim_index(&alice.pubkey());
+    // ---- 3. Claim (mint) reward into spendable coinbase coin(s), then SPEND them ----
+    // Claiming is gasless; the first claim reserves a gas coin, so the reward arrives as
+    // [1 ZCRYPT gas coin, rest]. Reconstruct and spend both (≤ N_IN inputs) as the reward.
+    let reward_start = node.claim_index(&alice.pubkey());
     let claimed_val = owed;
     let minted = node.claim_rewards(&alice.pubkey(), owed).unwrap();
-    assert_eq!(minted.len(), 1);
-    let reward_coin = alice.reward_coin(claimed_val, reward_idx);
-    assert_eq!(reward_coin.commitment(), minted[0]);
-    // Spend the reward coin: pay some to Bob (normal addr), change back to Alice.
+    let chunks = keys::claim_chunks(owed, reward_start == 0);
+    assert_eq!(minted.len(), chunks.len());
+    let reward_coins: Vec<_> = chunks
+        .iter()
+        .enumerate()
+        .map(|(i, &v)| alice.reward_coin(v, reward_start + i as u64))
+        .collect();
+    for (i, c) in reward_coins.iter().enumerate() {
+        assert_eq!(c.commitment(), minted[i], "rebuild minted coin {i}");
+    }
+    // Spend the whole reward: pay some to Bob (normal addr), change back to Alice.
     let pay = claimed_val - 100 - FEE;
     let blind_pay = keys::random_blind();
     let blind_chg = keys::random_blind();
@@ -131,7 +139,7 @@ fn full_product_surface_happy_path() {
     let out_chg = keys::out_coin(&alice.normal_address(), 100, blind_chg); // + FEE burned
     let note_bob = kem::ciphertext_to_bytes(&keys::encrypt_note(&bob.normal_address(), pay, blind_pay));
     let note_chg = kem::ciphertext_to_bytes(&keys::encrypt_note(&alice.normal_address(), 100, blind_chg));
-    let tx = build_shield(&node, &[reward_coin], [out_bob, out_chg], FEE, vec![note_bob, note_chg]).unwrap();
+    let tx = build_shield(&node, &reward_coins, [out_bob, out_chg], FEE, vec![note_bob, note_chg]).unwrap();
     node.submit_shield(CHAIN, &tx).expect("reward coin is spendable");
     eprintln!("[3] claimed the reward into a coin and spent it privately");
 
