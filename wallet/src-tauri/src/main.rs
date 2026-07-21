@@ -810,6 +810,12 @@ struct Settings {
     btc_pass: String,
     #[serde(default = "default_btc_wallet")]
     btc_wallet: String,
+    /// Bitcoin network the bridge talks to: `regtest` (devnet demo, default),
+    /// `signet`, `testnet`/`testnet4`, or `bitcoin` (mainnet). Only regtest may
+    /// self-mine; real networks require confirmations, so point this at your own
+    /// bitcoind on the chosen network and fund the wallets with real BTC.
+    #[serde(default = "default_btc_network")]
+    btc_network: String,
     /// Route node RPC through a local Tor SOCKS proxy (default ON for privacy).
     /// When on and the node is not localhost, RPC goes via SOCKS so the wallet's IP
     /// and query pattern stay hidden. Localhost/127.0.0.1 skips Tor automatically
@@ -834,6 +840,9 @@ fn default_btc_pass() -> String {
 fn default_btc_wallet() -> String {
     "demo".into()
 }
+fn default_btc_network() -> String {
+    "regtest".into()
+}
 fn default_tor_enabled() -> bool {
     true
 }
@@ -848,6 +857,7 @@ impl Default for Settings {
             btc_user: default_btc_user(),
             btc_pass: default_btc_pass(),
             btc_wallet: default_btc_wallet(),
+            btc_network: default_btc_network(),
             tor_enabled: default_tor_enabled(),
             tor_proxy: default_tor_proxy(),
         }
@@ -1716,12 +1726,13 @@ fn btc_client(state: &State<AppState>) -> Result<Btc, String> {
     // Create/load the user's bitcoind wallet if it doesn't exist yet, and on a fresh
     // regtest give it spendable BTC to shield — so testing the bridge needs zero manual
     // bitcoin-cli. Idempotent: once funded (> 1 BTC) it never re-mines.
+    let network = zcrypt_bridge::network_from_str(&s.btc_network);
     Btc::ensure_wallet(&s.btc_url, &s.btc_user, &s.btc_pass, &s.btc_wallet)?;
-    let b = Btc::connect(&s.btc_url, &s.btc_user, &s.btc_pass, &s.btc_wallet)?;
-    // Fund ONLY a brand-new (empty) wallet, once. Do NOT top up when the balance is merely
-    // low — otherwise shielding would silently refill your BTC and mask whether the bridge
-    // conserves value. A one-time ~50 BTC gives a clean baseline to test against.
-    if b.balance_btc().unwrap_or(1.0) < 0.001 {
+    let b = Btc::connect(&s.btc_url, &s.btc_user, &s.btc_pass, &s.btc_wallet, network)?;
+    // Auto-fund ONLY on regtest, and only a brand-new (empty) wallet, once — a one-time
+    // ~50 BTC gives a clean baseline. Real networks (signet/testnet/mainnet) can't self-mine,
+    // so fund this wallet with actual BTC before shielding.
+    if b.is_regtest() && b.balance_btc().unwrap_or(1.0) < 0.001 {
         b.fund_self(101)?; // 101 blocks → the first coinbase matures (~50 BTC spendable)
     }
     Ok(b)
@@ -1731,9 +1742,11 @@ fn btc_client(state: &State<AppState>) -> Result<Btc, String> {
 fn btc_bridge(state: &State<AppState>) -> Result<Btc, String> {
     let dir = state.data_dir.lock().unwrap().clone();
     let s = load_settings(&dir);
+    let network = zcrypt_bridge::network_from_str(&s.btc_network);
     Btc::ensure_wallet(&s.btc_url, &s.btc_user, &s.btc_pass, "bridge")?;
-    let b = Btc::connect(&s.btc_url, &s.btc_user, &s.btc_pass, "bridge")?;
-    if b.balance_btc().unwrap_or(0.0) < 10.0 {
+    let b = Btc::connect(&s.btc_url, &s.btc_user, &s.btc_pass, "bridge", network)?;
+    // Regtest only: auto-stock the LP wallet. On real networks fund it with real BTC.
+    if b.is_regtest() && b.balance_btc().unwrap_or(0.0) < 10.0 {
         b.fund_self(120)?; // give the LP spendable BTC to lock on redeem
     }
     Ok(b)

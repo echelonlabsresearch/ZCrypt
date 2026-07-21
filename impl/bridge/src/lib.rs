@@ -27,7 +27,19 @@ use bitcoin::{
 use bitcoincore_rpc::{Auth, Client, RpcApi};
 use std::str::FromStr;
 
+/// Default Bitcoin network when none is configured (the devnet/demo stack).
 pub const NETWORK: Network = Network::Regtest;
+
+/// Resolve a config string to a Bitcoin network. `testnet4` maps to the testnet
+/// address format (same `tb1…` prefix) for crate compatibility. Unknown → regtest.
+pub fn network_from_str(s: &str) -> Network {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "bitcoin" | "mainnet" | "main" => Network::Bitcoin,
+        "testnet" | "testnet3" | "testnet4" => Network::Testnet,
+        "signet" => Network::Signet,
+        _ => Network::Regtest,
+    }
+}
 
 /// The HTLC redeem (witness) script.
 pub fn htlc_script(
@@ -55,9 +67,9 @@ pub fn htlc_script(
         .into_script()
 }
 
-/// The P2WSH address the HTLC script commits to.
-pub fn htlc_address(script: &ScriptBuf) -> Address {
-    Address::p2wsh(script, NETWORK)
+/// The P2WSH address the HTLC script commits to, on `network`.
+pub fn htlc_address(script: &ScriptBuf, network: Network) -> Address {
+    Address::p2wsh(script, network)
 }
 
 /// A secp256k1 keypair for HTLC participants.
@@ -87,14 +99,22 @@ pub struct HtlcUtxo {
 
 pub struct Btc {
     pub rpc: Client,
+    pub network: Network,
 }
 
 impl Btc {
-    pub fn connect(url: &str, user: &str, pass: &str, wallet: &str) -> Result<Self, String> {
+    pub fn connect(url: &str, user: &str, pass: &str, wallet: &str, network: Network) -> Result<Self, String> {
         let full = format!("{}/wallet/{}", url.trim_end_matches('/'), wallet);
         let rpc = Client::new(&full, Auth::UserPass(user.into(), pass.into()))
             .map_err(|e| e.to_string())?;
-        Ok(Btc { rpc })
+        Ok(Btc { rpc, network })
+    }
+
+    /// True on regtest, where the bridge may mine its own blocks. On real networks
+    /// (mainnet/testnet/signet) mining is impossible, so swap confirmation must come
+    /// from polling for real confirmations instead (see `send_to_address`/`fund_htlc`).
+    pub fn is_regtest(&self) -> bool {
+        self.network == Network::Regtest
     }
 
     /// Best-effort create/load a bitcoind wallet by name (idempotent). Used to make
@@ -116,7 +136,7 @@ impl Btc {
         self.rpc
             .get_new_address(None, None)
             .map_err(|e| e.to_string())?
-            .require_network(NETWORK)
+            .require_network(self.network)
             .map_err(|e| e.to_string())
     }
 
@@ -130,21 +150,28 @@ impl Btc {
         use std::str::FromStr;
         let addr = Address::from_str(address.trim())
             .map_err(|e| format!("bad BTC address: {e}"))?
-            .require_network(NETWORK)
+            .require_network(self.network)
             .map_err(|e| format!("address not valid for this network: {e}"))?;
         let txid = self
             .rpc
             .send_to_address(&addr, amount, None, None, None, None, None, None)
             .map_err(|e| e.to_string())?;
-        self.mine(1)?;
+        // Regtest confirms instantly by self-mining. On real networks the tx enters the
+        // mempool; the caller must poll for confirmations before treating it as final.
+        if self.is_regtest() {
+            self.mine(1)?;
+        }
         Ok(txid.to_string())
     }
 
-    /// Mine `n` blocks to a **throwaway** address whose key nobody holds — the
-    /// coinbase is effectively burned, so confirming swap txs never inflates any
-    /// tracked wallet's balance.
+    /// Mine `n` blocks to a **throwaway** address whose key nobody holds — the coinbase
+    /// is effectively burned. **Regtest only**: real networks cannot mine, so this
+    /// errors there (confirmation must come from polling, not self-mining).
     pub fn mine(&self, n: u64) -> Result<(), String> {
-        let addr = throwaway_address();
+        if !self.is_regtest() {
+            return Err("mine() is regtest-only — a real Bitcoin network confirms via mined blocks you must wait for, not generate".to_string());
+        }
+        let addr = throwaway_address(self.network);
         self.rpc.generate_to_address(n, &addr).map_err(|e| e.to_string())?;
         Ok(())
     }
@@ -154,11 +181,14 @@ impl Btc {
     /// there's no backlog of immature coinbases that would later mature and silently
     /// inflate the balance (which is what made the demo wallet balloon to hundreds of BTC).
     pub fn fund_self(&self, n: u64) -> Result<(), String> {
+        if !self.is_regtest() {
+            return Err("fund_self() is regtest-only — on a real network fund this wallet with actual BTC".to_string());
+        }
         let addr = self.new_address()?;
         self.rpc.generate_to_address(1, &addr).map_err(|e| e.to_string())?;
         if n > 1 {
             self.rpc
-                .generate_to_address(n - 1, &throwaway_address())
+                .generate_to_address(n - 1, &throwaway_address(self.network))
                 .map_err(|e| e.to_string())?;
         }
         Ok(())
@@ -167,12 +197,16 @@ impl Btc {
     /// Fund an HTLC: pay `amount` BTC to the script's P2WSH address, mine 1 block,
     /// and return the resulting UTXO.
     pub fn fund_htlc(&self, script: &ScriptBuf, amount: Amount) -> Result<HtlcUtxo, String> {
-        let addr = htlc_address(script);
+        let addr = htlc_address(script, self.network);
         let txid = self
             .rpc
             .send_to_address(&addr, amount, None, None, None, None, None, None)
             .map_err(|e| e.to_string())?;
-        self.mine(1)?;
+        // Regtest confirms instantly; real networks require polling for confirmations
+        // before the HTLC UTXO is safe to rely on (the returned UTXO exists in-mempool).
+        if self.is_regtest() {
+            self.mine(1)?;
+        }
         // find the vout paying our address
         let tx = self.rpc.get_raw_transaction(&txid, None).map_err(|e| e.to_string())?;
         let spk = addr.script_pubkey();
@@ -295,16 +329,16 @@ pub mod zcrypt;
 
 /// A fixed P2WPKH address whose private key nobody uses — mining here burns the
 /// coinbase so confirming swap txs doesn't credit any tracked wallet's balance.
-fn throwaway_address() -> Address {
+fn throwaway_address(network: Network) -> Address {
     let key = Key::from_bytes(&[0xEE; 32]);
-    Address::p2wpkh(&key.compressed(), NETWORK)
+    Address::p2wpkh(&key.compressed(), network)
 }
 
-/// Parse a regtest address string.
-pub fn parse_address(s: &str) -> Result<Address, String> {
+/// Parse and network-check an address string against `network`.
+pub fn parse_address(s: &str, network: Network) -> Result<Address, String> {
     Address::from_str(s)
         .map_err(|e| e.to_string())?
-        .require_network(NETWORK)
+        .require_network(network)
         .map_err(|e| e.to_string())
 }
 

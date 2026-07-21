@@ -19,7 +19,7 @@ fn balance(btc: &Btc) -> Amount {
 }
 
 fn main() {
-    let btc = Btc::connect("http://localhost:18443", "zcrypt", "zcrypt", "demo").unwrap();
+    let btc = Btc::connect("http://localhost:18443", "zcrypt", "zcrypt", "demo", NETWORK).unwrap();
     println!("bitcoind height: {}", btc.height().unwrap());
 
     let claim = Key::from_bytes(&[0x11; 32]);
@@ -32,7 +32,7 @@ fn main() {
     let hashlock = htlc_hashlock(&preimage);
     let locktime = (btc.height().unwrap() + 100) as u32; // far future -> only claim works
     let script = htlc_script(&hashlock, &claim.pk, &refund.pk, locktime);
-    println!("HTLC address: {}", htlc_address(&script));
+    println!("HTLC address: {}", htlc_address(&script, NETWORK));
 
     let utxo = btc.fund_htlc(&script, Amount::from_btc(1.0).unwrap()).unwrap();
     println!("funded HTLC: {}:{} = {} BTC", utxo.outpoint.txid, utxo.outpoint.vout, utxo.value.to_btc());

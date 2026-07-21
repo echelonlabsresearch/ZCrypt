@@ -18,7 +18,7 @@ fn main() {
     // Create Alice's ("demo") wallet if the target bitcoind is fresh (the 3-node
     // regtest starts with no wallets).
     let _ = Btc::ensure_wallet(&btc_url, "zcrypt", "zcrypt", "demo");
-    let btc = Btc::connect(&btc_url, "zcrypt", "zcrypt", "demo").unwrap();
+    let btc = Btc::connect(&btc_url, "zcrypt", "zcrypt", "demo", zcrypt_bridge::NETWORK).unwrap();
     let zc = Zcrypt::new(&zc_url);
     let alice = Account::from_seed([0x11; 32]);
     // The treasury's M-of-N (here 2-of-3) post-quantum mint authority, derived from a
@@ -49,7 +49,7 @@ fn main() {
     let alice_key = Key::from_bytes(&[0xA1; 32]);
     // A distinct bridge/LP wallet, stocked with BTC for the redeem direction.
     Btc::ensure_wallet(&btc_url, "zcrypt", "zcrypt", "bridge").unwrap();
-    let bridge = Btc::connect(&btc_url, "zcrypt", "zcrypt", "bridge").unwrap();
+    let bridge = Btc::connect(&btc_url, "zcrypt", "zcrypt", "bridge", zcrypt_bridge::NETWORK).unwrap();
     if bridge.balance_btc().unwrap_or(0.0) < 10.0 {
         bridge.fund_self(120).unwrap();
     }

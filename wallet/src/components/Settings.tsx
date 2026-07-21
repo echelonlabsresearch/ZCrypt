@@ -15,6 +15,7 @@ interface WalletSettings {
   btc_user: string;
   btc_pass: string;
   btc_wallet: string;
+  btc_network: string;
   tor_enabled: boolean;
   tor_proxy: string;
 }
@@ -64,6 +65,7 @@ export default function Settings() {
       btc_user: full?.btc_user ?? "zcrypt",
       btc_pass: full?.btc_pass ?? "zcrypt",
       btc_wallet: full?.btc_wallet ?? "demo",
+      btc_network: full?.btc_network ?? "regtest",
       tor_enabled: torEnabled,
       tor_proxy: torProxy.trim() || "127.0.0.1:9050",
       ...next,
