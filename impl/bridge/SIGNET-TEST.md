@@ -36,7 +36,9 @@ This brings up the ZCrypt node (RPC `http://localhost:36657`) and signet bitcoin
 so restarts are instant). Watch it finish:
 
 ```sh
-alias BCLI='docker compose -f docker-compose.yml -f docker-compose.signet.yml exec -T bitcoind bitcoin-cli -signet'
+# bitcoind uses a static rpcuser/rpcpassword (not a cookie), and `exec` runs as root, so
+# bitcoin-cli can't find credentials on its own — pass them explicitly (note the `=`).
+alias BCLI='docker compose -f docker-compose.yml -f docker-compose.signet.yml exec -T bitcoind bitcoin-cli -signet -rpcuser=zcrypt -rpcpassword=zcrypt'
 BCLI getblockchaininfo | grep -E '"blocks"|"headers"|verificationprogress'
 # ready when blocks == headers and verificationprogress ~ 1.0
 ```
