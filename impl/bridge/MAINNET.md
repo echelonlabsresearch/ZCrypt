@@ -19,22 +19,32 @@ or is skipped, so the unsafe "confirm by mining my own block" path can never run
 real BTC. Point `btc_url` at your own bitcoind on the chosen network and set
 `btc_network`.
 
-## Step 2 — ⚠️ Confirmation polling (replaces self-mining)
+## Step 2 — ⚠️ Confirmation polling (replaces self-mining) ✅ DONE
 
-Every place that previously did `mine(1); read` must, on a real network, broadcast then
-**poll `getrawtransaction`/`gettransaction` until `confirmations >= THRESHOLD`** before
-treating a tx as final. Add `Btc::wait_confirmed(txid, n)` and call it in
-`swap.rs::zbtc_to_btc_progress` / `btc_to_zbtc_progress` in place of the `b.*.mine(1)`
-calls (`swap.rs:341,434`). Pick THRESHOLD per value (1 for signet tests, 3–6 for mainnet).
+`Btc::conf_target()` gives the min confirmations per network (regtest 0, signet/testnet 1,
+mainnet 2 — raise for larger swaps). `Btc::wait_confirmed(txid)` blocks until a tx reaches
+it (polling `getrawtransaction`), and `Btc::confirm(txid)` mines on regtest / waits on real
+networks. `fund_htlc` now blocks until the funding tx is confirmed before returning the
+UTXO, and the post-claim `mine(1)` calls in `swap.rs` are replaced by `confirm(&txid)`. So
+on a real network nothing acts on an unconfirmed HTLC/claim. Run bitcoind with `-txindex`.
+Caveat: `wait_confirmed` BLOCKS the caller — fine for signet validation, but the UI path
+needs step 3's async watcher so a swap doesn't freeze the wallet for a block interval.
 
-## Step 3 — ⚠️ A real deposit watcher
+## Step 3 — ⚠️ A real deposit watcher — PRIMITIVE ADDED, flow wiring + validation remain
 
-Today a single process funds the inbound BTC HTLC itself. A real user funds it from their
-own wallet, so the bridge must *detect* that deposit: poll (or bitcoind ZMQ `rawtx`/
-`hashblock`) for a confirmed payment to the expected HTLC address, and only THEN open the
-zBTC mint escrow. This is the difference between "minted against BTC that exists" and
-unbacked zBTC. Split the current all-in-one orchestration into: (a) present the HTLC
-address to the user, (b) watch for their confirmed deposit, (c) mint zBTC, (d) settle.
+`Btc::watch_htlc_deposit(script, expected, timeout)` is the detection primitive: it polls
+`scantxoutset` (scans the confirmed UTXO set — no wallet import, works on descriptor or
+legacy wallets) for a confirmed deposit of ≥`expected` to the HTLC address, verifies
+`conf_target`, and returns the funding UTXO. **It is UNTESTED against live bitcoind and NOT
+yet wired into the flow** — validate on signet first.
+
+Remaining: split the single-process orchestration (the wallet currently plays BOTH the user
+and the bridge) into a real two-party flow: (a) present the HTLC address to the user, (b)
+the bridge service calls `watch_htlc_deposit` to see the user's own confirmed deposit, (c)
+only THEN mint zBTC, (d) settle. This bridge/watcher service does not exist yet and is the
+largest remaining piece — it is what separates "minted against BTC that provably exists"
+from unbacked zBTC. `scantxoutset` is a heavy full-UTXO scan; a production watcher should
+move to bitcoind ZMQ (`rawtx`/`hashblock`) or descriptor-wallet `listsinceblock`.
 
 ## Step 4 — ⚠️ Fee estimation
 

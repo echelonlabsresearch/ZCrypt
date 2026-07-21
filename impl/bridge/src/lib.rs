@@ -164,6 +164,51 @@ impl Btc {
         Ok(txid.to_string())
     }
 
+    /// Minimum confirmations to treat a Bitcoin tx as final, by network. Regtest is 0
+    /// (it self-mines instantly); signet/testnet use 1; mainnet uses 2 as a floor —
+    /// raise it for larger swaps. This is the number a real deposit/HTLC must reach
+    /// before the counterparty mints or claims against it.
+    pub fn conf_target(&self) -> u32 {
+        match self.network {
+            Network::Regtest => 0,
+            Network::Bitcoin => 2,
+            _ => 1,
+        }
+    }
+
+    /// Block until `txid` reaches [`conf_target`] confirmations (no-op on regtest).
+    /// Polls `getrawtransaction` (verbose). Times out after ~3h so a dropped/replaced
+    /// tx doesn't hang forever. NOTE: this BLOCKS the caller — on mainnet block times a
+    /// swap step can wait many minutes; the async watcher (MAINNET.md step 3) removes
+    /// that from the UI path. Run bitcoind with `-txindex` so non-wallet txs are visible.
+    pub fn wait_confirmed(&self, txid: &Txid) -> Result<(), String> {
+        let target = self.conf_target();
+        if target == 0 {
+            return Ok(());
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3 * 60 * 60);
+        loop {
+            if let Ok(info) = self.rpc.get_raw_transaction_info(txid, None) {
+                if info.confirmations.unwrap_or(0) >= target {
+                    return Ok(());
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(format!("timed out waiting for {target} confirmation(s) of {txid}"));
+            }
+            std::thread::sleep(std::time::Duration::from_secs(15));
+        }
+    }
+
+    /// Confirm a broadcast tx: mine it on regtest, else wait for real confirmations.
+    /// One call the swap flow uses regardless of network.
+    pub fn confirm(&self, txid: &Txid) -> Result<(), String> {
+        if self.is_regtest() {
+            return self.mine(1);
+        }
+        self.wait_confirmed(txid)
+    }
+
     /// Mine `n` blocks to a **throwaway** address whose key nobody holds — the coinbase
     /// is effectively burned. **Regtest only**: real networks cannot mine, so this
     /// errors there (confirmation must come from polling, not self-mining).
@@ -194,6 +239,56 @@ impl Btc {
         Ok(())
     }
 
+    /// ⚠️ MONEY-CRITICAL, and UNTESTED against live bitcoind — validate on signet before
+    /// trusting it with value. Watch for an EXTERNAL confirmed deposit of at least
+    /// `expected` BTC to the HTLC address. This is the detection the bridge must run for
+    /// BTC→zBTC: it may **not** mint zBTC until a real, confirmed deposit exists. Uses
+    /// `scantxoutset` (scans the confirmed UTXO set — no wallet import, works on descriptor
+    /// or legacy wallets) then verifies `conf_target` confirmations. Returns the funding
+    /// UTXO with its actual value. This is a standalone primitive for the future bridge
+    /// watcher service; it is NOT yet wired into the single-process demo flow.
+    pub fn watch_htlc_deposit(
+        &self,
+        script: &ScriptBuf,
+        expected: Amount,
+        timeout_secs: u64,
+    ) -> Result<HtlcUtxo, String> {
+        use serde_json::json;
+        let addr = htlc_address(script, self.network);
+        let desc = format!("addr({addr})");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+        loop {
+            let res: serde_json::Value = self
+                .rpc
+                .call("scantxoutset", &[json!("start"), json!([{ "desc": desc }])])
+                .map_err(|e| e.to_string())?;
+            if let Some(unspents) = res["unspents"].as_array() {
+                for u in unspents {
+                    // scantxoutset reports amounts in BTC; compare in sats to avoid float drift.
+                    let sats = (u["amount"].as_f64().unwrap_or(0.0) * 1e8).round() as u64;
+                    if sats >= expected.to_sat() {
+                        let txid_str = u["txid"].as_str().ok_or("scan: missing txid")?;
+                        let vout = u["vout"].as_u64().ok_or("scan: missing vout")? as u32;
+                        let txid = Txid::from_str(txid_str).map_err(|e| e.to_string())?;
+                        self.wait_confirmed(&txid)?; // require conf_target confirmations
+                        return Ok(HtlcUtxo {
+                            outpoint: OutPoint { txid, vout },
+                            value: Amount::from_sat(sats),
+                            script: script.clone(),
+                        });
+                    }
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(format!(
+                    "no confirmed deposit of ≥{} BTC to the HTLC address within the watch window",
+                    expected.to_btc()
+                ));
+            }
+            std::thread::sleep(std::time::Duration::from_secs(30));
+        }
+    }
+
     /// Fund an HTLC: pay `amount` BTC to the script's P2WSH address, mine 1 block,
     /// and return the resulting UTXO.
     pub fn fund_htlc(&self, script: &ScriptBuf, amount: Amount) -> Result<HtlcUtxo, String> {
@@ -202,10 +297,13 @@ impl Btc {
             .rpc
             .send_to_address(&addr, amount, None, None, None, None, None, None)
             .map_err(|e| e.to_string())?;
-        // Regtest confirms instantly; real networks require polling for confirmations
-        // before the HTLC UTXO is safe to rely on (the returned UTXO exists in-mempool).
+        // Regtest confirms instantly; real networks BLOCK here until the funding tx has
+        // `conf_target` confirmations, so the returned UTXO is settled (not a mempool tx
+        // a counterparty could still double-spend/RBF) before anyone acts on it.
         if self.is_regtest() {
             self.mine(1)?;
+        } else {
+            self.wait_confirmed(&txid)?;
         }
         // find the vout paying our address
         let tx = self.rpc.get_raw_transaction(&txid, None).map_err(|e| e.to_string())?;

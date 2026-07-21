@@ -338,7 +338,7 @@ pub fn btc_to_zbtc_progress(
         return Err("on-chain preimage mismatch".to_string());
     }
     let txid = b.bridge.claim(&utxo, &revealed, b.bridge_key, b.bridge_dest, fee)?;
-    b.bridge.mine(1)?;
+    b.bridge.confirm(&txid)?; // regtest mines; real networks wait for confirmations
     println!("  [btc] bridge took the BTC with the revealed preimage ({txid})");
     progress(100, "Done — zBTC is in your wallet.");
     Ok(coin)
@@ -431,7 +431,9 @@ pub fn zbtc_to_btc_progress(
     // 3. Alice claims the BTC (to her own wallet), revealing the preimage on Bitcoin.
     progress(65, "Claiming your BTC (revealing the preimage)…");
     let claim_txid = b.alice.claim(&utxo, preimage, b.alice_key, b.alice_dest, fee)?;
-    b.alice.mine(1)?;
+    // Confirm Alice's claim before the bridge reads the preimage from it and burns the
+    // zBTC — on a real network an unconfirmed claim could still be replaced.
+    b.alice.confirm(&claim_txid)?;
     println!("  [btc] Alice took the BTC (preimage revealed on Bitcoin)");
 
     // 4. Bridge reads the preimage FROM Bitcoin and burns the zBTC.
