@@ -1,0 +1,31 @@
+[package]
+name = "zcrypt-wallet"
+version = "0.1.0"
+edition = "2021"
+description = "ZCrypt post-quantum wallet"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+hex = "0.4"
+chacha20poly1305 = "0.10"
+ureq = { version = "2", features = ["json", "socks-proxy"] }
+base64 = "0.22"
+zcrypt-core = { path = "../../impl/core" }
+zcrypt-shield = { path = "../../impl/shield" }
+zcrypt-bridge = { path = "../../impl/bridge" }
+bitcoin = "0.32"
+rand = "0.8"
+argon2 = "0.5"
+
+# zcrypt-shield (pulled via zcrypt-core) needs the patched p3-util + nightly
+# (see ../rust-toolchain.toml).
+[patch.crates-io]
+p3-util = { path = "../../impl/vendor/p3-util" }
+
+[profile.release]
+opt-level = 3

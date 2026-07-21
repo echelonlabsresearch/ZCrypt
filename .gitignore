@@ -1,0 +1,37 @@
+# build artifacts (any Cargo target dir, anywhere)
+target/
+node_modules/
+wallet/dist/
+
+# local python environments (lattice parameter estimation)
+.micromamba/
+.venv-lattice/
+
+# run/debug output — regenerable
+*.log
+nohup.out
+zcrypt-state*.bin
+impl/scripts/lattice_*_output.txt
+impl/scripts/lattice_param_sweep*.txt
+impl/scripts/*_state.jsonl
+__pycache__/
+
+# LaTeX intermediates (whitepaper.pdf itself is committed)
+*.aux
+*.fls
+*.fdb_latexmk
+*.synctex.gz
+*.toc
+*.out
+
+# OS / editor / local tooling
+.DS_Store
+.tmp/
+.claude/
+.vscode/
+.idea/
+
+# never commit key material
+*.mnemonic
+priv_validator_key.json
+node_key.json

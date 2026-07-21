@@ -1,0 +1,63 @@
+//! Print the foundation account's claim material, for genesis setup and for
+//! claiming vested tranches (tag 0x58):
+//!   * `pk`             — 64-byte shield pubkey (8×u64 LE), the claim-tx payload
+//!   * `reward_address` — 32-byte hash of pk; the ABCI node registers the genesis
+//!                        foundation allocation to this address
+//!   * `claim_tx`       — a ready-to-broadcast 0x58 claim payload for [amount]
+//!
+//! Run: `cargo run -p zcrypt-core --example foundation_keys [amount_atomic] [index]`
+//! The devnet seed below matches `FOUNDATION_SEED` in the ABCI node. PRODUCTION
+//! uses an offline cold key instead — never a committed seed.
+
+use zcrypt_core::emission;
+use zcrypt_core::keys::{self, Account};
+
+fn main() {
+    // `foundation_keys new` — the PRODUCTION key ceremony. Run this on an AIR-GAPPED
+    // machine: it generates a fresh foundation account and prints the mnemonic (write
+    // it down, never store digitally) and the reward address to bake into genesis via
+    // the node's ZCRYPT_FOUNDATION_ADDR env var. Only this mnemonic can ever claim
+    // the vesting tranches.
+    if std::env::args().nth(1).as_deref() == Some("new") {
+        let (account, mnemonic) = keys::new_account();
+        println!("== FOUNDATION KEY CEREMONY — keep this output OFFLINE ==");
+        println!("mnemonic (the ONLY way to claim the 4.2M — write it down, split it, vault it):");
+        println!("  {mnemonic}");
+        let pk = account.pubkey();
+        let mut pk_bytes = Vec::with_capacity(64);
+        for limb in &pk {
+            pk_bytes.extend_from_slice(&limb.to_le_bytes());
+        }
+        println!("pk_hex={}", hex::encode(&pk_bytes));
+        println!("ZCRYPT_FOUNDATION_ADDR={}", hex::encode(account.reward_address()));
+        return;
+    }
+
+    let account = Account::from_seed([0xF0; 32]);
+    let pk = account.pubkey();
+    let mut pk_bytes = Vec::with_capacity(64);
+    for limb in &pk {
+        pk_bytes.extend_from_slice(&limb.to_le_bytes());
+    }
+    println!("pk_hex={}", hex::encode(&pk_bytes));
+    println!("reward_address_hex={}", hex::encode(account.reward_address()));
+
+    // Default claim: the genesis-liquid tranche (50,000 ZCRYPT).
+    let args: Vec<String> = std::env::args().collect();
+    let amount: u64 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(emission::FOUNDATION_LIQUID);
+    let index: u64 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(0);
+
+    let mut tx = vec![0x58u8];
+    tx.extend_from_slice(&pk_bytes);
+    tx.extend_from_slice(&amount.to_le_bytes());
+    println!("claim_tx_hex={}", hex::encode(&tx));
+
+    // The coinbase coin the claim mints (owner reconstructs and spends it).
+    let coin = account.reward_coin(amount, index);
+    let c = coin.commitment();
+    let mut cb = Vec::with_capacity(64);
+    for x in &c {
+        cb.extend_from_slice(&x.to_le_bytes());
+    }
+    println!("claimed_coin_commitment={}", hex::encode(cb));
+}

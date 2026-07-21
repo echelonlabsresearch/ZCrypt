@@ -1,0 +1,174 @@
+# 3-validator ZCrypt devnet: three ABCI apps + three CometBFT validators that reach
+# consensus over the SAME state machine. Proves determinism (all nodes agree on each
+# block's app_hash) and real block production/rewards under multi-node consensus.
+#
+#   docker compose -f docker-compose.3node.yml up --build -d
+#   ./e2e/consensus-smoke.sh          # verify agreement + drive simple txs
+#   docker compose -f docker-compose.3node.yml down -v   # tear down + wipe state
+#
+# RPCs are published on the host: node0=46657, node1=46667, node2=46677.
+
+services:
+  # ---- ABCI apps (one per validator, each with its own persisted state) ----
+  abci0:
+    build:
+      context: ..
+      dockerfile: chain/docker/Dockerfile
+      args:
+        ABCI_FEATURES: devnet
+    container_name: zcrypt-abci0
+    restart: unless-stopped
+    environment:
+      ABCI_PORT: "26658"
+      ZCRYPT_STATE_FILE: /data/zcrypt-state.bin
+      # production: the foundation cold key's reward address (64 hex) — REQUIRED by
+      # non-devnet builds; identical on every validator (consensus at genesis)
+      ZCRYPT_FOUNDATION_ADDR: ${ZCRYPT_FOUNDATION_ADDR:-}
+      # devnet-only: accelerate the foundation vesting pacing (1 = real schedule)
+      ZCRYPT_VESTING_ACCEL: ${ZCRYPT_VESTING_ACCEL:-1}
+    volumes:
+      - abci0-data:/data
+    networks: [zcrypt-net]
+
+  abci1:
+    build:
+      context: ..
+      dockerfile: chain/docker/Dockerfile
+      args:
+        ABCI_FEATURES: devnet
+    container_name: zcrypt-abci1
+    restart: unless-stopped
+    environment:
+      ABCI_PORT: "26658"
+      ZCRYPT_STATE_FILE: /data/zcrypt-state.bin
+      # production: the foundation cold key's reward address (64 hex) — REQUIRED by
+      # non-devnet builds; identical on every validator (consensus at genesis)
+      ZCRYPT_FOUNDATION_ADDR: ${ZCRYPT_FOUNDATION_ADDR:-}
+      # devnet-only: accelerate the foundation vesting pacing (1 = real schedule)
+      ZCRYPT_VESTING_ACCEL: ${ZCRYPT_VESTING_ACCEL:-1}
+    volumes:
+      - abci1-data:/data
+    networks: [zcrypt-net]
+
+  abci2:
+    build:
+      context: ..
+      dockerfile: chain/docker/Dockerfile
+      args:
+        ABCI_FEATURES: devnet
+    container_name: zcrypt-abci2
+    restart: unless-stopped
+    environment:
+      ABCI_PORT: "26658"
+      ZCRYPT_STATE_FILE: /data/zcrypt-state.bin
+      # production: the foundation cold key's reward address (64 hex) — REQUIRED by
+      # non-devnet builds; identical on every validator (consensus at genesis)
+      ZCRYPT_FOUNDATION_ADDR: ${ZCRYPT_FOUNDATION_ADDR:-}
+      # devnet-only: accelerate the foundation vesting pacing (1 = real schedule)
+      ZCRYPT_VESTING_ACCEL: ${ZCRYPT_VESTING_ACCEL:-1}
+    volumes:
+      - abci2-data:/data
+    networks: [zcrypt-net]
+
+  # ---- one-shot: generate the shared 3-validator testnet config ----
+  cometbft-init:
+    image: cometbft/cometbft:v0.38.17
+    container_name: zcrypt-cometbft-init
+    user: "0"
+    environment:
+      CHAIN_ID: zcrypt-devnet
+    entrypoint: ["/bin/sh", "/init.sh"]
+    volumes:
+      - ./docker/testnet-init.sh:/init.sh:ro
+      - testnet-data:/testnet
+    networks: [zcrypt-net]
+
+  # ---- CometBFT validators ----
+  cometbft0:
+    image: cometbft/cometbft:v0.38.17
+    container_name: zcrypt-cometbft0
+    user: "0"
+    restart: unless-stopped
+    depends_on:
+      cometbft-init:
+        condition: service_completed_successfully
+      abci0:
+        condition: service_started
+    environment:
+      NODE_INDEX: "0"
+    entrypoint: ["/bin/sh", "/start.sh"]
+    volumes:
+      - ./docker/cometbft-node-start.sh:/start.sh:ro
+      - testnet-data:/testnet
+    ports:
+      - "46657:26657"
+    networks: [zcrypt-net]
+
+  cometbft1:
+    image: cometbft/cometbft:v0.38.17
+    container_name: zcrypt-cometbft1
+    user: "0"
+    restart: unless-stopped
+    depends_on:
+      cometbft-init:
+        condition: service_completed_successfully
+      abci1:
+        condition: service_started
+    environment:
+      NODE_INDEX: "1"
+    entrypoint: ["/bin/sh", "/start.sh"]
+    volumes:
+      - ./docker/cometbft-node-start.sh:/start.sh:ro
+      - testnet-data:/testnet
+    ports:
+      - "46667:26657"
+    networks: [zcrypt-net]
+
+  cometbft2:
+    image: cometbft/cometbft:v0.38.17
+    container_name: zcrypt-cometbft2
+    user: "0"
+    restart: unless-stopped
+    depends_on:
+      cometbft-init:
+        condition: service_completed_successfully
+      abci2:
+        condition: service_started
+    environment:
+      NODE_INDEX: "2"
+    entrypoint: ["/bin/sh", "/start.sh"]
+    volumes:
+      - ./docker/cometbft-node-start.sh:/start.sh:ro
+      - testnet-data:/testnet
+    ports:
+      - "46677:26657"
+    networks: [zcrypt-net]
+
+  # Bitcoin Core (regtest) — the BTC counterparty for BTC<->zBTC atomic swaps.
+  bitcoind:
+    image: ruimarinho/bitcoin-core:24
+    container_name: zcrypt-bitcoind-3n
+    restart: unless-stopped
+    command:
+      - -regtest=1
+      - -server=1
+      - -txindex=1
+      - -fallbackfee=0.0002
+      - -rpcbind=0.0.0.0
+      - -rpcallowip=0.0.0.0/0
+      - -rpcuser=zcrypt
+      - -rpcpassword=zcrypt
+      - -rpcport=18443
+    ports:
+      - "28443:18443"
+    networks: [zcrypt-net]
+
+volumes:
+  abci0-data:
+  abci1-data:
+  abci2-data:
+  testnet-data:
+
+networks:
+  zcrypt-net:
+    driver: bridge

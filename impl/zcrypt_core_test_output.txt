@@ -1,0 +1,23 @@
+=== cargo test -p zcrypt-core --quiet ===
+
+running 97 tests
+....................................................................................... 87/97
+...test shielded_tx::tests::authorized_transfer_verifies has been running for over 60 seconds
+test shielded_tx::tests::fabricated_nullifier_fails has been running for over 60 seconds
+test shielded_tx::tests::no_native_input_cannot_pay_fee has been running for over 60 seconds
+test shielded_tx::tests::node_records_nullifiers_and_blocks_double_spend has been running for over 60 seconds
+test shielded_tx::tests::serialization_roundtrip has been running for over 60 seconds
+test shielded_tx::tests::tampered_signature_fails has been running for over 60 seconds
+test shielded_tx::tests::wrong_owner_binding_fails has been running for over 60 seconds
+.......
+test result: ok. 97 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 84.61s
+
+
+running 12 tests
+./Users/chris/Desktop/Development/zcrypt-v2/impl/run_zcrypt_core_tests.sh: line 9: 16334 Killed: 9               cargo test -p zcrypt-core --quiet 2>&1
+EXIT_CODE=137
+.........test multi_hop_no_history has been running for over 60 seconds
+test stealth_receive_slots_unlinkable has been running for over 60 seconds
+..
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 74.06s
+

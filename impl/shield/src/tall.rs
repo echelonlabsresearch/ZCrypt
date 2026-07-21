@@ -1,0 +1,731 @@
+//! HYBRID TALL-SKINNY shield circuit — a smaller-proof twin of the wide [`CoinsAir`].
+//!
+//! Same statement, same witness, same public outputs (nullifiers, output commitments,
+//! anchor root, chain domain) — but a far smaller proof, because the trace is reshaped
+//! from wide-and-short to (mostly) tall-and-skinny. STARK proof size is ~linear in
+//! trace WIDTH but only log in height, so this shrinks it substantially.
+//!
+//! **Design (hybrid, chosen for safety):**
+//!   * ROW 0 holds the 8 "core" Poseidon2 blocks (commit×S, nf×N_IN, pk×N_IN) side by
+//!     side, and its constraints are copied BYTE-FOR-BYTE from the audited wide AIR
+//!     (ownership, nullifier construction, conservation, range, active/dummy,
+//!     single-asset, published nullifiers/outputs). Only the row gating changes.
+//!   * The N_IN·DEPTH Merkle-path blocks — the dominant cost — go TALL: one compression
+//!     per ROW, chained with adjacent-row transition constraints (the shape proven in
+//!     `tall_spike`). Cross-row wiring uses preprocessed role selectors + two small
+//!     carries (input-1's leaf; the active flags, to gate the root binding).
+//!
+//! This keeps the dangerous value-semantics in row 0 identical to the reviewed circuit
+//! and confines the new soundness surface to the (spike-de-risked) path chain + carries.
+//! This is the production circuit: `prove`/`verify` in lib.rs route here, with the
+//! wide circuit retained as the differential-tested reference twin.
+
+use core::borrow::Borrow;
+
+use p3_air::{Air, AirBuilder, BaseAir, WindowAccess};
+use p3_baby_bear::{
+    BabyBear, BABYBEAR_POSEIDON2_RC_16_EXTERNAL_FINAL as RC_EF,
+    BABYBEAR_POSEIDON2_RC_16_EXTERNAL_INITIAL as RC_EI, BABYBEAR_POSEIDON2_RC_16_INTERNAL as RC_I,
+};
+use p3_field::PrimeCharacteristicRing;
+use p3_matrix::dense::RowMajorMatrix;
+use p3_poseidon2::GenericPoseidon2LinearLayers;
+use p3_poseidon2_air::{generate_trace_rows, Poseidon2Cols, RoundConstants};
+use p3_uni_stark::{
+    prove_with_preprocessed, setup_preprocessed, verify_with_preprocessed, Proof,
+};
+
+use super::*;
+
+// ---- layout -------------------------------------------------------------------
+// Core blocks in row 0's column groups 0..CORE, in the SAME order as the wide AIR:
+//   [commit_0..commit_S) ‖ [nf_0..nf_N_IN) ‖ [pk_0..pk_N_IN)  (S + 2·N_IN = 8 groups).
+const CORE: usize = S + 2 * N_IN;
+// Path rows: input i occupies rows [1 + i·DEPTH .. 1 + (i+1)·DEPTH); its path blocks
+// live in column group 0. Groups 1..CORE on path/padding rows are dummy permutations.
+const PATH_ROWS: usize = N_IN * DEPTH;
+/// Trace height: 1 core row + all path rows, padded up to a power of two.
+/// DEPTH 32: 1 + N_IN*32 = 1 + 64 = 65 -> 128.
+const HEIGHT: usize = 128;
+const DEGREE_BITS: usize = 7; // log2(HEIGHT)
+// Geometry guards: if DEPTH changes, these fail at compile time until HEIGHT/DEGREE_BITS
+// are retuned (HEIGHT must cover the core row + every path row, be a power of two, and
+// equal 2^DEGREE_BITS).
+const _: () = assert!(HEIGHT >= 1 + PATH_ROWS, "HEIGHT too small for 1 core row + PATH_ROWS");
+const _: () = assert!(HEIGHT.is_power_of_two(), "HEIGHT must be a power of two");
+const _: () = assert!(1usize << DEGREE_BITS == HEIGHT, "DEGREE_BITS must equal log2(HEIGHT)");
+
+// Aux column offsets (after the CORE·BLK block columns).
+const AUX: usize = CORE * BLK;
+const R_RANGE: usize = AUX; // S·2·BITS value-limb bits (row 0)
+const R_FEE: usize = R_RANGE + S * 2 * BITS; // BITS fee bits (row 0)
+const R_CARRY: usize = R_FEE + BITS; // CARRY_BITS carry bits (row 0)
+const R_ACT: usize = R_CARRY + CARRY_BITS; // N_IN active flags (row 0)
+const R_PSIB: usize = R_ACT + N_IN; // 8 sibling limbs (path rows)
+const R_PDIR: usize = R_PSIB + 8; // 1 direction bit (path rows)
+const R_CLEAF: usize = R_PDIR + 1; // 8-limb carried leaf of input 1 (all rows)
+const R_CACT: usize = R_CLEAF + 8; // N_IN carried active flags (all rows)
+const TALL_W: usize = R_CACT + N_IN;
+
+// Preprocessed selector columns (fixed per row).
+const P_CORE: usize = 0; // row 0
+const P_PATH: usize = 1; // rows 1..=PATH_ROWS
+const P_CHAIN: usize = 2; // rows whose NEXT row continues the same chain
+const P_P1FIRST: usize = 3; // first path row of input 1
+const P_P0LAST: usize = 4; // last path row of input 0
+const P_P1LAST: usize = 5; // last path row of input 1
+const NUM_SEL: usize = 6;
+
+pub struct CoinsAirTall;
+
+impl BaseAir<BabyBear> for CoinsAirTall {
+    fn width(&self) -> usize {
+        TALL_W
+    }
+    fn num_public_values(&self) -> usize {
+        // Identical to the wide circuit: outputs ‖ fee ‖ nullifiers ‖ root ‖ chain.
+        N_OUT * 8 + 1 + N_IN * 8 + 8 + 1
+    }
+    fn preprocessed_trace(&self) -> Option<RowMajorMatrix<BabyBear>> {
+        let mut v = vec![BabyBear::ZERO; HEIGHT * NUM_SEL];
+        let mut set = |row: usize, col: usize| v[row * NUM_SEL + col] = BabyBear::ONE;
+        set(0, P_CORE);
+        for r in 1..=PATH_ROWS {
+            set(r, P_PATH);
+        }
+        // input 0 path: rows 1..=DEPTH ; input 1 path: rows DEPTH+1..=2·DEPTH.
+        for i in 0..N_IN {
+            let first = 1 + i * DEPTH;
+            let last = i * DEPTH + DEPTH; // = first + DEPTH - 1
+            // chain links: every path row of this input EXCEPT its last one.
+            for r in first..last {
+                set(r, P_CHAIN);
+            }
+            if i == 1 {
+                set(first, P_P1FIRST);
+                set(last, P_P1LAST);
+            }
+            if i == 0 {
+                set(last, P_P0LAST);
+            }
+        }
+        Some(RowMajorMatrix::new(v, NUM_SEL))
+    }
+}
+
+/// Run one Poseidon2 compression block over a `BLK`-wide slice; return its 8 outputs.
+fn eval_block<AB: AirBuilder<F = BabyBear>>(builder: &mut AB, cols_slice: &[AB::Var]) -> [AB::Var; 8] {
+    let cols: &Poseidon2Cols<AB::Var, WIDTH, SD, SR, HFR, PR> = cols_slice.borrow();
+    let mut state: [AB::Expr; WIDTH] = core::array::from_fn(|k| cols.inputs[k].into());
+    LL::external_linear_layer(&mut state);
+    for r in 0..HFR {
+        eval_full::<AB>(&mut state, &cols.beginning_full_rounds[r], &RC_EI[r], builder);
+    }
+    for r in 0..PR {
+        eval_partial::<AB>(&mut state, &cols.partial_rounds[r], &RC_I[r], builder);
+    }
+    for r in 0..HFR {
+        eval_full::<AB>(&mut state, &cols.ending_full_rounds[r], &RC_EF[r], builder);
+    }
+    core::array::from_fn(|k| cols.ending_full_rounds[HFR - 1].post[k])
+}
+
+impl<AB: AirBuilder<F = BabyBear>> Air<AB> for CoinsAirTall {
+    fn eval(&self, builder: &mut AB) {
+        let main = builder.main();
+        let local = main.current_slice().to_vec();
+        let next = main.next_slice().to_vec();
+        let pre = builder.preprocessed().current_slice().to_vec();
+        let pis: Vec<AB::Expr> = builder.public_values().iter().map(|x| (*x).into()).collect();
+
+        let out_off = 0;
+        let fee_i = N_OUT * 8;
+        let nf_off = fee_i + 1;
+        let root_off = nf_off + N_IN * 8;
+        let fee_pub = pis[fee_i].clone();
+
+        let p_core: AB::Expr = pre[P_CORE].into();
+        let p_path: AB::Expr = pre[P_PATH].into();
+        let p_chain: AB::Expr = pre[P_CHAIN].into();
+        let p_p1first: AB::Expr = pre[P_P1FIRST].into();
+        let p_p0last: AB::Expr = pre[P_P0LAST].into();
+        let p_p1last: AB::Expr = pre[P_P1LAST].into();
+
+        // Every row: all CORE column groups are valid Poseidon2 compressions.
+        let outs: Vec<[AB::Var; 8]> = (0..CORE)
+            .map(|g| eval_block(builder, &local[g * BLK..(g + 1) * BLK]))
+            .collect();
+
+        // ---- carry propagation (every transition): CLEAF and CACT stay constant ----
+        {
+            let mut wt = builder.when_transition();
+            for j in 0..8 {
+                wt.assert_eq(next[R_CLEAF + j], local[R_CLEAF + j]);
+            }
+            for i in 0..N_IN {
+                wt.assert_eq(next[R_CACT + i], local[R_CACT + i]);
+            }
+        }
+
+        // ============================================================
+        // CORE ROW (gated by P_CORE == row 0). Copied from the wide AIR.
+        // Column group g in row 0 == wide block g, so all indexing matches.
+        // ============================================================
+        // helper: assert `expr == 0` only on the core row.
+        macro_rules! core_zero {
+            ($b:expr, $e:expr) => {
+                $b.assert_zero(p_core.clone() * ($e));
+            };
+        }
+
+        // SINGLE-ASSET: commit blocks share asset (commit input[14]).
+        for i in 1..S {
+            core_zero!(builder, Into::<AB::Expr>::into(local[i * BLK + 14]) - local[14].into());
+        }
+
+        // per coin: range-check value limbs; inputs prove ownership + tree membership.
+        for i in 0..S {
+            let lo = recompose::<AB>(builder, &local, R_RANGE + i * 2 * BITS, BITS);
+            let hi = recompose::<AB>(builder, &local, R_RANGE + i * 2 * BITS + BITS, BITS);
+            core_zero!(builder, lo - local[i * BLK].into());
+            core_zero!(builder, hi - Into::<AB::Expr>::into(local[i * BLK + 1]));
+
+            if i < N_IN {
+                let pk_blk = S + N_IN + i;
+                let nf_blk = S + i;
+                let act: AB::Expr = local[R_ACT + i].into();
+                core_zero!(builder, act.clone() * (act.clone() - AB::Expr::ONE)); // boolean
+                let one_minus_act = AB::Expr::ONE - act.clone();
+                core_zero!(builder, one_minus_act.clone() * Into::<AB::Expr>::into(local[i * BLK]));
+                core_zero!(builder, one_minus_act * Into::<AB::Expr>::into(local[i * BLK + 1]));
+                // OWNERSHIP: pk in the commitment (input[6..14]) == Poseidon2(ss).
+                for t in 0..8 {
+                    core_zero!(builder, Into::<AB::Expr>::into(local[i * BLK + 6 + t]) - outs[pk_blk][t].into());
+                }
+                for t in 8..WIDTH {
+                    core_zero!(builder, Into::<AB::Expr>::into(local[pk_blk * BLK + t]));
+                }
+                // CANONICAL nullifier input: [ss(8), vlo, vhi, blind(4), asset].
+                for t in 0..8 {
+                    core_zero!(builder, Into::<AB::Expr>::into(local[nf_blk * BLK + t]) - local[pk_blk * BLK + t].into());
+                }
+                core_zero!(builder, Into::<AB::Expr>::into(local[nf_blk * BLK + 8]) - local[i * BLK].into());
+                core_zero!(builder, Into::<AB::Expr>::into(local[nf_blk * BLK + 9]) - local[i * BLK + 1].into());
+                for t in 0..4 {
+                    core_zero!(builder, Into::<AB::Expr>::into(local[nf_blk * BLK + 10 + t]) - local[i * BLK + 2 + t].into());
+                }
+                core_zero!(builder, Into::<AB::Expr>::into(local[nf_blk * BLK + 14]) - local[i * BLK + 14].into());
+                core_zero!(builder, Into::<AB::Expr>::into(local[nf_blk * BLK + 15]));
+                // Published nullifier for EVERY input (real or dummy) — arity-leak fix.
+                for k in 0..8 {
+                    core_zero!(builder, Into::<AB::Expr>::into(outs[nf_blk][k]) - pis[nf_off + i * 8 + k].clone());
+                }
+            } else {
+                core_zero!(builder, Into::<AB::Expr>::into(local[i * BLK + 15]));
+                for j in 0..8 {
+                    core_zero!(builder, Into::<AB::Expr>::into(outs[i][j]) - pis[out_off + (i - N_IN) * 8 + j].clone());
+                }
+            }
+        }
+
+        // FEE range-check.
+        let fee_re = recompose::<AB>(builder, &local, R_FEE, BITS);
+        core_zero!(builder, fee_re - fee_pub.clone());
+
+        // CONSERVATION (multi-limb with carry).
+        let lo = |i: usize| -> AB::Expr { local[i * BLK].into() };
+        let hi = |i: usize| -> AB::Expr { local[i * BLK + 1].into() };
+        let mut sum_in_lo = AB::Expr::ZERO;
+        let mut sum_in_hi = AB::Expr::ZERO;
+        for i in 0..N_IN {
+            sum_in_lo += lo(i);
+            sum_in_hi += hi(i);
+        }
+        let mut sum_out_lo = AB::Expr::ZERO;
+        let mut sum_out_hi = AB::Expr::ZERO;
+        for i in N_IN..S {
+            sum_out_lo += lo(i);
+            sum_out_hi += hi(i);
+        }
+        let d = sum_in_lo - sum_out_lo - fee_pub;
+        let e = sum_out_hi - sum_in_hi;
+        let e_shifted = recompose::<AB>(builder, &local, R_CARRY, CARRY_BITS);
+        core_zero!(builder, e_shifted - (e.clone() + pow2::<AB>(3)));
+        core_zero!(builder, d - pow2::<AB>(SHIFT) * e);
+
+        // Load carries on the core row: CLEAF := leaf of input 1 (commit block 1's
+        // output); CACT[i] := active_i.
+        for j in 0..8 {
+            core_zero!(builder, Into::<AB::Expr>::into(local[R_CLEAF + j]) - outs[1][j].into());
+        }
+        for i in 0..N_IN {
+            core_zero!(builder, Into::<AB::Expr>::into(local[R_CACT + i]) - local[R_ACT + i].into());
+        }
+
+        // ============================================================
+        // TALL PATH (group 0 blocks on rows 1..=PATH_ROWS). `outs[0]` is this row's
+        // compression output. `running(row)` is the leaf/previous-node fed in.
+        // ============================================================
+        let running = |row: &[AB::Var]| -> [AB::Expr; 8] {
+            let dir: AB::Expr = row[R_PDIR].into();
+            core::array::from_fn(|j| {
+                let l: AB::Expr = row[j].into();
+                let r: AB::Expr = row[8 + j].into();
+                (AB::Expr::ONE - dir.clone()) * l + dir.clone() * r
+            })
+        };
+
+        // dir booleanity + sibling consistency (path rows). left=input[0..8],
+        // right=input[8..16]; the sibling is whichever child is NOT the running node.
+        {
+            let dir: AB::Expr = local[R_PDIR].into();
+            builder.assert_zero(p_path.clone() * dir.clone() * (dir.clone() - AB::Expr::ONE));
+            for j in 0..8 {
+                let l: AB::Expr = local[j].into();
+                let r: AB::Expr = local[8 + j].into();
+                let sib: AB::Expr = local[R_PSIB + j].into();
+                builder.assert_zero(
+                    p_path.clone() * (sib - (dir.clone() * l + (AB::Expr::ONE - dir.clone()) * r)),
+                );
+            }
+        }
+
+        // Leaf feed, input 0: on the (row 0 -> row 1) transition, the next row's
+        // running node equals commit block 0's output (input 0's leaf).
+        {
+            let mut wt = builder.when_transition();
+            let run_next = running(&next);
+            for j in 0..8 {
+                wt.assert_zero(p_core.clone() * (run_next[j].clone() - outs[0][j].into()));
+            }
+        }
+
+        // Leaf feed, input 1: on input 1's first path row, its running node equals the
+        // carried leaf (input 1's commit output, carried down from row 0).
+        {
+            let run_local = running(&local);
+            for j in 0..8 {
+                builder.assert_zero(p_p1first.clone() * (run_local[j].clone() - local[R_CLEAF + j].into()));
+            }
+        }
+
+        // Chain link: on a chain row, the NEXT row's running node == this row's output.
+        {
+            let mut wt = builder.when_transition();
+            let run_next = running(&next);
+            for j in 0..8 {
+                wt.assert_zero(p_chain.clone() * (run_next[j].clone() - outs[0][j].into()));
+            }
+        }
+
+        // Root binding (gated by the carried active flag): an ACTIVE input's path-last
+        // output equals the public anchor root. A dummy (inactive) input proves nothing.
+        for j in 0..8 {
+            let root_j = pis[root_off + j].clone();
+            let cact0: AB::Expr = local[R_CACT].into();
+            let cact1: AB::Expr = local[R_CACT + 1].into();
+            builder.assert_zero(p_p0last.clone() * cact0 * (Into::<AB::Expr>::into(outs[0][j]) - root_j.clone()));
+            builder.assert_zero(p_p1last.clone() * cact1 * (Into::<AB::Expr>::into(outs[0][j]) - root_j));
+        }
+    }
+}
+
+// ---- trace generation ---------------------------------------------------------
+
+/// Build the hybrid tall trace + public values for a (validated) spend. Mirrors the
+/// wide `prove` block/aux computation exactly, then arranges it in the tall layout.
+#[allow(clippy::type_complexity)]
+fn tall_trace(
+    inputs: &[SpendWitness],
+    outputs: &[OutCoin],
+    fee: u64,
+    chain_id: &[u8],
+) -> Option<(RowMajorMatrix<BabyBear>, Vec<BabyBear>, Vec<Commitment>, Vec<Commitment>, Commitment)>
+{
+    if !shape_ok(inputs, outputs, fee) {
+        return None;
+    }
+    let n_real = inputs.len();
+    let root = shared_root(&inputs[..n_real])?;
+    let asset = inputs[0].asset_id;
+    let real_inputs: Vec<SpendWitness> = inputs.to_vec();
+    let mut padded: Vec<SpendWitness> = inputs.to_vec();
+    while padded.len() < N_IN {
+        let j = padded.len();
+        padded.push(dummy_witness(&real_inputs, j, asset));
+    }
+    let active: Vec<bool> = (0..N_IN).map(|i| i < n_real).collect();
+    let inputs: &[SpendWitness] = &padded;
+
+    let in_pks: Vec<PubKey> = inputs.iter().map(|i| spend_pubkey(&i.spend_secret)).collect();
+    let coin_values: Vec<u64> = inputs
+        .iter()
+        .map(|i| i.value)
+        .chain(outputs.iter().map(|&(v, _, _, _)| v))
+        .collect();
+    let commit_states: Vec<[BabyBear; WIDTH]> = inputs
+        .iter()
+        .enumerate()
+        .map(|(i, inp)| coin_input(inp.value, &inp.blind, &in_pks[i], inp.asset_id))
+        .chain(outputs.iter().map(|(v, b, pk, a)| coin_input(*v, b, pk, *a)))
+        .collect();
+    let out_commits: Vec<Commitment> = commit_states[N_IN..].iter().map(native_commit).collect();
+    let nf_states: Vec<[BabyBear; WIDTH]> =
+        inputs.iter().map(|i| nf_input(&i.spend_secret, i.value, &i.blind, i.asset_id)).collect();
+    let nullifiers: Vec<Commitment> = nf_states.iter().map(native_commit).collect();
+    let pk_states: Vec<[BabyBear; WIDTH]> = inputs.iter().map(|i| pk_input(&i.spend_secret)).collect();
+    let leaf_commits: Vec<Commitment> = commit_states[..N_IN].iter().map(native_commit).collect();
+
+    // Path block input states (per input, per level), + siblings/dirs for the aux cols.
+    let mut path_states: Vec<[BabyBear; WIDTH]> = Vec::with_capacity(PATH_ROWS);
+    for i in 0..N_IN {
+        let mut cur = leaf_commits[i];
+        for lvl in 0..DEPTH {
+            let sib = inputs[i].path_siblings.get(lvl).copied().unwrap_or([0u64; 8]);
+            let dir = inputs[i].path_dirs.get(lvl).copied().unwrap_or(false);
+            let (left, right) = if dir { (sib, cur) } else { (cur, sib) };
+            let mut st = [BabyBear::ZERO; WIDTH];
+            for j in 0..8 {
+                st[j] = BabyBear::from_u64(left[j]);
+                st[8 + j] = BabyBear::from_u64(right[j]);
+            }
+            path_states.push(st);
+            cur = compress2(&left, &right);
+        }
+    }
+
+    // Core blocks in row 0's column groups (commit S ‖ nf N_IN ‖ pk N_IN).
+    let core_states: Vec<[BabyBear; WIDTH]> = commit_states
+        .iter()
+        .chain(&nf_states)
+        .chain(&pk_states)
+        .copied()
+        .collect();
+    debug_assert_eq!(core_states.len(), CORE);
+
+    // For each column group g, the state occupying (row, g).
+    let dummy = [BabyBear::ZERO; WIDTH];
+    let mut group_states: Vec<Vec<[BabyBear; WIDTH]>> = vec![vec![dummy; HEIGHT]; CORE];
+    for g in 0..CORE {
+        group_states[g][0] = core_states[g]; // row 0: the core block
+    }
+    // Group 0's path rows: input 0 -> rows 1..=DEPTH, input 1 -> rows DEPTH+1..=2·DEPTH.
+    for (idx, st) in path_states.iter().enumerate() {
+        group_states[0][1 + idx] = *st;
+    }
+
+    let constants = RoundConstants::<BabyBear, WIDTH, HFR, PR>::new(RC_EI, RC_I, RC_EF);
+    // Generate each group's full Poseidon2 trace (HEIGHT rows).
+    let group_traces: Vec<RowMajorMatrix<BabyBear>> = group_states
+        .iter()
+        .map(|states| generate_trace_rows::<BabyBear, LL, WIDTH, SD, SR, HFR, PR>(states.clone(), &constants, 0))
+        .collect();
+
+    // Carry witnesses.
+    let sum_in_hi: u64 = inputs.iter().map(|i| i.value >> SHIFT).sum();
+    let sum_out_hi: u64 = outputs.iter().map(|&(v, _, _, _)| v >> SHIFT).sum();
+    let ecarry: u64 = (sum_out_hi as i64 - sum_in_hi as i64 + CARRY_OFFSET as i64) as u64;
+    let leaf1 = leaf_commits[1];
+
+    // Assemble the full trace row by row.
+    let mut vals = Vec::with_capacity(HEIGHT * TALL_W);
+    for r in 0..HEIGHT {
+        // block columns for all CORE groups
+        for g in 0..CORE {
+            for c in 0..BLK {
+                vals.push(group_traces[g].values[r * BLK + c]);
+            }
+        }
+        // aux — only row 0 carries the core aux; path rows carry sibling/dir.
+        // R_RANGE: value-limb bits (row 0 only)
+        for (_i, &v) in coin_values.iter().enumerate() {
+            let (vlo, vhi) = (v & LIMB_MASK, v >> SHIFT);
+            for j in 0..BITS {
+                vals.push(BabyBear::from_u64(if r == 0 { (vlo >> j) & 1 } else { 0 }));
+            }
+            for j in 0..BITS {
+                vals.push(BabyBear::from_u64(if r == 0 { (vhi >> j) & 1 } else { 0 }));
+            }
+        }
+        // R_FEE
+        for j in 0..BITS {
+            vals.push(BabyBear::from_u64(if r == 0 { (fee >> j) & 1 } else { 0 }));
+        }
+        // R_CARRY
+        for j in 0..CARRY_BITS {
+            vals.push(BabyBear::from_u64(if r == 0 { (ecarry >> j) & 1 } else { 0 }));
+        }
+        // R_ACT
+        for i in 0..N_IN {
+            vals.push(BabyBear::from_u64(if r == 0 && active[i] { 1 } else { 0 }));
+        }
+        // R_PSIB / R_PDIR: sibling + dir for this path row (else zero).
+        let path_idx = if (1..=PATH_ROWS).contains(&r) { Some(r - 1) } else { None };
+        let (sib, dir) = match path_idx {
+            Some(idx) => {
+                let i = idx / DEPTH;
+                let lvl = idx % DEPTH;
+                (
+                    inputs[i].path_siblings.get(lvl).copied().unwrap_or([0u64; 8]),
+                    inputs[i].path_dirs.get(lvl).copied().unwrap_or(false),
+                )
+            }
+            None => ([0u64; 8], false),
+        };
+        for j in 0..8 {
+            vals.push(BabyBear::from_u64(sib[j]));
+        }
+        vals.push(if dir { BabyBear::ONE } else { BabyBear::ZERO });
+        // R_CLEAF (carried leaf of input 1) — constant every row.
+        for j in 0..8 {
+            vals.push(BabyBear::from_u64(leaf1[j]));
+        }
+        // R_CACT (carried active flags) — constant every row.
+        for i in 0..N_IN {
+            vals.push(BabyBear::from_u64(if active[i] { 1 } else { 0 }));
+        }
+    }
+    let trace = RowMajorMatrix::new(vals, TALL_W);
+
+    let mut pis: Vec<BabyBear> = Vec::new();
+    for c in &out_commits {
+        for &x in c {
+            pis.push(BabyBear::from_u64(x));
+        }
+    }
+    pis.push(BabyBear::from_u64(fee));
+    for nf in &nullifiers {
+        for &x in nf {
+            pis.push(BabyBear::from_u64(x));
+        }
+    }
+    for &x in &root {
+        pis.push(BabyBear::from_u64(x));
+    }
+    pis.push(BabyBear::from_u64(chain_domain(chain_id)));
+
+    Some((trace, pis, out_commits, nullifiers, root))
+}
+
+/// Prove a shielded-pool spend with the tall circuit. Same return shape as the wide
+/// [`super::prove`]: `(output commitments, nullifiers, anchor root, proof bytes)`.
+pub fn prove_tall(
+    inputs: &[SpendWitness],
+    outputs: &[OutCoin],
+    fee: u64,
+    chain_id: &[u8],
+) -> Option<(Vec<Commitment>, Vec<Commitment>, Commitment, Vec<u8>)> {
+    let (trace, pis, out_commits, nullifiers, root) = tall_trace(inputs, outputs, fee, chain_id)?;
+    // Preprocessed columns are fixed & public; commit them with the deterministic
+    // (fixed-seed) config so prover and verifier derive the same key without sharing.
+    let (pp_data, _pp_vk) = setup_preprocessed(&verifier_config(), &CoinsAirTall, DEGREE_BITS)?;
+    let proof = prove_with_preprocessed(&prover_config(), &CoinsAirTall, trace, &pis, Some(&pp_data));
+    let bytes = postcard::to_allocvec(&proof).ok()?;
+    Some((out_commits, nullifiers, root, bytes))
+}
+
+/// Verify a tall-circuit proof. Same signature as the wide [`super::verify`].
+pub fn verify_tall(
+    output_commits: &[Commitment],
+    nullifiers: &[Commitment],
+    fee: u64,
+    root: &Commitment,
+    proof_bytes: &[u8],
+    chain_id: &[u8],
+) -> bool {
+    if output_commits.len() != N_OUT || nullifiers.len() != N_IN {
+        return false;
+    }
+    if fee >= MAX_FEE {
+        return false;
+    }
+    let all_canonical =
+        output_commits.iter().chain(nullifiers).chain([root]).all(limbs_canonical);
+    if !all_canonical {
+        return false;
+    }
+    let (_pp_data, pp_vk) = match setup_preprocessed(&verifier_config(), &CoinsAirTall, DEGREE_BITS) {
+        Some(x) => x,
+        None => return false,
+    };
+    let proof: Proof<ZkConfig> = match postcard::from_bytes(proof_bytes) {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
+    let mut pis: Vec<BabyBear> = Vec::new();
+    for c in output_commits {
+        for &x in c {
+            pis.push(BabyBear::from_u64(x));
+        }
+    }
+    pis.push(BabyBear::from_u64(fee));
+    for nf in nullifiers {
+        for &x in nf {
+            pis.push(BabyBear::from_u64(x));
+        }
+    }
+    for &x in root {
+        pis.push(BabyBear::from_u64(x));
+    }
+    pis.push(BabyBear::from_u64(chain_domain(chain_id)));
+
+    let prev = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let ok = std::panic::catch_unwind(|| {
+        verify_with_preprocessed(&verifier_config(), &CoinsAirTall, &proof, &pis, Some(&pp_vk)).is_ok()
+    })
+    .unwrap_or(false);
+    std::panic::set_hook(prev);
+    ok
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const CHAIN: &[u8] = b"zcrypt-devnet";
+
+    fn bl(b: u64) -> Blind {
+        core::array::from_fn(|i| field_limb(b.wrapping_add(0x9e37u64.wrapping_mul(i as u64 + 1))))
+    }
+    fn ss(s: u64) -> SpendSecret {
+        core::array::from_fn(|i| field_limb(s ^ 0x11u64.wrapping_mul(i as u64 + 1)))
+    }
+    fn oc(v: u64, b: u64, s: u64) -> OutCoin {
+        (v, bl(b), spend_pubkey(&ss(s)), ASSET_ZCRYPT)
+    }
+    fn inp(v: u64, b: u64, s: u64) -> SpendWitness {
+        SpendWitness {
+            value: v,
+            blind: bl(b),
+            spend_secret: ss(s),
+            asset_id: ASSET_ZCRYPT,
+            path_siblings: vec![],
+            path_dirs: vec![],
+        }
+    }
+    /// Place inputs in one tree; fill their authentication paths. Returns (inputs, root).
+    fn with_tree(mut inputs: Vec<SpendWitness>) -> (Vec<SpendWitness>, Commitment) {
+        let mut t = tree::CommitmentTree::new();
+        let mut idxs = Vec::new();
+        for i in &inputs {
+            let leaf = commit_asset(i.value, &i.blind, &spend_pubkey(&i.spend_secret), i.asset_id);
+            idxs.push(t.append(leaf).unwrap());
+        }
+        let root = t.root();
+        for (i, &idx) in inputs.iter_mut().zip(&idxs) {
+            let (sib, dir) = t.path(idx).unwrap();
+            i.path_siblings = sib;
+            i.path_dirs = dir;
+        }
+        (inputs, root)
+    }
+
+    #[test]
+    fn tall_two_input_parity_verifies_and_is_smaller() {
+        let (ins, root) = with_tree(vec![inp(100, 11, 7), inp(50, 22, 8)]);
+        let outs = [oc(90, 33, 1), oc(55, 44, 2)];
+
+        // WIDE reference (the retained circuit; production `prove` now routes to tall).
+        let (wo, wn, wr, wp) = prove_wide(&ins, &outs, 5, CHAIN).expect("wide prove");
+        assert!(verify_wide(&wo, &wn, 5, &wr, &wp, CHAIN), "wide verifies");
+
+        // TALL.
+        let (to, tn, tr, tp) = prove_tall(&ins, &outs, 5, CHAIN).expect("tall prove");
+        // Bit-exact PUBLIC OUTPUT PARITY with the wide circuit.
+        assert_eq!(to, wo, "output commitments match wide");
+        assert_eq!(tn, wn, "nullifiers match wide");
+        assert_eq!(tr, wr, "anchor root matches wide");
+        assert_eq!(tr, root);
+        assert!(verify_tall(&to, &tn, 5, &tr, &tp, CHAIN), "tall verifies");
+
+        eprintln!(
+            "[tall] full 2-in/2-out shield: WIDE proof {} bytes ({:.0} KB) | TALL proof {} bytes ({:.0} KB) | {:.2}x smaller",
+            wp.len(), wp.len() as f64 / 1024.0, tp.len(), tp.len() as f64 / 1024.0,
+            wp.len() as f64 / tp.len() as f64,
+        );
+        assert!(tp.len() < wp.len(), "tall proof must be smaller");
+
+        // Cross-circuit sanity: each verifier rejects the other's proof.
+        assert!(!verify_tall(&wo, &wn, 5, &wr, &wp, CHAIN), "tall verify rejects a wide proof");
+        assert!(!verify_wide(&to, &tn, 5, &tr, &tp, CHAIN), "wide verify rejects a tall proof");
+    }
+
+    #[test]
+    fn tall_rejects_tampered_public_inputs() {
+        let (ins, _root) = with_tree(vec![inp(100, 11, 7), inp(50, 22, 8)]);
+        let (o, n, r, p) = prove_tall(&ins, &[oc(90, 33, 1), oc(55, 44, 2)], 5, CHAIN).unwrap();
+        assert!(verify_tall(&o, &n, 5, &r, &p, CHAIN));
+        // wrong root
+        let mut wrong = r;
+        wrong[0] ^= 1;
+        assert!(!verify_tall(&o, &n, 5, &wrong, &p, CHAIN), "wrong root rejected");
+        // wrong fee
+        assert!(!verify_tall(&o, &n, 6, &r, &p, CHAIN), "wrong fee rejected");
+        // tampered output commitment
+        let mut bo = o.clone();
+        bo[0][0] ^= 1;
+        assert!(!verify_tall(&bo, &n, 5, &r, &p, CHAIN), "tampered output rejected");
+        // tampered nullifier
+        let mut bn = n.clone();
+        bn[0][0] ^= 1;
+        assert!(!verify_tall(&o, &bn, 5, &r, &p, CHAIN), "tampered nullifier rejected");
+        // wrong chain id (domain separation)
+        assert!(!verify_tall(&o, &n, 5, &r, &p, b"other-chain"), "wrong chain id rejected");
+    }
+
+    #[test]
+    fn tall_single_input_parity() {
+        // 1-input spend: the 2nd slot is a value-0 dummy (arity fix) with a dummy path.
+        let (ins, _root) = with_tree(vec![inp(100, 11, 7)]);
+        let outs = [oc(90, 33, 1), oc(5, 44, 2)];
+        let (wo, wn, wr, _wp) = prove_wide(&ins, &outs, 5, CHAIN).expect("wide");
+        let (to, tn, tr, tp) = prove_tall(&ins, &outs, 5, CHAIN).expect("tall");
+        assert_eq!((to.clone(), tn.clone(), tr), (wo, wn, wr), "single-input parity with wide");
+        assert!(verify_tall(&to, &tn, 5, &tr, &tp, CHAIN), "single-input tall verifies");
+    }
+
+    #[test]
+    fn tall_equals_vm_outputs() {
+        // The transparent VM twin computes the public outputs the circuit must commit
+        // to. The tall circuit must reproduce them exactly (VM ≡ tall, transitively via
+        // VM ≡ wide ≡ tall, asserted directly here).
+        let (ins, _root) = with_tree(vec![inp(100, 11, 7), inp(50, 22, 8)]);
+        let outs = [oc(90, 33, 1), oc(55, 44, 2)];
+        let vm = zvm::run_shield_transfer(&ins, &outs, 5);
+        let (to, tn, _tr, _tp) = prove_tall(&ins, &outs, 5, CHAIN).unwrap();
+        assert!(vm.accept);
+        assert_eq!(vm.output_commitments, to, "VM and tall output commitments agree");
+        assert_eq!(vm.nullifiers, tn, "VM and tall nullifiers agree");
+    }
+
+    #[test]
+    fn tall_rejects_invalid_shapes_like_wide() {
+        // Invalid witnesses are rejected identically (shape_ok is shared): non-conserving,
+        // over the per-coin cap, and a corrupted authentication path (no shared root).
+        let mk = |ins: &[SpendWitness], o: [OutCoin; 2], fee: u64| {
+            (
+                prove_wide(ins, &o, fee, CHAIN).is_none(),
+                prove_tall(ins, &o, fee, CHAIN).is_none(),
+            )
+        };
+        let (nc, _) = with_tree(vec![inp(100, 1, 1), inp(1, 2, 2)]);
+        assert_eq!(mk(&nc, [oc(100, 3, 1), oc(1, 4, 2)], 5), (true, true), "non-conserving");
+        let (oc_ov, _) = with_tree(vec![inp(MAX_COIN_VALUE + 1, 1, 1), inp(0, 2, 2)]);
+        assert_eq!(mk(&oc_ov, [oc(0, 3, 1), oc(0, 4, 2)], 0), (true, true), "over cap");
+        let (mut corrupt, _) = with_tree(vec![inp(100, 11, 7), inp(50, 22, 8)]);
+        corrupt[0].path_siblings[0][0] ^= 1;
+        assert_eq!(mk(&corrupt, [oc(90, 33, 1), oc(55, 44, 2)], 5), (true, true), "corrupted path");
+    }
+
+    #[test]
+    fn tall_large_values_and_carry() {
+        // multi-limb values exercise the (row-0) conservation carry path.
+        let a = 5_000_000_000u64;
+        let b = 3_000_000_000u64;
+        let (ins, _root) = with_tree(vec![inp(a, 11, 7), inp(b, 22, 8)]);
+        let out0 = a + b - 100 - 5;
+        let (to, tn, tr, tp) = prove_tall(&ins, &[oc(out0, 33, 1), oc(100, 44, 2)], 5, CHAIN).unwrap();
+        assert!(verify_tall(&to, &tn, 5, &tr, &tp, CHAIN));
+    }
+}

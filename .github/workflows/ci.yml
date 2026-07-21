@@ -1,0 +1,63 @@
+# Fast regression gate — runs on EVERY push and PR.
+# Covers the 129 unit + integration tests (including real STARK proofs) and the
+# wallet build. The heavy live 3-node e2e is a separate workflow (live-e2e.yml)
+# because it stands up Docker and generates ~5 MB proofs — too slow per-push.
+name: CI
+
+on:
+  push:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust-tests:
+    name: Rust tests (impl workspace)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      # rust-toolchain.toml pins nightly; rustup installs it on first cargo call.
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: impl
+      - name: Show toolchain
+        working-directory: impl
+        run: rustup show
+      - name: Test workspace (unit + integration, incl. product_surface + recovery e2e)
+        working-directory: impl
+        run: cargo test --workspace --no-fail-fast
+      - name: Devnet-feature tests (SEED gating, BOND/UNBOND auth)
+        working-directory: impl
+        run: cargo test -p zcrypt-abci-node --features devnet
+
+  wallet:
+    name: Wallet (frontend build + backend test)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tauri system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev \
+            libayatana-appindicator3-dev
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: wallet/src-tauri
+      - name: Frontend typecheck + production build
+        working-directory: wallet
+        run: |
+          npm ci
+          npx tsc --noEmit
+          npm run build
+      - name: Wallet backend tests (Tor config, keystore)
+        working-directory: wallet/src-tauri
+        run: cargo test

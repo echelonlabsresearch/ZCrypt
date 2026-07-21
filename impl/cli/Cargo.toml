@@ -1,0 +1,15 @@
+[package]
+name = "zcrypt-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "zcrypt"
+path = "src/main.rs"
+
+[dependencies]
+zcrypt-core = { path = "../core" }
+zcrypt-shield = { path = "../shield" }
+serde_json.workspace = true
+hex.workspace = true

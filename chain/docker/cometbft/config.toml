@@ -1,0 +1,31 @@
+# CometBFT node config for ZCrypt ABCI (single-validator devnet)
+
+moniker = "zcrypt-node"
+fast_sync = true
+db_backend = "goleveldb"
+db_dir = "data"
+log_level = "info"
+log_format = "plain"
+
+[rpc]
+laddr = "tcp://0.0.0.0:26657"
+cors_allowed_origins = ["*"]
+
+[p2p]
+laddr = "tcp://0.0.0.0:26656"
+seeds = ""
+persistent_peers = ""
+addr_book_strict = false
+max_num_inbound_peers = 40
+max_num_outbound_peers = 10
+
+[consensus]
+timeout_commit = "2s"
+create_empty_blocks = true
+create_empty_blocks_interval = "0s"
+
+[tx_index]
+indexer = "kv"
+
+[instrumentation]
+prometheus = false

@@ -1,0 +1,27 @@
+[package]
+name = "zcrypt-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = []
+high-security = ["zcrypt-shield/high-security"]
+
+[dependencies]
+sha3.workspace = true
+sha2.workspace = true
+hkdf.workspace = true
+chacha20poly1305.workspace = true
+ml-kem.workspace = true
+kem.workspace = true
+bip39.workspace = true
+bech32.workspace = true
+rand.workspace = true
+rand_core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+postcard = { version = "1", features = ["alloc"] }
+hex.workspace = true
+zcrypt-shield = { path = "../shield", default-features = false }
+ml-dsa = "0.1.1"

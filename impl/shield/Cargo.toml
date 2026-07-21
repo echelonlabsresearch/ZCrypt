@@ -1,0 +1,30 @@
+[package]
+name = "zcrypt-shield"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = []
+## Roughly doubles FRI queries / PoW for a thicker soundness margin (mainnet).
+high-security = []
+
+[dependencies]
+p3-air = "0.6"
+p3-baby-bear = "0.6"
+p3-challenger = "0.6"
+p3-commit = "0.6"
+p3-dft = "0.6"
+p3-field = "0.6"
+p3-fri = "0.6"
+p3-keccak = "0.6"
+p3-matrix = "0.6"
+p3-merkle-tree = "0.6"
+p3-poseidon2 = "0.6"
+p3-poseidon2-air = "0.6"
+p3-symmetric = "0.6"
+p3-uni-stark = "0.6"
+p3-util = "0.6"
+rand = { version = "0.10.2", default-features = false, features = ["sys_rng", "chacha"] }
+postcard = { version = "1", features = ["alloc"] }
+serde = { version = "1", features = ["derive"] }

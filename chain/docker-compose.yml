@@ -1,0 +1,77 @@
+services:
+  abci:
+    build:
+      context: ..
+      dockerfile: chain/docker/Dockerfile
+      args:
+        # This is the devnet stack: enable the SEED (0x56) faucet/mint path the
+        # wallet uses. Production deployments build with ABCI_FEATURES="" instead.
+        ABCI_FEATURES: devnet
+    container_name: zcrypt-abci
+    restart: unless-stopped
+    environment:
+      ABCI_PORT: "26658"
+      # Persist consensus state on a named volume so a restart/rebuild resumes at
+      # the last committed height instead of replaying every block from genesis.
+      ZCRYPT_STATE_FILE: /data/zcrypt-state.bin
+      # production: the foundation cold key's reward address (64 hex) — REQUIRED by
+      # non-devnet builds; identical on every validator (consensus at genesis)
+      ZCRYPT_FOUNDATION_ADDR: ${ZCRYPT_FOUNDATION_ADDR:-}
+    volumes:
+      - abci-data:/data
+    # No host port publish: cometbft reaches the ABCI app over the compose
+    # network (tcp://abci:26658). Avoids colliding with other local chains.
+    networks:
+      - zcrypt-net
+
+  cometbft:
+    # ABCI 2.0 — matches the native Rust node (tendermint-abci 0.40 / v0_38 protos).
+    image: cometbft/cometbft:v0.38.17
+    container_name: zcrypt-cometbft
+    restart: unless-stopped
+    depends_on:
+      - abci
+    environment:
+      # The image bakes CMTHOME=/cometbft and ignores --home, so use that path.
+      COMETBFT_HOME: /cometbft
+      CHAIN_ID: zcrypt-devnet
+      ABCI_ADDR: tcp://abci:26658
+    volumes:
+      - ./docker/cometbft-entrypoint.sh:/entrypoint.sh:ro
+      - cometbft-data:/cometbft
+    entrypoint: ["/bin/sh", "/entrypoint.sh"]
+    # RPC remapped to 36657 on the host to avoid colliding with another local
+    # chain already using 26657. P2P (26656) not published (single-node devnet).
+    ports:
+      - "36657:26657"
+    networks:
+      - zcrypt-net
+
+  # Bitcoin Core in regtest — the "other chain" for BTC↔zBTC atomic swaps.
+  # RPC on host port 18443; wallet + bridge talk to it over JSON-RPC.
+  bitcoind:
+    image: ruimarinho/bitcoin-core:24
+    container_name: zcrypt-bitcoind
+    restart: unless-stopped
+    command:
+      - -regtest=1
+      - -server=1
+      - -txindex=1
+      - -fallbackfee=0.0002
+      - -rpcbind=0.0.0.0
+      - -rpcallowip=0.0.0.0/0
+      - -rpcuser=zcrypt
+      - -rpcpassword=zcrypt
+      - -rpcport=18443
+    ports:
+      - "18443:18443"
+    networks:
+      - zcrypt-net
+
+volumes:
+  cometbft-data:
+  abci-data:
+
+networks:
+  zcrypt-net:
+    driver: bridge

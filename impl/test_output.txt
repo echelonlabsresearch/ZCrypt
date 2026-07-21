@@ -1,0 +1,138 @@
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 52 tests
+test field::tests::q_is_prime_smoke ... ok
+test field::tests::ring_axioms ... ok
+test field::tests::wraps_at_q ... ok
+test hash::tests::xof_deterministic ... ok
+test hash::tests::domain_separation ... ok
+test file::tests::secrets_payload_size_sane ... ok
+test file::tests::file_kem_roundtrip ... ok
+test hiding::tests::hiding_masks_the_value ... ok
+test hiding::tests::commitment_is_homomorphic_in_value_slot ... ok
+test kem::tests::constant_size_ciphertext ... ok
+test kem::tests::hybrid_roundtrip ... ok
+test lattice::tests::honest_value_boundaries ... ok
+test lattice::tests::invariants_hold ... ok
+test lattice::tests::profile_matches_constants ... ok
+test kem::tests::file_encrypt_large_payload ... ok
+test nullifier::tests::owner_hash_binds_both_roots ... ok
+test nullifier::tests::tx_binding_distinguishes_conflicting_spends ... ok
+test lattice::tests::random_blinding_is_valid ... ok
+test range::tests::inflation_value_is_unprovable ... ok
+test kem::tests::wrong_key_fails ... ok
+test hiding::tests::tampered_response_rejected ... ok
+test hiding::tests::proof_does_not_verify_other_commitment ... ok
+test ring::tests::negacyclic_identity ... ok
+test ring::tests::weights_deterministic ... ok
+test hiding::tests::out_of_bound_response_rejected ... ok
+test hiding::tests::opening_proof_completeness ... ok
+test range::tests::valid_range_accepts ... ok
+test range::tests::zero_accepts ... ok
+test smt::tests::double_spend_rejected ... ok
+test smt::tests::empty_tree_non_inclusion ... ok
+test range::tests::wrong_commitment_rejected ... ok
+test smt::tests::insert_then_inclusion ... ok
+test smt::tests::tampered_proof_fails ... ok
+test tx::tests::output_merkle_proof_roundtrip ... ok
+test tx::tests::txbind_changes_when_outputs_differ ... ok
+test range::tests::context_binding ... ok
+test smt::tests::non_inclusion_after_other_inserts ... ok
+test hypertree::tests::serialization_roundtrips ... ok
+test vrf::tests::tampered_nf_rejected ... ok
+test hypertree::tests::sign_verify_roundtrip ... ok
+test hypertree::tests::wrong_index_fails ... ok
+test hypertree::tests::wrong_message_fails ... ok
+test hypertree::tests::wrong_seed_fails ... ok
+test hypertree::tests::deterministic ... ok
+test vrf::tests::unforgeable_without_seed ... ok
+test hypertree::tests::distinct_high_indices_across_subtrees ... ok
+test vrf::tests::deterministic_and_verifiable ... ok
+test vrf::tests::unpinned_leaf_rejected ... ok
+test sig::tests::forged_leaf_index_fails ... ok
+test sig::tests::wrong_message_fails ... ok
+test sig::tests::sign_verify_roundtrip ... ok
+test sig::tests::wrong_root_fails ... ok
+
+test result: ok. 52 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 57.98s
+
+
+running 11 tests
+test range_proof_blocks_wraparound ... ok
+test conservation_blocks_inflation has been running for over 60 seconds
+test double_spend_detected has been running for over 60 seconds
+test fabricated_nullifier_rejected has been running for over 60 seconds
+test griefing_prevented has been running for over 60 seconds
+test happy_path_mint_send_receive_reconcile has been running for over 60 seconds
+test multi_hop_no_history has been running for over 60 seconds
+test supply_cap_enforced has been running for over 60 seconds
+test tampered_output_proof_rejected has been running for over 60 seconds
+test topology_enforced has been running for over 60 stest conservation_blocks_inflation has been running for over 60 seconds
+test double_spend_detected has been running for over 60 seconds
+test fabricated_nullifier_rejected has been running for over 60 seconds
+test griefing_prevented has been running for over 60 seconds
+test happy_path_mint_send_receive_reconcile has been running for over 60 seconds
+test multi_hop_no_history has been running for over 60 seconds
+test supply_cap_enforced has been running for over 60 seconds
+test tampered_output_proof_rejected has been running for over 60 seconds
+test topology_enforced has been running for over 60 seconds
+test unbroadcast_spend_is_fraud has been running for over 60 seconds
+test topology_enforced ... ok
+test fabricated_nullifier_rejected ... ok
+test conservation_blocks_inflation ... ok
+test supply_cap_enforced ... ok
+test tampered_output_proof_rejected ... ok
+test unbroadcast_spend_is_fraud ... ok
+test happy_path_mint_send_receive_reconcile ... ok
+test griefing_prevented ... ok
+test multi_hop_no_history ... ok
+test double_spend_detected ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 90.33s
+
+     Running tests/lattice_security.rs (target/debug/deps/lattice_security-0f5db4951ba76560)
+
+running 17 tests
+test lattice_invariants_hold_at_startup ... ok
+test profile_documents_expected_parameters ... ok
+test homomorphic_add_preserves_opening_with_same_blinding ... ok
+test value_just_above_max_is_unprovable ... ok
+test commitment_bytes_roundtrip ... ok
+test different_blindings_do_not_add_in_value_slot ... ok
+test mod_q_wrap_values_are_unprovable ... ok
+test truncated_serialization_rejected ... ok
+test wrong_bit_count_in_serialization_rejected ... ok
+test tampered_bit_commitment_rejected ... ok
+test borrowed_proof_fails_on_different_commitment ... ok
+test tampered_challenge_split_rejected ... ok
+test tampered_aggregated_response_rejected ... ok
+test range_proof_at_zero ... ok
+test range_proof_at_max_honest_value ... ok
+test balanced_tx_passes_conservation_and_range ... FAILED
+test wrap_output_in_otherwise_balanced_tx_fails_range_check ... FAILED
+
+failures:
+
+---- balanced_tx_passes_conservation_and_range stdout ----
+
+thread 'balanced_tx_passes_conservation_and_range' panicked at core/tests/lattice_security.rs:190:5:
+expected conservation+range ok, got: WOTS_VERIFY: no signature
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- wrap_output_in_otherwise_balanced_tx_fails_range_check stdout ----
+
+thread 'wrap_output_in_otherwise_balanced_tx_fails_range_check' panicked at core/tests/lattice_security.rs:239:5:
+got: WOTS_VERIFY: no signature
+
+
+failures:
+    balanced_tx_passes_conservation_and_range
+    wrap_output_in_otherwise_balanced_tx_fails_range_check
+
+test result: FAILED. 15 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.30s
+
+error: test failed, to rerun pass `-p zcrypt-core --test lattice_security`

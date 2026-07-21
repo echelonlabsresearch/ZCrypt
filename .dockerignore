@@ -1,0 +1,10 @@
+# The ABCI image build only needs impl/ (see chain/docker/Dockerfile). Exclude
+# everything else so the Docker build context stays small — otherwise it ships
+# multi-GB target/ + conda dirs on every build (slow, esp. in CI).
+*
+!impl
+# ...but never the Rust build artifacts under impl.
+impl/target
+**/target
+**/node_modules
+.git

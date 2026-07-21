@@ -1,0 +1,67 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.04s
+     Running unittests src/lib.rs (impl/target/debug/deps/zcrypt_core-4d89fd48189973f4)
+
+running 52 tests
+test field::tests::ring_axioms ... ok
+test field::tests::wraps_at_q ... ok
+test field::tests::q_is_prime_smoke ... ok
+test hash::tests::domain_separation ... ok
+test file::tests::secrets_payload_size_sane ... ok
+test hash::tests::xof_deterministic ... ok
+test file::tests::file_kem_roundtrip ... ok
+test kem::tests::constant_size_ciphertext ... ok
+test hiding::tests::commitment_is_homomorphic_in_value_slot ... ok
+test hiding::tests::hiding_masks_the_value ... ok
+test kem::tests::file_encrypt_large_payload ... ok
+test lattice::tests::honest_value_boundaries ... ok
+test lattice::tests::invariants_hold ... ok
+test lattice::tests::profile_matches_constants ... ok
+test kem::tests::hybrid_roundtrip ... ok
+test nullifier::tests::owner_hash_binds_both_roots ... ok
+test nullifier::tests::tx_binding_distinguishes_conflicting_spends ... ok
+test lattice::tests::random_blinding_is_valid ... ok
+test range::tests::inflation_value_is_unprovable ... ok
+test kem::tests::wrong_key_fails ... ok
+test hiding::tests::tampered_response_rejected ... ok
+test hiding::tests::out_of_bound_response_rejected ... ok
+test ring::tests::negacyclic_identity ... ok
+test ring::tests::weights_deterministic ... ok
+test hiding::tests::proof_does_not_verify_other_commitment ... ok
+test hiding::tests::opening_proof_completeness ... ok
+test range::tests::zero_accepts ... ok
+test range::tests::wrong_commitment_rejected ... ok
+test smt::tests::double_spend_rejected ... ok
+test smt::tests::empty_tree_non_inclusion ... ok
+test smt::tests::insert_then_inclusion ... ok
+test range::tests::context_binding ... ok
+test smt::tests::tampered_proof_fails ... ok
+test tx::tests::output_merkle_proof_roundtrip ... ok
+test tx::tests::txbind_changes_when_outputs_differ ... ok
+test range::tests::valid_range_accepts ... ok
+test smt::tests::non_inclusion_after_other_inserts ... ok
+test vrf::tests::tampered_nf_rejected ... ok
+test hypertree::tests::wrong_index_fails ... ok
+test hypertree::tests::serialization_roundtrips ... ok
+test hypertree::tests::wrong_message_fails ... ok
+test hypertree::tests::wrong_seed_fails ... ok
+test hypertree::tests::sign_verify_roundtrip ... ok
+test hypertree::tests::deterministic has been running for over 60 seconds
+test hypertree::tests::distinct_high_indices_across_subtrees has been running for over 60 seconds
+test sig::tests::forged_leaf_index_fails has been running for over 60 seconds
+test sig::tests::sign_verify_roundtrip has been running for over 60 seconds
+test sig::tests::wrong_message_fails has been running for over 60 seconds
+test sig::tests::wrong_root_fails has been running for over 60 seconds
+test vrf::tests::deterministic_and_verifiable has been running for over 60 seconds
+test vrf::tests::unforgeable_without_seed has been running for over 60 seconds
+test hypertree::tests::deterministic ... ok
+test vrf::tests::deterministic_and_verifiable ... ok
+test hypertree::tests::distinct_high_indices_across_subtrees ... ok
+test vrf::tests::unforgeable_without_seed ... ok
+test vrf::tests::unpinned_leaf_rejected ... ok
+test sig::tests::forged_leaf_index_fails ... ok
+test sig::tests::sign_verify_roundtrip ... ok
+test sig::tests::wrong_message_fails ... ok
+test sig::tests::wrong_root_fails ... ok
+
+test result: ok. 52 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 74.86s
+

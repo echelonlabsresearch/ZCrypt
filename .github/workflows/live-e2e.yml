@@ -1,0 +1,36 @@
+# Heavy live end-to-end — a FRESH 3-validator network (+ bitcoind) with every real
+# RPC driver: consensus agreement, a real ~5 MB shield proof, the full product
+# surface (send/receive/spend, stealth, bearer, assets, abuse cases, bond→rewards
+# →claim→spend→unbond), mnemonic recovery, and BTC<->zBTC both directions.
+#
+# It builds Docker images and generates real STARK proofs, so it is NOT run per
+# push — only on `main`, nightly, or on demand ("Run workflow" button).
+name: Live 3-node E2E
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: '0 6 * * *'   # nightly at 06:00 UTC
+  workflow_dispatch: {}    # manual trigger
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  live-e2e:
+    name: 3-node network + all live drivers
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: Cache cargo build (drivers build the prover locally)
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: impl
+      - name: Show toolchain
+        working-directory: impl
+        run: rustup show
+      # Docker + docker compose + python3 + curl are preinstalled on ubuntu-latest.
+      - name: Full live e2e (fresh 3-node net -> all drivers -> teardown)
+        run: KEEP=0 ./chain/e2e/run-all.sh

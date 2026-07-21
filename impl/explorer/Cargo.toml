@@ -1,0 +1,17 @@
+[package]
+name = "zcrypt-explorer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "zcrypt-explorer"
+path = "src/main.rs"
+
+[dependencies]
+zcrypt-core = { path = "../core" }
+zcrypt-shield = { path = "../shield" }
+serde_json = { workspace = true }
+hex = { workspace = true }
+ureq = { version = "2", features = ["json"] }
+base64 = "0.22"
