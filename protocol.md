@@ -116,11 +116,11 @@ registers the foundation's reward address: production builds require it via
 
 ## Going deeper
 
-This page is the tour. The exhaustive wire-level specification (every field of
-every transaction, exact byte offsets, the state-transition rules, and the
-circuit's public inputs) lives in
-[protocol-specification.md](protocol-specification.md), which tracks the
-reference implementation in `impl/`.
+This page is the tour. For the exact byte-level wire formats, read the raw
+transactions live in the explorer (it renders the byte map consensus parses for
+every transaction) or the reference implementation in `impl/`, which is the
+ground truth. The formal treatment is the
+[whitepaper](whitepaper/whitepaper.pdf).
 
 Related: [vm.md](vm.md) for the programs gating each tag,
 [privacy.md](privacy.md) for what each transaction reveals,
