@@ -2059,111 +2059,118 @@ fn swap_shield_btc(zbtc_amount: u64, btc: f64, window: tauri::Window, state: Sta
     .and_then(ok)
 }
 
-/// zBTC → BTC: burn a **specific** amount of your zBTC and receive the matching BTC 1:1
-/// (atomic, hashlocked). Selects just enough on-chain zBTC to cover the requested amount
-/// plus the zBTC network fee, and records the change coin so the un-redeemed remainder stays
-/// spendable — a true partial redeem.
+/// zBTC → BTC: redeem `btc` worth of your zBTC for the matching BTC 1:1 (atomic,
+/// hashlocked). A single burn-lock spends at most `N_IN` coins, so when the balance is
+/// fragmented this runs the redeem in **rounds** — each round burns the two largest
+/// on-chain coins (up to `N_IN`) and pays its own zBTC fee — until the whole requested
+/// amount is out. No ZCRYPT gas and no separate consolidation step: each round is a
+/// self-contained atomic swap. Returns the zBTC actually redeemed (which may be a hair
+/// under the request, since every round burns a 0.0001 zBTC fee).
 #[tauri::command]
 fn swap_redeem_btc(btc: f64, window: tauri::Window, state: State<AppState>) -> R<u64> {
     if !(btc > 0.0) {
         return Err("enter a zBTC amount to redeem".to_string());
     }
-    let zbtc_value = (btc * 100_000_000.0).round() as u64; // 1:1 peg, 8 decimals
+    let want_total = (btc * 100_000_000.0).round() as u64; // 1:1 peg, 8 decimals
+    let fee = zcrypt_core::emission::MIN_FEE;
     let url = node_url(&state);
-    let leaves = chain::fetch_leaves(&url)?;
     let alice_btc = btc_client(&state)?;
     let bridge_btc = btc_bridge(&state)?;
     let zc = zc_client(&state);
     let asset = zbtc_asset(&zc)?;
-    let alice_dest = alice_btc.new_address()?;
-    let bridge_dest = bridge_btc.new_address()?;
     with_wallet(&state, |w| {
-        // Only zBTC coins actually present in the CURRENT commitment tree. This drops
-        // stale coins left in the wallet after a devnet chain reset (their commitments
-        // no longer exist on-chain) — that mismatch is what produced "input coin not
-        // on chain". Largest-first so the fewest inputs cover the requested amount.
-        let mut sel: Vec<usize> = w
-            .coins
-            .iter()
-            .enumerate()
-            .filter(|(_, c)| {
-                !c.spent
-                    && asset != 0
-                    && c.coin.asset_id == asset
-                    && chain::find_index(&leaves, &c.coin.commitment()).is_some()
-            })
-            .map(|(i, _)| i)
-            .collect();
-        if sel.is_empty() {
-            return Err(
-                "no on-chain zBTC coins to redeem — shield some BTC first \
-                 (stale coins from a chain reset are ignored)"
-                    .to_string(),
-            );
-        }
-        sel.sort_by_key(|&i| std::cmp::Reverse(w.coins[i].value));
-        // Greedily take the largest coins until they cover the requested amount + fee,
-        // capped at N_IN inputs (multi-limb lets a big amount live in a single coin).
-        let need = zbtc_value + zcrypt_core::emission::MIN_FEE;
-        let mut chosen: Vec<usize> = Vec::new();
-        let mut in_total: u64 = 0;
-        for &i in &sel {
-            if in_total >= need || chosen.len() >= zcrypt_shield::N_IN {
+        let (bridge_key, alice_key) = bridge_btc_keys(&w.account);
+        let mut redeemed: u64 = 0;
+        let mut round: u32 = 0;
+        while redeemed < want_total {
+            // Re-fetch leaves each round: the previous round's change coin (if any) is a
+            // committed leaf by now (broadcast_tx_commit), so it is selectable here.
+            let leaves = chain::fetch_leaves(&url)?;
+            let mut sel: Vec<usize> = w
+                .coins
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| {
+                    !c.spent
+                        && asset != 0
+                        && c.coin.asset_id == asset
+                        && chain::find_index(&leaves, &c.coin.commitment()).is_some()
+                })
+                .map(|(i, _)| i)
+                .collect();
+            sel.sort_by_key(|&i| std::cmp::Reverse(w.coins[i].value));
+            if sel.is_empty() {
+                if redeemed == 0 {
+                    return Err(
+                        "no on-chain zBTC coins to redeem — shield some BTC first \
+                         (stale coins from a chain reset are ignored)"
+                            .to_string(),
+                    );
+                }
+                break; // ran out of coins mid-way; report what actually went out
+            }
+            // This round spends the largest N_IN coins; it can burn up to their sum minus
+            // the per-tx zBTC fee.
+            let chosen: Vec<usize> = sel.iter().take(zcrypt_shield::N_IN).copied().collect();
+            let sum: u64 = chosen.iter().map(|&i| w.coins[i].value).sum();
+            let round_cap = sum.saturating_sub(fee);
+            if round_cap == 0 {
+                if redeemed == 0 {
+                    return Err(format!(
+                        "your largest {} zBTC coin(s) total {:.8}, which cannot cover the \
+                         {:.8} zBTC redeem fee. Shield more BTC so a coin exceeds the fee.",
+                        chosen.len(),
+                        sum as f64 / 1e8,
+                        fee as f64 / 1e8,
+                    ));
+                }
                 break;
             }
-            chosen.push(i);
-            in_total += w.coins[i].value;
+            let round_value = (want_total - redeemed).min(round_cap);
+            round += 1;
+            // Fresh BTC addresses per round (no address reuse across the atomic swaps).
+            let alice_dest = alice_btc.new_address()?;
+            let bridge_dest = bridge_btc.new_address()?;
+            let b = bswap::BtcParams {
+                alice: &alice_btc,
+                bridge: &bridge_btc,
+                bridge_key: &bridge_key,
+                alice_key: &alice_key,
+                alice_dest: &alice_dest,
+                bridge_dest: &bridge_dest,
+            };
+            let coins: Vec<Coin> = chosen.iter().map(|&i| w.coins[i].coin).collect();
+            let btc_amt = bitcoin::Amount::from_sat(round_value);
+            let preimage = bswap::fresh_preimage(); // 32 random bytes (HTLC hashlock security)
+            let this_round = round;
+            let progress = |pct: u8, phase: &str| {
+                let _ = window.emit(
+                    "swap-progress",
+                    serde_json::json!({ "percent": pct, "phase": phase, "round": this_round }),
+                );
+            };
+            let (change_value, change_blind) = bswap::zbtc_to_btc_progress(
+                &zc, &b, &w.account, asset, &coins, &preimage, round_value, btc_amt, &progress,
+            )?;
+            for &i in &chosen {
+                w.coins[i].spent = true;
+            }
+            // Record the change coin so an un-redeemed remainder stays spendable.
+            // `own_asset_coin` rebuilds the exact commitment the burn tx wrote to our key.
+            if change_value > 0 {
+                let change = w.account.own_asset_coin(change_value, change_blind, asset);
+                let com = change.commitment();
+                w.coins.push(CoinRec {
+                    coin_id: hex::encode(com[0].to_le_bytes()),
+                    value: change_value,
+                    coin: change,
+                    spent: false,
+                });
+            }
+            redeemed += round_value;
+            w.push_hist("redeem", -(round_value as i64), format!("zBTC→BTC (round {round})"), asset);
         }
-        if in_total < need {
-            let live: u64 = sel.iter().map(|&i| w.coins[i].value).sum();
-            let max_spendable: u64 =
-                sel.iter().take(zcrypt_shield::N_IN).map(|&i| w.coins[i].value).sum();
-            return Err(format!(
-                "not enough spendable zBTC to redeem {:.8}: one redeem spends up to {} coin(s) \
-                 (your largest {} total {:.8} zBTC), though you hold {:.8} live in all. Redeem a \
-                 smaller amount, or shield more so your balance consolidates into fewer coins.",
-                zbtc_value as f64 / 1e8,
-                zcrypt_shield::N_IN,
-                sel.len().min(zcrypt_shield::N_IN),
-                max_spendable as f64 / 1e8,
-                live as f64 / 1e8,
-            ));
-        }
-        let coins: Vec<Coin> = chosen.iter().map(|&i| w.coins[i].coin).collect();
-        let btc_amt = bitcoin::Amount::from_sat(zbtc_value);
-        let (bridge_key, alice_key) = bridge_btc_keys(&w.account);
-        let b = bswap::BtcParams {
-            alice: &alice_btc,
-            bridge: &bridge_btc,
-            bridge_key: &bridge_key,
-            alice_key: &alice_key,
-            alice_dest: &alice_dest,
-            bridge_dest: &bridge_dest,
-        };
-        let preimage = bswap::fresh_preimage(); // 32 random bytes (HTLC hashlock security)
-        let progress = |pct: u8, phase: &str| {
-            let _ = window.emit("swap-progress", serde_json::json!({ "percent": pct, "phase": phase }));
-        };
-        let (change_value, change_blind) = bswap::zbtc_to_btc_progress(
-            &zc, &b, &w.account, asset, &coins, &preimage, zbtc_value, btc_amt, &progress,
-        )?;
-        for &i in &chosen {
-            w.coins[i].spent = true;
-        }
-        // Record the change coin so the un-redeemed zBTC stays spendable (partial redeem).
-        // `own_asset_coin` rebuilds the exact commitment the burn tx wrote to Alice's key.
-        if change_value > 0 {
-            let change = w.account.own_asset_coin(change_value, change_blind, asset);
-            let com = change.commitment();
-            w.coins.push(CoinRec {
-                coin_id: hex::encode(com[0].to_le_bytes()),
-                value: change_value,
-                coin: change,
-                spent: false,
-            });
-        }
-        w.push_hist("redeem", -(zbtc_value as i64), "zBTC→BTC".into(), asset);
-        Ok(zbtc_value)
+        Ok(redeemed)
     })
     .and_then(ok)
 }

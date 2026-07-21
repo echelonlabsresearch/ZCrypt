@@ -16,8 +16,6 @@ interface Progress {
 
 /** 1 zBTC = 100,000,000 base units (8 decimals, like BTC). */
 const ZBTC_BASE = 100_000_000;
-/** zBTC network fee (base units) reserved on a redeem — matches emission::MIN_FEE. */
-const REDEEM_FEE = 10_000;
 const zfmt = (base: number) => (base / ZBTC_BASE).toLocaleString(undefined, { maximumFractionDigits: 8 });
 
 type Tab = "shield" | "redeem";
@@ -120,8 +118,13 @@ export default function Bridge({
     setBusy("redeem");
     setProgress({ percent: 0, phase: "Starting the atomic swap…" });
     try {
-      await call<number>("swap_redeem_btc", { btc });
-      onSwapped(`Redeemed ${btc} zBTC → ${btc} BTC`);
+      // The backend redeems in rounds when the balance is fragmented, each round
+      // burning a small zBTC fee, so the amount actually redeemed can be a hair under
+      // the request. Report what really went out (returned in base units).
+      const redeemedBase = await call<number>("swap_redeem_btc", { btc });
+      const got = redeemedBase / ZBTC_BASE;
+      const note = redeemedBase < Math.round(btc * ZBTC_BASE) ? " (per-round zBTC fees deducted)" : "";
+      onSwapped(`Redeemed ${zfmt(redeemedBase)} zBTC → ${got.toFixed(8)} BTC${note}`);
       await load();
     } catch (e) {
       setErr(String(e));
@@ -133,7 +136,9 @@ export default function Bridge({
 
   function redeemMax() {
     if (!status) return;
-    const max = Math.max(0, (status.zbtc_balance - REDEEM_FEE) / ZBTC_BASE);
+    // Request the full balance: the backend drains it in as many rounds as needed and
+    // returns the achievable amount (each round burns one fee), so we don't pre-subtract.
+    const max = Math.max(0, status.zbtc_balance / ZBTC_BASE);
     setRedeemAmt(max.toFixed(8).replace(/\.?0+$/, ""));
   }
 
@@ -216,7 +221,7 @@ export default function Bridge({
                   disabled={busy !== "" || !status}
                   onClick={redeemMax}
                 >
-                  Max {status ? `(${zfmt(Math.max(0, status.zbtc_balance - REDEEM_FEE))})` : ""}
+                  Max {status ? `(${zfmt(status.zbtc_balance)})` : ""}
                 </button>
               </label>
               <input
