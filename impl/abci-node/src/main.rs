@@ -1210,12 +1210,13 @@ impl Application for ZcryptApp {
             "/app/hash" => hex::encode(s.node.state_root()).into_bytes(),
             // ---- shielded-asset ticker registry ----
             "/asset/list" => {
-                // "<ticker>:<asset_id>:<minted> …"
+                // "<ticker>:<asset_id>:<minted>:<decimals> …" (decimals let a client
+                // render the minted supply in whole units, e.g. 8-dp zBTC).
                 let list: Vec<String> = s
                     .node
                     .assets_list()
                     .iter()
-                    .map(|m| format!("{}:{}:{}", m.ticker, m.asset_id, m.minted))
+                    .map(|m| format!("{}:{}:{}:{}", m.ticker, m.asset_id, m.minted, m.decimals))
                     .collect();
                 list.join(",").into_bytes()
             }

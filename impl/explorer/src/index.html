@@ -487,6 +487,18 @@ async function loadBlocks() {
   } catch (e) { note.style.display = "none"; $("#view-blocks").innerHTML = `<div class="empty-note">node unreachable</div>`; }
 }
 
+// Minted supply in whole units of the asset's own decimals (e.g. 3,000,000,000 atomic
+// at 8 dp → "30 zBTC"), with the raw atomic count on hover. Falls back to raw atomic
+// when a node is too old to report decimals.
+function fmtMinted(minted, decimals, ticker) {
+  const raw = minted ?? 0;
+  const t = ticker ? " " + esc(ticker) : "";
+  if (decimals == null) return `<span title="raw atomic units">${raw.toLocaleString()}${t}</span>`;
+  const whole = raw / Math.pow(10, decimals);
+  const shown = whole.toLocaleString(undefined, { maximumFractionDigits: decimals });
+  return `<span title="${raw.toLocaleString()} atomic units">${shown}${t}</span>`;
+}
+
 // All assets are held client-side so search is instant and offline-of-the-node — the
 // registry is small per request but may hold thousands of entries, so we filter locally
 // rather than round-trip the node on every keystroke.
@@ -508,9 +520,9 @@ function renderAssets() {
     ? `${shown.length} of ${allAssets.length} asset${allAssets.length === 1 ? "" : "s"}`
     : `${allAssets.length} asset${allAssets.length === 1 ? "" : "s"}`;
   box.innerHTML = shown.length
-    ? `<div class="table-wrap"><table><thead><tr><th>Ticker</th><th>Asset ID</th><th class="num">Minted</th></tr></thead><tbody>` +
+    ? `<div class="table-wrap"><table><thead><tr><th>Ticker</th><th>Asset ID</th><th class="num">Minted supply</th></tr></thead><tbody>` +
       shown.map(x => `<tr><td><b>${esc(x.ticker)}</b></td><td class="mono">${esc(x.asset_id)}</td>` +
-        `<td class="num">${(x.minted ?? 0).toLocaleString()}</td></tr>`).join("") +
+        `<td class="num">${fmtMinted(x.minted, x.decimals, x.ticker)}</td></tr>`).join("") +
       `</tbody></table></div>`
     : `<div class="empty-note">no asset matches “${esc(q)}”</div>`;
 }

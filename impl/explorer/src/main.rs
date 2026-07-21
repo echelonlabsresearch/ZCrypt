@@ -222,7 +222,13 @@ fn api_assets(node: &str) -> Value {
         .filter(|s| !s.is_empty())
         .map(|s| {
             let p: Vec<&str> = s.split(':').collect();
-            json!({ "ticker": p.first().copied(), "asset_id": p.get(1).copied(), "minted": p.get(2).and_then(|x| x.parse::<u64>().ok()) })
+            json!({
+                "ticker": p.first().copied(),
+                "asset_id": p.get(1).copied(),
+                "minted": p.get(2).and_then(|x| x.parse::<u64>().ok()),
+                // decimals absent on older nodes → the UI falls back to raw atomic units.
+                "decimals": p.get(3).and_then(|x| x.parse::<u8>().ok()),
+            })
         })
         .collect();
     json!(items)
