@@ -136,6 +136,11 @@ struct Wallet {
     stealth_seeds: Vec<[u8; 32]>,
     clock: u64,
     scan_height: i64,
+    /// The chain GENERATION this coin store belongs to (`chain::chain_tag`). When the
+    /// node reports a different tag (a re-genesis / different chain), the persisted
+    /// coins are from a dead chain: `scan_onchain` resets the scan and the on-chain
+    /// leaf reconcile drops them, so a wiped devnet never shows a phantom balance.
+    chain_tag: String,
 }
 
 impl Wallet {
@@ -274,6 +279,9 @@ struct PersistState {
     #[serde(default)]
     stealth_seeds: Vec<[u8; 32]>,
     clock: u64,
+    /// Chain generation this store belongs to (see [`Wallet::chain_tag`]).
+    #[serde(default)]
+    chain_tag: String,
 }
 
 // Encryption key for the coin store, bound to the account seed (available while
@@ -305,6 +313,7 @@ fn save_state(w: &Wallet, dir: &str) -> Result<(), String> {
         next_change: w.next_change,
         stealth_seeds: w.stealth_seeds.clone(),
         clock: w.clock,
+        chain_tag: w.chain_tag.clone(),
     };
     let json = serde_json::to_vec(&ps).map_err(|e| e.to_string())?;
     let cipher = ChaCha20Poly1305::new_from_slice(&state_key(&w.account)).unwrap();
@@ -362,6 +371,7 @@ fn load_state(w: &mut Wallet, dir: &str) {
     w.next_change = ps.next_change;
     w.stealth_seeds = ps.stealth_seeds;
     w.clock = ps.clock;
+    w.chain_tag = ps.chain_tag;
 }
 
 // ---------------------------------------------------------------------------
@@ -404,6 +414,7 @@ fn create_wallet(password: String, state: State<AppState>) -> R<CreateResult> {
         stealth_seeds: vec![],
         clock: 0,
         scan_height: 0,
+        chain_tag: String::new(),
     });
     ok(CreateResult { address, seed_phrase: phrase })
 }
@@ -434,6 +445,7 @@ fn restore_wallet(password: String, mnemonic: String, state: State<AppState>) ->
         stealth_seeds: vec![],
         clock: 0,
         scan_height: 0,
+        chain_tag: String::new(),
     });
     // if this machine already has coins for this mnemonic, restore them
     if let Some(w) = state.wallet.lock().unwrap().as_mut() {
@@ -459,6 +471,7 @@ fn unlock_wallet(password: String, state: State<AppState>) -> R<bool> {
         stealth_seeds: vec![],
         clock: 0,
         scan_height: 0,
+        chain_tag: String::new(),
     });
     // restore persisted coins/history/scan-height for this account
     if let Some(w) = state.wallet.lock().unwrap().as_mut() {
@@ -1418,23 +1431,41 @@ fn scan_onchain(state: State<AppState>) -> R<usize> {
     let url = node_url(&state);
     let dir = state.data_dir.lock().unwrap().clone();
     let tip = chain::node_height(&url)?;
+    // Identify the chain GENERATION the node is serving. If it differs from what this
+    // coin store was last synced against (a re-genesis, or the node was repointed at a
+    // different chain), every persisted coin is from a dead chain: rescan from genesis
+    // so the leaf reconcile below drops them and re-finds any coins on the new chain.
+    let node_tag = chain::chain_tag(&url).unwrap_or_default();
 
     // Snapshot only what we need (seed + scan cursor + known coins) under a BRIEF
     // lock. All network I/O + note decryption below runs WITHOUT the wallet lock,
     // so `get_balance`/`get_address`/etc. never block behind a long scan — this is
     // what was freezing the UI (the old scan held the lock across one HTTP call per
     // block, over a 160k-block chain).
-    let (seed, from, mut known): (_, i64, HashSet<zcrypt_shield::Commitment>) = {
-        let g = state.wallet.lock().unwrap();
-        let w = g.as_ref().ok_or("locked")?;
+    let (seed, mut from, mut known): (_, i64, HashSet<zcrypt_shield::Commitment>) = {
+        let mut g = state.wallet.lock().unwrap();
+        let w = g.as_mut().ok_or("locked")?;
+        // Chain changed (or first tagged sync): reset the cursor to genesis and adopt
+        // the new tag. A tip below our cursor also means the chain was reset underneath us.
+        let changed = !node_tag.is_empty() && node_tag != w.chain_tag;
+        if changed || (w.scan_height as i64) > tip {
+            if changed {
+                eprintln!("[scan] chain generation changed → resyncing this store from genesis");
+                w.chain_tag = node_tag.clone();
+            }
+            w.scan_height = 0;
+        }
         (
             w.account.seed(),
             w.scan_height as i64,
             w.coins.iter().map(|c| c.coin.commitment()).collect(),
         )
     };
-    if from >= tip {
-        return ok(0);
+    // No new blocks to scan for notes — but still reconcile, so a chain reset with a
+    // low tip (or simply drift) always drops stale coins rather than returning early.
+    let scan_notes = from < tip;
+    if !scan_notes {
+        from = tip;
     }
 
     // Fetch only tx-bearing blocks (skips the empty-block flood), decrypt notes.
@@ -1453,7 +1484,7 @@ fn scan_onchain(state: State<AppState>) -> R<usize> {
         scan_accounts.push(Account::from_seed(*s));
     }
     let leaves = chain::fetch_leaves(&url)?;
-    let heights = chain::nonempty_heights(&url, from + 1, tip)?;
+    let heights = if scan_notes { chain::nonempty_heights(&url, from + 1, tip)? } else { Vec::new() };
     let mut received: Vec<Coin> = Vec::new();
     for h in heights {
         for tx in chain::block_txs(&url, h) {

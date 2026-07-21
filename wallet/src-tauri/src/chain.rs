@@ -61,6 +61,22 @@ pub fn node_height(url: &str) -> Result<i64, String> {
         .unwrap_or(0))
 }
 
+/// A tag that uniquely identifies the chain GENERATION the node is serving:
+/// `"{chain_id}:{earliest_block_hash}"`. The chain id alone is not enough — a devnet
+/// re-genesis (`docker compose down -v`) reuses the same chain id but produces a fresh
+/// genesis, so a wallet must key its coin store to the genesis block hash to avoid
+/// showing coins from a wiped chain. Returns Err if the node is unreachable.
+pub fn chain_tag(url: &str) -> Result<String, String> {
+    let u = format!("{}/status", base(url));
+    let b: Value = agent().get(&u).call().map_err(|e| e.to_string())?.into_json().map_err(|e| e.to_string())?;
+    let chain_id = b["result"]["node_info"]["network"].as_str().unwrap_or("");
+    let genesis = b["result"]["sync_info"]["earliest_block_hash"].as_str().unwrap_or("");
+    if chain_id.is_empty() || genesis.is_empty() {
+        return Err("status: missing chain id or genesis hash".to_string());
+    }
+    Ok(format!("{chain_id}:{genesis}"))
+}
+
 fn abci_query_hex(url: &str, path: &str) -> Result<String, String> {
     let u = format!("{}/abci_query?path=%22{}%22", base(url), path);
     let b: Value = agent().get(&u).call().map_err(|e| e.to_string())?.into_json().map_err(|e| e.to_string())?;
