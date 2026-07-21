@@ -241,8 +241,10 @@ chain/                    Docker consensus stacks
   docker/                       Dockerfile + CometBFT init/entrypoint scripts
   e2e/run-all.sh                full live end-to-end
 wallet/                   Tauri + React desktop wallet
-protocol-specification.md Protocol spec
-crypto-security.md        Cryptography & security notes
+protocol.md                 Protocol tour
+security.md               Security & threat model
+privacy.md                Privacy model
+vm.md                     Auditability VM
 ```
 
 ---
@@ -274,8 +276,8 @@ transactions in which even the input count is unobservable.
   external audit** — which is what keeps this a testnet rather than something for securing
   large stake, not any missing mechanism.
 
-See [`crypto-security.md`](crypto-security.md) and
-[`protocol-specification.md`](protocol-specification.md) for details.
+See [protocol.md](protocol.md), [security.md](security.md), [privacy.md](privacy.md),
+and [vm.md](vm.md) for details, and the [whitepaper](whitepaper/whitepaper.pdf) for the formal treatment.
 
 ---
 
