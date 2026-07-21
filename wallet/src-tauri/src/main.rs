@@ -1771,6 +1771,9 @@ struct BridgeStatus {
     btc_balance: f64,
     zbtc_asset: u64,
     zbtc_balance: u64,
+    /// The configured Bitcoin network (regtest | signet | testnet | bitcoin), so the UI
+    /// labels the real network instead of a hardcoded "regtest".
+    btc_network: String,
 }
 
 /// Register zBTC + seed a decoy pool so shield spends have a ring. Idempotent.
@@ -1807,6 +1810,10 @@ fn bridge_init(state: State<AppState>) -> R<u64> {
 fn bridge_status(state: State<AppState>) -> R<BridgeStatus> {
     let zc = zc_client(&state);
     let asset = zbtc_asset(&zc).unwrap_or(0);
+    let btc_network = {
+        let dir = state.data_dir.lock().unwrap().clone();
+        load_settings(&dir).btc_network
+    };
     let (btc_connected, btc_balance) = match btc_client(&state).and_then(|b| b.balance_btc()) {
         Ok(bal) => (true, bal),
         Err(_) => (false, 0.0),
@@ -1823,7 +1830,7 @@ fn bridge_status(state: State<AppState>) -> R<BridgeStatus> {
             None => 0,
         }
     };
-    ok(BridgeStatus { btc_connected, btc_balance, zbtc_asset: asset, zbtc_balance })
+    ok(BridgeStatus { btc_connected, btc_balance, zbtc_asset: asset, zbtc_balance, btc_network })
 }
 
 #[derive(Serialize)]

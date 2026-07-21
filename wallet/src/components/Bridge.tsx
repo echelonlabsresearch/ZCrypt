@@ -7,6 +7,7 @@ interface Status {
   btc_balance: number;
   zbtc_asset: number;
   zbtc_balance: number;
+  btc_network: string;
 }
 
 interface Progress {
@@ -150,7 +151,7 @@ export default function Bridge({
       <div className="card" style={{ maxWidth: 620, margin: "0 auto" }}>
         <div className="bridge-stats">
           <div className="bridge-stat">
-            <span className="util">Bitcoin (regtest)</span>
+            <span className="util">Bitcoin ({status?.btc_network ?? "…"})</span>
             <div className="reward-amount" style={{ fontSize: "1.5rem", color: "var(--color-cyan)" }}>
               {status?.btc_connected ? `${status.btc_balance.toFixed(4)} BTC` : "— not connected"}
             </div>
