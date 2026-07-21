@@ -11,6 +11,9 @@ wallet/dist/
 *.log
 nohup.out
 zcrypt-state*.bin
+impl/*_output.txt
+impl/unit_only.txt
+impl/e2e_only.txt
 impl/scripts/lattice_*_output.txt
 impl/scripts/lattice_param_sweep*.txt
 impl/scripts/*_state.jsonl

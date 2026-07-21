@@ -114,6 +114,14 @@ registers the foundation's reward address: production builds require it via
 `ZCRYPT_FOUNDATION_ADDR` and refuse to start otherwise. Full go-live procedure:
 [`chain/LAUNCH.md`](chain/LAUNCH.md).
 
+## Going deeper
+
+This page is the tour. The exhaustive wire-level specification (every field of
+every transaction, exact byte offsets, the state-transition rules, and the
+circuit's public inputs) lives in
+[protocol-specification.md](protocol-specification.md), which tracks the
+reference implementation in `impl/`.
+
 Related: [vm.md](vm.md) for the programs gating each tag,
 [privacy.md](privacy.md) for what each transaction reveals,
 [security.md](security.md) for the assumptions underneath.

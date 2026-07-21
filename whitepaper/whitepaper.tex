@@ -4,26 +4,16 @@
 \setlength{\columnsep}{0.25in}
 \usepackage{inconsolata}
 
-% ============================================
-% CYAN VISUAL IDENTITY
-% Visual identity layer; content unchanged.
-% Subtle cyan page tint, themed cover, themed section heads.
-% Document name is just "Whitepaper"; cyan is the colour
-% scheme, not the title.
-% ============================================
 \usepackage{xcolor}
 \usepackage{titlesec}
 
-% Brand palette: print-safe variants of the wallet's neon #00FFFF
 \definecolor{zcryptcyan}{HTML}{007F8A}      % Body cyan, readable on white
 \definecolor{zcryptcyandeep}{HTML}{005F66}  % Deeper cyan for section heads
 \definecolor{zcryptcyantint}{HTML}{F0FBFC}  % Page background tint (very subtle)
 \definecolor{zcryptrule}{HTML}{00BCD4}      % Mid-tone cyan for decorative rules
 
-% Subtle page tint: Ethereum's Yellow Paper uses yellow!5 the same way
 \pagecolor{zcryptcyantint}
 
-% Cyan hyperlinks (override the default blue)
 \hypersetup{
     colorlinks=true,
     linkcolor=zcryptcyan,
@@ -31,7 +21,6 @@
     citecolor=zcryptcyan
 }
 
-% Cyan section headings
 \titleformat{\section}
   {\normalfont\Large\bfseries\color{zcryptcyandeep}}{\thesection}{1em}{}
 \titleformat{\subsection}
@@ -39,20 +28,16 @@
 \titleformat{\subsubsection}
   {\normalfont\normalsize\bfseries\color{zcryptcyan}}{\thesubsubsection}{1em}{}
 
-% Slightly tighter heading spacing than the LaTeX defaults.
 \titlespacing*{\section}{0pt}{2.0ex plus 0.5ex minus 0.2ex}{1.0ex}
 \titlespacing*{\subsection}{0pt}{1.8ex plus 0.4ex minus 0.2ex}{0.6ex}
 \titlespacing*{\subsubsection}{0pt}{1.4ex plus 0.3ex minus 0.2ex}{0.5ex}
 
-% Tighten list spacing.
 \usepackage{enumitem}
 \setlist{topsep=3pt, itemsep=2pt, parsep=0pt}
 
-% Avoid stranded section heads at column bottoms.
 \usepackage{needspace}
 \newcommand{\sectionbreak}{\Needspace*{6\baselineskip}}
 
-% Two-column typography hardening.
 \widowpenalty=10000
 \clubpenalty=10000
 \raggedbottom
