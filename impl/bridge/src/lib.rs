@@ -425,6 +425,7 @@ impl Btc {
 pub mod esplora;
 pub mod hdwallet;
 pub mod swap;
+pub mod txbuilder;
 pub mod zcrypt;
 
 /// A fixed P2WPKH address whose private key nobody uses — mining here burns the
