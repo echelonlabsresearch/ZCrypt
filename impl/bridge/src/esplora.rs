@@ -120,6 +120,12 @@ impl Esplora {
         resp.into_string().map(|s| s.trim().to_string()).map_err(|e| e.to_string())
     }
 
+    /// Full transaction JSON (`/tx/{txid}`) — used to read a claim tx's witness and
+    /// extract the revealed HTLC preimage.
+    pub fn tx_json(&self, txid: &str) -> Result<Value, String> {
+        self.get_json(&format!("/tx/{txid}"))
+    }
+
     /// Current chain tip height.
     pub fn tip_height(&self) -> Result<u64, String> {
         self.get_text("/blocks/tip/height")?.trim().parse().map_err(|e| format!("tip height: {e}"))

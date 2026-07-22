@@ -424,6 +424,7 @@ impl Btc {
 
 pub mod esplora;
 pub mod hdwallet;
+pub mod selfcustody;
 pub mod swap;
 pub mod txbuilder;
 pub mod zcrypt;

@@ -816,6 +816,15 @@ struct Settings {
     /// bitcoind on the chosen network and fund the wallets with real BTC.
     #[serde(default = "default_btc_network")]
     btc_network: String,
+    /// Self-custody Bitcoin: derive BTC keys from the wallet mnemonic and use an Esplora
+    /// API for data, instead of a local bitcoind wallet. One mnemonic restores both
+    /// chains; no node required. Default on for real networks.
+    #[serde(default = "default_btc_selfcustody")]
+    btc_selfcustody: bool,
+    /// Esplora REST endpoint for self-custody mode (blockstream.info / mempool.space or
+    /// your own). Network-specific; the default is public signet.
+    #[serde(default = "default_esplora_url")]
+    esplora_url: String,
     /// Route node RPC through a local Tor SOCKS proxy (default ON for privacy).
     /// When on and the node is not localhost, RPC goes via SOCKS so the wallet's IP
     /// and query pattern stay hidden. Localhost/127.0.0.1 skips Tor automatically
@@ -843,6 +852,12 @@ fn default_btc_wallet() -> String {
 fn default_btc_network() -> String {
     "regtest".into()
 }
+fn default_btc_selfcustody() -> bool {
+    true
+}
+fn default_esplora_url() -> String {
+    "https://mempool.space/signet/api".into()
+}
 fn default_tor_enabled() -> bool {
     true
 }
@@ -858,6 +873,8 @@ impl Default for Settings {
             btc_pass: default_btc_pass(),
             btc_wallet: default_btc_wallet(),
             btc_network: default_btc_network(),
+            btc_selfcustody: default_btc_selfcustody(),
+            esplora_url: default_esplora_url(),
             tor_enabled: default_tor_enabled(),
             tor_proxy: default_tor_proxy(),
         }
@@ -1878,17 +1895,44 @@ struct BtcWallet {
     deposit_address: String,
 }
 
-/// Your Bitcoin (L1) wallet: balance + a fresh deposit address (send BTC here, then
-/// shield it to zBTC). `connected=false` if no bitcoind is reachable.
+/// Your Bitcoin (L1) wallet: balance + the deposit address (send BTC here, then shield
+/// it to zBTC). In **self-custody mode** (default for real networks) the address is
+/// derived from your mnemonic (BIP-84) and the balance comes from Esplora — no bitcoind,
+/// and the same seed phrase restores it. Regtest keeps using the local bitcoind wallet.
 #[tauri::command]
 fn btc_wallet_info(state: State<AppState>) -> R<BtcWallet> {
+    let dir = state.data_dir.lock().unwrap().clone();
+    let s = load_settings(&dir);
+    let network = zcrypt_bridge::network_from_str(&s.btc_network);
+    let none = || BtcWallet { connected: false, balance: 0.0, deposit_address: String::new() };
+    if s.btc_selfcustody && network != bitcoin::Network::Regtest {
+        let mnemonic = {
+            let g = state.wallet.lock().unwrap();
+            match g.as_ref() {
+                Some(w) => w.mnemonic.clone(),
+                None => return ok(none()),
+            }
+        };
+        let sc = match zcrypt_bridge::selfcustody::SelfCustodyBtc::new(&mnemonic, "", network, &s.esplora_url) {
+            Ok(sc) => sc,
+            Err(_) => return ok(none()),
+        };
+        let deposit_address = sc.receive_address().map(|a| a.to_string()).unwrap_or_default();
+        // Fast deposit-address balance (one Esplora call); reachability = "connected".
+        let (connected, balance) = match sc.deposit_balance_sats() {
+            Ok(sats) => (true, sats as f64 / 1e8),
+            Err(_) => (false, 0.0),
+        };
+        return ok(BtcWallet { connected, balance, deposit_address });
+    }
+    // Regtest / self-custody off: the local bitcoind wallet.
     match btc_client(&state) {
         Ok(btc) => {
             let balance = btc.balance_btc().unwrap_or(0.0);
             let deposit_address = btc.new_address().map(|a| a.to_string()).unwrap_or_default();
             ok(BtcWallet { connected: true, balance, deposit_address })
         }
-        Err(_) => ok(BtcWallet { connected: false, balance: 0.0, deposit_address: String::new() }),
+        Err(_) => ok(none()),
     }
 }
 

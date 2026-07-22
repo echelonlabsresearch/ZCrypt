@@ -16,6 +16,8 @@ interface WalletSettings {
   btc_pass: string;
   btc_wallet: string;
   btc_network: string;
+  btc_selfcustody: boolean;
+  esplora_url: string;
   tor_enabled: boolean;
   tor_proxy: string;
 }
@@ -66,6 +68,8 @@ export default function Settings() {
       btc_pass: full?.btc_pass ?? "zcrypt",
       btc_wallet: full?.btc_wallet ?? "demo",
       btc_network: full?.btc_network ?? "regtest",
+      btc_selfcustody: full?.btc_selfcustody ?? true,
+      esplora_url: full?.esplora_url ?? "https://mempool.space/signet/api",
       tor_enabled: torEnabled,
       tor_proxy: torProxy.trim() || "127.0.0.1:9050",
       ...next,
