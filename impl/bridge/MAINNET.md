@@ -67,6 +67,33 @@ binary (`wallet/src-tauri/src/main.rs`). For mainnet, distribute the N derived s
 keys (`mint_auth::derive_signer`) to separate custodians/HSMs and never ship the master.
 The bridge's BTC payout wallet must be a real funded hot wallet, not `fund_self`.
 
+## Step 8 — ⚠️⚠️ HEADLINE REWORK: self-custody HD Bitcoin wallet + hosted data provider
+
+The current design custodies the user's BTC in **bitcoind's own wallet** — the receiving
+address (`getnewaddress`) has no relationship to the ZCrypt seed, so the mnemonic does NOT
+back up the Bitcoin, and every user must run a full bitcoind. Both are wrong for a product.
+Target architecture:
+
+1. **Seed-derived keys (BIP-32/39/84).** Derive native-segwit Bitcoin keys from the same
+   BIP-39 mnemonic → receive + change address chains. One mnemonic restores ZCrypt *and*
+   Bitcoin. (The HTLC claim/refund keys are already seed-derived; extend this to the whole
+   BTC wallet.)
+2. **Light-wallet data provider, not a full node.** Use an **Esplora REST API**
+   (`blockstream.info/api` or `mempool.space/api`; hosted options: QuickNode, GetBlock) for
+   per-address UTXOs, fee estimation, broadcast, and confirmations. Bitcoin Core JSON-RPC is
+   the wrong tool — it can't query arbitrary-address UTXOs without watch-only import /
+   `scantxoutset`. Make the provider URL a wallet setting (default a public Esplora).
+3. **Local UTXO tracking + tx build/sign.** Track the wallet's UTXOs (gap-limit scan over
+   derived addresses via the provider), construct funding/HTLC txs with the `bitcoin` crate,
+   sign with the seed-derived keys, broadcast via the provider. Replaces bitcoind's
+   `send_to_address`/`fund_self` and the `bitcoincore-rpc` dependency for the user path.
+
+This SUBSUMES step 2 (confirmations) and step 4 (fee estimation) — both come from the Esplora
+API. It is money-critical (a local-signing bug loses funds) and the largest single piece, so
+build it against Esplora on **signet/testnet** and test refund/claim/timeout paths before
+mainnet. The bridge/LP side may still run its own node; it's the *user* wallet that must be
+self-custody + node-free.
+
 ## Step 7 — RPC auth hardening
 
 `Btc::connect` supports only `Auth::UserPass`. Add `Auth::CookieFile` and move
