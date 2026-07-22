@@ -67,7 +67,7 @@ binary (`wallet/src-tauri/src/main.rs`). For mainnet, distribute the N derived s
 keys (`mint_auth::derive_signer`) to separate custodians/HSMs and never ship the master.
 The bridge's BTC payout wallet must be a real funded hot wallet, not `fund_self`.
 
-## Step 8 — ⚠️⚠️ HEADLINE REWORK: self-custody HD Bitcoin wallet + hosted data provider
+## Step 8 — ⚠️⚠️ HEADLINE REWORK: self-custody HD Bitcoin wallet + Blockbook data API
 
 The current design custodies the user's BTC in **bitcoind's own wallet** — the receiving
 address (`getnewaddress`) has no relationship to the ZCrypt seed, so the mnemonic does NOT
@@ -75,24 +75,34 @@ back up the Bitcoin, and every user must run a full bitcoind. Both are wrong for
 Target architecture:
 
 1. **Seed-derived keys (BIP-32/39/84).** Derive native-segwit Bitcoin keys from the same
-   BIP-39 mnemonic → receive + change address chains. One mnemonic restores ZCrypt *and*
-   Bitcoin. (The HTLC claim/refund keys are already seed-derived; extend this to the whole
-   BTC wallet.)
-2. **Light-wallet data provider, not a full node.** Use an **Esplora REST API**
-   (`blockstream.info/api` or `mempool.space/api`; hosted options: QuickNode, GetBlock) for
-   per-address UTXOs, fee estimation, broadcast, and confirmations. Bitcoin Core JSON-RPC is
-   the wrong tool — it can't query arbitrary-address UTXOs without watch-only import /
-   `scantxoutset`. Make the provider URL a wallet setting (default a public Esplora).
-3. **Local UTXO tracking + tx build/sign.** Track the wallet's UTXOs (gap-limit scan over
-   derived addresses via the provider), construct funding/HTLC txs with the `bitcoin` crate,
-   sign with the seed-derived keys, broadcast via the provider. Replaces bitcoind's
-   `send_to_address`/`fund_self` and the `bitcoincore-rpc` dependency for the user path.
+   BIP-39 mnemonic → receive + change address chains, plus the account **xpub**. One mnemonic
+   restores ZCrypt *and* Bitcoin. (The HTLC claim/refund keys are already seed-derived;
+   extend this to the whole BTC wallet.)
+2. **Blockbook data API, not a full node, not raw Core RPC.** Bitcoin Core JSON-RPC (what
+   Alchemy/QuickNode expose as "Bitcoin RPC") CANNOT answer address queries — verified: on the
+   Alchemy endpoint `scantxoutset`, `getaddressutxos`, `getaddressbalance` all return
+   "Unsupported method". Use **Blockbook** (Trezor's indexer) instead: its `bb_*` / REST API
+   gives per-address and — crucially — **whole-xpub** balance + UTXO lookups in one call,
+   which is exactly the HD-wallet query. Plus fee estimation, broadcast, and confirmations.
+   Hosted cheaply by QuickNode (Blockbook add-on; free tier 10M credits/mo, then ~$49/mo),
+   GetBlock, or NOWNodes. Make the provider URL + type a wallet setting.
+   PRIVACY: a hosted Blockbook sees your xpub = all your Bitcoin addresses. For a privacy
+   product, **self-host Blockbook (or Esplora)** on the bridge node in production; route
+   hosted queries over Tor at minimum.
+3. **Local UTXO tracking + tx build/sign.** Fetch the wallet's UTXOs by xpub via Blockbook,
+   construct funding/HTLC txs with the `bitcoin` crate, sign with the seed-derived keys,
+   broadcast via the API. Replaces bitcoind's `send_to_address`/`fund_self` and the
+   `bitcoincore-rpc` dependency for the user path.
 
-This SUBSUMES step 2 (confirmations) and step 4 (fee estimation) — both come from the Esplora
+This SUBSUMES step 2 (confirmations) and step 4 (fee estimation) — both come from the Blockbook
 API. It is money-critical (a local-signing bug loses funds) and the largest single piece, so
-build it against Esplora on **signet/testnet** and test refund/claim/timeout paths before
+build it against Blockbook on **signet/testnet** and test refund/claim/timeout paths before
 mainnet. The bridge/LP side may still run its own node; it's the *user* wallet that must be
 self-custody + node-free.
+
+Reference: Blockbook `bb_*` methods (QuickNode docs), address/xpub UTXO + balance + broadcast.
+Providers verified reasonable (2026): QuickNode, GetBlock, NOWNodes. mempool.space enterprise
+is not cost-effective; public Esplora is fine for dev only.
 
 ## Step 7 — RPC auth hardening
 
