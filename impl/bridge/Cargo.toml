@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 bitcoin = { version = "0.32", features = ["rand-std"] }
+bip39 = "2"
 rand = { workspace = true }
 bitcoincore-rpc = "0.19"
 ureq = { version = "2", features = ["json"] }

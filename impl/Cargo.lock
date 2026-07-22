@@ -2116,6 +2116,7 @@ name = "zcrypt-bridge"
 version = "2.0.0"
 dependencies = [
  "base64 0.22.1",
+ "bip39",
  "bitcoin",
  "bitcoincore-rpc",
  "ed25519-dalek",

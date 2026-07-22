@@ -422,6 +422,7 @@ impl Btc {
     }
 }
 
+pub mod hdwallet;
 pub mod swap;
 pub mod zcrypt;
 
