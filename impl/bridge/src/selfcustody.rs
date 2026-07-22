@@ -26,9 +26,22 @@ pub struct SelfCustodyBtc {
 }
 
 impl SelfCustodyBtc {
-    /// Build from the mnemonic + an Esplora endpoint for `network`.
+    /// Build from the mnemonic + an Esplora endpoint for `network` (account 0).
     pub fn new(mnemonic: &str, passphrase: &str, network: Network, esplora_url: &str) -> Result<Self, String> {
-        let hd = HdWallet::from_mnemonic(mnemonic, passphrase, network)?;
+        Self::new_account(mnemonic, passphrase, network, esplora_url, 0)
+    }
+
+    /// Build on a specific BIP-84 account. Account 0 is the user; the demo bridge/LP uses
+    /// account 1 so its addresses (and UTXOs) are distinct from the user's under one seed.
+    /// A real LP is a separate operator with its own mnemonic + endpoint.
+    pub fn new_account(
+        mnemonic: &str,
+        passphrase: &str,
+        network: Network,
+        esplora_url: &str,
+        account: u32,
+    ) -> Result<Self, String> {
+        let hd = HdWallet::from_mnemonic_account(mnemonic, passphrase, network, account)?;
         Ok(Self { hd, esplora: Esplora::new(esplora_url), network })
     }
 
@@ -162,6 +175,24 @@ impl SelfCustodyBtc {
 
     pub fn network(&self) -> Network {
         self.network
+    }
+}
+
+impl crate::BtcBackend for SelfCustodyBtc {
+    fn fund_htlc(&self, script: &ScriptBuf, amount: Amount) -> Result<HtlcUtxo, String> {
+        SelfCustodyBtc::fund_htlc(self, script, amount)
+    }
+    fn claim(&self, utxo: &HtlcUtxo, preimage: &[u8], key: &Key, dest: &Address, fee: Amount) -> Result<Txid, String> {
+        SelfCustodyBtc::claim(self, utxo, preimage, key, dest, fee)
+    }
+    fn height(&self) -> Result<u64, String> {
+        SelfCustodyBtc::height(self)
+    }
+    fn preimage_from_claim(&self, txid: &Txid) -> Option<Vec<u8>> {
+        SelfCustodyBtc::preimage_from_claim(self, txid)
+    }
+    fn confirm(&self, txid: &Txid) -> Result<(), String> {
+        SelfCustodyBtc::confirm(self, txid)
     }
 }
 

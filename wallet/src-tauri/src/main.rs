@@ -1768,6 +1768,34 @@ fn btc_bridge(state: &State<AppState>) -> Result<Btc, String> {
     }
     Ok(b)
 }
+/// The Bitcoin backend for one side of a swap, plus its receive/dest address. In
+/// self-custody mode (default, real networks) this is a node-free wallet on an Esplora
+/// API with keys from the mnemonic — `account` 0 is the user, 1 is the demo bridge/LP,
+/// so their addresses are distinct under one seed. Regtest (or self-custody off) uses the
+/// local bitcoind wallet (`demo` for account 0, `bridge` for account 1).
+fn swap_backend(
+    state: &State<AppState>,
+    account: u32,
+) -> Result<(Box<dyn zcrypt_bridge::BtcBackend>, bitcoin::Address), String> {
+    let dir = state.data_dir.lock().unwrap().clone();
+    let s = load_settings(&dir);
+    let network = zcrypt_bridge::network_from_str(&s.btc_network);
+    if s.btc_selfcustody && network != bitcoin::Network::Regtest {
+        let mnemonic = {
+            let g = state.wallet.lock().unwrap();
+            g.as_ref().ok_or("wallet locked")?.mnemonic.clone()
+        };
+        let sc = zcrypt_bridge::selfcustody::SelfCustodyBtc::new_account(
+            &mnemonic, "", network, &s.esplora_url, account,
+        )?;
+        let dest = sc.receive_address()?;
+        Ok((Box::new(sc), dest))
+    } else {
+        let b = if account == 0 { btc_client(state)? } else { btc_bridge(state)? };
+        let dest = b.new_address()?;
+        Ok((Box::new(b), dest))
+    }
+}
 fn zc_client(state: &State<AppState>) -> Zcrypt {
     Zcrypt::new(&node_url(state))
 }
@@ -1831,10 +1859,10 @@ fn bridge_status(state: State<AppState>) -> R<BridgeStatus> {
         let dir = state.data_dir.lock().unwrap().clone();
         load_settings(&dir).btc_network
     };
-    let (btc_connected, btc_balance) = match btc_client(&state).and_then(|b| b.balance_btc()) {
-        Ok(bal) => (true, bal),
-        Err(_) => (false, 0.0),
-    };
+    // Reuse the same BTC-backend logic as the Balance tab: self-custody deposit balance
+    // (via Esplora, no node) when enabled, else the local bitcoind wallet.
+    let snap = btc_wallet_snapshot(&state);
+    let (btc_connected, btc_balance) = (snap.connected, snap.balance);
     let zbtc_balance = {
         let g = state.wallet.lock().unwrap();
         match g.as_ref() {
@@ -1901,6 +1929,13 @@ struct BtcWallet {
 /// and the same seed phrase restores it. Regtest keeps using the local bitcoind wallet.
 #[tauri::command]
 fn btc_wallet_info(state: State<AppState>) -> R<BtcWallet> {
+    ok(btc_wallet_snapshot(&state))
+}
+
+/// Plain (non-command) BTC wallet snapshot, so both the Balance tab and the Bridge tab
+/// use identical logic. Self-custody (Esplora, no node) when enabled off regtest; else
+/// the local bitcoind wallet.
+fn btc_wallet_snapshot(state: &State<AppState>) -> BtcWallet {
     let dir = state.data_dir.lock().unwrap().clone();
     let s = load_settings(&dir);
     let network = zcrypt_bridge::network_from_str(&s.btc_network);
@@ -1910,12 +1945,12 @@ fn btc_wallet_info(state: State<AppState>) -> R<BtcWallet> {
             let g = state.wallet.lock().unwrap();
             match g.as_ref() {
                 Some(w) => w.mnemonic.clone(),
-                None => return ok(none()),
+                None => return none(),
             }
         };
         let sc = match zcrypt_bridge::selfcustody::SelfCustodyBtc::new(&mnemonic, "", network, &s.esplora_url) {
             Ok(sc) => sc,
-            Err(_) => return ok(none()),
+            Err(_) => return none(),
         };
         let deposit_address = sc.receive_address().map(|a| a.to_string()).unwrap_or_default();
         // Fast deposit-address balance (one Esplora call); reachability = "connected".
@@ -1923,16 +1958,16 @@ fn btc_wallet_info(state: State<AppState>) -> R<BtcWallet> {
             Ok(sats) => (true, sats as f64 / 1e8),
             Err(_) => (false, 0.0),
         };
-        return ok(BtcWallet { connected, balance, deposit_address });
+        return BtcWallet { connected, balance, deposit_address };
     }
     // Regtest / self-custody off: the local bitcoind wallet.
-    match btc_client(&state) {
+    match btc_client(state) {
         Ok(btc) => {
             let balance = btc.balance_btc().unwrap_or(0.0);
             let deposit_address = btc.new_address().map(|a| a.to_string()).unwrap_or_default();
-            ok(BtcWallet { connected: true, balance, deposit_address })
+            BtcWallet { connected: true, balance, deposit_address }
         }
-        Err(_) => ok(none()),
+        Err(_) => none(),
     }
 }
 
@@ -2088,18 +2123,18 @@ fn swap_shield_btc(zbtc_amount: u64, btc: f64, window: tauri::Window, state: Sta
             MAX_COIN as f64 / 100_000_000.0
         ));
     }
-    let alice_btc = btc_client(&state)?;
-    let bridge_btc = btc_bridge(&state)?;
+    // Node-free Bitcoin backends (self-custody via Esplora) for both sides; falls back to
+    // bitcoind only on regtest. Account 0 = user, 1 = demo LP.
+    let (alice_bk, alice_dest) = swap_backend(&state, 0)?;
+    let (bridge_bk, bridge_dest) = swap_backend(&state, 1)?;
     let zc = zc_client(&state);
     let asset = zbtc_asset(&zc)?;
-    let alice_dest = alice_btc.new_address()?;
-    let bridge_dest = bridge_btc.new_address()?;
     let btc_amt = bitcoin::Amount::from_btc(btc).map_err(|e| e.to_string())?;
     with_wallet(&state, |w| {
         let (bridge_key, alice_key) = bridge_btc_keys(&w.account);
         let b = bswap::BtcParams {
-            alice: &alice_btc,
-            bridge: &bridge_btc,
+            alice: alice_bk.as_ref(),
+            bridge: bridge_bk.as_ref(),
             bridge_key: &bridge_key,
             alice_key: &alice_key,
             alice_dest: &alice_dest,
@@ -2138,8 +2173,9 @@ fn swap_redeem_btc(btc: f64, window: tauri::Window, state: State<AppState>) -> R
     let want_total = (btc * 100_000_000.0).round() as u64; // 1:1 peg, 8 decimals
     let fee = zcrypt_core::emission::MIN_FEE;
     let url = node_url(&state);
-    let alice_btc = btc_client(&state)?;
-    let bridge_btc = btc_bridge(&state)?;
+    // Node-free backends (self-custody via Esplora) for both sides; bitcoind only on regtest.
+    let (alice_bk, alice_dest) = swap_backend(&state, 0)?;
+    let (bridge_bk, bridge_dest) = swap_backend(&state, 1)?;
     let zc = zc_client(&state);
     let asset = zbtc_asset(&zc)?;
     with_wallet(&state, |w| {
@@ -2192,12 +2228,9 @@ fn swap_redeem_btc(btc: f64, window: tauri::Window, state: State<AppState>) -> R
             }
             let round_value = (want_total - redeemed).min(round_cap);
             round += 1;
-            // Fresh BTC addresses per round (no address reuse across the atomic swaps).
-            let alice_dest = alice_btc.new_address()?;
-            let bridge_dest = bridge_btc.new_address()?;
             let b = bswap::BtcParams {
-                alice: &alice_btc,
-                bridge: &bridge_btc,
+                alice: alice_bk.as_ref(),
+                bridge: bridge_bk.as_ref(),
                 bridge_key: &bridge_key,
                 alice_key: &alice_key,
                 alice_dest: &alice_dest,

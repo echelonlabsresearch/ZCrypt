@@ -11,7 +11,7 @@ use zcrypt_core::shield_tx::{self, Spend};
 use zcrypt_shield::{Commitment, OutCoin, PubKey};
 
 use crate::zcrypt::Zcrypt;
-use crate::{htlc_script, Btc, Key};
+use crate::{htlc_script, BtcBackend, Key};
 
 pub const CHAIN: &[u8] = b"zcrypt-devnet";
 
@@ -253,11 +253,12 @@ pub fn parse_transfer_payload(b: &[u8]) -> Option<(shield_tx::ShieldTx, shield_t
 }
 
 pub struct BtcParams<'a> {
-    /// Alice's wallet (the user) — the balance the UI shows.
-    pub alice: &'a Btc,
-    /// The bridge/LP wallet — a *distinct* bitcoind wallet, so Alice's BTC really
-    /// leaves on shield and really arrives on redeem.
-    pub bridge: &'a Btc,
+    /// Alice's Bitcoin backend (the user). Any [`BtcBackend`] — a node-free self-custody
+    /// wallet on an Esplora API in production, or a local node for regtest/dev.
+    pub alice: &'a dyn BtcBackend,
+    /// The bridge/LP's Bitcoin backend — a *distinct* wallet, so Alice's BTC really
+    /// leaves on shield and really arrives on redeem. Also any [`BtcBackend`].
+    pub bridge: &'a dyn BtcBackend,
     pub bridge_key: &'a Key,
     pub alice_key: &'a Key,
     pub alice_dest: &'a Address,  // where Alice receives BTC (redeem)

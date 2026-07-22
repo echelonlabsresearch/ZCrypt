@@ -422,6 +422,41 @@ impl Btc {
     }
 }
 
+/// The Bitcoin operations the atomic swap needs from a wallet backend, abstracted so
+/// the swap can run over EITHER a local node ([`Btc`], regtest/dev) OR a node-free
+/// self-custody wallet on an Esplora API ([`selfcustody::SelfCustodyBtc`], production).
+/// Both the user and the bridge/LP use the same interface, so no bitcoind is required.
+pub trait BtcBackend {
+    /// Fund an HTLC's P2WSH address with `amount`; return the confirmed funding UTXO.
+    fn fund_htlc(&self, script: &ScriptBuf, amount: Amount) -> Result<HtlcUtxo, String>;
+    /// Spend an HTLC's claim branch with `preimage`, signed by `key`, paying `dest`.
+    fn claim(&self, utxo: &HtlcUtxo, preimage: &[u8], key: &Key, dest: &Address, fee: Amount) -> Result<Txid, String>;
+    /// Current chain tip height (for locktime math).
+    fn height(&self) -> Result<u64, String>;
+    /// The preimage revealed in a claim transaction (witness item 1).
+    fn preimage_from_claim(&self, txid: &Txid) -> Option<Vec<u8>>;
+    /// Wait until `txid` is confirmed (mines on regtest; waits for real confs otherwise).
+    fn confirm(&self, txid: &Txid) -> Result<(), String>;
+}
+
+impl BtcBackend for Btc {
+    fn fund_htlc(&self, script: &ScriptBuf, amount: Amount) -> Result<HtlcUtxo, String> {
+        Btc::fund_htlc(self, script, amount)
+    }
+    fn claim(&self, utxo: &HtlcUtxo, preimage: &[u8], key: &Key, dest: &Address, fee: Amount) -> Result<Txid, String> {
+        Btc::claim(self, utxo, preimage, key, dest, fee)
+    }
+    fn height(&self) -> Result<u64, String> {
+        Btc::height(self)
+    }
+    fn preimage_from_claim(&self, txid: &Txid) -> Option<Vec<u8>> {
+        Btc::preimage_from_claim(self, txid)
+    }
+    fn confirm(&self, txid: &Txid) -> Result<(), String> {
+        Btc::confirm(self, txid)
+    }
+}
+
 pub mod esplora;
 pub mod hdwallet;
 pub mod selfcustody;

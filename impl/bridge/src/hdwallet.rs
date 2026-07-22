@@ -43,14 +43,21 @@ fn coin_type(network: Network) -> u32 {
 }
 
 impl HdWallet {
-    /// Derive the wallet from a BIP-39 mnemonic (+ optional passphrase) for `network`.
-    /// The mnemonic is the SAME one that backs the ZCrypt account.
+    /// Derive the wallet from a BIP-39 mnemonic (+ optional passphrase) for `network`,
+    /// on BIP-84 account 0. The mnemonic is the SAME one that backs the ZCrypt account.
     pub fn from_mnemonic(mnemonic: &str, passphrase: &str, network: Network) -> Result<Self, String> {
+        Self::from_mnemonic_account(mnemonic, passphrase, network, 0)
+    }
+
+    /// Like [`Self::from_mnemonic`] but on BIP-84 `account` `m/84'/coin'/account'`. Used
+    /// to give the demo bridge/LP (account 1) addresses distinct from the user (account 0)
+    /// under a single mnemonic.
+    pub fn from_mnemonic_account(mnemonic: &str, passphrase: &str, network: Network, account_index: u32) -> Result<Self, String> {
         let mn = bip39::Mnemonic::parse(mnemonic.trim()).map_err(|e| format!("invalid mnemonic: {e}"))?;
         let seed = mn.to_seed(passphrase); // 64-byte BIP-39 seed
         let master = Xpriv::new_master(network, &seed).map_err(|e| e.to_string())?;
         let secp = Secp256k1::signing_only();
-        let path = DerivationPath::from_str(&format!("m/84'/{}'/0'", coin_type(network)))
+        let path = DerivationPath::from_str(&format!("m/84'/{}'/{account_index}'", coin_type(network)))
             .map_err(|e| e.to_string())?;
         let account = master.derive_priv(&secp, &path).map_err(|e| e.to_string())?;
         Ok(Self { network, account, secp })
