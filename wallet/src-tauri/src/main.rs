@@ -1819,6 +1819,12 @@ struct BridgeStatus {
     /// The configured Bitcoin network (regtest | signet | testnet | bitcoin), so the UI
     /// labels the real network instead of a hardcoded "regtest".
     btc_network: String,
+    /// Your (account-0) seed-derived deposit address — fund this to SHIELD. Self-custody
+    /// networks only; empty on regtest/bitcoind.
+    deposit_address: String,
+    /// The demo LP's (account-1) seed-derived address — fund this too to test REDEEM (the
+    /// LP needs BTC to pay out). Self-custody networks only. A real LP is a separate party.
+    lp_address: String,
 }
 
 /// Register zBTC + seed a decoy pool so shield spends have a ring. Idempotent.
@@ -1863,6 +1869,9 @@ fn bridge_status(state: State<AppState>) -> R<BridgeStatus> {
     // (via Esplora, no node) when enabled, else the local bitcoind wallet.
     let snap = btc_wallet_snapshot(&state);
     let (btc_connected, btc_balance) = (snap.connected, snap.balance);
+    // Seed-derived addresses to fund for testing: account 0 (you, shield) + account 1 (the
+    // demo LP, redeem). Only meaningful in self-custody mode; empty otherwise.
+    let (deposit_address, lp_address) = selfcustody_addresses(&state);
     let zbtc_balance = {
         let g = state.wallet.lock().unwrap();
         match g.as_ref() {
@@ -1875,7 +1884,30 @@ fn bridge_status(state: State<AppState>) -> R<BridgeStatus> {
             None => 0,
         }
     };
-    ok(BridgeStatus { btc_connected, btc_balance, zbtc_asset: asset, zbtc_balance, btc_network })
+    ok(BridgeStatus { btc_connected, btc_balance, zbtc_asset: asset, zbtc_balance, btc_network, deposit_address, lp_address })
+}
+
+/// The seed-derived (account 0, account 1) Bitcoin addresses for the self-custody bridge —
+/// the user's deposit address and the demo LP's address. Empty pair when not in
+/// self-custody mode (regtest / bitcoind) or the wallet is locked.
+fn selfcustody_addresses(state: &State<AppState>) -> (String, String) {
+    let dir = state.data_dir.lock().unwrap().clone();
+    let s = load_settings(&dir);
+    let network = zcrypt_bridge::network_from_str(&s.btc_network);
+    if !s.btc_selfcustody || network == bitcoin::Network::Regtest {
+        return (String::new(), String::new());
+    }
+    let mnemonic = match state.wallet.lock().unwrap().as_ref() {
+        Some(w) => w.mnemonic.clone(),
+        None => return (String::new(), String::new()),
+    };
+    let addr = |account: u32| {
+        zcrypt_bridge::selfcustody::SelfCustodyBtc::new_account(&mnemonic, "", network, &s.esplora_url, account)
+            .and_then(|sc| sc.receive_address())
+            .map(|a| a.to_string())
+            .unwrap_or_default()
+    };
+    (addr(0), addr(1))
 }
 
 #[derive(Serialize)]

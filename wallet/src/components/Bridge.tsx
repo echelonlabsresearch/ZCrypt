@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { call } from "../lib/api";
+import { CopyButton } from "./Share";
 
 interface Status {
   btc_connected: boolean;
@@ -8,6 +9,8 @@ interface Status {
   zbtc_asset: number;
   zbtc_balance: number;
   btc_network: string;
+  deposit_address: string;
+  lp_address: string;
 }
 
 interface Progress {
@@ -163,6 +166,28 @@ export default function Bridge({
             </div>
           </div>
         </div>
+
+        {status && (status.deposit_address || status.lp_address) && (
+          <div className="card" style={{ marginTop: "1rem", background: "var(--bg-grid)" }}>
+            <div style={{ fontWeight: "bold", color: "var(--color-text-dim)", marginBottom: 6 }}>
+              Fund these seed-derived addresses to test (self-custody, no node)
+            </div>
+            <div style={{ fontSize: "0.72rem", color: "var(--color-text-dim)", marginBottom: 8 }}>
+              Fund <b>your</b> address to SHIELD; fund the <b>LP</b> address too to test REDEEM
+              (the LP needs BTC to pay out). Both derive from your mnemonic.
+            </div>
+            <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>
+              <span style={{ minWidth: 40 }}>You</span>
+              <code style={{ fontSize: "0.72rem", wordBreak: "break-all", flex: 1 }}>{status.deposit_address || "—"}</code>
+              <CopyButton text={status.deposit_address} />
+            </div>
+            <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+              <span style={{ minWidth: 40 }}>LP</span>
+              <code style={{ fontSize: "0.72rem", wordBreak: "break-all", flex: 1 }}>{status.lp_address || "—"}</code>
+              <CopyButton text={status.lp_address} />
+            </div>
+          </div>
+        )}
 
         {status && status.zbtc_asset === 0 && (
           <div className="warn" style={{ marginTop: "1rem" }}>
