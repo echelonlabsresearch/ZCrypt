@@ -21,20 +21,16 @@ fn main() {
     let btc = Btc::connect(&btc_url, "zcrypt", "zcrypt", "demo", zcrypt_bridge::NETWORK).unwrap();
     let zc = Zcrypt::new(&zc_url);
     let alice = Account::from_seed([0x11; 32]);
-    // The treasury's M-of-N (here 2-of-3) post-quantum mint authority, derived from a
-    // master secret that must match the wallet's. Its commitment IS the registered authority.
-    let master: &[u8] = b"zcrypt-bridge-treasury-master";
-    let (keyset, signers) = zcrypt_core::mint_auth::derive_keyset(master, 3, 2);
-    // A signing closure: given the mint message, return the encoded threshold authorization.
-    let sign_mint = |msg: &[u8]| {
-        let sigs = zcrypt_core::mint_auth::authorize(&keyset, &signers, msg);
-        zcrypt_core::mint_auth::encode_auth(&keyset, &sigs)
-    };
     let asset_ticker = "zBTC";
 
-    // register zBTC (idempotent-ish: ignore "already registered")
-    let authority = keyset.commitment();
-    let _ = zc.broadcast(&swap::register_tx(asset_ticker, 8, &authority, 21_000_000 * 100_000_000));
+    // The bridge's Bitcoin RESERVE key. Consensus derives zBTC's mint authority
+    // from this key (`spv_authority`), so zBTC mints ONLY against SPV-proven BTC
+    // deposits claimable by it — no treasury, no signers, nothing to trust.
+    let bridge_key = Key::from_bytes(&[0xB1; 32]);
+
+    // register zBTC in SPV form (idempotent-ish: ignore "already registered")
+    let reserve_pk: [u8; 33] = bridge_key.pk.inner.serialize();
+    let _ = zc.broadcast(&swap::register_spv_tx(asset_ticker, 8, &reserve_pk, 21_000_000 * 100_000_000));
     let asset: u64 = zc.query(&format!("/asset/by_ticker/{asset_ticker}")).unwrap().trim().parse().unwrap();
     println!("zBTC asset_id = {asset}");
 
@@ -45,7 +41,6 @@ fn main() {
         let _ = zc.broadcast(&swap::seed_tx(&c));
     }
 
-    let bridge_key = Key::from_bytes(&[0xB1; 32]);
     let alice_key = Key::from_bytes(&[0xA1; 32]);
     // A distinct bridge/LP wallet, stocked with BTC for the redeem direction.
     Btc::ensure_wallet(&btc_url, "zcrypt", "zcrypt", "bridge").unwrap();
@@ -68,26 +63,39 @@ fn main() {
         bridge_dest: &bridge_dest,
     };
 
-    let zbtc = 900_000_000u64; // 9 zBTC (8 decimals) — over the OLD ~2.68 cap, now fine
+    // 1:1 peg, enforced by consensus: minted base units can never exceed locked sats.
     let btc_amt = Amount::from_btc(0.1).unwrap();
+    let zbtc = btc_amt.to_sat(); // 0.1 zBTC (8 decimals) against 0.1 BTC
 
     // ===== BTC -> zBTC (twice, so Alice ends with two zBTC coins to redeem) =====
-    println!("\n== SWAP 1: BTC -> zBTC ==");
+    println!("\n== SWAP 1: BTC -> zBTC (SPV-verified mint) ==");
     println!("  Alice BTC before: {:.4}", btc.balance_btc().unwrap());
     // Each swap uses a fresh, unguessable preimage from OS entropy (H5) — never a
     // fixed string, which an on-chain observer could reverse from the hashlock.
-    let coin_a = swap::btc_to_zbtc(&zc, &b, &alice, asset, &sign_mint, &swap::fresh_preimage(), btc_amt, zbtc).unwrap();
+    let coin_a = swap::btc_to_zbtc(&zc, &b, &alice, asset, &swap::fresh_preimage(), btc_amt, zbtc).unwrap();
     println!("  Alice BTC after:  {:.4}  (should be LOWER — BTC left Alice)", btc.balance_btc().unwrap());
-    println!("== SWAP 2: BTC -> zBTC ==");
-    let coin_b = swap::btc_to_zbtc(&zc, &b, &alice, asset, &sign_mint, &swap::fresh_preimage(), btc_amt, zbtc).unwrap();
+    println!("== SWAP 2: BTC -> zBTC (SPV-verified mint) ==");
+    let coin_b = swap::btc_to_zbtc(&zc, &b, &alice, asset, &swap::fresh_preimage(), btc_amt, zbtc).unwrap();
     let minted = zc.query(&format!("/asset/id/{asset}")).unwrap();
     println!("zBTC supply after 2 mints: {minted}");
 
+    // Before redeeming, the freshly-minted zBTC must MATURE: SPV mints are held out of
+    // the spendable pool until their Bitcoin deposit is buried past reorg risk (the
+    // deep-reorg defense). On regtest we mine the extra blocks + relay; on a real
+    // network you simply wait for confirmations.
+    println!("\n== Maturing zBTC (deep-reorg defense: coins unspendable until deposit is deep) ==");
+    println!("  pending before: {}", zc.query("/spv/pending").unwrap_or_default());
+    swap::wait_for_maturity(&zc, &btc, Some(&|n| btc.mine(n)), 6).expect("zBTC matures");
+    println!("  pending after:  {} (all matured → spendable)", zc.query("/spv/pending").unwrap_or_default());
+
     // ===== zBTC -> BTC (redeem Alice's two coins back to BTC) =====
     println!("\n== SWAP 3: zBTC -> BTC (redeem) ==");
-    // Redeem all but the universal-gas fee (the zBTC spend pays its fee in zBTC).
-    let redeem = 2 * zbtc - zcrypt_core::emission::MIN_FEE;
-    swap::zbtc_to_btc(&zc, &b, &alice, asset, &[coin_a, coin_b], &swap::fresh_preimage(), redeem, btc_amt).unwrap();
+    // Redeem the coins Alice actually holds (each is the minted value minus the bridge
+    // fee that went to stakers) less the universal in-asset gas fee.
+    let redeem = coin_a.value + coin_b.value - zcrypt_core::emission::MIN_FEE;
+    // The SPV bridge enforces a 1:1 peg on redeem: the BTC released must equal the zBTC
+    // burned, so the requested BTC amount is exactly `redeem` sats (both coins, net of gas).
+    swap::zbtc_to_btc(&zc, &b, &alice, asset, &[coin_a, coin_b], &swap::fresh_preimage(), redeem, Amount::from_sat(redeem)).unwrap();
     let after = zc.query(&format!("/asset/id/{asset}")).unwrap();
     println!("zBTC supply after redeem: {after}");
 

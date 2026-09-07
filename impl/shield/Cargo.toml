@@ -6,8 +6,6 @@ license.workspace = true
 
 [features]
 default = []
-## Roughly doubles FRI queries / PoW for a thicker soundness margin (mainnet).
-high-security = []
 
 [dependencies]
 p3-air = "0.6"

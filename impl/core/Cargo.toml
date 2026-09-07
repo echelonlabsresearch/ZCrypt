@@ -6,7 +6,6 @@ license.workspace = true
 
 [features]
 default = []
-high-security = ["zcrypt-shield/high-security"]
 
 [dependencies]
 sha3.workspace = true
@@ -25,3 +24,6 @@ postcard = { version = "1", features = ["alloc"] }
 hex.workspace = true
 zcrypt-shield = { path = "../shield", default-features = false }
 ml-dsa = "0.1.1"
+bitcoin = "0.32"
+# Incremental consensus-state store (replaces full-file postcard dumps for live commit).
+rocksdb = { version = "0.22", default-features = true }

@@ -1,0 +1,81 @@
+# Become a ZCrypt validator. Plug-and-play: download this file, run one command, then bond.
+#
+#   docker compose -f docker-compose.validator.yml up -d      # joins + syncs, zero config
+#   ./validator-bond.sh                                       # then bond to start producing
+#
+# It generates its own validator identity, downloads the chain's genesis, dials the public
+# seed node, and syncs. You never touch the genesis file. Watch it:
+#
+#   docker logs -f zcrypt-validator-cometbft
+#   curl -s localhost:56657/status | grep catching_up
+#
+# The defaults below point at the public foundation. To join a DIFFERENT chain (e.g. a
+# local test foundation), drop a `.env` next to this file overriding GENESIS_URL / SEED_*.
+
+name: zcrypt-validator
+
+services:
+  # This validator's own ABCI state machine. The foundation address (and everything else)
+  # comes from the downloaded genesis, so there is nothing to configure here.
+  validator-abci:
+    # Published image so downloaders need no source. Falls back to a local build.
+    image: ${ZCRYPT_ABCI_IMAGE:-ghcr.io/zcryptnetwork/zcrypt-abci:latest}
+    build:
+      context: ..
+      dockerfile: chain/docker/Dockerfile
+      args:
+        # PRODUCTION build by default (no features): a mainnet validator MUST NOT run the
+        # devnet feature (SEED faucet / dev-seed). Mainnet-grade FRI parameters are compiled
+        # into every binary unconditionally, so validators and wallets always share one
+        # proof format. Override to `devnet` only for a local test chain.
+        ABCI_FEATURES: ${ABCI_FEATURES:-}
+    container_name: zcrypt-validator-abci
+    restart: unless-stopped
+    environment:
+      ABCI_PORT: "26658"
+      ZCRYPT_STATE_FILE: /data/zcrypt-state.bin
+      ZCRYPT_VESTING_ACCEL: ${ZCRYPT_VESTING_ACCEL:-1}
+      # NOTE: the Bitcoin SPV network + checkpoint are NOT set here. They live in the
+      # genesis this node downloads from the seed, so the abci configures the identical
+      # Bitcoin anchor at InitChain automatically. A validator sets NOTHING for the bridge.
+    volumes:
+      - validator-abci-data:/data
+    networks: [vnet]
+
+  # This validator's CometBFT node — own identity, downloads genesis, dials the seed.
+  validator-cometbft:
+    image: cometbft/cometbft:v0.38.17
+    container_name: zcrypt-validator-cometbft
+    user: "0"
+    restart: unless-stopped
+    depends_on:
+      - validator-abci
+    environment:
+      CHAIN_ID: ${CHAIN_ID:-zcrypt-1}
+      ABCI_ADDR: tcp://validator-abci:26658
+      # How to find the chain. By default everything comes from the seed node's RPC: the
+      # genesis (SEED_RPC/genesis) and a peer (SEED_RPC/status). Override SEED_RPC/SEED_P2P_*
+      # in .env to join a different chain (e.g. a local foundation). GENESIS_URL is an
+      # optional static-file override for when the genesis is hosted separately.
+      SEED_RPC: ${SEED_RPC:-https://foundation.zcrypt.network:26657}
+      SEED_P2P_HOST: ${SEED_P2P_HOST:-foundation.zcrypt.network}
+      SEED_P2P_PORT: ${SEED_P2P_PORT:-26656}
+      GENESIS_URL: ${GENESIS_URL:-}
+      # Optional: skip auto-discovery by giving the full seed string <node_id>@host:26656.
+      ZCRYPT_SEEDS: ${ZCRYPT_SEEDS:-}
+    entrypoint: ["/bin/sh", "/entrypoint.sh"]
+    volumes:
+      - ./docker/validator-entrypoint.sh:/entrypoint.sh:ro
+      - validator-cometbft-data:/cometbft
+    ports:
+      - "${VALIDATOR_RPC_PORT:-56657}:26657"   # this validator's RPC
+      - "${VALIDATOR_P2P_PORT:-56656}:26656"   # P2P (reachable so peers can dial back)
+    networks: [vnet]
+
+volumes:
+  validator-abci-data:
+  validator-cometbft-data:
+
+networks:
+  vnet:
+    driver: bridge

@@ -20,14 +20,6 @@ use zcrypt_bridge::swap::{self as bswap};
 use zcrypt_bridge::zcrypt::Zcrypt;
 use zcrypt_bridge::{Btc, Key as BtcKey};
 
-/// The bridge treasury's master mint secret (this single-user demo plays both Alice and
-/// the treasury; a real deployment distributes the N derived signing keys among custodians).
-const BRIDGE_CAP: &[u8] = b"zcrypt-bridge-capability";
-/// zBTC treasury authority is M-of-N post-quantum (ML-DSA). 2-of-3: any two of the three
-/// derived treasury keys authorize a mint; no single key (nor any one of them) can.
-const TREASURY_N: u32 = 3;
-const TREASURY_M: u32 = 2;
-
 /// The commitment stored as an asset's on-chain `authority` for an M-of-N mint key set
 /// derived from `master`. Deriving keys needs ML-DSA keygen, so this is used where only the
 /// authority id is needed (registration, ownership checks).
@@ -47,8 +39,20 @@ fn mint_authority(master: &[u8], n: u32, threshold: u32) -> ([u8; 32], impl Fn(&
     (commitment, sign)
 }
 
-/// Chain id (matches the ABCI node's CHAIN_ID and genesis).
-const CHAIN: &[u8] = b"zcrypt-devnet";
+/// Compile-time DEFAULT chain-id. Kept only as a last-resort identity for a brand-new
+/// wallet that has never connected to any node; it is NEVER used as a signing fallback.
+/// Signing goes through [`chain::pinned_chain_id`], which REFUSES rather than silently
+/// trusting this constant when a chain-id can't be confirmed (FIX 2 — chain-id pinning).
+#[allow(dead_code)]
+const DEFAULT_CHAIN: &[u8] = b"zcrypt-1";
+
+/// Chain-id for signing, PINNED to the first chain this wallet connected to. Returns an
+/// error (refusing to sign) if the node reports a different chain-id than the pinned one,
+/// or if the node is unreachable and nothing has been pinned yet. See
+/// [`chain::pinned_chain_id`].
+fn chain_id_for(url: &str) -> Result<Vec<u8>, String> {
+    chain::pinned_chain_id(url)
+}
 /// Universal gas: every transfer bundles a ZCRYPT gas note that burns this much ZCRYPT
 /// (0.01 ZCRYPT). Staking is gasless. So moving a hidden non-ZCRYPT asset still pays its
 /// gas in ZCRYPT — you need a little ZCRYPT on hand ("gas") to send anything.
@@ -141,6 +145,13 @@ struct Wallet {
     /// coins are from a dead chain: `scan_onchain` resets the scan and the on-chain
     /// leaf reconcile drops them, so a wiped devnet never shows a phantom balance.
     chain_tag: String,
+    /// Commitments of coins produced by INTERNAL coin-reshaping self-transfers (the
+    /// auto split/consolidate a send does behind the scenes). These are plumbing, not
+    /// user activity: the reshape send is not logged, and when `scan_onchain` later
+    /// picks up the self-addressed output it adds the coin but skips the history line,
+    /// so the user sees one clean "Sent 3" instead of the intermediate split steps.
+    /// Transient (not persisted) — it only spans a single reshape+scan cycle.
+    hist_suppress: std::collections::HashSet<zcrypt_shield::Commitment>,
 }
 
 impl Wallet {
@@ -415,6 +426,7 @@ fn create_wallet(password: String, state: State<AppState>) -> R<CreateResult> {
         clock: 0,
         scan_height: 0,
         chain_tag: String::new(),
+        hist_suppress: std::collections::HashSet::new(),
     });
     ok(CreateResult { address, seed_phrase: phrase })
 }
@@ -446,6 +458,7 @@ fn restore_wallet(password: String, mnemonic: String, state: State<AppState>) ->
         clock: 0,
         scan_height: 0,
         chain_tag: String::new(),
+        hist_suppress: std::collections::HashSet::new(),
     });
     // if this machine already has coins for this mnemonic, restore them
     if let Some(w) = state.wallet.lock().unwrap().as_mut() {
@@ -472,6 +485,7 @@ fn unlock_wallet(password: String, state: State<AppState>) -> R<bool> {
         clock: 0,
         scan_height: 0,
         chain_tag: String::new(),
+        hist_suppress: std::collections::HashSet::new(),
     });
     // restore persisted coins/history/scan-height for this account
     if let Some(w) = state.wallet.lock().unwrap().as_mut() {
@@ -513,23 +527,28 @@ fn get_address(state: State<AppState>) -> R<String> {
 
 #[derive(Serialize)]
 struct StealthInfo {
+    index: u32,
     address: String,
-    backup: String,
 }
 
 /// Generate a fresh **stealth** sub-address: a random keypair NOT derived from the
-/// mnemonic. Persisted in this wallet so you can receive on it, but recoverable
-/// only from the returned `backup` (or this install) — the mnemonic will not
-/// restore it. Opaque to your view key.
+/// mnemonic. Persisted in this wallet so you can receive on it, but recoverable only
+/// from its backup seed (or this install) — the mnemonic will not restore it. Opaque to
+/// your view key.
+///
+/// The backup seed is a spend secret, so it is NEVER returned here (an unlocked session
+/// alone must not be able to exfiltrate spend keys). Reveal it one at a time, behind a
+/// fresh password check, via [`reveal_stealth_backup`].
 #[tauri::command]
 fn new_stealth_address(state: State<AppState>) -> R<StealthInfo> {
     with_wallet(&state, |w| {
         let seed = keys::random_seed();
         w.stealth_seeds.push(seed);
+        let index = (w.stealth_seeds.len() - 1) as u32;
         let acct = Account::from_seed(seed);
         Ok(StealthInfo {
+            index,
             address: acct.stealth_address().to_bech32(),
-            backup: hex::encode(seed),
         })
     })
     .and_then(ok)
@@ -539,14 +558,16 @@ fn new_stealth_address(state: State<AppState>) -> R<StealthInfo> {
 struct StealthEntry {
     index: u32,
     address: String,
-    /// The 32-byte seed (hex) — the ONLY way to recover this stealth sub-address's funds
-    /// off this install (the mnemonic will not).
-    backup: String,
 }
 
-/// Every stealth sub-address this wallet has generated, with its address AND its backup
-/// key. The seeds are persisted (encrypted in `coins.enc`), so this always reflects the
-/// full set — you never lose a stealth address or its key after generating it.
+/// Every stealth sub-address this wallet has generated, with its address and index. The
+/// seeds are persisted (encrypted in `coins.enc`), so this always reflects the full set —
+/// you never lose a stealth address after generating it.
+///
+/// The backup SEED (a spend secret) is deliberately NOT included: bulk-exporting every
+/// stealth spend key to the frontend from an unlocked session would let a compromised
+/// webview drain them all. Reveal a single seed, behind a fresh password check, via
+/// [`reveal_stealth_backup`].
 #[tauri::command]
 fn list_stealth_addresses(state: State<AppState>) -> R<Vec<StealthEntry>> {
     with_wallet(&state, |w| {
@@ -558,10 +579,31 @@ fn list_stealth_addresses(state: State<AppState>) -> R<Vec<StealthEntry>> {
                 StealthEntry {
                     index: i as u32,
                     address: acct.stealth_address().to_bech32(),
-                    backup: hex::encode(seed),
                 }
             })
             .collect())
+    })
+    .and_then(ok)
+}
+
+/// Reveal the backup seed (hex) of a SINGLE stealth sub-address, gated behind a fresh
+/// password check — the same keystore re-verification [`get_seed_phrase`] performs. This
+/// is the ONLY path that discloses a stealth spend secret: it is never bulk-exported, so a
+/// compromised (but unlocked) webview cannot pull every stealth spend key without also
+/// knowing the password. Returns the 32-byte seed (hex) for `index`.
+#[tauri::command]
+fn reveal_stealth_backup(index: u32, password: String, state: State<AppState>) -> R<String> {
+    // Re-verify the password against the keystore before revealing any spend secret.
+    let dir = state.data_dir.lock().unwrap().clone();
+    let raw = std::fs::read_to_string(keystore_path(&dir)).map_err(|_| "no wallet")?;
+    let ks: Keystore = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
+    unseal(&password, &ks).ok_or("wrong password")?;
+    with_wallet(&state, |w| {
+        let seed = w
+            .stealth_seeds
+            .get(index as usize)
+            .ok_or("no such stealth address")?;
+        Ok(hex::encode(seed))
     })
     .and_then(ok)
 }
@@ -751,7 +793,8 @@ fn claim_bearer(token: String, state: State<AppState>) -> R<Received> {
         // The sweep is a transfer, so it pays ZCRYPT gas via a bundled gas note (built
         // first — it reserves a spare ZCRYPT coin). You get the FULL bearer value; the
         // 0.01 ZCRYPT gas comes from a separate ZCRYPT coin you hold.
-        let (gas_tx, gas_blind, gas_i, gchg_rec) = build_gas_note(w, &leaves, &[])?;
+        let cid = chain_id_for(&url)?;
+        let (gas_tx, gas_blind, gas_i, gchg_rec) = build_gas_note(w, &leaves, &[], &cid)?;
         // Sweep: single-input spend of the bearer coin → a fresh coin we own (new
         // secret), plus a 0-value change output (2-output topology). No in-tx fee.
         // Membership proof against the whole shielded pool — no ring selection.
@@ -773,7 +816,7 @@ fn claim_bearer(token: String, state: State<AppState>) -> R<Received> {
         let out1 = keys::out_asset_coin(&self_addr, 0, blind_b, bcoin.asset_id);
         let note0 = kem::ciphertext_to_bytes(&keys::encrypt_note_asset(&self_addr, net, blind_a, bcoin.asset_id));
         let note1 = kem::ciphertext_to_bytes(&keys::encrypt_note_asset(&self_addr, 0, blind_b, bcoin.asset_id));
-        let main_tx = shield_tx::build(CHAIN, &[spend], &[out0, out1], 0, vec![note0, note1])
+        let main_tx = shield_tx::build(&cid, &[spend], &[out0, out1], 0, vec![note0, note1])
             .ok_or("failed to build the claim proof")?;
         let raw = bundle_transfer(&gas_blind, &gas_tx, &main_tx);
         chain::broadcast(&url, &raw)?;
@@ -810,10 +853,10 @@ struct Settings {
     btc_pass: String,
     #[serde(default = "default_btc_wallet")]
     btc_wallet: String,
-    /// Bitcoin network the bridge talks to: `regtest` (devnet demo, default),
-    /// `signet`, `testnet`/`testnet4`, or `bitcoin` (mainnet). Only regtest may
-    /// self-mine; real networks require confirmations, so point this at your own
-    /// bitcoind on the chosen network and fund the wallets with real BTC.
+    /// Bitcoin network the bridge talks to: `bitcoin` (mainnet, default), `signet`,
+    /// `testnet`/`testnet4`, or `regtest` (local demo). Only regtest may self-mine;
+    /// real networks require confirmations. In self-custody mode (default) this must
+    /// match `esplora_url`'s network — a mainnet wallet on a signet endpoint is rejected.
     #[serde(default = "default_btc_network")]
     btc_network: String,
     /// Self-custody Bitcoin: derive BTC keys from the wallet mnemonic and use an Esplora
@@ -822,7 +865,9 @@ struct Settings {
     #[serde(default = "default_btc_selfcustody")]
     btc_selfcustody: bool,
     /// Esplora REST endpoint for self-custody mode (blockstream.info / mempool.space or
-    /// your own). Network-specific; the default is public signet.
+    /// your own). Network-specific and MUST match `btc_network`; the default is public
+    /// mainnet. For privacy a hosted endpoint sees your xpub, so self-host in production
+    /// or route over Tor.
     #[serde(default = "default_esplora_url")]
     esplora_url: String,
     /// Route node RPC through a local Tor SOCKS proxy (default ON for privacy).
@@ -850,13 +895,13 @@ fn default_btc_wallet() -> String {
     "demo".into()
 }
 fn default_btc_network() -> String {
-    "regtest".into()
+    "bitcoin".into()
 }
 fn default_btc_selfcustody() -> bool {
     true
 }
 fn default_esplora_url() -> String {
-    "https://mempool.space/signet/api".into()
+    "https://blockstream.info/api".into()
 }
 fn default_tor_enabled() -> bool {
     true
@@ -881,14 +926,42 @@ impl Default for Settings {
     }
 }
 
-/// Normalize a Tor proxy setting into a full SOCKS5 URL. Accepts `host:port` or a
-/// `socks5://host:port` URL. Returns `None` when Tor is disabled, the value is
-/// blank, or the node is localhost (devnet — Tor would only add friction).
+/// The unusable-proxy SENTINEL: a SOCKS5 endpoint nothing listens on (loopback port 1).
+/// Routing a request here makes it ERROR (fail closed) instead of silently falling back to a
+/// direct, de-anonymizing connection. Both `chain::agent_with_timeout` and the bridge's
+/// `proxied_agent` parse and apply it as-is. This is the same sentinel those two already use
+/// for a NON-empty but unparseable proxy string.
+const FAILCLOSED_PROXY: &str = "socks5://127.0.0.1:1";
+
+/// Normalize a `host:port` (or explicit `socks5://…`) proxy string to a full SOCKS5 URL.
+/// A blank/whitespace value returns [`FAILCLOSED_PROXY`] so that an enabled-Tor caller for a
+/// remote host NEVER silently goes direct (audit M8). A non-empty but otherwise malformed
+/// value is normalized here and then rejected downstream by `ureq::Proxy::new`, which also
+/// fails closed onto the same sentinel.
+fn normalize_proxy_or_failclosed(proxy: &str) -> String {
+    let p = proxy.trim();
+    if p.is_empty() {
+        FAILCLOSED_PROXY.to_string()
+    } else if p.starts_with("socks5://") || p.starts_with("socks5h://") || p.starts_with("socks://") {
+        p.to_string()
+    } else {
+        format!("socks5://{p}")
+    }
+}
+
+/// Normalize a Tor proxy setting into a full SOCKS5 URL for the NODE RPC. Accepts `host:port`
+/// or a `socks5://host:port` URL. Returns `None` (direct is correct) ONLY when Tor is disabled
+/// or the node is loopback — Tor to a local process is pointless and can't reach it.
+///
+/// FAIL-CLOSED (audit M8): when Tor is ENABLED and the node is REMOTE (non-loopback) this must
+/// never return `None`. A blank/missing proxy would otherwise send the request DIRECT and leak
+/// the wallet's IP; instead it returns [`FAILCLOSED_PROXY`] so the request errors out.
 fn tor_proxy_url(s: &Settings) -> Option<String> {
     if !s.tor_enabled {
         return None;
     }
-    // Local nodes: always direct (privacy vs local process is a non-goal).
+    // Local nodes: always direct (privacy vs a local process is a non-goal, and Tor cannot
+    // reach loopback).
     let host = s
         .node_url
         .trim()
@@ -900,20 +973,82 @@ fn tor_proxy_url(s: &Settings) -> Option<String> {
     if host == "localhost" || host == "127.0.0.1" || host == "::1" || host == "[::1]" {
         return None;
     }
-    let p = s.tor_proxy.trim();
-    if p.is_empty() {
+    // Tor ON + REMOTE node: from here we must NEVER return `None` (that would go direct and
+    // leak the IP). A blank/invalid proxy fails closed onto the unusable sentinel.
+    Some(normalize_proxy_or_failclosed(&s.tor_proxy))
+}
+
+/// The Tor SOCKS proxy for the BRIDGE (ZCrypt node RPC + Esplora), WITHOUT the node-localhost
+/// skip: the bridge reaches multiple hosts (a possibly-local node, a possibly-local bitcoind,
+/// and a remote Esplora), so it decides per-target which to route (loopback bypasses Tor
+/// inside `proxied_agent`). Returns `None` only when Tor is OFF.
+///
+/// FAIL-CLOSED (audit M8): when Tor is ENABLED a blank/invalid proxy returns [`FAILCLOSED_PROXY`]
+/// rather than `None`, so a REMOTE bridge call errors instead of leaking the IP; loopback
+/// targets still bypass it in `proxied_agent`, so local calls stay direct.
+fn tor_raw_proxy(s: &Settings) -> Option<String> {
+    if !s.tor_enabled {
         return None;
     }
-    if p.starts_with("socks5://") || p.starts_with("socks5h://") || p.starts_with("socks://") {
-        Some(p.to_string())
-    } else {
-        Some(format!("socks5://{p}"))
+    Some(normalize_proxy_or_failclosed(&s.tor_proxy))
+}
+
+#[cfg(test)]
+mod reshape_tests {
+    use super::*;
+    const G: u64 = 10_000; // GAS_FEE (0.01 ZCRYPT)
+    const M: u64 = 1_000_000; // 1 ZCRYPT in base units
+
+    #[test]
+    fn ready_when_a_single_coin_covers_it() {
+        // One big ZCRYPT coin + a gas coin → send anything up to the big coin: Ready.
+        assert_eq!(reshape_plan(&[5 * M, M], true, 3 * M, G), ReshapePlan::Ready);
+    }
+
+    #[test]
+    fn the_user_case_two_coins_send_more_than_one_reshapes_not_errors() {
+        // 5 ZCRYPT in two 2.5 coins, sending 3: NOT insufficient — reshape (split) instead.
+        let p = reshape_plan(&[25 * M / 10, 25 * M / 10], true, 3 * M, G);
+        match p {
+            ReshapePlan::SelfSend(s) => assert!(s > 0 && s < 25 * M / 10, "split within a coin"),
+            other => panic!("expected a reshape self-send, got {other:?}"),
+        }
+        // And after that split conceptually yields 3 coins, a send of 3 is Ready:
+        assert_eq!(reshape_plan(&[249 * M / 100, 125 * M / 100, 125 * M / 100], true, 3 * M, G), ReshapePlan::Ready);
+    }
+
+    #[test]
+    fn fragmented_many_small_coins_consolidates() {
+        // Five 1-ZCRYPT coins (total 5), sending 3: top-2-after-gas = 2 < 3 → consolidate.
+        let p = reshape_plan(&[M, M, M, M, M], true, 3 * M, G);
+        assert_eq!(p, ReshapePlan::SelfSend(2 * M), "merge two smallest");
+    }
+
+    #[test]
+    fn genuinely_insufficient_is_reported() {
+        // Total 2 ZCRYPT, sending 3: truly not enough → Insufficient (a real error).
+        assert_eq!(reshape_plan(&[M, M], true, 3 * M, G), ReshapePlan::Insufficient);
+        // No coin can even pay gas.
+        assert_eq!(reshape_plan(&[G / 2], true, 0, G), ReshapePlan::Insufficient);
+    }
+
+    #[test]
+    fn non_zcrypt_uses_two_inputs_and_reshapes_when_needed() {
+        // zBTC: gas is separate ZCRYPT (checked elsewhere); payment = top-2.
+        assert_eq!(reshape_plan(&[3 * M, M], false, 3 * M, G), ReshapePlan::Ready); // 3+1 ≥ 3
+        // Two 2 coins, send 3: 2+2=4 ≥ 3 → Ready (both inputs).
+        assert_eq!(reshape_plan(&[2 * M, 2 * M], false, 3 * M, G), ReshapePlan::Ready);
+        // Fragmented: five 1s, send 3 → top-2 = 2 < 3 → consolidate.
+        assert_eq!(reshape_plan(&[M, M, M, M, M], false, 3 * M, G), ReshapePlan::SelfSend(2 * M));
     }
 }
 
 #[cfg(test)]
 mod tor_tests {
     use super::*;
+
+    // The unusable-proxy sentinel a fail-closed route points at (see FAILCLOSED_PROXY).
+    const SENTINEL: &str = "socks5://127.0.0.1:1";
 
     #[test]
     fn tor_on_by_default_skips_localhost_and_normalizes_when_remote() {
@@ -930,10 +1065,53 @@ mod tor_tests {
         // An explicit scheme is passed through unchanged.
         s.tor_proxy = "socks5://127.0.0.1:9150".into();
         assert_eq!(tor_proxy_url(&s).as_deref(), Some("socks5://127.0.0.1:9150"));
+    }
 
-        // Enabled but blank proxy -> None (nothing to route through).
-        s.tor_proxy = "   ".into();
+    #[test]
+    fn tor_disabled_is_always_direct() {
+        // Tor off → direct is correct regardless of proxy/target (no IP-privacy promise).
+        let mut s = Settings::default();
+        s.tor_enabled = false;
+        s.node_url = "http://node.example:26657".into();
+        s.tor_proxy = "".into();
+        assert_eq!(tor_proxy_url(&s), None, "disabled → direct");
+        assert_eq!(tor_raw_proxy(&s), None, "disabled → direct (bridge)");
+        // Even a perfectly good proxy string is ignored while disabled.
+        s.tor_proxy = "127.0.0.1:9050".into();
         assert_eq!(tor_proxy_url(&s), None);
+        assert_eq!(tor_raw_proxy(&s), None);
+    }
+
+    #[test]
+    fn enabled_remote_blank_proxy_fails_closed_not_direct() {
+        // THE M8 FIX: Tor ON + a REMOTE node + a blank/whitespace proxy must NOT go direct
+        // (which would leak the wallet IP). It routes to the unusable sentinel so the request
+        // fails closed. Previously this returned None → direct → IP leak.
+        let mut s = Settings::default();
+        s.node_url = "http://node.example:26657".into();
+        for blank in ["", "   ", "\t "] {
+            s.tor_proxy = blank.into();
+            assert_eq!(
+                tor_proxy_url(&s).as_deref(),
+                Some(SENTINEL),
+                "enabled + remote + blank proxy must fail closed, not go direct"
+            );
+            // The bridge raw proxy (no node-loopback skip) also fails closed on blank.
+            assert_eq!(tor_raw_proxy(&s).as_deref(), Some(SENTINEL));
+        }
+    }
+
+    #[test]
+    fn enabled_loopback_target_stays_direct_even_with_blank_proxy() {
+        // A loopback node is never Tor-routed (Tor can't reach a local process), so a blank
+        // proxy there is still DIRECT — not fail-closed. This is the intended exception.
+        let mut s = Settings::default();
+        assert!(s.tor_enabled);
+        for loop_url in ["http://localhost:36657", "http://127.0.0.1:36657"] {
+            s.node_url = loop_url.into();
+            s.tor_proxy = "".into();
+            assert_eq!(tor_proxy_url(&s), None, "loopback node must stay direct");
+        }
     }
 }
 fn settings_path(dir: &str) -> std::path::PathBuf {
@@ -945,8 +1123,10 @@ fn load_settings(dir: &str) -> Settings {
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default();
     // Keep the node-RPC transport in sync with the persisted Tor preference, so any
-    // request path (send, scan, claim, …) honors it without threading it through.
+    // request path (send, scan, claim, …) honors it without threading it through. The
+    // bridge (ZCrypt node + Esplora) gets the raw proxy and skips loopback per-target.
     chain::set_tor(tor_proxy_url(&s));
+    zcrypt_bridge::set_tor(tor_raw_proxy(&s));
     s
 }
 
@@ -967,7 +1147,81 @@ fn save_settings(settings: Settings, state: State<AppState>) -> R<bool> {
     .map_err(|e| e.to_string())?;
     // Apply the Tor preference immediately (don't wait for the next settings read).
     chain::set_tor(tor_proxy_url(&settings));
+    zcrypt_bridge::set_tor(tor_raw_proxy(&settings));
     ok(true)
+}
+
+/// Live Tor status for the current settings + node.
+#[derive(Serialize)]
+struct TorStatus {
+    /// The Tor setting (Settings toggle).
+    enabled: bool,
+    /// Is the SOCKS proxy actually listening (a Tor daemon is up)?
+    reachable: bool,
+    /// Is THIS node's RPC routed through Tor right now? (false when the node is local.)
+    node_routed: bool,
+    /// Are remote bridge calls (Esplora) routed through Tor?
+    bridge_routed: bool,
+    /// The SOCKS proxy host:port.
+    proxy: String,
+    /// Human-readable summary for the UI.
+    detail: String,
+}
+
+fn proxy_hostport(url: &str) -> String {
+    url.trim_start_matches("socks5h://")
+        .trim_start_matches("socks5://")
+        .trim_start_matches("socks://")
+        .to_string()
+}
+
+/// TCP-connect to the SOCKS proxy to confirm a Tor daemon is actually listening.
+fn socks_reachable(hostport: &str) -> bool {
+    use std::net::ToSocketAddrs;
+    hostport
+        .to_socket_addrs()
+        .ok()
+        .and_then(|mut a| a.next())
+        .map(|addr| std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(800)).is_ok())
+        .unwrap_or(false)
+}
+
+/// Live Tor status: whether it is on, whether the proxy is reachable, and whether the current
+/// node RPC and remote bridge traffic are actually being routed through it.
+#[tauri::command]
+fn tor_status(state: State<AppState>) -> R<TorStatus> {
+    let dir = state.data_dir.lock().unwrap().clone();
+    let s = load_settings(&dir);
+    let raw = tor_raw_proxy(&s);
+    let node_routed = tor_proxy_url(&s).is_some(); // None when node is local
+    let bridge_routed = raw.is_some();
+    let hostport = raw.as_deref().map(proxy_hostport).unwrap_or_default();
+    // A blank/whitespace proxy is a MISCONFIGURATION: `tor_raw_proxy` maps it to the
+    // fail-closed sentinel, so `hostport` here is `127.0.0.1:1` (nothing listens there).
+    // Detect it from the raw setting so the UI explains fail-closed rather than blaming a
+    // "127.0.0.1:1" the user never typed.
+    let proxy_configured = !s.tor_proxy.trim().is_empty();
+    let reachable = !hostport.is_empty() && socks_reachable(&hostport);
+    let detail = if !s.tor_enabled {
+        "Tor is off — enable it in Settings for IP privacy.".to_string()
+    } else if !proxy_configured {
+        "Tor is on but no SOCKS proxy is configured (the proxy field is blank). Remote requests \
+         FAIL CLOSED (they error) rather than leak your IP — set the proxy to 127.0.0.1:9050 and \
+         start a Tor daemon."
+            .to_string()
+    } else if !reachable {
+        format!(
+            "Tor is on but the SOCKS proxy {hostport} is not reachable. Start a Tor daemon (it listens \
+             on 127.0.0.1:9050) — until then remote requests fail closed rather than leak your IP."
+        )
+    } else if node_routed {
+        "Active: this node's RPC and remote bridge traffic route through Tor.".to_string()
+    } else {
+        "Active for remote traffic. Your node is local, so its RPC is direct (Tor to a local process \
+         is pointless); remote bridge calls (Esplora) still route through Tor."
+            .to_string()
+    };
+    ok(TorStatus { enabled: s.tor_enabled, reachable, node_routed, bridge_routed, proxy: hostport, detail })
 }
 
 #[derive(Serialize)]
@@ -1073,6 +1327,7 @@ fn build_gas_note(
     w: &mut Wallet,
     leaves: &[zcrypt_shield::Commitment],
     exclude: &[usize],
+    chain_id: &[u8],
 ) -> Result<(shield_tx::ShieldTx, [u64; 4], usize, Option<CoinRec>), String> {
     let gas_i = w
         .coins
@@ -1118,7 +1373,7 @@ fn build_gas_note(
     let gas_change = keys::out_coin(&gchg_addr, gchg_val, gchg_blind);
     let gchg_note = kem::ciphertext_to_bytes(&keys::encrypt_note(&gchg_addr, gchg_val, gchg_blind));
     let gas_tx = shield_tx::build(
-        CHAIN,
+        chain_id,
         &[gas_spend],
         &[gas_burn, gas_change],
         0,
@@ -1172,12 +1427,13 @@ fn shield_pay(
     recipient_out: zcrypt_shield::OutCoin,
     onchain_note: Vec<u8>,
 ) -> Result<(), String> {
+    let chain_id = chain_id_for(url)?;
     if amount > MAX_COIN {
         return Err(format!("amount too large — must be ≤ {MAX_COIN} base units"));
     }
     // ---- Universal gas: build a ZCRYPT gas note first (reserves a spare ZCRYPT coin,
     //      even for a ZCRYPT send — the node can't tell ZCRYPT from a hidden asset). ----
-    let (gas_tx, gas_blind, gas_i, gchg_rec) = build_gas_note(w, leaves, &[])?;
+    let (gas_tx, gas_blind, gas_i, gchg_rec) = build_gas_note(w, leaves, &[], &chain_id)?;
 
     // ---- Main transfer inputs: fewest coins of `asset_id` covering `amount`, EXCLUDING
     //      the gas coin. No in-tx fee (the moved asset is never burned for gas). ----
@@ -1286,7 +1542,7 @@ fn shield_pay(
     // onchain_note must always be fixed-size cover-or-real so stealth is not
     // fingerprintable by empty ciphertext. Callers pass cover bytes for stealth.
     let main_tx = shield_tx::build(
-        CHAIN,
+        &chain_id,
         &spends,
         &[recipient_out, change_out],
         0, // no in-tx fee — gas is the external ZCRYPT note
@@ -1318,12 +1574,176 @@ fn shield_pay(
 
 /// Shared shield-send for any shielded asset (`asset_id` 0 = ZCRYPT, else zBTC/…).
 /// `stealth = true` omits the recipient's on-chain note (returned as a file instead).
+/// What the wallet should do next so a send of `amount` can succeed, given the on-chain
+/// coin values of the asset. Pure + deterministic so it can be unit-tested exhaustively.
+#[derive(Debug, PartialEq, Eq)]
+enum ReshapePlan {
+    /// Coins are already in a shape that covers the send.
+    Ready,
+    /// Do a self-transfer of this many base units FIRST (reshapes the coins), then retry.
+    SelfSend(u64),
+    /// Total balance genuinely cannot cover `amount` (+ gas). A real error.
+    Insufficient,
+}
+
+/// Decide the next step to make a send of `amount` of an asset spendable. `vals` are the
+/// on-chain unspent coin values of the asset; `is_zcrypt` means gas is drawn from the same
+/// pool (a spare coin is reserved), otherwise gas is a separate ZCRYPT coin the caller
+/// already checked exists. A transfer draws from at most 2 payment coins (N_IN), and gas
+/// needs its own coin — so a balance can be "enough total" yet the wrong SHAPE. This
+/// returns a self-transfer that fixes the shape (split when too few coins, consolidate when
+/// too fragmented), so the wallet can make any within-balance send work without the user
+/// ever seeing coin plumbing.
+fn reshape_plan(vals: &[u64], is_zcrypt: bool, amount: u64, gas_fee: u64) -> ReshapePlan {
+    let mut v: Vec<u64> = vals.iter().copied().filter(|&x| x > 0).collect();
+    v.sort_unstable_by(|a, b| b.cmp(a)); // descending
+
+    if is_zcrypt {
+        // Reserve the SMALLEST coin that can cover gas; the rest fund the payment.
+        let Some(gi) = v.iter().rposition(|&x| x >= gas_fee) else {
+            return ReshapePlan::Insufficient; // nothing can even pay the 0.01 gas
+        };
+        let mut rest = v.clone();
+        rest.remove(gi);
+        let cover: u64 = rest.iter().take(2).sum();
+        if cover >= amount {
+            return ReshapePlan::Ready;
+        }
+        let total: u64 = v.iter().sum();
+        if total < amount.saturating_add(gas_fee) {
+            return ReshapePlan::Insufficient;
+        }
+        // Enough value, wrong shape.
+        if v.len() < 3 {
+            // Too few coins: gas eats the only spare. SPLIT the largest into two so the
+            // payment can use two coins. Self-send ~half of it (change stays positive).
+            let big = v[0];
+            let s = (big / 2).clamp(gas_fee, big.saturating_sub(gas_fee));
+            if s == 0 {
+                return ReshapePlan::Insufficient;
+            }
+            ReshapePlan::SelfSend(s)
+        } else {
+            // Fragmented across many coins: CONSOLIDATE the two smallest into one.
+            let n = v.len();
+            ReshapePlan::SelfSend(v[n - 1] + v[n - 2])
+        }
+    } else {
+        // Non-ZCRYPT: gas is a separate ZCRYPT coin (caller-checked). Payment = top 2.
+        let cover: u64 = v.iter().take(2).sum();
+        if cover >= amount {
+            return ReshapePlan::Ready;
+        }
+        let total: u64 = v.iter().sum();
+        if total < amount {
+            return ReshapePlan::Insufficient;
+        }
+        if v.len() < 3 {
+            let big = v[0];
+            let s = (big / 2).clamp(1, big.saturating_sub(1));
+            if s == 0 {
+                return ReshapePlan::Insufficient;
+            }
+            ReshapePlan::SelfSend(s)
+        } else {
+            let n = v.len();
+            ReshapePlan::SelfSend(v[n - 1] + v[n - 2])
+        }
+    }
+}
+
+/// On-chain unspent coin values of `asset_id` held by `w` (only coins actually in the
+/// current commitment tree count — stale coins from a wiped chain are ignored).
+fn onchain_asset_values(w: &Wallet, leaves: &[zcrypt_shield::Commitment], asset_id: u64) -> Vec<u64> {
+    w.coins
+        .iter()
+        .filter(|c| !c.spent && c.coin.asset_id == asset_id
+            && c.value <= MAX_COIN
+            && chain::find_index(leaves, &c.coin.commitment()).is_some())
+        .map(|c| c.value)
+        .collect()
+}
+
+/// Reshape a wallet's coins so a send of `amount` of `asset_id` can succeed, by running
+/// automatic self-transfers (split/consolidate) until the shape is right. The user never
+/// sees this — it just runs before the actual send. Bounded so it can never loop forever;
+/// returns a clear error only when the balance genuinely can't cover the send.
+fn ensure_spendable(asset_id: u64, amount: u64, state: &State<AppState>) -> Result<(), String> {
+    let is_zcrypt = asset_id == zcrypt_shield::ASSET_ZCRYPT;
+    let self_addr = {
+        let g = state.wallet.lock().unwrap();
+        let w = g.as_ref().ok_or("locked")?;
+        w.account.normal_address().to_bech32()
+    };
+    for _ in 0..12 {
+        let url = node_url(state);
+        let leaves = chain::fetch_leaves(&url)?;
+        // Non-ZCRYPT sends need a separate ZCRYPT coin for gas — check it exists.
+        if !is_zcrypt {
+            let has_gas = {
+                let g = state.wallet.lock().unwrap();
+                let w = g.as_ref().ok_or("locked")?;
+                onchain_asset_values(w, &leaves, zcrypt_shield::ASSET_ZCRYPT)
+                    .iter()
+                    .any(|&v| v >= GAS_FEE)
+            };
+            if !has_gas {
+                return Err("you need a little ZCRYPT on hand to pay the 0.01 gas fee for this transfer (on devnet, click Fund).".into());
+            }
+        }
+        let vals = {
+            let g = state.wallet.lock().unwrap();
+            let w = g.as_ref().ok_or("locked")?;
+            onchain_asset_values(w, &leaves, asset_id)
+        };
+        match reshape_plan(&vals, is_zcrypt, amount, GAS_FEE) {
+            ReshapePlan::Ready => return Ok(()),
+            ReshapePlan::Insufficient => {
+                let total: u64 = vals.iter().sum();
+                return Err(format!(
+                    "insufficient balance: you have {:.6} of this asset on-chain but the transfer \
+                     (including the 0.01 gas) needs more. Receive or fund more, then retry.",
+                    total as f64 / 1e6
+                ));
+            }
+            // Reshape: a self-transfer that fixes the coin shape, then loop and re-check.
+            // Uses the RAW send (no nested reshape) — the plan guarantees this self-send
+            // is already coverable by the current coins.
+            ReshapePlan::SelfSend(s) => {
+                do_shield_send_raw(&self_addr, s, asset_id, state, false, true)?;
+                // Pick up the self-sent coin (its note is on-chain, addressed to us).
+                let _ = scan_onchain(state.clone());
+            }
+        }
+    }
+    Err("could not arrange your coins to cover this send; try a smaller amount or fund more.".into())
+}
+
 fn do_shield_send(
     recipient: &str,
     amount: u64,
     asset_id: u64,
     state: &State<AppState>,
     stealth: bool,
+) -> Result<SendResult, String> {
+    // Auto-reshape the wallet's coins first, so a within-balance send never fails on the
+    // 2-input / separate-gas-coin plumbing. No-op when the coins are already spendable.
+    ensure_spendable(asset_id, amount, state)?;
+    do_shield_send_raw(recipient, amount, asset_id, state, stealth, false)
+}
+
+/// The actual shield send, WITHOUT auto-reshaping (used directly by the reshaper's own
+/// self-transfers to avoid recursion). `reshape = true` marks this as an INTERNAL
+/// coin-reshaping self-transfer: its "send" line is not logged, and its output
+/// commitment is registered so `scan_onchain` also suppresses the matching "receive"
+/// line — the user sees only their real transfer, not the plumbing that enabled it.
+fn do_shield_send_raw(
+    recipient: &str,
+    amount: u64,
+    asset_id: u64,
+    state: &State<AppState>,
+    stealth: bool,
+    reshape: bool,
 ) -> Result<SendResult, String> {
     let url = node_url(state);
     let leaves = chain::fetch_leaves(&url)?;
@@ -1353,8 +1773,26 @@ fn do_shield_send(
         } else {
             real_note.clone()
         };
+        // For an internal reshaping self-transfer, capture the output commitment BEFORE
+        // `shield_pay` consumes `recipient_out` (the OutCoin tuple = value, blind, pk,
+        // asset). The follow-up scan uses it to credit the coin WITHOUT logging a
+        // "receive"; the reshape "send" is not logged either.
+        let reshape_com = if reshape {
+            Some(zcrypt_shield::commit_asset(
+                recipient_out.0,
+                &recipient_out.1,
+                &recipient_out.2,
+                recipient_out.3,
+            ))
+        } else {
+            None
+        };
         shield_pay(w, &url, &leaves, asset_id, amount, recipient_out, onchain_note)?;
-        w.push_hist("send", -(amount as i64), short(recipient), asset_id);
+        if let Some(com) = reshape_com {
+            w.hist_suppress.insert(com);
+        } else {
+            w.push_hist("send", -(amount as i64), short(recipient), asset_id);
+        }
         Ok(SendResult {
             on_chain: true, // commitment always on-chain; stealth note is off-chain
             file: if stealth { Some(format!("zct1{}", hex::encode(real_note))) } else { None },
@@ -1470,6 +1908,64 @@ fn open_external(target: String) -> R<bool> {
     ok(true)
 }
 
+/// Collect encrypted note blobs from any consensus tag that embeds a shield tx
+/// (transfers, stake pledges, burn/swap locks). Used by rescan so change survives
+/// without relying solely on local `coins.enc`.
+fn shield_enc_notes_in_tx(tx: &[u8]) -> Vec<Vec<u8>> {
+    let tag = match tx.first() {
+        Some(t) => *t,
+        None => return Vec::new(),
+    };
+    let body = &tx[1..];
+    let mut notes = Vec::new();
+    let mut push_stx = |raw: &[u8]| {
+        if let Some(stx) = shield_tx::from_bytes(raw) {
+            notes.extend(stx.enc_notes);
+        }
+    };
+    match tag {
+        0x55 => {
+            // gas_blind(32) ‖ gas_len(4) ‖ gas_tx ‖ main_tx
+            if let Some((gas, main)) = bswap::parse_transfer_payload(body) {
+                notes.extend(gas.enc_notes);
+                notes.extend(main.enc_notes);
+            }
+        }
+        // bond: pk(32) stake(8) reward(32) commission(2) sig(64) stake_blind(32) ‖ shield
+        0x57 => {
+            if body.len() > 170 {
+                push_stx(&body[170..]);
+            }
+        }
+        // burn-lock: value(8) blind(32) asset(8) hashlock(32) timeout(8) refund_pk(64) ‖ shield
+        0x5D => {
+            if body.len() > 152 {
+                push_stx(&body[152..]);
+            }
+        }
+        // delegate: del_pk(32) target(20) stake(8) reward(32) sig(64) stake_blind(32) ‖ shield
+        0x5F => {
+            if body.len() > 188 {
+                push_stx(&body[188..]);
+            }
+        }
+        // swap-lock: value(8) blind(32) asset(8) hashlock(32) timeout(8) counterparty(64) refund(64) ‖ shield
+        0x62 => {
+            if body.len() > 216 {
+                push_stx(&body[216..]);
+            }
+        }
+        // burn-lock with btc_claim_pk: 33 + burn-lock body (same shield offset as 0x5D + 33)
+        0x67 => {
+            if body.len() > 185 {
+                push_stx(&body[185..]);
+            }
+        }
+        _ => {}
+    }
+    notes
+}
+
 /// Scan new blocks for incoming coins (trial-decrypt on-chain notes) and mark any
 /// of our coins whose nullifier now appears in the registry as spent.
 #[tauri::command]
@@ -1535,16 +2031,10 @@ fn scan_onchain(state: State<AppState>) -> R<usize> {
     let mut received: Vec<Coin> = Vec::new();
     for h in heights {
         for tx in chain::block_txs(&url, h) {
-            if tx.first() != Some(&0x55) {
-                continue;
-            }
-            // A 0x55 transfer bundles a ZCRYPT gas note + the main transfer — scan both.
-            let (gas_tx, main_tx) = match bswap::parse_transfer_payload(&tx[1..]) {
-                Some(pair) => pair,
-                None => continue,
-            };
-            for note in main_tx.enc_notes.iter().chain(gas_tx.enc_notes.iter()) {
-                if let Some(ct) = kem::ciphertext_from_bytes(note) {
+            // Trial-decrypt encrypted notes from every shield-bearing tag so change
+            // after bond/delegate/burn/swap locks is recoverable without coins.enc.
+            for note in shield_enc_notes_in_tx(&tx) {
+                if let Some(ct) = kem::ciphertext_from_bytes(&note) {
                     for acc in &scan_accounts {
                         if let Some(coin) = acc.receive(&ct) {
                             let com = coin.commitment();
@@ -1609,7 +2099,14 @@ fn scan_onchain(state: State<AppState>) -> R<usize> {
                     coin,
                     spent: false,
                 });
-                w.push_hist("receive", v as i64, "incoming".into(), asset);
+                // A coin from an internal reshaping self-transfer is credited but NOT
+                // logged — it's plumbing, not a real incoming payment. Genuine receives
+                // (not in the suppress set) log normally.
+                if w.hist_suppress.remove(&com) {
+                    // reshaping output: silently spendable, no history noise
+                } else {
+                    w.push_hist("receive", v as i64, "incoming".into(), asset);
+                }
             }
         }
         for c in w.coins.iter_mut() {
@@ -1621,15 +2118,30 @@ fn scan_onchain(state: State<AppState>) -> R<usize> {
         // tree — the "phantom balance" left after a devnet chain reset, which is what
         // makes a send fail with "no coins of this asset on-chain". This applies to EVERY
         // asset (ZCRYPT, zBTC, GOLD, …), so a single Refresh self-heals the wallet.
-        // (A just-broadcast coin is already a committed leaf by the time Refresh runs, and
-        // spendability itself requires tree membership, so this never drops a usable coin.)
         // Membership via a set built once → O(coins), not O(coins × leaves).
+        //
+        // EXCEPTION: freshly-shielded zBTC is held IMMATURE by design (the deep-reorg
+        // defense) — it is deliberately NOT a leaf yet, so a naive "not in tree ⇒ stale"
+        // rule would wrongly kill a maturing coin (and it would never recover). Ask the
+        // node which commitments are still pending and spare those; a coin that is neither
+        // a leaf nor pending is genuinely stale (or a reorg voided its mint) and is dropped.
+        // If the node can't answer (too old / transient error), SKIP the drop this cycle
+        // rather than risk losing a maturing coin — stale-coin cleanup can wait a cycle.
         let leaf_set: HashSet<zcrypt_shield::Commitment> = leaves.iter().copied().collect();
         let mut dropped = 0usize;
-        for c in w.coins.iter_mut() {
-            if !c.spent && !leaf_set.contains(&c.coin.commitment()) {
-                c.spent = true;
-                dropped += 1;
+        match chain::fetch_pending_coins(&url) {
+            Ok(pending) => {
+                let pending_set: HashSet<zcrypt_shield::Commitment> = pending.into_iter().collect();
+                for c in w.coins.iter_mut() {
+                    let com = c.coin.commitment();
+                    if !c.spent && !leaf_set.contains(&com) && !pending_set.contains(&com) {
+                        c.spent = true;
+                        dropped += 1;
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("[scan] pending-coins query failed ({e}); skipping stale-coin drop this cycle to protect maturing zBTC");
             }
         }
         if dropped > 0 {
@@ -1660,6 +2172,436 @@ fn pk_hex(pk: &zcrypt_shield::PubKey) -> String {
 
 /// Unclaimed staking reward balance (base units) for this wallet's address.
 /// Returns 0 when the node is unreachable or nothing has accrued.
+/// Build a coin-backed BOND tx (`0x57`): authenticated header (consensus pubkey ‖ stake ‖
+/// reward ‖ ed25519 signature over `"ZCRYPT-BOND-v1"‖chain‖pubkey‖stake‖reward`), then the
+/// `stake_blind` and the `pledge` shield tx whose output[0] burns exactly `stake` ZCRYPT.
+fn bond_tx(
+    sk: &ed25519_dalek::SigningKey,
+    stake: u64,
+    reward: [u8; 32],
+    commission: u16,
+    stake_blind: [u64; 4],
+    nonce: u64,
+    pledge: &shield_tx::ShieldTx,
+    chain_id: &[u8],
+) -> Vec<u8> {
+    use ed25519_dalek::Signer;
+    let pk = sk.verifying_key().to_bytes();
+    let mut msg = Vec::new();
+    msg.extend_from_slice(b"ZCRYPT-BOND-v1");
+    msg.extend_from_slice(chain_id);
+    msg.extend_from_slice(&pk);
+    msg.extend_from_slice(&stake.to_le_bytes());
+    msg.extend_from_slice(&reward);
+    msg.extend_from_slice(&commission.to_le_bytes());
+    msg.extend_from_slice(&nonce.to_le_bytes()); // replay-protection nonce
+    let sig = sk.sign(&msg);
+    let mut t = vec![0x57u8];
+    t.extend_from_slice(&pk);
+    t.extend_from_slice(&stake.to_le_bytes());
+    t.extend_from_slice(&reward);
+    t.extend_from_slice(&commission.to_le_bytes());
+    t.extend_from_slice(&nonce.to_le_bytes());
+    t.extend_from_slice(&sig.to_bytes());
+    for limb in stake_blind {
+        t.extend_from_slice(&limb.to_le_bytes());
+    }
+    t.extend_from_slice(&shield_tx::to_bytes(pledge));
+    t
+}
+
+/// Bond a validator into the active producing set, funding the stake from THIS wallet's own
+/// coins. Pledges `stake_zcrypt` ZCRYPT (>= 10,000) as a real burn (returned after a 10-day
+/// unbond), signed by the validator node's ed25519 consensus key (`consensus_seed_hex` =
+/// first 32 bytes of its `priv_validator_key.json`, hex). Block rewards accrue to this
+/// wallet's reward address. On the next block the node emits a CometBFT ValidatorUpdate and
+/// the validator starts producing.
+#[tauri::command]
+fn bond_validator(
+    consensus_seed_hex: String,
+    stake_zcrypt: String,
+    commission_pct: String,
+    state: State<AppState>,
+) -> R<String> {
+    let seed = hex::decode(consensus_seed_hex.trim())
+        .map_err(|e| format!("consensus seed: invalid hex ({e})"))?;
+    if seed.len() < 32 {
+        return Err("consensus seed must be 32+ bytes (the first 32 of priv_validator_key.json)".into());
+    }
+    let seed32: [u8; 32] = seed[..32].try_into().unwrap();
+    let sk = ed25519_dalek::SigningKey::from_bytes(&seed32);
+    let stake_whole: u64 = stake_zcrypt
+        .trim()
+        .parse()
+        .map_err(|_| "stake must be a whole number of ZCRYPT".to_string())?;
+    let atomic = zcrypt_core::emission::ATOMIC;
+    let stake = stake_whole.checked_mul(atomic).ok_or("stake too large")?;
+    let min = zcrypt_core::staking::MIN_STAKE;
+    if stake < min {
+        return Err(format!("stake must be at least {} ZCRYPT (the validator minimum)", min / atomic));
+    }
+    // Commission percent (e.g. "5" or "2.5") -> basis points, 0..=100%.
+    // Integer bps: "5" → 500, "2.5" → 250 (at most 2 fractional digits).
+    let commission_bps_u64 = parse_decimal_units(commission_pct.trim(), 2)?;
+    if commission_bps_u64 > 10_000 {
+        return Err("commission must be between 0 and 100 percent".into());
+    }
+    let commission_bps = commission_bps_u64 as u16;
+    let commission_pct_display = format!("{}.{:02}", commission_bps / 100, commission_bps % 100);
+    let url = node_url(&state);
+    // Reject re-bond in the wallet: consensus destroys the previous self-bond pledge.
+    let vpk_hex = hex::encode(sk.verifying_key().to_bytes());
+    if let Ok(list) = chain::query_str(&url, "/staking/validators") {
+        for tok in list.split(',') {
+            let f: Vec<&str> = tok.split(':').collect();
+            if !f.is_empty() && f[0].eq_ignore_ascii_case(&vpk_hex) {
+                return Err(
+                    "this consensus key is already bonded; unbond and wait for release before re-bonding or changing commission"
+                        .into(),
+                );
+            }
+        }
+    }
+    let leaves = chain::fetch_leaves(&url)?;
+    with_wallet(&state, |w| {
+        let cid = chain_id_for(&url)?;
+        let (pledge, stake_blind, inputs, chg_rec) =
+            build_stake_pledge(w, &leaves, stake, &cid).map_err(|e| format!("bonding: {e}"))?;
+        // Broadcast the BOND — rewards to THIS wallet's reward address. The BOND carries the
+        // consensus key's current replay-protection nonce (M3), so the signature is single-use.
+        let reward = w.account.reward_address();
+        let bond_nonce: u64 = chain::query_str(&url, &format!("/staking/auth_nonce/{vpk_hex}"))
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(0);
+        chain::broadcast(&url, &bond_tx(&sk, stake, reward, commission_bps, stake_blind, bond_nonce, &pledge, &cid))?;
+        for &i in &inputs {
+            w.coins[i].spent = true;
+        }
+        if let Some(c) = chg_rec {
+            w.coins.push(c);
+        }
+        let vpk = hex::encode(sk.verifying_key().to_bytes());
+        w.push_hist("bond", -(stake as i64), format!("bond {}", &vpk[..12]), zcrypt_shield::ASSET_ZCRYPT);
+        Ok(format!(
+            "Bonded {} ZCRYPT at {}% commission. Validator {} joins the active set on the next block; \
+             rewards accrue to this wallet.",
+            stake / atomic, commission_pct_display, vpk
+        ))
+    })
+    .and_then(ok)
+}
+
+/// Select the fewest on-chain ZCRYPT coins (<=2 = N_IN) covering `stake` and build a shield
+/// spend burning exactly `stake` into BURN_PK with change back to a fresh stealth-change
+/// address. Returns `(pledge, stake_blind, input coin indices, change coin to record)` — the
+/// caller broadcasts the pledge inside a BOND/DELEGATE, then marks inputs spent + records the
+/// change. Shared by bonding and delegating (both pledge a coin-backed stake).
+fn build_stake_pledge(
+    w: &mut Wallet,
+    leaves: &[zcrypt_shield::Commitment],
+    stake: u64,
+    chain_id: &[u8],
+) -> Result<(shield_tx::ShieldTx, [u64; 4], Vec<usize>, Option<CoinRec>), String> {
+    let mut cand: Vec<usize> = w
+        .coins
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| {
+            !c.spent
+                && c.coin.asset_id == zcrypt_shield::ASSET_ZCRYPT
+                && c.value <= MAX_COIN
+                && chain::find_index(leaves, &c.coin.commitment()).is_some()
+        })
+        .map(|(i, _)| i)
+        .collect();
+    cand.sort_by_key(|&i| std::cmp::Reverse(w.coins[i].value));
+    // The pledge now pays MIN_FEE (M2): inputs must cover stake + fee, and the change drops
+    // by the fee so Σin = stake(burn) + change + fee holds.
+    let need = stake + zcrypt_core::emission::MIN_FEE;
+    let mut inputs: Vec<usize> = Vec::new();
+    let mut sum = 0u64;
+    for &i in &cand {
+        inputs.push(i);
+        sum += w.coins[i].value;
+        if sum >= need || inputs.len() == 2 {
+            break;
+        }
+    }
+    if sum < need {
+        return Err(format!(
+            "needs {} ZCRYPT within 2 coins, but your 2 largest spendable coins total {:.6}. \
+             Consolidate first (send that amount to yourself), then retry.",
+            stake / zcrypt_core::emission::ATOMIC,
+            sum as f64 / 1e6
+        ));
+    }
+    let mut spends = Vec::new();
+    for &i in &inputs {
+        let coin = w.coins[i].coin;
+        let idx = chain::find_index(leaves, &coin.commitment()).ok_or("stake coin not on chain")?;
+        let (ps, pd) = chain::merkle_path(leaves, idx as usize).ok_or("stake coin not in the tree")?;
+        spends.push(shield_tx::Spend {
+            value: coin.value,
+            blind: coin.blind,
+            spend_secret: coin.spend_secret,
+            asset_id: zcrypt_shield::ASSET_ZCRYPT,
+            path_siblings: ps,
+            path_dirs: pd,
+        });
+    }
+    let stake_blind = keys::random_blind();
+    let burn_out: zcrypt_shield::OutCoin =
+        (stake, stake_blind, zcrypt_core::htlc_shield::BURN_PK, zcrypt_shield::ASSET_ZCRYPT);
+    let chg_val = sum - need;
+    let chg_blind = keys::random_blind();
+    let chg_idx = w.next_change;
+    w.next_change = w.next_change.saturating_add(1);
+    let chg_acct = w.account.stealth(chg_idx);
+    let chg_addr = chg_acct.stealth_address();
+    let chg_out = keys::out_coin(&chg_addr, chg_val, chg_blind);
+    let chg_note = kem::ciphertext_to_bytes(&keys::encrypt_note(&chg_addr, chg_val, chg_blind));
+    let pledge = shield_tx::build(
+        chain_id,
+        &spends,
+        &[burn_out, chg_out],
+        zcrypt_core::emission::MIN_FEE,
+        vec![keys::cover_note_bytes(), chg_note],
+    )
+    .ok_or("failed to build the stake pledge proof")?;
+    let chg_rec = if chg_val > 0 {
+        let c = chg_acct.own_coin(chg_val, chg_blind);
+        Some(CoinRec {
+            coin_id: hex::encode(c.commitment()[0].to_le_bytes()),
+            value: chg_val,
+            coin: c,
+            spent: false,
+        })
+    } else {
+        None
+    };
+    Ok((pledge, stake_blind, inputs, chg_rec))
+}
+
+/// The wallet's stable DELEGATOR ed25519 identity, derived from the account seed. Used to
+/// sign DELEGATE/UNDELEGATE so only this wallet can pull its delegation back later. Distinct
+/// from any validator consensus key — a delegator does not run a node.
+fn delegator_signing_key(account: &Account) -> ed25519_dalek::SigningKey {
+    ed25519_dalek::SigningKey::from_bytes(&zcrypt_core::hash::h(b"ZC-DELEGATOR-KEY", &[&account.seed()]))
+}
+
+/// A validator's on-chain id from its consensus pubkey hex: `SHA256(pubkey)[..20]`.
+fn validator_target(pubkey_hex: &str) -> Result<Vec<u8>, String> {
+    use sha2::{Digest, Sha256};
+    let pk = hex::decode(pubkey_hex.trim()).map_err(|e| format!("validator key: invalid hex ({e})"))?;
+    if pk.len() != 32 {
+        return Err("validator consensus key must be 32 bytes (64 hex chars)".into());
+    }
+    Ok(Sha256::digest(&pk)[..20].to_vec())
+}
+
+/// Build a coin-backed DELEGATE (`0x5F`): signed header (delegator pubkey ‖ target ‖ stake ‖
+/// reward ‖ sig over `"ZCRYPT-DELEGATE-v1"‖chain‖…`) then `stake_blind` + the burn pledge.
+fn delegate_tx(
+    sk: &ed25519_dalek::SigningKey,
+    target: &[u8],
+    stake: u64,
+    reward: [u8; 32],
+    stake_blind: [u64; 4],
+    pledge: &shield_tx::ShieldTx,
+    chain_id: &[u8],
+) -> Vec<u8> {
+    use ed25519_dalek::Signer;
+    let pk = sk.verifying_key().to_bytes();
+    let mut msg = Vec::new();
+    msg.extend_from_slice(b"ZCRYPT-DELEGATE-v1");
+    msg.extend_from_slice(chain_id);
+    msg.extend_from_slice(&pk);
+    msg.extend_from_slice(target);
+    msg.extend_from_slice(&stake.to_le_bytes());
+    msg.extend_from_slice(&reward);
+    let sig = sk.sign(&msg);
+    let mut t = vec![0x5Fu8];
+    t.extend_from_slice(&pk);
+    t.extend_from_slice(target);
+    t.extend_from_slice(&stake.to_le_bytes());
+    t.extend_from_slice(&reward);
+    t.extend_from_slice(&sig.to_bytes());
+    for limb in stake_blind {
+        t.extend_from_slice(&limb.to_le_bytes());
+    }
+    t.extend_from_slice(&shield_tx::to_bytes(pledge));
+    t
+}
+
+/// Build an UNDELEGATE (`0x60`): delegator pubkey ‖ target ‖ nonce ‖ signature over
+/// `"ZCRYPT-UNDELEGATE-v1"‖chain‖pubkey‖target‖nonce`. The nonce (queried from the node) makes
+/// the signature single-use, so it can't be replayed to force-withdraw a later re-delegation.
+/// Starts the stake's 10-day unbonding.
+fn undelegate_tx(sk: &ed25519_dalek::SigningKey, target: &[u8], chain_id: &[u8], nonce: u64) -> Vec<u8> {
+    use ed25519_dalek::Signer;
+    let pk = sk.verifying_key().to_bytes();
+    let mut msg = Vec::new();
+    msg.extend_from_slice(b"ZCRYPT-UNDELEGATE-v1");
+    msg.extend_from_slice(chain_id);
+    msg.extend_from_slice(&pk);
+    msg.extend_from_slice(target);
+    msg.extend_from_slice(&nonce.to_le_bytes());
+    let sig = sk.sign(&msg);
+    let mut t = vec![0x60u8];
+    t.extend_from_slice(&pk);
+    t.extend_from_slice(target);
+    t.extend_from_slice(&nonce.to_le_bytes());
+    t.extend_from_slice(&sig.to_bytes());
+    t
+}
+
+#[derive(Serialize)]
+struct ValidatorInfo {
+    /// ed25519 consensus pubkey (hex) — what you delegate to.
+    pubkey: String,
+    /// Total voting stake (self-bond + delegated), base units as a string (u64 > JS 2^53).
+    #[serde(with = "u64_str")]
+    stake: u64,
+    /// The validator's chosen commission on delegators' rewards (percent, may be fractional).
+    commission_pct: f64,
+}
+
+/// The bonded validators you can delegate to, with each one's chosen commission (from
+/// `/staking/validators` = comma-joined "<pubkey_hex>:<stake>:<commission_bps>").
+#[tauri::command]
+fn list_validators(state: State<AppState>) -> R<Vec<ValidatorInfo>> {
+    let url = node_url(&state);
+    let raw = chain::query_str(&url, "/staking/validators").unwrap_or_default();
+    let mut out = Vec::new();
+    for tok in raw.split(',') {
+        let f: Vec<&str> = tok.split(':').collect();
+        // Tolerate BOTH the new "<pk>:<stake>:<commission_bps>" and the older "<pk>:<stake>"
+        // (a node that predates per-validator commission — its commission is the fixed 10%).
+        if f.len() >= 2 && f[0].len() == 64 {
+            let commission_pct = if f.len() >= 3 {
+                f[2].trim().parse::<u16>().unwrap_or(0) as f64 / 100.0
+            } else {
+                (zcrypt_core::staking::COMMISSION_NUM * 100 / zcrypt_core::staking::COMMISSION_DEN) as f64
+            };
+            out.push(ValidatorInfo {
+                pubkey: f[0].to_string(),
+                stake: f[1].trim().parse().unwrap_or(0),
+                commission_pct,
+            });
+        }
+    }
+    ok(out)
+}
+
+/// Delegate `stake_zcrypt` ZCRYPT from THIS wallet to an already-bonded validator (identified
+/// by its consensus pubkey hex). The stake is pledged (a real burn, returned after a 10-day
+/// undelegate). You earn a share of the validator's rewards proportional to your stake, minus
+/// the validator's commission; your share accrues to this wallet's reward address.
+#[tauri::command]
+fn delegate_validator(validator_pubkey_hex: String, stake_zcrypt: String, state: State<AppState>) -> R<String> {
+    let target = validator_target(&validator_pubkey_hex)?;
+    let stake_whole: u64 = stake_zcrypt
+        .trim()
+        .parse()
+        .map_err(|_| "stake must be a whole number of ZCRYPT".to_string())?;
+    let atomic = zcrypt_core::emission::ATOMIC;
+    let stake = stake_whole.checked_mul(atomic).ok_or("stake too large")?;
+    if stake == 0 {
+        return Err("delegation must be a positive amount".into());
+    }
+    let url = node_url(&state);
+    let leaves = chain::fetch_leaves(&url)?;
+    with_wallet(&state, |w| {
+        let del_sk = delegator_signing_key(&w.account);
+        let cid = chain_id_for(&url)?;
+        let (pledge, stake_blind, inputs, chg_rec) =
+            build_stake_pledge(w, &leaves, stake, &cid).map_err(|e| format!("delegating: {e}"))?;
+        let reward = w.account.reward_address();
+        chain::broadcast(&url, &delegate_tx(&del_sk, &target, stake, reward, stake_blind, &pledge, &cid))?;
+        for &i in &inputs {
+            w.coins[i].spent = true;
+        }
+        if let Some(c) = chg_rec {
+            w.coins.push(c);
+        }
+        w.push_hist(
+            "delegate",
+            -(stake as i64),
+            format!("delegate {}", &validator_pubkey_hex[..12.min(validator_pubkey_hex.len())]),
+            zcrypt_shield::ASSET_ZCRYPT,
+        );
+        Ok(format!(
+            "Delegated {} ZCRYPT to validator {}. Your share of its rewards (minus commission) \
+             accrues to this wallet; claim it in Rewards.",
+            stake / atomic,
+            &validator_pubkey_hex[..16.min(validator_pubkey_hex.len())]
+        ))
+    })
+    .and_then(ok)
+}
+
+/// Undelegate from a validator (by its consensus pubkey hex). Removes your delegated stake
+/// from the validator immediately and starts the 10-day unbonding; the stake returns after.
+#[tauri::command]
+fn undelegate_validator(validator_pubkey_hex: String, state: State<AppState>) -> R<String> {
+    let target = validator_target(&validator_pubkey_hex)?;
+    let url = node_url(&state);
+    with_wallet(&state, |w| {
+        let del_sk = delegator_signing_key(&w.account);
+        let cid = chain_id_for(&url)?;
+        // Fetch the delegator key's current replay-protection nonce so the signature is single-use.
+        let pk_hex = hex::encode(del_sk.verifying_key().to_bytes());
+        let nonce: u64 = chain::query_str(&url, &format!("/staking/auth_nonce/{pk_hex}"))
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(0);
+        chain::broadcast(&url, &undelegate_tx(&del_sk, &target, &cid, nonce))?;
+        w.push_hist(
+            "undelegate",
+            0,
+            format!("undelegate {}", &validator_pubkey_hex[..12.min(validator_pubkey_hex.len())]),
+            zcrypt_shield::ASSET_ZCRYPT,
+        );
+        Ok(format!(
+            "Undelegated from validator {}. Your stake returns after the 10-day unbonding period.",
+            &validator_pubkey_hex[..16.min(validator_pubkey_hex.len())]
+        ))
+    })
+    .and_then(ok)
+}
+
+/// One pending unbonding: `stake` returns to this wallet at `release_time` (unix seconds).
+#[derive(Serialize)]
+struct UnbondingEntry {
+    #[serde(with = "u64_str")]
+    stake: u64,
+    #[serde(with = "u64_str")]
+    release_time: u64,
+}
+
+/// This wallet's own pending unbondings (from both unbonding a validator AND undelegating),
+/// each with when its stake becomes free. Keyed by this wallet's reward address, so it
+/// persists until the 10-day timer elapses — not just a one-time message after the action.
+#[tauri::command]
+fn my_unbonding(state: State<AppState>) -> R<Vec<UnbondingEntry>> {
+    let url = node_url(&state);
+    let reward_hex = {
+        let g = state.wallet.lock().unwrap();
+        hex::encode(g.as_ref().ok_or("wallet locked")?.account.reward_address())
+    };
+    let raw = chain::query_str(&url, &format!("/staking/my_unbonding/{reward_hex}")).unwrap_or_default();
+    let mut out = Vec::new();
+    for tok in raw.split(',') {
+        if let Some((s, r)) = tok.split_once(':') {
+            if let (Ok(stake), Ok(release_time)) = (s.trim().parse::<u64>(), r.trim().parse::<u64>()) {
+                out.push(UnbondingEntry { stake, release_time });
+            }
+        }
+    }
+    ok(out)
+}
+
 #[tauri::command]
 fn get_claimable(state: State<AppState>) -> R<u64> {
     let url = node_url(&state);
@@ -1730,6 +2672,90 @@ fn claim_rewards(state: State<AppState>) -> R<ClaimResult> {
             index += 1;
         }
         Ok(ClaimResult { claimed: claimable, coins: n })
+    })
+    .and_then(ok)
+}
+
+/// A claimable bridge-fee balance in one bridged asset (real, asset-denominated yield a
+/// staker/delegator earns from bridge volume — e.g. zBTC).
+#[derive(Serialize)]
+struct FeeClaimable {
+    #[serde(with = "u64_str")]
+    asset_id: u64,
+    ticker: String,
+    decimals: u8,
+    #[serde(with = "u64_str")]
+    amount: u64,
+}
+
+/// Bridge-fee yield this wallet can claim, per bridged asset (block rewards are ZCRYPT and
+/// claimed separately; these are asset-denominated, e.g. zBTC). Same reward address as
+/// staking rewards, so a validator AND its delegators accrue here by stake × participation.
+#[tauri::command]
+fn claimable_fees(state: State<AppState>) -> R<Vec<FeeClaimable>> {
+    let url = node_url(&state);
+    let pk_h = {
+        let g = state.wallet.lock().unwrap();
+        pk_hex(&g.as_ref().ok_or("wallet locked")?.account.pubkey())
+    };
+    let mut out = Vec::new();
+    for (ticker, asset_id, _minted) in chain::asset_list(&url) {
+        let amount = chain::staking_u64(&url, &format!("/staking/fees/{pk_h}/{asset_id}")).unwrap_or(0);
+        if amount > 0 {
+            let decimals = chain::asset_meta(&url, asset_id).map(|(_, d)| d).unwrap_or(8);
+            out.push(FeeClaimable { asset_id, ticker, decimals, amount });
+        }
+    }
+    ok(out)
+}
+
+/// Claim accrued bridge-fee yield in `asset_id`: broadcast a `CLAIM_FEE` (0x66) tx (which
+/// mints coins of that asset bound to our key), then reconstruct those coins locally so they
+/// become spendable. Mirrors the ZCRYPT reward claim but per bridged asset.
+#[tauri::command]
+fn claim_fees(asset_id: String, state: State<AppState>) -> R<u64> {
+    let url = node_url(&state);
+    let asset: u64 = asset_id.trim().parse().map_err(|_| "bad asset id".to_string())?;
+    let pk = {
+        let g = state.wallet.lock().unwrap();
+        g.as_ref().ok_or("wallet locked")?.account.pubkey()
+    };
+    let pk_h = pk_hex(&pk);
+    let claimable = chain::staking_u64(&url, &format!("/staking/fees/{pk_h}/{asset}"))?;
+    if claimable == 0 {
+        return Err("no bridge-fee yield to claim for this asset".into());
+    }
+    // Next fee-coin index for reconstruction. Defaults to 0 if the node predates this query
+    // (correct for a first-ever fee claim; a rebuilt node returns the real index for repeats).
+    let start = chain::staking_u64(&url, &format!("/staking/fee_claim_index/{pk_h}/{asset}")).unwrap_or(0);
+    // CLAIM_FEE tx: 0x66 ‖ pk(64) ‖ asset_id(8 LE) ‖ amount(8 LE).
+    let mut tx = vec![0x66u8];
+    tx.extend_from_slice(&hex::decode(&pk_h).unwrap());
+    tx.extend_from_slice(&asset.to_le_bytes());
+    tx.extend_from_slice(&claimable.to_le_bytes());
+    chain::broadcast(&url, &tx)?;
+    // Reconstruct the minted fee coins (node uses claim_chunks(amount, false) + monotonic
+    // fee-claim indices from `start`) so our coins match the node's exactly.
+    let (ticker, _dec) = asset_label(&url, asset);
+    let leaves = chain::fetch_leaves(&url)?;
+    with_wallet(&state, |w| {
+        let mut index = start;
+        for chunk in zcrypt_core::keys::claim_chunks(claimable, false) {
+            let coin = w.account.fee_reward_coin(chunk, asset, index);
+            let com = coin.commitment();
+            let already = w.coins.iter().any(|c| c.coin.commitment() == com);
+            if chain::find_index(&leaves, &com).is_some() && !already {
+                w.coins.push(CoinRec {
+                    coin_id: hex::encode(com[0].to_le_bytes()),
+                    value: chunk,
+                    coin,
+                    spent: false,
+                });
+                w.push_hist("fee", chunk as i64, format!("{ticker} bridge fee"), asset);
+            }
+            index += 1;
+        }
+        Ok(claimable)
     })
     .and_then(ok)
 }
@@ -1815,7 +2841,13 @@ struct BridgeStatus {
     btc_connected: bool,
     btc_balance: f64,
     zbtc_asset: u64,
+    /// SPENDABLE zBTC: coins that are in the on-chain commitment tree (matured).
     zbtc_balance: u64,
+    /// MATURING zBTC: freshly-shielded coins whose Bitcoin deposit has not yet been
+    /// buried past reorg risk. They are minted but held out of the spendable pool
+    /// (the deep-reorg defense) until the deposit is buried past reorg risk (value-scaled depth)
+    /// (regtest 3 / signet 6 / mainnet 100 ≈ 16h). Not yet spendable/redeemable.
+    zbtc_maturing: u64,
     /// The configured Bitcoin network (regtest | signet | testnet | bitcoin), so the UI
     /// labels the real network instead of a hardcoded "regtest".
     btc_network: String,
@@ -1827,16 +2859,25 @@ struct BridgeStatus {
     lp_address: String,
 }
 
-/// Register zBTC + seed a decoy pool so shield spends have a ring. Idempotent.
+/// Register zBTC (SPV-gated, trustless mint) + seed a decoy pool so shield spends
+/// have a ring. Idempotent.
 #[tauri::command]
 fn bridge_init(state: State<AppState>) -> R<u64> {
     let zc = zc_client(&state);
-    let authority = mint_authority_commitment(BRIDGE_CAP, TREASURY_N, TREASURY_M);
+    // zBTC's mint authority is the SPV sentinel over the bridge's Bitcoin RESERVE
+    // key: consensus derives `spv_authority(reserve_pk)` itself, and from then on
+    // zBTC can only ever be minted against an SPV-proven BTC deposit claimable by
+    // that key. No treasury, no signers — and no rotation back (one-way).
+    let reserve_pk: [u8; 33] = {
+        let g = state.wallet.lock().unwrap();
+        let w = g.as_ref().ok_or("locked")?;
+        bridge_btc_keys(&w.account).0.pk.inner.serialize()
+    };
     // zBTC's ticker, decimals and 21M cap are protocol-pinned in core (a single source
     // of truth). Consensus rejects any zBTC registration with other values, and these
     // fit a shield coin's multi-limb range (MAX_COIN_VALUE ≈ 2^52).
     use zcrypt_core::asset_registry::{ZBTC_DECIMALS, ZBTC_MAX_SUPPLY, ZBTC_TICKER};
-    let _ = zc.broadcast(&bswap::register_tx(ZBTC_TICKER, ZBTC_DECIMALS, &authority, ZBTC_MAX_SUPPLY)); // ignore "already registered"
+    let _ = zc.broadcast(&bswap::register_spv_tx(ZBTC_TICKER, ZBTC_DECIMALS, &reserve_pk, ZBTC_MAX_SUPPLY)); // ignore "already registered"
     let asset = zbtc_asset(&zc)?;
     // Seed a shielded pool so the very first spend hides among a non-trivial tree
     // (the anonymity set is the whole pool; no fixed ring size to satisfy).
@@ -1872,19 +2913,30 @@ fn bridge_status(state: State<AppState>) -> R<BridgeStatus> {
     // Seed-derived addresses to fund for testing: account 0 (you, shield) + account 1 (the
     // demo LP, redeem). Only meaningful in self-custody mode; empty otherwise.
     let (deposit_address, lp_address) = selfcustody_addresses(&state);
-    let zbtc_balance = {
+    // Split zBTC into SPENDABLE (present in the on-chain commitment tree = matured) vs
+    // MATURING (minted but held immature by the deep-reorg defense — not yet a tree leaf,
+    // so not spendable/redeemable). This is what stops a freshly-shielded-but-immature coin
+    // from showing as a phantom spendable balance.
+    let url = node_url(&state);
+    let leaves = chain::fetch_leaves(&url).unwrap_or_default();
+    let (zbtc_balance, zbtc_maturing) = {
         let g = state.wallet.lock().unwrap();
         match g.as_ref() {
-            Some(w) => w
-                .coins
-                .iter()
-                .filter(|c| !c.spent && asset != 0 && c.coin.asset_id == asset)
-                .map(|c| c.value)
-                .sum(),
-            None => 0,
+            Some(w) => {
+                let (mut spendable, mut maturing) = (0u64, 0u64);
+                for c in w.coins.iter().filter(|c| !c.spent && asset != 0 && c.coin.asset_id == asset) {
+                    if chain::find_index(&leaves, &c.coin.commitment()).is_some() {
+                        spendable += c.value;
+                    } else {
+                        maturing += c.value;
+                    }
+                }
+                (spendable, maturing)
+            }
+            None => (0, 0),
         }
     };
-    ok(BridgeStatus { btc_connected, btc_balance, zbtc_asset: asset, zbtc_balance, btc_network, deposit_address, lp_address })
+    ok(BridgeStatus { btc_connected, btc_balance, zbtc_asset: asset, zbtc_balance, zbtc_maturing, btc_network, deposit_address, lp_address })
 }
 
 /// The seed-derived (account 0, account 1) Bitcoin addresses for the self-custody bridge —
@@ -2005,9 +3057,13 @@ fn btc_wallet_snapshot(state: &State<AppState>) -> BtcWallet {
 
 /// Withdraw real BTC from your wallet to an external Bitcoin address.
 #[tauri::command]
-fn withdraw_btc(address: String, btc: f64, state: State<AppState>) -> R<String> {
+fn withdraw_btc(address: String, btc: String, state: State<AppState>) -> R<String> {
     let client = btc_client(&state)?;
-    let amt = bitcoin::Amount::from_btc(btc).map_err(|e| e.to_string())?;
+    let sats = parse_decimal_units(&btc, 8)?;
+    if sats == 0 {
+        return Err("enter a BTC amount".into());
+    }
+    let amt = bitcoin::Amount::from_sat(sats);
     client.send_to_address(address.trim(), amt).and_then(ok)
 }
 
@@ -2143,16 +3199,55 @@ fn mint_asset(
     .and_then(ok)
 }
 
+/// Parse a non-negative decimal string into integer base units without IEEE float.
+fn parse_decimal_units(s: &str, decimals: u32) -> Result<u64, String> {
+    let s = s.trim();
+    if s.is_empty() || !s.chars().all(|c| c.is_ascii_digit() || c == '.') {
+        return Err(format!("invalid amount: {s}"));
+    }
+    if s.starts_with('-') {
+        return Err("amount must be non-negative".into());
+    }
+    let mut parts = s.split('.');
+    let whole = parts.next().unwrap_or("0");
+    let frac = parts.next().unwrap_or("");
+    if parts.next().is_some() {
+        return Err("invalid amount".into());
+    }
+    if frac.len() > decimals as usize {
+        return Err(format!("too many decimal places (max {decimals})"));
+    }
+    let whole = if whole.is_empty() { "0" } else { whole };
+    let whole_n: u64 = whole.parse().map_err(|_| "invalid whole part".to_string())?;
+    let mut frac_n: u64 = if frac.is_empty() {
+        0
+    } else {
+        frac.parse().map_err(|_| "invalid fractional part".to_string())?
+    };
+    for _ in frac.len()..(decimals as usize) {
+        frac_n = frac_n.checked_mul(10).ok_or("amount overflow")?;
+    }
+    let scale = 10u64.pow(decimals);
+    whole_n.checked_mul(scale).and_then(|w| w.checked_add(frac_n)).ok_or_else(|| "amount overflow".into())
+}
+
 /// BTC → zBTC: lock BTC, receive shielded zBTC (atomic, hashlocked).
+/// `btc` is a decimal BTC string (or whole sats if you pass integer base via zbtc_amount 1:1).
 #[tauri::command]
-fn swap_shield_btc(zbtc_amount: u64, btc: f64, window: tauri::Window, state: State<AppState>) -> R<u64> {
+fn swap_shield_btc(zbtc_amount: u64, btc: String, window: tauri::Window, state: State<AppState>) -> R<u64> {
     // A shielded coin holds a multi-limb value up to MAX_COIN_VALUE (2^52-1 base
     // units ≈ 45M zBTC at 8 decimals) — no practical per-shield cap. Guard only the
     // absolute maximum so we never mint a coin the circuit can't range-prove.
     if zbtc_amount > MAX_COIN {
         return Err(format!(
-            "amount too large: max {:.8} zBTC per shield; shield a smaller amount",
-            MAX_COIN as f64 / 100_000_000.0
+            "amount too large: max {} zBTC per shield; shield a smaller amount",
+            MAX_COIN / 100_000_000
+        ));
+    }
+    let btc_sats = parse_decimal_units(&btc, 8)?;
+    if btc_sats != zbtc_amount {
+        return Err(format!(
+            "shield must be 1:1: {btc_sats} sats != {zbtc_amount} zBTC base units"
         ));
     }
     // Node-free Bitcoin backends (self-custody via Esplora) for both sides; falls back to
@@ -2161,8 +3256,8 @@ fn swap_shield_btc(zbtc_amount: u64, btc: f64, window: tauri::Window, state: Sta
     let (bridge_bk, bridge_dest) = swap_backend(&state, 1)?;
     let zc = zc_client(&state);
     let asset = zbtc_asset(&zc)?;
-    let btc_amt = bitcoin::Amount::from_btc(btc).map_err(|e| e.to_string())?;
-    with_wallet(&state, |w| {
+    let btc_amt = bitcoin::Amount::from_sat(btc_sats);
+    let res = with_wallet(&state, |w| {
         let (bridge_key, alice_key) = bridge_btc_keys(&w.account);
         let b = bswap::BtcParams {
             alice: alice_bk.as_ref(),
@@ -2176,18 +3271,41 @@ fn swap_shield_btc(zbtc_amount: u64, btc: f64, window: tauri::Window, state: Sta
         let progress = |pct: u8, phase: &str| {
             let _ = window.emit("swap-progress", serde_json::json!({ "percent": pct, "phase": phase }));
         };
-        // The treasury signs the mint with its M-of-N ML-DSA authority; only signatures
-        // (never the master secret) reach the chain.
-        let (_, sign_mint) = mint_authority(BRIDGE_CAP, TREASURY_N, TREASURY_M);
+        // Trustless mint: the swap relays Bitcoin headers to the chain and submits
+        // an SPV proof of the deposit — every validator verifies it; nobody signs.
         let coin = bswap::btc_to_zbtc_progress(
-            &zc, &b, &w.account, asset, &sign_mint, &preimage, btc_amt, zbtc_amount, &progress,
+            &zc, &b, &w.account, asset, &preimage, btc_amt, zbtc_amount, &progress,
         )?;
         let com = coin.commitment();
         w.coins.push(CoinRec { coin_id: hex::encode(com[0].to_le_bytes()), value: coin.value, coin, spent: false });
-        w.push_hist("shield", zbtc_amount as i64, "BTC→zBTC".into(), asset);
+        w.push_hist("shield", zbtc_amount as i64, "BTC→zBTC (maturing)".into(), asset);
         Ok(zbtc_amount)
-    })
-    .and_then(ok)
+    });
+    // The minted zBTC is held IMMATURE (deep-reorg defense) until its Bitcoin deposit is
+    // buried past reorg risk. Relay the latest headers so the chain can start maturing it,
+    // and tell the UI the coin is maturing (it shows under "maturing", not spendable, until
+    // the deposit matures (value-scaled: small amounts fast, whales deeper)).
+    let _ = bswap::relay_btc_headers(&zc, alice_bk.as_ref());
+    let pending = zc.query("/spv/pending").unwrap_or_default();
+    let _ = window.emit("swap-progress", serde_json::json!({
+        "percent": 100u8,
+        "phase": format!("Shielded — zBTC is maturing before it can be spent ({})", pending.trim()),
+    }));
+    res.and_then(ok)
+}
+
+/// Relay the latest Bitcoin headers to the chain and report SPV maturity progress. The
+/// UI calls this periodically so freshly-shielded (immature) zBTC matures over time as
+/// new Bitcoin blocks are confirmed — without it, the chain's Bitcoin view would go
+/// stale and pending coins would never mature. Returns "<pending_count>:<pending_value>".
+#[tauri::command]
+fn bridge_mature(state: State<AppState>) -> R<String> {
+    let zc = zc_client(&state);
+    // Relay from the user's Bitcoin backend (untrusted transport — headers self-prove).
+    if let Ok((backend, _)) = swap_backend(&state, 0) {
+        let _ = bswap::relay_btc_headers(&zc, backend.as_ref());
+    }
+    ok(zc.query("/spv/pending").unwrap_or_default())
 }
 
 /// zBTC → BTC: redeem `btc` worth of your zBTC for the matching BTC 1:1 (atomic,
@@ -2198,11 +3316,11 @@ fn swap_shield_btc(zbtc_amount: u64, btc: f64, window: tauri::Window, state: Sta
 /// self-contained atomic swap. Returns the zBTC actually redeemed (which may be a hair
 /// under the request, since every round burns a 0.0001 zBTC fee).
 #[tauri::command]
-fn swap_redeem_btc(btc: f64, window: tauri::Window, state: State<AppState>) -> R<u64> {
-    if !(btc > 0.0) {
+fn swap_redeem_btc(btc: String, window: tauri::Window, state: State<AppState>) -> R<u64> {
+    let want_total = parse_decimal_units(&btc, 8)?;
+    if want_total == 0 {
         return Err("enter a zBTC amount to redeem".to_string());
     }
-    let want_total = (btc * 100_000_000.0).round() as u64; // 1:1 peg, 8 decimals
     let fee = zcrypt_core::emission::MIN_FEE;
     let url = node_url(&state);
     // Node-free backends (self-custody via Esplora) for both sides; bitcoind only on regtest.
@@ -2395,7 +3513,11 @@ fn main() {
                 .map(|p| p.join(".zcrypt"))
                 .unwrap_or_else(|_| std::path::PathBuf::from(".zcrypt"));
             let _ = std::fs::create_dir_all(&dir);
-            *app.state::<AppState>().data_dir.lock().unwrap() = dir.to_string_lossy().to_string();
+            let dir_str = dir.to_string_lossy().to_string();
+            *app.state::<AppState>().data_dir.lock().unwrap() = dir_str.clone();
+            // FIX 2: point chain-id pinning at the same data dir (chain_id.txt lives next
+            // to keystore.json) so every future signature is bound to the pinned chain.
+            chain::set_pin_dir(dir_str);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -2407,6 +3529,7 @@ fn main() {
             get_address,
             new_stealth_address,
             list_stealth_addresses,
+            reveal_stealth_backup,
             get_view_key,
             send_stealth,
             get_balance,
@@ -2419,14 +3542,23 @@ fn main() {
             get_seed_phrase,
             get_settings,
             save_settings,
+            tor_status,
             node_status,
             fund_onchain,
             send_onchain,
             scan_onchain,
             get_claimable,
             claim_rewards,
+            claimable_fees,
+            claim_fees,
+            bond_validator,
+            list_validators,
+            delegate_validator,
+            undelegate_validator,
+            my_unbonding,
             bridge_init,
             bridge_status,
+            bridge_mature,
             swap_shield_btc,
             swap_redeem_btc,
             bridge_recover,

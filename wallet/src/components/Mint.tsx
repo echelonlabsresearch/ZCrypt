@@ -119,7 +119,7 @@ export default function Mint({ onMinted }: { onMinted: (amount: number) => void 
       )}
 
       <div id="mint-asset-form" className="card" style={{ maxWidth: 560, margin: "0 auto" }}>
-        <h2>🪙 Mint a shielded asset</h2>
+        <h2>🪙 Mint a new ZRC20 asset</h2>
         <div style={{ fontSize: "0.82rem", opacity: 0.7, marginBottom: "0.6rem" }}>
           Register a ticker and issue it to yourself. Tickers are <b>first-mint-wins</b> and{" "}
           <b>case-insensitive</b> (<code>zBTC</code> = <code>ZBTC</code> = <code>zbtc</code>). When you're the

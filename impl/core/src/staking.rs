@@ -35,6 +35,11 @@ pub const SLASH_DEN: u64 = 100;
 /// protocol rate (per-validator rates are a later refinement). Integer math ⇒ deterministic.
 pub const COMMISSION_NUM: u64 = 10;
 pub const COMMISSION_DEN: u64 = 100;
+/// Commission is now PER-VALIDATOR (basis points, see [`Validator::commission_bps`]); this
+/// is the default a validator gets if it does not specify one (the historical 10%). Full
+/// scale is 10,000 bps = 100%.
+pub const DEFAULT_COMMISSION_BPS: u16 = (COMMISSION_NUM * 10_000 / COMMISSION_DEN) as u16;
+pub const MAX_COMMISSION_BPS: u16 = 10_000;
 
 /// Unbonding period: how long a validator's stake stays **locked** after it unbonds
 /// before it is released. Measured in seconds of consensus (BFT) block time so it is a
@@ -60,6 +65,13 @@ pub struct Validator {
     /// exact validator → voting-power mapping is part of the consensus app_hash.
     #[serde(default)]
     pub consensus_pubkey: Vec<u8>,
+    /// The validator's chosen COMMISSION on delegators' rewards, in basis points
+    /// (0..=10000 = 0%..100%). The operator keeps this fraction of a delegator's reward
+    /// as payment for running the node; the delegator receives the rest. Set by the
+    /// validator when it bonds, so validators compete on commission. Folded into
+    /// [`Staking::root`] (consensus state). Defaults to [`DEFAULT_COMMISSION_BPS`].
+    #[serde(default)]
+    pub commission_bps: u16,
 }
 
 /// A single delegation: one delegator's stake pledged toward one validator. Keyed in
@@ -108,6 +120,13 @@ pub struct Staking {
     /// reward address -> *unclaimed* accrued balance (atomic units). Debited when
     /// a validator claims rewards into spendable coinbase coins.
     rewards: BTreeMap<Hash, u64>,
+    /// reward address -> **lifetime** block rewards ever credited (atomic units).
+    /// Never debited: claims move value out of `rewards` but leave this untouched,
+    /// and returned unbonded stake (which flows through `rewards`) is NOT counted —
+    /// this is pure earnings, the number an explorer shows as "rewards accumulated".
+    /// Consensus state (folded into [`Staking::root`]).
+    #[serde(default)]
+    earned: BTreeMap<Hash, u64>,
     /// reward address -> next coinbase coin index (monotonic, so claimed-coin
     /// commitments never collide across repeated claims).
     claim_index: BTreeMap<Hash, u64>,
@@ -127,6 +146,33 @@ pub struct Staking {
     /// Foundation value claimed into coins so far (≤ vested(height) always).
     #[serde(default)]
     foundation_claimed: u64,
+    /// Bridge fees accrued but not yet distributed, per asset id. Filled by
+    /// [`Staking::accrue_bridge_fee`] as zBTC (and other bridged assets) mints mature,
+    /// drained by [`Staking::distribute_fees`] at each epoch into `fee_rewards`.
+    #[serde(default)]
+    fee_pool: BTreeMap<u64, u64>,
+    /// (reward address, asset id) -> claimable bridge-fee balance. The staker analogue of
+    /// `rewards`, but denominated in the bridged asset rather than ZCRYPT: this is the
+    /// real, asset-denominated yield that ties staking demand to bridge volume.
+    #[serde(default)]
+    fee_rewards: BTreeMap<(Hash, u64), u64>,
+    /// (reward address, asset id) -> next claimed-coin index, so repeated fee claims
+    /// never collide (mirrors `claim_index` for ZCRYPT rewards).
+    #[serde(default)]
+    fee_claim_index: BTreeMap<(Hash, u64), u64>,
+    /// (reward address, asset id) -> **lifetime** bridge fees ever credited (the
+    /// fee analogue of `earned`: never debited by claims). Consensus state.
+    #[serde(default)]
+    fee_earned: BTreeMap<(Hash, u64), u64>,
+    /// Monotonic per-signer-key nonce for signature-only staking txs (UNBOND / UNDELEGATE).
+    /// Those txs are NOT coin-backed, so without a nonce a captured signature could be
+    /// replayed to force-eject a validator/delegator that later re-bonded. The signer includes
+    /// the current nonce in the signed message; consensus accepts it only if it equals the
+    /// stored value, then increments — so every such tx is single-use. Keyed by the 32-byte
+    /// ed25519 signer pubkey. (BOND/DELEGATE need no nonce: their pledged-coin nullifier
+    /// already makes them single-use.) Consensus state (folded into [`Staking::root`]).
+    #[serde(default)]
+    auth_nonce: BTreeMap<[u8; 32], u64>,
 }
 
 impl Staking {
@@ -141,7 +187,11 @@ impl Staking {
         consensus_pubkey: Vec<u8>,
         stake: u64,
         reward_address: Hash,
+        commission_bps: u16,
     ) -> Result<(), String> {
+        if commission_bps > MAX_COMMISSION_BPS {
+            return Err(format!("commission {commission_bps} bps exceeds 100% ({MAX_COMMISSION_BPS} bps)"));
+        }
         if self.tombstoned.contains(&validator_id) {
             return Err("validator is tombstoned (slashed for misbehavior) and cannot re-bond".to_string());
         }
@@ -169,7 +219,7 @@ impl Staking {
             .ok_or("stake accounting overflow")?;
         self.total_staked = new_total;
         self.validators
-            .insert(validator_id, Validator { stake, delegated, reward_address, consensus_pubkey });
+            .insert(validator_id, Validator { stake, delegated, reward_address, consensus_pubkey, commission_bps });
         Ok(())
     }
 
@@ -413,6 +463,18 @@ impl Staking {
             .collect()
     }
 
+    /// Pending unbonding entries whose stake returns to `reward` — i.e. what a specific
+    /// staker (validator OR delegator) can see as THEIR own unbonding schedule: each
+    /// `(stake, release_time)`. Keyed by reward address so a delegator can look up its own
+    /// unbondings without knowing every validator it delegated to.
+    pub fn unbonding_by_reward(&self, reward: &Hash) -> Vec<(u64, u64)> {
+        self.unbonding
+            .iter()
+            .filter(|u| &u.reward_address == reward)
+            .map(|u| (u.stake, u.release_time))
+            .collect()
+    }
+
     pub fn is_validator(&self, pubkey: &[u8]) -> bool {
         self.validators.contains_key(pubkey)
     }
@@ -431,6 +493,30 @@ impl Staking {
     /// Unclaimed reward balance for `addr` (atomic units).
     pub fn reward_balance(&self, addr: &Hash) -> u64 {
         *self.rewards.get(addr).unwrap_or(&0)
+    }
+    /// **Lifetime** block rewards ever credited to `addr` (atomic units): unaffected
+    /// by claims, and excludes returned unbonded stake. The explorer's
+    /// "rewards accumulated" number.
+    pub fn earned_of(&self, addr: &Hash) -> u64 {
+        *self.earned.get(addr).unwrap_or(&0)
+    }
+    /// Lifetime bridge fees credited to `addr` as `(asset_id, amount)` per asset.
+    pub fn fee_earned_of(&self, addr: &Hash) -> Vec<(u64, u64)> {
+        self.fee_earned
+            .iter()
+            .filter(|((a, _), amt)| a == addr && **amt > 0)
+            .map(|((_, asset), amt)| (*asset, *amt))
+            .collect()
+    }
+    /// Blocks `validator_id` has signed so far in the **current** epoch (resets to 0
+    /// at each epoch boundary when rewards distribute).
+    pub fn participation_of(&self, validator_id: &[u8]) -> u64 {
+        *self.participation.get(validator_id).unwrap_or(&0)
+    }
+    /// All bonded validators as `(validator_id, &Validator)` in deterministic
+    /// (BTreeMap key) order — the read-only view an explorer or RPC layer uses.
+    pub fn validators(&self) -> impl Iterator<Item = (&Vec<u8>, &Validator)> {
+        self.validators.iter()
     }
     /// Total value issued as of `height` = the foundation's **vested** amount +
     /// all block rewards distributed. Claim-invariant (claiming moves value from
@@ -488,6 +574,16 @@ impl Staking {
         self.validators
             .values()
             .map(|v| (v.consensus_pubkey.clone(), v.stake + v.delegated))
+            .collect()
+    }
+
+    /// Like [`Self::validator_set`] but also each validator's commission (basis points):
+    /// `(consensus_pubkey, stake + delegated, commission_bps)`. For the public validator
+    /// listing so delegators can compare commissions.
+    pub fn validator_set_full(&self) -> Vec<(Vec<u8>, u64, u16)> {
+        self.validators
+            .values()
+            .map(|v| (v.consensus_pubkey.clone(), v.stake + v.delegated, v.commission_bps))
             .collect()
     }
 
@@ -577,14 +673,15 @@ impl Staking {
     /// portion; the remainder of the delegated reward flows to each delegator pro-rata by
     /// their delegation. Integer-division dust stays unminted, so the total distributed
     /// never exceeds the scheduled reward.
-    pub fn distribute_epoch(&mut self, height: u64) -> u64 {
-        let reward = emission::epoch_reward(height)
-            .min(emission::MINEABLE.saturating_sub(self.emitted));
-        if reward == 0 {
-            self.participation.clear();
-            return 0;
+    /// Split `amount` across reward addresses by this epoch's weight
+    /// = (self-stake + delegated) × blocks signed, applying validator commission and
+    /// delegator pro-rata exactly as the block reward does. Returns `(credits, total)`;
+    /// an empty result means no one participated (caller must not distribute). Pure over
+    /// committed state, so ZCRYPT rewards and bridge fees share one splitting rule.
+    fn credits_by_weight(&self, amount: u64) -> (Vec<(Hash, u64)>, u64) {
+        if amount == 0 {
+            return (Vec::new(), 0);
         }
-        // weight = (self-stake + delegated) × blocks signed this epoch
         let weights: Vec<(Vec<u8>, u128)> = self
             .validators
             .iter()
@@ -595,32 +692,25 @@ impl Staking {
             .collect();
         let total_weight: u128 = weights.iter().map(|(_, w)| *w).sum();
         if total_weight == 0 {
-            // no one participated -> no reward this epoch (never over-mints)
-            self.participation.clear();
-            return 0;
+            return (Vec::new(), 0);
         }
-        // Compute all credits first (immutable borrow of validators/delegations), then
-        // apply them (mutable borrow of rewards) — keeps the borrow checker happy and the
-        // accounting a pure function of committed state.
         let mut credits: Vec<(Hash, u64)> = Vec::new();
         for (pk, w) in &weights {
             if *w == 0 {
                 continue;
             }
             let v = self.validators.get(pk).expect("from validators");
-            let r_v = (reward as u128 * *w / total_weight) as u64; // this validator's slice
+            let r_v = (amount as u128 * *w / total_weight) as u64;
             if r_v == 0 {
                 continue;
             }
-            let total_stake_v = v.stake as u128 + v.delegated as u128; // > 0 since w > 0
+            let total_stake_v = v.stake as u128 + v.delegated as u128;
             if v.delegated == 0 {
-                // No delegators: the whole slice is the operator's.
                 credits.push((v.reward_address, r_v));
                 continue;
             }
-            // Split: commission on the delegated reward + the operator's pro-rata share of
-            // its own self-stake go to the validator; each delegator gets their pro-rata.
-            let commission = (r_v as u128 * COMMISSION_NUM as u128 / COMMISSION_DEN as u128) as u64;
+            // Per-validator commission (basis points): the operator's cut of the slice.
+            let commission = (r_v as u128 * v.commission_bps as u128 / 10_000) as u64;
             let rest = r_v - commission;
             let self_share = (rest as u128 * v.stake as u128 / total_stake_v) as u64;
             credits.push((v.reward_address, commission + self_share));
@@ -631,16 +721,89 @@ impl Staking {
                 }
             }
         }
-        let mut distributed = 0u64;
+        let total: u64 = credits.iter().map(|(_, a)| *a).sum();
+        (credits, total)
+    }
+
+    pub fn distribute_epoch(&mut self, height: u64) -> u64 {
+        let reward = emission::epoch_reward(height)
+            .min(emission::MINEABLE.saturating_sub(self.emitted));
+        let (credits, distributed) = self.credits_by_weight(reward);
+        if distributed == 0 {
+            // no reward this epoch, or no one participated (never over-mints)
+            self.participation.clear();
+            return 0;
+        }
         for (addr, amt) in credits {
-            if amt > 0 {
-                *self.rewards.entry(addr).or_default() += amt;
-                distributed += amt;
-            }
+            *self.rewards.entry(addr).or_default() += amt;
+            // Lifetime earnings ledger: credited here (real block rewards) and only
+            // here — returned unbonded stake never inflates it.
+            *self.earned.entry(addr).or_default() += amt;
         }
         self.emitted += distributed;
         self.participation.clear();
         distributed
+    }
+
+    /// Accrue a bridge fee of `amount` in the bridged `asset_id` into the undistributed
+    /// pool. Called by the node as an SPV mint MATURES, so a reorg-voided mint (which
+    /// never matures) never contributes a fee; the fee is a portion of value that was
+    /// already minted and fully backed 1:1, redirected from the recipient to stakers.
+    pub fn accrue_bridge_fee(&mut self, asset_id: u64, amount: u64) {
+        if amount > 0 {
+            *self.fee_pool.entry(asset_id).or_default() += amount;
+        }
+    }
+
+    /// Distribute all accrued bridge fees to stakers by the current epoch weight (the same
+    /// split as [`Self::distribute_epoch`]), moving them from `fee_pool` into per-staker,
+    /// per-asset `fee_rewards`. Any remainder that cannot be split (no participation this
+    /// epoch, or rounding dust) stays in the pool for the next epoch. Call each epoch,
+    /// BEFORE `distribute_epoch` clears participation. Returns total distributed.
+    pub fn distribute_fees(&mut self) -> u64 {
+        let assets: Vec<u64> = self.fee_pool.iter().filter(|(_, v)| **v > 0).map(|(a, _)| *a).collect();
+        let mut total = 0u64;
+        for asset in assets {
+            let pool = *self.fee_pool.get(&asset).unwrap_or(&0);
+            let (credits, distributed) = self.credits_by_weight(pool);
+            if distributed == 0 {
+                continue; // carry this asset's pool to the next epoch
+            }
+            for (addr, amt) in credits {
+                *self.fee_rewards.entry((addr, asset)).or_default() += amt;
+                *self.fee_earned.entry((addr, asset)).or_default() += amt;
+            }
+            *self.fee_pool.get_mut(&asset).unwrap() -= distributed; // keep rounding dust
+            total += distributed;
+        }
+        total
+    }
+
+    /// A reward address's claimable bridge-fee balance in `asset_id`.
+    pub fn claimable_fee(&self, addr: &Hash, asset_id: u64) -> u64 {
+        *self.fee_rewards.get(&(*addr, asset_id)).unwrap_or(&0)
+    }
+
+    /// Debit `amount` of claimed bridge fee for `(addr, asset_id)` (the node then mints the
+    /// matching asset coins). Rejects an over-claim.
+    pub fn debit_fee(&mut self, addr: &Hash, asset_id: u64, amount: u64) -> Result<(), String> {
+        let bal = self.fee_rewards.entry((*addr, asset_id)).or_default();
+        if amount == 0 || amount > *bal {
+            return Err(format!("fee claim {amount} exceeds claimable {bal}"));
+        }
+        *bal -= amount;
+        Ok(())
+    }
+
+    /// The next coinbase index for a fee claim on `(addr, asset_id)`, then advance it.
+    pub fn take_fee_claim_index(&mut self, addr: &Hash, asset_id: u64) -> u64 {
+        let e = self.fee_claim_index.entry((*addr, asset_id)).or_default();
+        let i = *e;
+        *e += 1;
+        i
+    }
+    pub fn fee_claim_index_of(&self, addr: &Hash, asset_id: u64) -> u64 {
+        *self.fee_claim_index.get(&(*addr, asset_id)).unwrap_or(&0)
     }
 
     /// A 32-byte digest of the staking state, folded into the app_hash so the
@@ -666,6 +829,14 @@ impl Staking {
             // voting power, so it is part of the consensus-agreed validator set.
             buf.extend_from_slice(&(v.consensus_pubkey.len() as u32).to_le_bytes());
             buf.extend_from_slice(&v.consensus_pubkey);
+            // Commission drives reward/fee splits — consensus-critical.
+            buf.extend_from_slice(&v.commission_bps.to_le_bytes());
+        }
+        // Epoch participation counters drive credits_by_weight until distribute clears them.
+        for (id, n) in &self.participation {
+            buf.extend_from_slice(&(id.len() as u32).to_le_bytes());
+            buf.extend_from_slice(id);
+            buf.extend_from_slice(&n.to_le_bytes());
         }
         for (addr, amt) in &self.rewards {
             buf.extend_from_slice(addr);
@@ -700,7 +871,54 @@ impl Staking {
             buf.extend_from_slice(&d.stake.to_le_bytes());
             buf.extend_from_slice(&d.reward_address);
         }
+        // Bridge fee state (accrued pool + per-staker per-asset claimable + indices) is
+        // consensus state: every node must agree on how much bridge yield each staker is
+        // owed, in each asset. BTreeMaps iterate in deterministic key order.
+        for (asset, amt) in &self.fee_pool {
+            buf.extend_from_slice(&asset.to_le_bytes());
+            buf.extend_from_slice(&amt.to_le_bytes());
+        }
+        for ((addr, asset), amt) in &self.fee_rewards {
+            buf.extend_from_slice(addr);
+            buf.extend_from_slice(&asset.to_le_bytes());
+            buf.extend_from_slice(&amt.to_le_bytes());
+        }
+        for ((addr, asset), idx) in &self.fee_claim_index {
+            buf.extend_from_slice(addr);
+            buf.extend_from_slice(&asset.to_le_bytes());
+            buf.extend_from_slice(&idx.to_le_bytes());
+        }
+        // Lifetime earnings ledgers (block rewards + bridge fees) are consensus state
+        // like every other credit map: all nodes must agree on what each address has
+        // ever been paid, since the explorer/API serves it as an on-chain fact.
+        for (addr, amt) in &self.earned {
+            buf.extend_from_slice(addr);
+            buf.extend_from_slice(&amt.to_le_bytes());
+        }
+        for ((addr, asset), amt) in &self.fee_earned {
+            buf.extend_from_slice(addr);
+            buf.extend_from_slice(&asset.to_le_bytes());
+            buf.extend_from_slice(&amt.to_le_bytes());
+        }
+        // Replay-protection nonces are consensus state (all nodes must agree which
+        // UNBOND/UNDELEGATE signatures are already spent). BTreeMap → deterministic order.
+        for (pk, n) in &self.auth_nonce {
+            buf.extend_from_slice(pk);
+            buf.extend_from_slice(&n.to_le_bytes());
+        }
         crate::hash::h(b"ZC-STAKE", &[&buf])
+    }
+
+    /// The current replay-protection nonce a UNBOND/UNDELEGATE from `signer_pk` must carry
+    /// (0 if the key has never signed one). See [`Self::auth_nonce`] field.
+    pub fn auth_nonce(&self, signer_pk: &[u8; 32]) -> u64 {
+        self.auth_nonce.get(signer_pk).copied().unwrap_or(0)
+    }
+
+    /// Advance `signer_pk`'s nonce after a successful signature-only staking tx, so the exact
+    /// signature can never be replayed.
+    pub fn bump_auth_nonce(&mut self, signer_pk: &[u8; 32]) {
+        *self.auth_nonce.entry(*signer_pk).or_insert(0) += 1;
     }
 }
 
@@ -721,7 +939,7 @@ mod tests {
     }
     // Bond helper: id and consensus-pubkey derived from the same scalar.
     fn bond(s: &mut Staking, n: u8, stake: u64, reward: Hash) -> Result<(), String> {
-        s.bond(pk(n), cpk(n), stake, reward)
+        s.bond(pk(n), cpk(n), stake, reward, DEFAULT_COMMISSION_BPS)
     }
 
     #[test]
@@ -984,6 +1202,27 @@ mod tests {
     }
 
     #[test]
+    fn per_validator_commission_lets_validators_compete() {
+        // Two identical validators differing ONLY in commission. The delegator to the
+        // lower-commission validator keeps more of the reward — the competitive lever.
+        let mut s = Staking::default();
+        let st = 10_000 * emission::ATOMIC;
+        s.bond(pk(1), cpk(1), st, addr(1), 0).unwrap(); // 0% commission
+        s.bond(pk(2), cpk(2), st, addr(2), 5_000).unwrap(); // 50% commission
+        s.delegate(pk(1), del(51), st, addr(51)).unwrap();
+        s.delegate(pk(2), del(52), st, addr(52)).unwrap();
+        for _ in 0..emission::EPOCH {
+            s.record_block(&[pk(1), pk(2)]);
+        }
+        s.distribute_epoch(emission::EPOCH);
+        let low = s.reward_balance(&addr(51)); // delegated to the 0% validator
+        let high = s.reward_balance(&addr(52)); // delegated to the 50% validator
+        assert!(low > high, "delegator to the lower-commission validator earns more: {low} vs {high}");
+        // 0% → delegator keeps ~half the slice; 50% → ~a quarter. So low ≈ 2×high.
+        assert!(high > 0 && low >= 2 * high - 4, "0% deleg {low} ≈ 2× the 50% deleg {high}");
+    }
+
+    #[test]
     fn undelegate_locks_then_returns_to_delegator() {
         let mut s = Staking::default();
         bond(&mut s, 1, MIN_STAKE, addr(1)).unwrap();
@@ -1052,6 +1291,44 @@ mod tests {
         s.slash(&pk(1), 0);
         // Tombstoned target rejected.
         assert!(s.delegate(pk(1), del(50), MIN_STAKE, addr(50)).is_err());
+    }
+
+    #[test]
+    fn lifetime_earned_survives_claims_and_excludes_returned_stake() {
+        let mut s = Staking::default();
+        bond(&mut s, 1, MIN_STAKE, addr(1)).unwrap();
+        for _ in 0..emission::EPOCH {
+            s.record_block(&[pk(1)]);
+        }
+        s.distribute_epoch(emission::EPOCH);
+        let accrued = s.reward_balance(&addr(1));
+        assert!(accrued > 0);
+        // Lifetime earned mirrors what was distributed...
+        assert_eq!(s.earned_of(&addr(1)), accrued);
+        // ...and claiming everything empties the balance but not the earnings ledger.
+        s.debit_reward(&addr(1), accrued).unwrap();
+        assert_eq!(s.reward_balance(&addr(1)), 0);
+        assert_eq!(s.earned_of(&addr(1)), accrued, "claims never reduce lifetime earnings");
+        // Returned unbonded stake flows through `rewards` but is NOT earnings.
+        let now = 1_000u64;
+        s.unbond(&pk(1), now).unwrap();
+        s.release_matured_unbonding(now + UNBONDING_PERIOD_SECS);
+        assert_eq!(s.reward_balance(&addr(1)), MIN_STAKE, "stake returned as claimable");
+        assert_eq!(s.earned_of(&addr(1)), accrued, "returned stake never inflates earnings");
+        // Earnings accumulate across epochs (participation re-recorded each epoch).
+        let mut t = Staking::default();
+        bond(&mut t, 2, MIN_STAKE, addr(2)).unwrap();
+        for _ in 0..emission::EPOCH {
+            t.record_block(&[pk(2)]);
+        }
+        t.distribute_epoch(emission::EPOCH);
+        let after_one = t.earned_of(&addr(2));
+        assert!(after_one > 0);
+        for _ in 0..emission::EPOCH {
+            t.record_block(&[pk(2)]);
+        }
+        t.distribute_epoch(2 * emission::EPOCH);
+        assert!(t.earned_of(&addr(2)) > after_one, "earnings accumulate across epochs");
     }
 
     #[test]

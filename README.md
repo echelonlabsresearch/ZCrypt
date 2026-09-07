@@ -41,7 +41,7 @@ EXPLORER_NODE=http://localhost:36657 cargo run --release -p zcrypt-explorer
 # and the STARK proof re-verified in front of you.
 ```
 
-The desktop wallet (`wallet/`, Tauri + React, Tor-by-default) funds, sends, stakes, claims rewards, mints assets, and drives the BTC bridge: `npm install && npm run tauri:dev`. A three-validator consensus stack, a full product-surface e2e, and a live BTC swap demo are one command each (`chain/docker-compose.3node.yml`, `chain/e2e/run-all.sh`). The complete operational guide (validators, bonding, wallet, e2e verification) is [running.md](running.md); the production go-live runbook is [`chain/LAUNCH.md`](chain/LAUNCH.md).
+The desktop wallet (`wallet/`, Tauri + React, Tor-by-default) funds, sends, stakes, claims rewards, mints assets, and drives the BTC bridge: `npm install && npm run tauri:dev`. A three-validator consensus stack, a full product-surface e2e, and a live BTC swap demo are one command each (`chain/e2e/docker-compose.3node.yml`, `chain/e2e/run-all.sh`). **To run a validator** (start it, get its identity, bond it from your wallet) see [`chain/README-validator.md`](chain/README-validator.md). The complete operational guide (foundation, wallet, e2e verification) is [running.md](running.md); the production go-live runbook is [`chain/LAUNCH.md`](chain/LAUNCH.md).
 
 ## Dig deeper
 

@@ -109,14 +109,6 @@ fn unpad<const L: usize>(buf: &[u8]) -> Option<Vec<u8>> {
     Some(buf[4..4 + len].to_vec())
 }
 
-fn unframe(buf: &[u8]) -> Option<Vec<u8>> {
-    if buf.len() < 4 {
-        return None;
-    }
-    let len = u32::from_le_bytes(buf[..4].try_into().ok()?) as usize;
-    buf.get(4..4 + len).map(|s| s.to_vec())
-}
-
 fn encrypt_padded<const L: usize>(
     recipient: &RecipientPublic,
     plaintext: &[u8],
@@ -168,46 +160,17 @@ pub fn decrypt(dk: &Dk, ek: &Ek, ct: &KemCiphertext) -> Option<Vec<u8>> {
     decrypt_padded::<PAD_LEN>(dk, ek, ct)
 }
 
-/// Encrypt a `.zcrypt` secrets payload (variable-length framed AEAD).
+/// Encrypt a `.zcrypt` secrets payload. Padded to a FIXED `FILE_PAD_LEN` so the
+/// AEAD ciphertext length is constant and cannot leak the plaintext byte-length
+/// (unlike variable-length framing, which let a passive observer distinguish a
+/// small secret from a large one).
 pub fn encrypt_file(recipient: &RecipientPublic, plaintext: &[u8]) -> KemCiphertext {
-    let mut rng = rand::thread_rng();
-    let (ct, ss_pq) = recipient
-        .mlkem
-        .encapsulate(&mut rng)
-        .expect("ml-kem encapsulate");
-    let mlkem_ct = ct.as_slice().to_vec();
-    let ek_bytes = ek_to_bytes(&recipient.mlkem);
-    let key = derive_key(ss_pq.as_slice(), &mlkem_ct, &ek_bytes);
-
-    let cipher = ChaCha20Poly1305::new_from_slice(&key).unwrap();
-    let mut nonce = [0u8; 12];
-    rng.fill_bytes(&mut nonce);
-    let mut framed = Vec::with_capacity(plaintext.len() + 4);
-    framed.extend_from_slice(&(plaintext.len() as u32).to_le_bytes());
-    framed.extend_from_slice(plaintext);
-    let aead_ct = cipher
-        .encrypt(Nonce::from_slice(&nonce), framed.as_ref())
-        .expect("aead encrypt");
-
-    KemCiphertext {
-        mlkem_ct,
-        nonce,
-        aead_ct,
-    }
+    encrypt_padded::<FILE_PAD_LEN>(recipient, plaintext)
 }
 
-/// Decrypt a `.zcrypt` secrets payload.
+/// Decrypt a `.zcrypt` secrets payload (fixed-size padded AEAD).
 pub fn decrypt_file(dk: &Dk, ek: &Ek, ct: &KemCiphertext) -> Option<Vec<u8>> {
-    let mlkem_ct = ml_kem::Ciphertext::<MlKem768>::try_from(ct.mlkem_ct.as_slice()).ok()?;
-    let ss_pq = dk.decapsulate(&mlkem_ct).ok()?;
-    let ek_bytes = ek_to_bytes(ek);
-    let key = derive_key(ss_pq.as_slice(), &ct.mlkem_ct, &ek_bytes);
-
-    let cipher = ChaCha20Poly1305::new_from_slice(&key).unwrap();
-    let framed = cipher
-        .decrypt(Nonce::from_slice(&ct.nonce), ct.aead_ct.as_ref())
-        .ok()?;
-    unframe(&framed)
+    decrypt_padded::<FILE_PAD_LEN>(dk, ek, ct)
 }
 
 /// Serialize a ciphertext to bytes (for embedding in JSON / on-chain notes).

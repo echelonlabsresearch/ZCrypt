@@ -44,6 +44,15 @@ export default function Settings() {
   const [status, setStatus] = useState<NodeStatus | null>(null);
   const [checking, setChecking] = useState(false);
   const [saved, setSaved] = useState(false);
+  type TorStatus = {
+    enabled: boolean;
+    reachable: boolean;
+    node_routed: boolean;
+    bridge_routed: boolean;
+    proxy: string;
+    detail: string;
+  };
+  const [tor, setTor] = useState<TorStatus | null>(null);
 
   useEffect(() => {
     call<WalletSettings>("get_settings")
@@ -67,9 +76,9 @@ export default function Settings() {
       btc_user: full?.btc_user ?? "zcrypt",
       btc_pass: full?.btc_pass ?? "zcrypt",
       btc_wallet: full?.btc_wallet ?? "demo",
-      btc_network: full?.btc_network ?? "regtest",
+      btc_network: full?.btc_network ?? "bitcoin",
       btc_selfcustody: full?.btc_selfcustody ?? true,
-      esplora_url: full?.esplora_url ?? "https://mempool.space/signet/api",
+      esplora_url: full?.esplora_url ?? "https://blockstream.info/api",
       tor_enabled: torEnabled,
       tor_proxy: torProxy.trim() || "127.0.0.1:9050",
       ...next,
@@ -94,6 +103,11 @@ export default function Settings() {
       setStatus({ connected: false, height: 0, app: "", version: "" });
     } finally {
       setChecking(false);
+    }
+    try {
+      setTor(await call<TorStatus>("tor_status"));
+    } catch {
+      setTor(null);
     }
   }
 
@@ -162,8 +176,25 @@ export default function Settings() {
             }}
             style={{ width: "auto" }}
           />
-          <span>Route node traffic through Tor</span>
-          {torEnabled && <span style={{ color: "var(--color-green)", fontSize: "0.8rem" }}>● on</span>}
+          <span>Route node + bridge traffic through Tor</span>
+          {torEnabled && tor && (
+            <span
+              style={{
+                fontSize: "0.8rem",
+                color: !tor.reachable
+                  ? "var(--color-red, #e5484d)"
+                  : tor.node_routed
+                    ? "var(--color-green)"
+                    : "var(--color-amber, #d99a00)",
+              }}
+            >
+              {!tor.reachable
+                ? "● proxy unreachable"
+                : tor.node_routed
+                  ? "● routed via Tor"
+                  : "● active (node is local → direct)"}
+            </span>
+          )}
         </label>
         <div className="field" style={{ marginTop: "0.8rem" }}>
           <label>Tor SOCKS proxy</label>
@@ -179,11 +210,10 @@ export default function Settings() {
         <button className="btn-primary" onClick={() => saveSettings({ tor_proxy: torProxy.trim() })}>
           {saved ? "✓ Saved" : "Save Tor settings"}
         </button>
-        {torEnabled && (
-          <div className="warn" style={{ marginTop: "0.9rem" }}>
-            With Tor on, a failed connection usually means the Tor daemon isn't running on{" "}
-            <code>{torProxy || "127.0.0.1:9050"}</code>. The wallet <b>fails closed</b> — it will not fall back to a
-            direct connection that would reveal your IP.
+        {torEnabled && tor && (
+          <div className={tor.reachable ? "warn" : "msg err"} style={{ marginTop: "0.9rem" }}>
+            {tor.detail} The wallet <b>fails closed</b> — it never falls back to a direct
+            connection that would reveal your IP.
           </div>
         )}
       </div>

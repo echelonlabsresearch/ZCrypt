@@ -1,55 +1,130 @@
+# Foundation stack — one VPS, one `docker compose up`:
+#   abci + cometbft + explorer + caddy (HTTPS for explorer.* and rpc.*)
+#   P2P 26656 published on the HOST for validators / firewall
+# Optional:
+#   --profile bridge  → bridge_watcher (needs ZCRYPT_RESERVE_SEED)
+#   --profile dev     → regtest bitcoind
+#
+# DNS before public TLS: EXPLORER_DOMAIN and RPC_DOMAIN both A → this machine's IP.
+# Copy env:  cp .env.example .env
+
 services:
   abci:
     build:
       context: ..
       dockerfile: chain/docker/Dockerfile
       args:
-        # This is the devnet stack: enable the SEED (0x56) faucet/mint path the
-        # wallet uses. Production deployments build with ABCI_FEATURES="" instead.
-        ABCI_FEATURES: devnet
+        # PRODUCTION build by default (no features). Mainnet-grade FRI parameters are
+        # compiled into every binary unconditionally. Local faucet: ABCI_FEATURES=devnet
+        ABCI_FEATURES: ${ABCI_FEATURES:-}
     container_name: zcrypt-abci
     restart: unless-stopped
     environment:
       ABCI_PORT: "26658"
-      # Persist consensus state on a named volume so a restart/rebuild resumes at
-      # the last committed height instead of replaying every block from genesis.
       ZCRYPT_STATE_FILE: /data/zcrypt-state.bin
-      # production: the foundation cold key's reward address (64 hex) — REQUIRED by
-      # non-devnet builds; identical on every validator (consensus at genesis)
-      ZCRYPT_FOUNDATION_ADDR: ${ZCRYPT_FOUNDATION_ADDR:-}
     volumes:
       - abci-data:/data
-    # No host port publish: cometbft reaches the ABCI app over the compose
-    # network (tcp://abci:26658). Avoids colliding with other local chains.
     networks:
       - zcrypt-net
 
   cometbft:
-    # ABCI 2.0 — matches the native Rust node (tendermint-abci 0.40 / v0_38 protos).
     image: cometbft/cometbft:v0.38.17
     container_name: zcrypt-cometbft
     restart: unless-stopped
     depends_on:
       - abci
     environment:
-      # The image bakes CMTHOME=/cometbft and ignores --home, so use that path.
       COMETBFT_HOME: /cometbft
-      CHAIN_ID: zcrypt-devnet
+      CHAIN_ID: ${CHAIN_ID:-zcrypt-1}
       ABCI_ADDR: tcp://abci:26658
+      ZCRYPT_FOUNDATION_ADDR: ${ZCRYPT_FOUNDATION_ADDR:-}
+      ZCRYPT_BTC_NET: ${ZCRYPT_BTC_NET:-mainnet}
+      ZCRYPT_BTC_CHECKPOINT: ${ZCRYPT_BTC_CHECKPOINT:-}
     volumes:
       - ./docker/cometbft-entrypoint.sh:/entrypoint.sh:ro
       - cometbft-data:/cometbft
     entrypoint: ["/bin/sh", "/entrypoint.sh"]
-    # RPC remapped to 36657 on the host to avoid colliding with another local
-    # chain already using 26657. P2P (26656) not published (single-node devnet).
+    # P2P on the HOST (open this in the VPS firewall for other validators).
+    # Raw RPC bound to localhost by default — public RPC goes through Caddy (rpc.*).
     ports:
-      - "36657:26657"
+      - "${FOUNDATION_P2P_PORT:-26656}:26656"
+      - "${FOUNDATION_RPC_PORT:-127.0.0.1:36657}:26657"
     networks:
       - zcrypt-net
 
-  # Bitcoin Core in regtest — the "other chain" for BTC↔zBTC atomic swaps.
-  # RPC on host port 18443; wallet + bridge talk to it over JSON-RPC.
+  explorer:
+    build:
+      context: ..
+      dockerfile: chain/docker/Dockerfile
+      args:
+        ABCI_FEATURES: ${ABCI_FEATURES:-}
+    container_name: zcrypt-explorer
+    restart: unless-stopped
+    depends_on:
+      - cometbft
+    command: ["zcrypt-explorer"]
+    environment:
+      # Inside the compose network — not the host-published RPC port
+      EXPLORER_NODE: http://cometbft:26657
+      EXPLORER_PORT: "8080"
+    networks:
+      - zcrypt-net
+
+  caddy:
+    image: caddy:2-alpine
+    container_name: zcrypt-caddy
+    restart: unless-stopped
+    depends_on:
+      - explorer
+      - cometbft
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    environment:
+      EXPLORER_DOMAIN: ${EXPLORER_DOMAIN:-explorer.localhost}
+      RPC_DOMAIN: ${RPC_DOMAIN:-rpc.localhost}
+      ACME_EMAIL: ${ACME_EMAIL:-}
+    volumes:
+      - ./docker/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    networks:
+      - zcrypt-net
+
+  # Public bridge operator — NOT started by default (needs hot reserve key).
+  #   ZCRYPT_RESERVE_SEED=... docker compose --profile bridge up -d
+  bridge-watcher:
+    profiles: ["bridge"]
+    build:
+      context: ..
+      dockerfile: chain/docker/Dockerfile
+      args:
+        ABCI_FEATURES: ${ABCI_FEATURES:-}
+    container_name: zcrypt-bridge-watcher
+    restart: unless-stopped
+    depends_on:
+      - cometbft
+    command: ["bridge_watcher"]
+    environment:
+      ZC_URL: http://cometbft:26657
+      ZCRYPT_RESERVE_SEED: ${ZCRYPT_RESERVE_SEED:-}
+      WATCHER_STATE: /data/bridge-watcher-state.json
+      WATCHER_POLL_SECS: ${WATCHER_POLL_SECS:-10}
+      WATCHER_FINALIZE_MARGIN: ${WATCHER_FINALIZE_MARGIN:-130000}
+      BTC_URL: ${BTC_URL:-http://bitcoind:18443}
+      BTC_USER: ${BTC_USER:-zcrypt}
+      BTC_PASS: ${BTC_PASS:-zcrypt}
+      BTC_NETWORK: ${BTC_NETWORK:-regtest}
+      BTC_WALLET: ${BTC_WALLET:-operator}
+    volumes:
+      - watcher-data:/data
+    networks:
+      - zcrypt-net
+
+  # Regtest bitcoind — LOCAL demos only. Never on a public production host.
   bitcoind:
+    profiles: ["dev", "bridge"]
     image: ruimarinho/bitcoin-core:24
     container_name: zcrypt-bitcoind
     restart: unless-stopped
@@ -65,12 +140,18 @@ services:
       - -rpcport=18443
     ports:
       - "18443:18443"
+    volumes:
+      - bitcoind-data:/home/bitcoin/.bitcoin
     networks:
       - zcrypt-net
 
 volumes:
   cometbft-data:
   abci-data:
+  bitcoind-data:
+  watcher-data:
+  caddy-data:
+  caddy-config:
 
 networks:
   zcrypt-net:

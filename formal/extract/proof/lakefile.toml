@@ -1,0 +1,12 @@
+name = "zcrypt-extract-proof"
+defaultTargets = ["Proof"]
+
+[[require]]
+name = "aeneas"
+path = "/Users/chris/fv/aeneas/backends/lean"
+
+[[lean_lib]]
+name = "ZcryptVmCore"
+
+[[lean_lib]]
+name = "Proof"

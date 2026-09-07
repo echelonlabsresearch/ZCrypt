@@ -47,12 +47,14 @@ impl Esplora {
         Esplora { base: base.trim_end_matches('/').to_string() }
     }
 
-    fn agent() -> ureq::Agent {
-        ureq::builder().timeout(Duration::from_secs(30)).build()
+    /// HTTP agent for this Esplora endpoint, routed through Tor when configured. Esplora is
+    /// third-party and always remote, so this is the bridge's most privacy-relevant traffic.
+    fn agent(&self) -> ureq::Agent {
+        crate::proxied_agent(&self.base, 30)
     }
 
     fn get_json(&self, path: &str) -> Result<Value, String> {
-        Self::agent()
+        self.agent()
             .get(&format!("{}{path}", self.base))
             .call()
             .map_err(|e| e.to_string())?
@@ -61,7 +63,7 @@ impl Esplora {
     }
 
     fn get_text(&self, path: &str) -> Result<String, String> {
-        Self::agent()
+        self.agent()
             .get(&format!("{}{path}", self.base))
             .call()
             .map_err(|e| e.to_string())?
@@ -107,7 +109,7 @@ impl Esplora {
 
     /// Broadcast a raw (hex) transaction; returns the txid.
     pub fn broadcast(&self, tx_hex: &str) -> Result<String, String> {
-        let resp = Self::agent()
+        let resp = self.agent()
             .post(&format!("{}/tx", self.base))
             .send_string(tx_hex)
             .map_err(|e| match e {
@@ -126,9 +128,46 @@ impl Esplora {
         self.get_json(&format!("/tx/{txid}"))
     }
 
+    /// The txid that SPENT output `vout` of `txid`, if any (`/tx/:txid/outspend/:vout`).
+    /// `Ok(None)` when the output is still unspent. Lets the redeem watcher detect a user's
+    /// HTLC claim without scanning blocks.
+    pub fn outspend(&self, txid: &str, vout: u32) -> Result<Option<String>, String> {
+        let v = self.get_json(&format!("/tx/{txid}/outspend/{vout}"))?;
+        if v["spent"].as_bool().unwrap_or(false) {
+            Ok(v["txid"].as_str().map(|s| s.to_string()))
+        } else {
+            Ok(None)
+        }
+    }
+
     /// Current chain tip height.
     pub fn tip_height(&self) -> Result<u64, String> {
         self.get_text("/blocks/tip/height")?.trim().parse().map_err(|e| format!("tip height: {e}"))
+    }
+
+    /// The raw 80-byte block header at `height` (via `/block-height` → `/block/:hash/header`).
+    /// Untrusted transport for the consensus SPV chain: the header's own proof-of-work
+    /// is what gets verified, so a lying endpoint cannot forge anything.
+    pub fn block_header(&self, height: u64) -> Result<[u8; 80], String> {
+        let hash = self.get_text(&format!("/block-height/{height}"))?;
+        let hex_hdr = self.get_text(&format!("/block/{}/header", hash.trim()))?;
+        hex::decode(hex_hdr.trim())
+            .map_err(|e| e.to_string())?
+            .try_into()
+            .map_err(|_| "header is not 80 bytes".to_string())
+    }
+
+    /// Raw bytes of a transaction (`/tx/:txid/hex`).
+    pub fn tx_raw(&self, txid: &str) -> Result<Vec<u8>, String> {
+        let h = self.get_text(&format!("/tx/{txid}/hex"))?;
+        hex::decode(h.trim()).map_err(|e| e.to_string())
+    }
+
+    /// A `merkleblock` inclusion proof for a confirmed tx
+    /// (`/tx/:txid/merkleblock-proof` — byte-identical to bitcoind's `gettxoutproof`).
+    pub fn merkleblock_proof(&self, txid: &str) -> Result<Vec<u8>, String> {
+        let h = self.get_text(&format!("/tx/{txid}/merkleblock-proof"))?;
+        hex::decode(h.trim()).map_err(|e| e.to_string())
     }
 
     /// Confirmations of a transaction (0 if unconfirmed / in mempool).

@@ -114,11 +114,21 @@ impl AssetRegistry {
         // BTC-pegged asset MUST use Bitcoin's 8 decimals and its 21M ceiling. This is the
         // single chokepoint every registration path funnels through, so no register_tx —
         // whoever sends it — can mint a `zBTC` with a looser cap that could go unbacked.
-        if canon == canonical_ticker(ZBTC_TICKER) && (decimals != ZBTC_DECIMALS || max_supply != ZBTC_MAX_SUPPLY) {
-            return Err(format!(
-                "'{ZBTC_TICKER}' is protocol-pinned to {ZBTC_DECIMALS} decimals and a hard \
-                 {ZBTC_MAX_SUPPLY} base-unit cap (21M) — it cannot be registered with other values"
-            ));
+        if canon == canonical_ticker(ZBTC_TICKER) {
+            if decimals != ZBTC_DECIMALS || max_supply != ZBTC_MAX_SUPPLY {
+                return Err(format!(
+                    "'{ZBTC_TICKER}' is protocol-pinned to {ZBTC_DECIMALS} decimals and a hard \
+                     {ZBTC_MAX_SUPPLY} base-unit cap (21M) — it cannot be registered with other values"
+                ));
+            }
+            // zBTC must have a mint authority (in production: SPV sentinel). Without this,
+            // discretionary M-of-N minting of the peg ticker is possible at the core layer.
+            if authority.is_none() {
+                return Err(format!(
+                    "'{ZBTC_TICKER}' requires a mint authority (SPV reserve commitment); \
+                     discretionary minting of the Bitcoin peg is forbidden"
+                ));
+            }
         }
         if self.by_ticker.contains_key(&canon) {
             return Err(format!("ticker '{ticker}' is already registered"));
@@ -258,15 +268,19 @@ mod tests {
     #[test]
     fn first_mint_wins() {
         let mut r = AssetRegistry::default();
-        let id = r.register("zBTC", 8, None, CAP).unwrap();
+        let auth = Some([7u8; 32]);
+        let id = r.register("zBTC", 8, auth, CAP).unwrap();
         assert_eq!(id, asset_id_for("zBTC"));
         assert_ne!(id, NATIVE_ASSET);
         // second registration of the same ticker is rejected
-        assert!(r.register("zBTC", 8, None, CAP).is_err());
+        assert!(r.register("zBTC", 8, auth, CAP).is_err());
         // CASE-INSENSITIVE: a different-cased spelling is the same asset -> rejected,
         // and resolves to the same id.
-        assert!(r.register("ZBTC", 8, None, CAP).is_err());
-        assert!(r.register("zbtc", 8, None, CAP).is_err());
+        assert!(r.register("ZBTC", 8, auth, CAP).is_err());
+        assert!(r.register("zbtc", 8, auth, CAP).is_err());
+        // zBTC without authority is forbidden
+        let mut r2 = AssetRegistry::default();
+        assert!(r2.register("zBTC", 8, None, CAP).is_err());
         assert_eq!(r.asset_of("ZBTC"), Some(id));
         assert_eq!(r.asset_of("zbtc"), Some(id));
         assert!(r.ticker_taken("Zbtc"));
@@ -303,7 +317,7 @@ mod tests {
     #[test]
     fn mint_tracks_supply_and_root_changes() {
         let mut r = AssetRegistry::default();
-        let id = r.register("zBTC", 8, None, CAP).unwrap();
+        let id = r.register("zBTC", 8, Some([1u8; 32]), CAP).unwrap();
         let root0 = r.root();
         r.record_mint(id, 100_000).unwrap();
         assert_eq!(r.minted(id), 100_000);
@@ -379,7 +393,7 @@ mod tests {
     fn deterministic_root() {
         let build = || {
             let mut r = AssetRegistry::default();
-            r.register("zBTC", 8, None, CAP).unwrap();
+            r.register("zBTC", 8, Some([1u8; 32]), CAP).unwrap();
             r.register("USDC", 6, Some([7u8; 32]), CAP).unwrap();
             r.record_mint(asset_id_for("zBTC"), 42).unwrap();
             r.root()

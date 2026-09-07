@@ -127,13 +127,16 @@ burned, while every other output stays hidden", hex_at(0, 32)));
             shield_rows(&format!("[{}..] main", 37 + gas_len), &main, &mut r);
         }
         0x57 => {
+            // Wire: ed25519_pk(32) ‖ stake(8) ‖ reward(32) ‖ commission_bps(2) ‖ nonce(8) ‖ sig(64) ‖ stake_blind(32) ‖ shield_tx
             r.push(row("[1..33]".into(), "consensus pubkey (ed25519) -> validator id", hex_at(0, 32)));
             r.push(row("[33..41]".into(), "stake (u64 LE) -> Ctx.stake", rd_u64(body, 32).map(zcry)?));
             r.push(row("[41..73]".into(), "reward address", hex_at(40, 32)));
-            r.push(row("[73..137]".into(), "ed25519 signature over ZCRYPT-BOND-v1 ‖ chain ‖ pk ‖ stake ‖ reward", hex_at(72, 64)));
-            r.push(row("[137..169]".into(), "stake blind (opens the pledge burn output)", hex_at(136, 32)));
-            if let Some(stx) = body.get(168..).and_then(shield_tx::from_bytes) {
-                shield_rows("[169..] pledge", &stx, &mut r);
+            r.push(row("[73..75]".into(), "commission_bps (u16 LE)", format!("{}", u16::from_le_bytes(body.get(72..74)?.try_into().ok()?))));
+            r.push(row("[75..83]".into(), "auth nonce (u64 LE, replay protection)", format!("{}", rd_u64(body, 74)?)));
+            r.push(row("[83..147]".into(), "ed25519 signature over ZCRYPT-BOND-v1 ‖ chain ‖ pk ‖ stake ‖ reward ‖ commission ‖ nonce", hex_at(82, 64)));
+            r.push(row("[147..179]".into(), "stake blind (opens the pledge burn output)", hex_at(146, 32)));
+            if let Some(stx) = body.get(178..).and_then(shield_tx::from_bytes) {
+                shield_rows("[179..] pledge", &stx, &mut r);
             }
         }
         0x58 => {
@@ -189,12 +192,15 @@ which hides among the whole pool", hex_at(0, 64)));
             }
         }
         0x5E => {
+            // Wire: pubkey(32) ‖ nonce(8) ‖ sig(64) — nonce is signed for replay protection
             r.push(row("[1..33]".into(), "consensus pubkey (ed25519)", hex_at(0, 32)));
-            r.push(row("[33..97]".into(), "ed25519 signature over ZCRYPT-UNBOND-v1 ‖ chain ‖ pk", hex_at(32, 64)));
+            r.push(row("[33..41]".into(), "auth nonce (u64 LE, replay protection)", format!("{}", rd_u64(body, 32)?)));
+            r.push(row("[41..105]".into(), "ed25519 signature over ZCRYPT-UNBOND-v1 ‖ chain ‖ pk ‖ nonce", hex_at(40, 64)));
         }
         0x5F => {
-            r.push(row("[1..21]".into(), "target validator address", hex_at(0, 20)));
-            r.push(row("[21..53]".into(), "delegator pubkey (ed25519)", hex_at(20, 32)));
+            // Wire: delegator_pk(32) ‖ target_addr(20) ‖ stake(8) ‖ reward(32) ‖ sig(64) ‖ stake_blind(32) ‖ shield_tx
+            r.push(row("[1..33]".into(), "delegator pubkey (ed25519)", hex_at(0, 32)));
+            r.push(row("[33..53]".into(), "target validator address", hex_at(32, 20)));
             r.push(row("[53..61]".into(), "stake (u64 LE) -> Ctx.stake", rd_u64(body, 52).map(zcry)?));
             r.push(row("[61..93]".into(), "reward address", hex_at(60, 32)));
             r.push(row("[93..157]".into(), "ed25519 signature", hex_at(92, 64)));
@@ -204,9 +210,11 @@ which hides among the whole pool", hex_at(0, 64)));
             }
         }
         0x60 => {
+            // Wire: delegator_pk(32) ‖ target(20) ‖ nonce(8) ‖ sig(64)
             r.push(row("[1..33]".into(), "delegator pubkey (ed25519)", hex_at(0, 32)));
             r.push(row("[33..53]".into(), "target validator address", hex_at(32, 20)));
-            r.push(row("[53..117]".into(), "ed25519 signature", hex_at(52, 64)));
+            r.push(row("[53..61]".into(), "auth nonce (u64 LE, replay protection)", format!("{}", rd_u64(body, 52)?)));
+            r.push(row("[61..125]".into(), "ed25519 signature over ZCRYPT-UNDELEGATE-v1 ‖ chain ‖ pk ‖ target ‖ nonce", hex_at(60, 64)));
         }
         0x61 => {
             r.push(row("[1..9]".into(), "asset id (u64 LE)", format!("{}", rd_u64(body, 0)?)));
@@ -214,6 +222,25 @@ which hides among the whole pool", hex_at(0, 64)));
             r.push(row("[41..]".into(), "rotation authorization from the CURRENT key set (epoch-bound) -> Ctx.mint_*", format!("{} bytes", body.len().saturating_sub(40))));
         }
         0x56 => r.push(row("[1..65]".into(), "coin commitment (8 x u64 LE)", hex_at(0, 64))),
+        0x63 => {
+            let n = body.len() / 80;
+            r.push(row(
+                "[1..]".into(),
+                "raw Bitcoin block headers (80 bytes each) — every validator verifies linkage, proof-of-work, difficulty rules, and heaviest-chain fork choice",
+                format!("{n} header(s); first: {}", hex_at(0, 80.min(body.len()))),
+            ));
+        }
+        0x64 => {
+            let aid = rd_u64(body, 0)?;
+            r.push(row("[1..9]".into(), "asset id (u64 LE)", format!("{aid}")));
+            r.push(row("[9..17]".into(), "escrow value (u64 LE, base units — must be ≤ the proven locked sats)", asset_amt(rd_u64(body, 8)?, Some(aid), None, None)));
+            r.push(row("[17..49]".into(), "hashlock (SHA-256) -> Ctx.hashlock", hex_at(16, 32)));
+            r.push(row("[49..57]".into(), "timeout height (u64 LE) -> Ctx.timeout", format!("{}", rd_u64(body, 48)?)));
+            r.push(row("[57..121]".into(), "claimer shield pubkey", hex_at(56, 64)));
+            r.push(row("[121..154]".into(), "Bitcoin reserve claim key (33B) — must hash to the asset's SPV authority", hex_at(120, 33)));
+            r.push(row("[154..187]".into(), "depositor refund key (33B)", hex_at(153, 33)));
+            r.push(row("[187..]".into(), "refund locktime ‖ vout ‖ raw funding tx ‖ merkleblock proof -> Ctx.spv_ok", format!("{} bytes", body.len().saturating_sub(186))));
+        }
         _ => return None,
     }
     Some(r)
@@ -315,7 +342,8 @@ pub fn describe_tx(b: &[u8], chain_id: &[u8], with_rules: bool, height: u64) -> 
         Some(0x5E) => json!({
             "type": "Unbond", "tag": tag_hex,
             "validator_key": rd_hex(body, 0, 32),
-            "explains": "Releases a validator's stake; signed by its consensus key.",
+            "auth_nonce": rd_u64(body, 32),
+            "explains": "Releases a validator's stake; signed by its consensus key over chain_id + nonce (replay-safe).",
         }),
         Some(0x5F) => json!({
             "type": "Delegate", "tag": tag_hex,
@@ -328,6 +356,8 @@ pub fn describe_tx(b: &[u8], chain_id: &[u8], with_rules: bool, height: u64) -> 
             "type": "Undelegate", "tag": tag_hex,
             "delegator_key": rd_hex(body, 0, 32),
             "validator_addr": rd_hex(body, 32, 20),
+            "auth_nonce": rd_u64(body, 52),
+            "explains": "Removes a delegation; signed over chain_id + nonce (replay-safe).",
         }),
         Some(0x61) => json!({
             "type": "Authority rotation", "tag": tag_hex,
@@ -343,6 +373,20 @@ pub fn describe_tx(b: &[u8], chain_id: &[u8], with_rules: bool, height: u64) -> 
             "timeout_height": rd_u64(body, 80),
             "hidden": ["which coins funded the lock"],
             "explains": "One leg of a private asset-for-asset swap. The locked value and asset are public for the escrow; the funding coins are hidden. Two such legs under one hashlock settle atomically.",
+        }),
+        Some(0x63) => json!({
+            "type": "Bitcoin header relay", "tag": tag_hex,
+            "headers": body.len() / 80,
+            "explains": "Raw Bitcoin block headers feeding the consensus SPV chain — the trustless zBTC mint gate. Anyone may relay; each header proves itself by its proof-of-work, so the relayer is untrusted.",
+        }),
+        Some(0x64) => json!({
+            "type": "HTLC open (SPV-verified mint)", "tag": tag_hex,
+            "asset_id": rd_u64(body, 0).map(|a| a.to_string()),
+            "value_atomic": rd_u64(body, 8),
+            "hashlock": rd_hex(body, 16, 32),
+            "timeout_height": rd_u64(body, 48),
+            "reserve_pk": rd_hex(body, 120, 33),
+            "explains": "A trustless bridge mint: every validator re-verified a Bitcoin SPV proof that real BTC (≥ the minted base units, 1:1) is locked in an HTLC claimable only by the pinned reserve key. No treasury, no signatures — nothing to trust.",
         }),
         _ => json!({ "type": "Unknown", "tag": tag_hex, "bytes": b.len() }),
     };
@@ -551,8 +595,9 @@ fn gate_op_result(tag: u8, op: u8, body: &[u8], height: u64) -> Option<Value> {
             let hl = zcrypt_core::nullifier::htlc_hashlock(preimage);
             Some(json!({ "ok": Value::Null, "note": format!("explorer computed SHA256(preimage) = {}… (consensus checked this equals the escrow's registered hashlock)", hex::encode(&hl[..10])) }))
         }
-        // state-dependent checks: honest note. (0x1D here is rotation, which binds a historical epoch.)
-        0x14 | 0x15 | 0x17 | 0x1B | 0x1D => Some(state),
+        // state-dependent checks: honest note. (0x1D here is rotation, which binds a historical
+        // epoch; 0x1E is the SPV deposit proof, verified against the consensus header chain.)
+        0x14 | 0x15 | 0x17 | 0x1B | 0x1D | 0x1E => Some(state),
         _ => None,
     }
 }
@@ -569,6 +614,7 @@ fn rules(tag: u8, main: Option<&ShieldTx>, body: &[u8], chain_id: &[u8], height:
         0x5C => (g::HTLC_EXPIRE, false),
         0x5D | 0x62 => (g::HTLC_BURN_LOCK, false),
         0x61 => (g::ROTATE_AUTH, false),
+        0x64 => (g::HTLC_OPEN_SPV, false),
         _ => return None,
     };
     // Annotate each opcode with per-transaction execution: shield emits values (COMPUTE steps),

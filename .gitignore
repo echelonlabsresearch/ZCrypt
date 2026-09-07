@@ -38,3 +38,9 @@ __pycache__/
 *.mnemonic
 priv_validator_key.json
 node_key.json
+
+# Lean 4 build cache + fetched mathlib/batteries clones (multi-GB, regenerable via `lake build`)
+.lake/
+
+# separate repository (github.com/zcryptnetwork/prelaunch-website), not part of this tree
+zcryptlaunchholdingpage/

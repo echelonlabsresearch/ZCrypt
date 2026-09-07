@@ -24,7 +24,7 @@ fn note(addr: &keys::Address, v: u64, b: [u64; 4]) -> Vec<u8> {
 /// transfer bundles a ZCRYPT gas note + the main transfer, so scan both.
 fn scan_for(zc: &Zcrypt, who: &Account, from: i64, to: i64) -> Option<Coin> {
     for h in from..=to {
-        for raw in zc.block_txs(h) {
+        for raw in zc.block_txs(h).unwrap_or_default() {
             if raw.first() != Some(&0x55) {
                 continue;
             }

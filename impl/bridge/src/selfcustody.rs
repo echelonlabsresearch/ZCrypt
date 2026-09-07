@@ -41,6 +41,22 @@ impl SelfCustodyBtc {
         esplora_url: &str,
         account: u32,
     ) -> Result<Self, String> {
+        // Money-critical guard: a mainnet wallet pointed at a signet/testnet/regtest
+        // Esplora would derive real `bc1…` addresses while every UTXO/fee/header/broadcast
+        // call hit a DIFFERENT chain — balances read as 0 and a real broadcast could target
+        // the wrong network. The endpoint path names the network, so catch the mismatch here
+        // (the single constructor every self-custody path flows through). Only enforced for
+        // mainnet, to avoid blocking custom self-hosted test endpoints.
+        if network == Network::Bitcoin {
+            let u = esplora_url.to_ascii_lowercase();
+            if u.contains("signet") || u.contains("testnet") || u.contains("regtest") {
+                return Err(format!(
+                    "Bitcoin mainnet is configured, but the Esplora endpoint ({esplora_url}) \
+                     looks like a test network. Point esplora_url at a MAINNET endpoint \
+                     (e.g. https://blockstream.info/api) before moving real BTC."
+                ));
+            }
+        }
         let hd = HdWallet::from_mnemonic_account(mnemonic, passphrase, network, account)?;
         Ok(Self { hd, esplora: Esplora::new(esplora_url), network })
     }
@@ -69,10 +85,12 @@ impl SelfCustodyBtc {
         self.esplora.tip_height()
     }
 
-    /// Confirmations to treat a tx as final, by network.
+    /// Confirmations to treat a tx as final — aligned with SPV `min_conf`.
     pub fn conf_target(&self) -> u32 {
         match self.network {
-            Network::Bitcoin => 2,
+            Network::Bitcoin => zcrypt_core::spv::min_conf_for(zcrypt_core::spv::BtcNet::Mainnet) as u32,
+            Network::Signet => zcrypt_core::spv::min_conf_for(zcrypt_core::spv::BtcNet::Signet) as u32,
+            Network::Regtest => 0,
             _ => 1,
         }
     }
@@ -167,10 +185,17 @@ impl SelfCustodyBtc {
     }
 
     /// The preimage revealed in a claim tx (witness item 1), read via Esplora.
+    /// Returns `None` for refund spends (empty witness item 1) so callers do not
+    /// treat a refund as a successful claim.
     pub fn preimage_from_claim(&self, txid: &Txid) -> Option<Vec<u8>> {
         let v = self.esplora.tx_json(&txid.to_string()).ok()?;
         let wit = v["vin"][0]["witness"].as_array()?;
-        hex::decode(wit.get(1)?.as_str()?).ok()
+        let raw = hex::decode(wit.get(1)?.as_str()?).ok()?;
+        if raw.is_empty() {
+            None // refund branch: OP_IF selector false, empty preimage slot
+        } else {
+            Some(raw)
+        }
     }
 
     pub fn network(&self) -> Network {
@@ -188,11 +213,37 @@ impl crate::BtcBackend for SelfCustodyBtc {
     fn height(&self) -> Result<u64, String> {
         SelfCustodyBtc::height(self)
     }
+    fn network(&self) -> Network {
+        self.network
+    }
     fn preimage_from_claim(&self, txid: &Txid) -> Option<Vec<u8>> {
         SelfCustodyBtc::preimage_from_claim(self, txid)
     }
     fn confirm(&self, txid: &Txid) -> Result<(), String> {
         SelfCustodyBtc::confirm(self, txid)
+    }
+    fn fee_rate_sat_vb(&self, target: u32) -> Result<f64, String> {
+        self.esplora.fee_rate_sat_vb(target)
+    }
+    fn find_htlc_spend_preimage(&self, utxo: &HtlcUtxo, _since_height: u64) -> Result<Option<Vec<u8>>, String> {
+        // Esplora exposes the spender directly — no block scan needed.
+        // `preimage_from_claim` returns None for refund spends (empty witness item).
+        match self.esplora.outspend(&utxo.outpoint.txid.to_string(), utxo.outpoint.vout)? {
+            Some(spend_txid) => {
+                let txid = Txid::from_str(&spend_txid).map_err(|e| e.to_string())?;
+                Ok(self.preimage_from_claim(&txid))
+            }
+            None => Ok(None),
+        }
+    }
+    fn block_header(&self, height: u64) -> Result<[u8; 80], String> {
+        self.esplora.block_header(height)
+    }
+    fn raw_tx(&self, txid: &Txid) -> Result<Vec<u8>, String> {
+        self.esplora.tx_raw(&txid.to_string())
+    }
+    fn txout_proof(&self, txid: &Txid) -> Result<Vec<u8>, String> {
+        self.esplora.merkleblock_proof(&txid.to_string())
     }
 }
 

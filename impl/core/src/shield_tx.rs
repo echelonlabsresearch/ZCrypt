@@ -98,6 +98,46 @@ pub fn txbind(chain_id: &[u8], tx: &ShieldTx) -> Hash {
     h(b"SHIELDTXBIND_", &[chain_id, &buf])
 }
 
+/// An 8-limb digest of the transaction's **auxiliary bound data**, added to the STARK's public
+/// inputs so the proof is bound to it. Prover and verifier compute it identically; if a relayer
+/// alters any of it, the verifier's digest changes, the Fiat-Shamir transcript diverges, and the
+/// proof fails. Each limb is masked to 28 bits (< the BabyBear field).
+///
+/// Two things are bound here:
+///   * `enc_notes` — so a relayer cannot strip or replace them, which would leave a valid
+///     on-chain coin undecryptable by its intended owner. The note count is bound too.
+///   * `envelope` — the plaintext parameters of an escrow-lock transaction that steer where the
+///     locked value ultimately goes (hashlock, timeout, refund key, Bitcoin payout key). See
+///     [`crate::htlc_shield::lock_envelope`]. These ride *alongside* the proof rather than
+///     inside it, so without this binding a mempool observer could copy a victim's proof
+///     verbatim, rewrite the envelope to redirect the payout to themselves, and win the
+///     nullifier race — stealing the funds. An empty `envelope` (every non-lock transaction)
+///     hashes exactly as before, so plain transfers are unaffected.
+pub fn aux_digest(enc_notes: &[Vec<u8>], envelope: &[u8]) -> [u64; 8] {
+    let mut buf = Vec::new();
+    buf.extend_from_slice(&(enc_notes.len() as u32).to_le_bytes());
+    for n in enc_notes {
+        buf.extend_from_slice(&(n.len() as u32).to_le_bytes());
+        buf.extend_from_slice(n);
+    }
+    if !envelope.is_empty() {
+        buf.extend_from_slice(&(envelope.len() as u32).to_le_bytes());
+        buf.extend_from_slice(envelope);
+    }
+    let d = h(b"ZC-ENCNOTES-BIND", &[&buf]);
+    let mut out = [0u64; 8];
+    for (i, o) in out.iter_mut().enumerate() {
+        let x = u32::from_le_bytes([d[4 * i], d[4 * i + 1], d[4 * i + 2], d[4 * i + 3]]);
+        *o = (x & 0x0FFF_FFFF) as u64; // 28 bits, safely canonical in BabyBear
+    }
+    out
+}
+
+/// The note-only digest — [`aux_digest`] with no envelope (plain transfers).
+pub fn enc_notes_digest(enc_notes: &[Vec<u8>]) -> [u64; 8] {
+    aux_digest(enc_notes, &[])
+}
+
 /// Build a shielded-pool spend: prove whole-tree membership + openings + nullifiers +
 /// conservation. `spends` (1..=`N_IN`) carry each input's coin + authentication path;
 /// `outputs` are `(value, blind, recipient_pk, asset)` for the `N_OUT` new coins.
@@ -107,6 +147,21 @@ pub fn build(
     outputs: &[OutCoin],
     fee: u64,
     enc_notes: Vec<Vec<u8>>,
+) -> Option<ShieldTx> {
+    build_bound(chain_id, spends, outputs, fee, enc_notes, &[])
+}
+
+/// [`build`], additionally binding `envelope` into the proof's public inputs. Escrow-lock
+/// transactions (burn-lock, swap-lock, BTC redeem) MUST use this and pass the envelope from
+/// [`crate::htlc_shield::lock_envelope`]: it is what stops a mempool observer from replaying
+/// the proof under rewritten lock parameters. See [`aux_digest`].
+pub fn build_bound(
+    chain_id: &[u8],
+    spends: &[Spend],
+    outputs: &[OutCoin],
+    fee: u64,
+    enc_notes: Vec<Vec<u8>>,
+    envelope: &[u8],
 ) -> Option<ShieldTx> {
     if spends.is_empty() || spends.len() > N_IN || outputs.len() != N_OUT || enc_notes.len() != N_OUT {
         return None;
@@ -126,8 +181,11 @@ pub fn build(
     // nullifiers — real coins first, then genuine dummy nullifiers for the unused slots
     // (so the input count is not revealed) — plus the anchor root every active input
     // proved membership against.
+    // Bind the encrypted notes AND the escrow envelope (if any) into the proof's public inputs,
+    // so neither can be stripped, replaced, or rewritten in the mempool.
+    let enc_digest = aux_digest(&enc_notes, envelope);
     let (output_commitments, nullifiers, root, proof) =
-        zcrypt_shield::prove(&witnesses, outputs, fee, chain_id)?;
+        zcrypt_shield::prove(&witnesses, outputs, fee, chain_id, &enc_digest)?;
 
     // DEFENSE-IN-DEPTH: the transparent VM (the human-readable spec) must agree with
     // the ZK circuit on THIS exact transaction before we broadcast it. We hold the
@@ -165,6 +223,14 @@ pub fn build(
 /// Merkle membership to real chain state, so the whole pool is the anonymity set.
 /// Returns the registry nullifier keys.
 pub fn verify(chain_id: &[u8], tx: &ShieldTx) -> Result<Vec<Hash>, String> {
+    verify_bound(chain_id, tx, &[])
+}
+
+/// [`verify`], additionally requiring the proof to be bound to `envelope`. Consensus
+/// reconstructs the envelope from the lock parameters carried in the transaction, so a relayer
+/// who rewrites any of them produces a digest the proof was not made against and the
+/// verification fails. See [`aux_digest`].
+pub fn verify_bound(chain_id: &[u8], tx: &ShieldTx, envelope: &[u8]) -> Result<Vec<Hash>, String> {
     if tx.inputs.len() != N_IN || tx.output_commitments.len() != N_OUT {
         return Err("shield-tx: wrong shape".to_string());
     }
@@ -187,8 +253,10 @@ pub fn verify(chain_id: &[u8], tx: &ShieldTx) -> Result<Vec<Hash>, String> {
         nf_keys.push(key);
     }
     let nullifiers: Vec<Commitment> = tx.inputs.iter().map(|i| i.nullifier).collect();
-    // chain_id is a public input of the STARK — a proof for chain A will not
-    // verify under chain B's domain tag.
+    // chain_id is a public input of the STARK — a proof for chain A will not verify under chain
+    // B's domain tag. The aux digest is likewise a public input, so a mempool relayer that
+    // strips/replaces `tx.enc_notes` (or rewrites an escrow `envelope`) breaks the proof.
+    let enc_digest = aux_digest(&tx.enc_notes, envelope);
     if !zcrypt_shield::verify(
         &tx.output_commitments,
         &nullifiers,
@@ -196,8 +264,15 @@ pub fn verify(chain_id: &[u8], tx: &ShieldTx) -> Result<Vec<Hash>, String> {
         &tx.root,
         &tx.proof,
         chain_id,
+        &enc_digest,
     ) {
-        return Err("shield-tx: value/membership proof invalid".to_string());
+        return Err(if envelope.is_empty() {
+            "shield-tx: value/membership/note-binding proof invalid".to_string()
+        } else {
+            // Most likely cause on a lock tx: the envelope was rewritten after the prover
+            // signed off on it (a mempool front-run), so the digest no longer matches.
+            "shield-tx: value/membership/note/envelope-binding proof invalid".to_string()
+        });
     }
     Ok(nf_keys)
 }
@@ -401,6 +476,21 @@ mod tests {
         // the tx carries NO coin commitment and NO ring indices — only nullifiers,
         // the output commitments, and the pool root the proof anchors on.
         assert_eq!(tx.inputs.len(), N_IN);
+    }
+
+    #[test]
+    fn tx_survives_wire_roundtrip_and_the_enc_digest_stays_intact() {
+        // The node receives the SERIALIZED tx; the enc_notes-binding digest must survive the
+        // codec, or every real (network) shield spend would be rejected.
+        let pool = pool_with(tc(100_000, 11, 0), tc(50_000, 22, 1));
+        let a = spend_coin(100_000, 11, 0, 0, &pool);
+        let b = spend_coin(50_000, 22, 1, 1, &pool);
+        let tx = build(CHAIN, &[a, b], &[oc(90_000, 33, 2), oc(50_000, 44, 3)], FEE, notes()).unwrap();
+        let tx2 = from_bytes(&to_bytes(&tx)).expect("deserialize");
+        assert_eq!(tx2.enc_notes, tx.enc_notes, "enc_notes round-trip byte-identical");
+        assert_eq!(enc_notes_digest(&tx2.enc_notes), enc_notes_digest(&tx.enc_notes), "digest stable");
+        let mut node = seeded_node(&pool);
+        node.submit_shield(CHAIN, &tx2).expect("the DESERIALIZED tx still verifies");
     }
 
     #[test]

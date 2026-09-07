@@ -9,9 +9,10 @@ bitcoin = { version = "0.32", features = ["rand-std"] }
 bip39 = "2"
 rand = { workspace = true }
 bitcoincore-rpc = "0.19"
-ureq = { version = "2", features = ["json"] }
+ureq = { version = "2", features = ["json", "socks-proxy"] }
 base64 = "0.22"
 hex = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
 ed25519-dalek = "2"
 sha2 = { workspace = true }

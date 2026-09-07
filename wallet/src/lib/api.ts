@@ -23,9 +23,30 @@ export const ZCRYPT_DECIMALS = 6;
 export const fmtAsset = (base: number, decimals = ZCRYPT_DECIMALS): string =>
   (base / Math.pow(10, decimals)).toLocaleString(undefined, { maximumFractionDigits: decimals });
 
-/** Parse a decimal string into `base` units for an asset with `decimals` places. */
-export const toBaseAsset = (amount: string, decimals = ZCRYPT_DECIMALS): number =>
-  Math.round(parseFloat(amount) * Math.pow(10, decimals));
+/**
+ * Parse a decimal amount string into integer base units without IEEE float.
+ * Accepts "1", "1.5", ".5", "0.00000001". Rejects scientific notation and empty.
+ */
+export function toBaseAsset(amount: string, decimals = ZCRYPT_DECIMALS): number {
+  const s = amount.trim();
+  if (!s || !/^\d*\.?\d+$/.test(s)) {
+    throw new Error(`invalid amount: ${amount}`);
+  }
+  const neg = s.startsWith("-");
+  if (neg) throw new Error("amount must be non-negative");
+  const [wholePart, fracPart = ""] = s.split(".");
+  if (fracPart.length > decimals) {
+    throw new Error(`too many decimal places (max ${decimals})`);
+  }
+  const whole = wholePart === "" ? "0" : wholePart;
+  const frac = fracPart.padEnd(decimals, "0");
+  // BigInt for intermediate so we don't lose precision near 2^53.
+  const base = BigInt(whole) * 10n ** BigInt(decimals) + BigInt(frac || "0");
+  if (base > BigInt(Number.MAX_SAFE_INTEGER)) {
+    throw new Error("amount too large for safe integer transport");
+  }
+  return Number(base);
+}
 
 // ZCRYPT-specific convenience wrappers (unchanged call sites keep working).
 export const fmt = (base: number): string => fmtAsset(base, ZCRYPT_DECIMALS);

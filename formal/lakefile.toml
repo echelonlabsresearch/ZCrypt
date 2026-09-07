@@ -1,0 +1,5 @@
+name = "zcrypt-formal"
+defaultTargets = ["Zcrypt"]
+
+[[lean_lib]]
+name = "Zcrypt"

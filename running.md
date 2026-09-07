@@ -65,6 +65,10 @@ docker compose down -v
 
 ## Join the chain as a validator
 
+> For the plug-and-play path (one-command validator + wallet bonding + how to get the
+> consensus key), see [`chain/README-validator.md`](chain/README-validator.md). This
+> section is the deeper reference on the underlying BOND/UNBOND/DELEGATE mechanics.
+
 Validators **bond ZCRYPT (min 10,000)** and, in return, produce blocks and earn
 rewards. Bonding and unbonding are **fully dynamic**: a `BOND` transaction adds your
 node to CometBFT's block-producing validator set from the next block, and an `UNBOND`

@@ -88,14 +88,14 @@ Echelon Labs LLC\\[4pt]
 \twocolumn
 
 \begin{abstract}
-We present ZCrypt, a proof-of-stake ledger in which every unit of value lives inside a single shielded pool. There are no transparent transfers: the one value-moving transaction publishes only nullifiers, fresh coin commitments, encrypted notes, and a zero-knowledge proof. The proof is a STARK built entirely from hash functions (no elliptic-curve pairings, no trusted setup), so the soundness of the money itself rests on assumptions a quantum computer does not break. Each spend proves membership of the coin in the global commitment tree by an in-circuit Merkle path, making the anonymity set the entire history of the pool rather than a sampled decoy ring, and one-input spends are padded with value-zero phantom coins so that transaction arity is invisible. Spending authority is knowledge of a hash preimage proven inside the circuit; the protocol contains no signature scheme on the value layer at all. Notes to recipients are sealed with ML-KEM-768, a lattice key-encapsulation standard, so amounts harvested today cannot be read by a future quantum adversary. Every private rule enforced by the circuit has a public twin: a seven-instruction bytecode program, differentially tested against the circuit, that anyone can read as the authoritative specification of what a valid transfer is. Consensus is Byzantine fault tolerant with instant finality; validators bond stake by provably burning shielded coins, and issuance follows a fixed 21-million schedule with halvings and a height-vested foundation allocation, audited against a state root that commits to every ledger. The pool carries arbitrary registered assets whose type identifier is hidden inside the commitment; issuance of each asset is authorized by an $M$-of-$N$ threshold of ML-DSA lattice signatures whose key set can be rotated on chain. A hash-time-locked escrow mechanism, sharing plain SHA-256 with Bitcoin script, lets bitcoin enter and leave the pool as a shielded asset through atomic swaps, and the same escrow lets any two parties atomically exchange one shielded asset for another without leaving the pool. The fee for moving value is fixed, paid in the native coin, and burned.
+We present ZCrypt, a proof-of-stake ledger in which every unit of value lives inside a single shielded pool: there are no transparent transfers. The one value-moving transaction publishes only nullifiers, fresh coin commitments, encrypted notes, and a zero-knowledge proof. The proof is a STARK built entirely from hash functions, with no trusted setup, so the soundness of the money rests on assumptions a quantum computer does not break. Each spend proves membership in the global commitment tree by an in-circuit Merkle path, making the anonymity set the entire pool rather than a sampled decoy ring, and one-input spends are padded with value-zero phantom coins so that arity is invisible. Spending authority is a hash preimage proven inside the circuit (the value layer contains no signatures), and notes to recipients are sealed with ML-KEM-768 against harvest-now-decrypt-later attacks. Every private rule enforced by the circuit has a public twin: a seven-instruction bytecode program, differentially tested against the circuit, that serves as the authoritative specification of a valid transfer. Consensus is Byzantine fault tolerant with instant finality; issuance follows a fixed 21-million schedule audited against a committed state root; the pool carries arbitrary registered assets with hidden type identifiers, issued under rotatable $M$-of-$N$ ML-DSA threshold authorities; and bitcoin enters and leaves the pool through trustless SPV-verified atomic swaps. The fee for moving value is fixed, paid in the native coin, and burned.
 \end{abstract}
 
 \section{Introduction}
 
-Public blockchains solved double-spending by publishing everything. The cost of that choice compounds: every payment on a transparent ledger is a permanent, globally replicated record of who paid whom, how much, and when, available to any adversary with a block explorer. The secondary cost is fungibility. Coins with visible histories acquire reputations; exchanges and processors refuse coins ``tainted'' by prior owners the current holder never met. Cash has neither problem, because a banknote carries no ledger.
+Public blockchains solved double-spending by publishing everything~\cite{nakamoto2008bitcoin}. The cost of that choice compounds: every payment on a transparent ledger is a permanent, globally replicated record of who paid whom, how much, and when, available to any adversary with a block explorer. The secondary cost is fungibility. Coins with visible histories acquire reputations; exchanges and processors refuse coins ``tainted'' by prior owners the current holder never met. Cash has neither problem, because a banknote carries no ledger.
 
-Privacy systems built since then each concede something structural. Decoy-based designs hide a spend among a small sampled ring, and the effective anonymity degrades under intersection analysis as rings overlap. Shielded-pool designs with pairing-based SNARKs achieve strong hiding but inherit a trusted setup and discrete-logarithm assumptions that quantum computers are expected to break: an uncomfortable foundation for money intended to outlive its designers' hardware assumptions. And nearly all of them keep a transparent ledger alongside the private one, so most value never enters the shielded pool and the pool's anonymity suffers for it.
+Privacy systems built since then each concede something structural. Decoy-based designs~\cite{monero2013} hide a spend among a small sampled ring, and the effective anonymity degrades under intersection analysis as rings overlap. Shielded-pool designs~\cite{hopwood2016zcash} achieve strong hiding with elliptic-curve SNARKs; later proof systems removed the original trusted setup~\cite{halo}, and multi-asset shielded pools with in-pool exchange now exist~\cite{penumbra,namada}, but all of these rest on discrete-logarithm assumptions that quantum computers are expected to break: an uncomfortable foundation for money intended to outlive its designers' hardware assumptions. And nearly all of them keep a transparent ledger alongside the private one, so most value never enters the shielded pool and the pool's anonymity suffers for it.
 
 ZCrypt is built from four commitments:
 
@@ -121,7 +121,7 @@ The network is a proof-of-stake replicated state machine with instant finality (
 \item the staking ledger, the asset registry, and an escrow book for cross-chain swaps.
 \end{itemize}
 
-A hash of all five roots is the application state root agreed by consensus at every block.
+A hash of these roots, together with the Bitcoin SPV header-chain digest and the immature-mint queue introduced with the bridge (\S\ref{sec:bridge}), is the application state root agreed by consensus at every block: seven components in all.
 
 Wallets do the heavy lifting. To pay, a wallet selects its own coins, builds a zero-knowledge proof locally, and broadcasts a transaction containing only the proof and its public inputs. Validators verify the proof, check the nullifiers are fresh, append the new commitments, and never learn amounts, asset types, or participants. To receive, a wallet trial-decrypts the encrypted notes attached to on-chain transactions; a note that authenticates under the wallet's decapsulation key is a payment to it.
 
@@ -137,7 +137,7 @@ All in-circuit objects (commitments, nullifiers, public keys, Merkle nodes) are 
 
 An algebraic hash matters because the same function must be cheap both natively and inside the proof: one Poseidon2 permutation costs 298 trace columns in the circuit, versus tens of thousands for a bit-oriented hash like SHA-256. Preimage resistance of Poseidon2 is what makes spend authority (\S\ref{sec:nosig}) and the burn address (\S\ref{sec:gas}) meaningful; against a quantum adversary Grover's algorithm gives at most a square-root speedup, which the parameter sizes absorb.
 
-Outside the circuit, byte-level hashing (state roots, transaction binding, key derivation tags, escrow identifiers) uses SHA3-256 with an 8-byte ASCII domain tag and length-prefixed fields, and the FRI commitment layer inside the proof system uses Keccak. Nothing anywhere in the value layer depends on the hardness of discrete logarithms.
+Outside the circuit, byte-level hashing (state roots, transaction binding, key derivation tags, escrow identifiers) uses SHA3-256~\cite{fips202} with an 8-byte ASCII domain tag and length-prefixed fields, and the FRI commitment layer inside the proof system uses Keccak. Nothing anywhere in the value layer depends on the hardness of discrete logarithms.
 
 \subsection{The Proof System: a Hiding STARK}
 \label{sec:stark}
@@ -146,12 +146,12 @@ Transfer proofs are STARKs~\cite{stark} in the AIR/FRI paradigm~\cite{fri}, prod
 
 The standard parameterization uses 56 FRI queries plus 16 bits of proof-of-work grinding on both the commitment and query phases, for a conjectured soundness level of 128 bits; a high-security build raises this to 112 queries and 20-bit grinding ($\approx 244$ bits). The prover asserts at configuration time that conjectured soundness is at least 100 bits.
 
-Zero-knowledge is achieved in the polynomial commitment layer: the Merkle commitments over trace and FRI codewords are \emph{hiding} (each leaf is masked with randomness drawn from a ChaCha20-based CSPRNG seeded from the operating system), and four random codewords blind the quotient. Two proofs of the same statement are byte-wise independent. Crucially, there is \emph{no trusted setup}: the only preprocessing is a deterministic public matrix of selector columns that prover and verifier each derive independently from the circuit description.
+Zero-knowledge is achieved in the polynomial commitment layer: the Merkle commitments over trace and FRI codewords are \emph{hiding} (each leaf is masked with randomness drawn from a ChaCha20-based CSPRNG seeded from the operating system), and four random codewords blind the quotient. Two proofs of the same statement are byte-wise independent. This hiding layer is a deliberate departure from a stock transparent STARK, whose Merkle openings expose raw trace values: here every opening the verifier sees is masked and the low-degree test is blinded, so the privacy claims of \S\ref{sec:privacy} rest on this layer, and a formal simulation-based zero-knowledge analysis of it is the principal piece of outstanding theory work. Crucially, there is \emph{no trusted setup}: the only preprocessing is a deterministic public matrix of selector columns that prover and verifier each derive independently from the circuit description.
 
 \subsection{Note Encryption: ML-KEM-768}
 \label{sec:kem}
 
-A payment must convey the coin's opening (value, blinding factor, asset identifier) to the recipient and no one else. Each output slot of a transaction carries an encrypted \emph{note} produced as follows: the sender encapsulates against the recipient's ML-KEM-768~\cite{fips203} public key; the shared secret is expanded with HKDF-SHA256, with the KEM ciphertext and the recipient's encapsulation key bound into the derivation transcript; the resulting key encrypts the note with ChaCha20-Poly1305. The plaintext is 48 bytes (value, blind, asset identifier) padded to a fixed 256 bytes, so every note ciphertext on chain has identical size regardless of content.
+A payment must convey the coin's opening (value, blinding factor, asset identifier) to the recipient and no one else. Each output slot of a transaction carries an encrypted \emph{note} produced as follows: the sender encapsulates against the recipient's ML-KEM-768~\cite{fips203} public key; the shared secret is expanded with HKDF-SHA256~\cite{rfc5869}, with the KEM ciphertext and the recipient's encapsulation key bound into the derivation transcript; the resulting key encrypts the note with ChaCha20-Poly1305~\cite{rfc8439}. The plaintext is 48 bytes (value, blind, asset identifier) padded to a fixed 256 bytes, so every note ciphertext on chain has identical size regardless of content.
 
 Recipients scan by trial decryption: a note either authenticates under the wallet's decapsulation key or it is noise. Because ML-KEM is a lattice scheme standardized for post-quantum confidentiality, note ciphertexts harvested from the chain today are not retroactively readable by a future quantum computer, a property classical ECDH-based note encryption cannot offer.
 
@@ -179,12 +179,12 @@ Values are capped at $2^{52}-1$ atomic units per coin; with six decimal places t
 
 \subsection{Key Hierarchy}
 
-An account is derived from a 24-word BIP-39 mnemonic (256-bit entropy). The mnemonic seed is domain-hashed into: the spend secret $s$ (eight field limbs); and a deterministic ML-KEM-768 keypair for note encryption. Both are recoverable from the phrase alone. The spend public key is $\mathit{pk}=\mathsf{P2}(s)$, a hash image rather than a group element.
+An account is derived from a 24-word BIP-39 mnemonic~\cite{bip39} (256-bit entropy). The mnemonic seed is domain-hashed into: the spend secret $s$ (eight field limbs); and a deterministic ML-KEM-768 keypair for note encryption. Both are recoverable from the phrase alone. The spend public key is $\mathit{pk}=\mathsf{P2}(s)$, a hash image rather than a group element.
 
 \subsection{Addresses and Payment Instruments}
 \label{sec:addresses}
 
-An address serializes a kind tag, the 64-byte spend public key, and the 1184-byte ML-KEM encapsulation key, about 1.2\,kB in total, encoded in bech32m with human-readable part \texttt{zc}. (The bech32m implementation lifts the 1023-character length limit; the checksum's formal error-detection guarantee applies within it, with $1-2^{-30}$ detection beyond.) Three payment instruments share this machinery:
+An address serializes a kind tag, the 64-byte spend public key, and the 1184-byte ML-KEM encapsulation key, about 1.2\,kB in total, encoded in bech32m~\cite{bip350} with human-readable part \texttt{zc}. (The bech32m implementation lifts the 1023-character length limit; the checksum's formal error-detection guarantee applies within it, with $1-2^{-30}$ detection beyond.) Three payment instruments share this machinery:
 
 \begin{itemize}
 \item \textbf{Normal address.} The account's primary address. Incoming payments carry a real encrypted note on chain and are discovered automatically by scanning. Recoverable from the mnemonic.
@@ -200,6 +200,8 @@ An address serializes a kind tag, the 64-byte spend public key, and the 1184-byt
 \label{sec:nosig}
 
 The value layer contains no signature scheme. Authorization to spend a coin is knowledge of the spend secret $s$, and that knowledge is proven inside the circuit: the spent commitment is constrained to open to $\mathit{pk}=\mathsf{P2}(s)$ for the $s$ the prover supplies, and the published nullifier is constrained to be derived from the same $s$. Transaction malleability is closed off separately: every ciphertext, commitment, fee, and the proof itself are bound into a transaction-binding hash recorded with each nullifier, so a transaction cannot be spliced after broadcast. Removing signatures removes the largest classical attack surface: there is no ECDSA or EdDSA anywhere between a user's funds and an adversary.
+
+One consequence deserves stating plainly: there is no in-protocol multi-signature custody of user funds. Because authority is knowledge of $s$, threshold custody means splitting $s$ (or the mnemonic that derives it) by secret sharing outside the protocol and reconstructing it to spend. Issuance authorities are threshold-governed on chain (\S\ref{sec:mintauth}); individual coins are not, and institutional custody of pool coins is today an off-chain key-management problem.
 
 \section{The Shielded Transfer}
 \label{sec:transfer}
@@ -221,7 +223,7 @@ Hidden: amounts, asset type, sender, recipient, which coins were spent, and even
 
 \subsection{The Proven Statement}
 
-The proof attests, with respect to 42 public field elements (output commitments, fee, nullifiers, anchor root, and a chain-domain tag), that the prover knows openings $(v_i, b_i, s_i, a)$ for each input and $(v'_j, b'_j, \mathit{pk}'_j, a)$ for each output such that:
+The proof attests, with respect to 50 public field elements (output commitments, fee, nullifiers, anchor root, a chain-domain tag, and an eight-limb digest binding the transaction's encrypted notes into the proof), that the prover knows openings $(v_i, b_i, s_i, a)$ for each input and $(v'_j, b'_j, \mathit{pk}'_j, a)$ for each output such that:
 
 \begin{enumerate}
 \item \textbf{Membership.} Each active input's commitment is a leaf of the depth-32 commitment tree with the public anchor root, via an in-circuit Merkle path of Poseidon2 compressions. The path proves both existence and position without revealing either.
@@ -251,7 +253,7 @@ Second, when a tree does fill, the ledger rolls over to a fresh tree of the same
 
 \subsection{The Nullifier Set}
 
-Spent-coin state is a sparse Merkle tree of height 256 keyed by a hash of the nullifier (limbs reduced to canonical field form first, so no alternative encoding of the same nullifier exists). The leaf \emph{value} is the spending transaction's binding hash, which makes conflicting spends of one coin distinguishable in the tree itself. Insertion is first-spend-wins: a transaction is rejected if any of its nullifiers is present. The tree supports compact inclusion \emph{and non-inclusion} proofs, so a wallet can obtain an authenticated answer to ``is this coin spent?'' against the committed root, without trusting the node it asks (see \S\ref{sec:wallet} for how it asks without revealing which coin it cares about).
+Spent-coin state is a sparse Merkle tree of height 256 keyed by a hash of the nullifier (limbs reduced to canonical field form first, so no alternative encoding of the same nullifier exists). The leaf \emph{value} is the spending transaction's binding hash, which makes conflicting spends of one coin distinguishable in the tree itself. Insertion is first-spend-wins: a transaction is rejected if any of its nullifiers is present. The tree supports compact inclusion \emph{and non-inclusion} proofs, so a wallet can obtain an authenticated answer to ``is this coin spent?'' by verifying a proof against the registry root rather than trusting a bare claim (see \S\ref{sec:wallet} for how it asks without revealing which coin it cares about, and the residual root-trust caveat).
 
 \subsection{Arity Hiding}
 \label{sec:arity}
@@ -266,6 +268,8 @@ Every user transfer pays a fixed fee of 0.01 ZCRYPT, and the fee is \emph{burned
 C_{\mathrm{gas}} = \mathsf{P2}(0.01\,\mathrm{ZCRYPT},\, b_{\mathrm{gas}},\, \mathit{pk}_{\mathrm{burn}},\, 0),
 \]
 with the blind $b_{\mathrm{gas}}$ revealed in the transaction so the burn is publicly checkable. The burn key $\mathit{pk}_{\mathrm{burn}}$ is a fixed constant with no known Poseidon2 preimage: coins committed to it are provably unspendable and permanently out of circulation. ZCRYPT is thus the universal gas asset (transferring any asset consumes native coin), while the transferred asset itself is never taxed and never revealed. The two bundled proofs must not share a coin, and both verify before either applies.
+
+The 0.01 constant is a consensus parameter, changeable only by coordinated upgrade, and it doubles as the spam price: block space is bounded, every occupied slot burns the sender's own ZCRYPT, and a flooder must also bear the full proving cost per transaction, so sustained flooding amounts to a standing donation to every other holder.
 
 \section{Transparent Rules: the Auditability VM}
 \label{sec:vm}
@@ -284,7 +288,7 @@ Transparent transactions (staking, claims, asset registration, authority rotatio
 
 \subsection{Circuit Engineering}
 
-The transfer circuit exists in two differentially-tested forms proving the identical statement with identical public inputs: a \emph{wide} reference trace (32 rows $\times$ 14\,904 columns, all 48 Poseidon2 permutations side by side) and the production \emph{tall} trace (64 rows $\times$ 2\,643 columns plus 6 preprocessed selector columns), which runs the 40 Merkle-path compressions one per row instead of side by side. STARK proof size grows linearly with trace width but only logarithmically with height, so the tall layout yields substantially smaller proofs for the same statement; cross-verification between the two forms, and against the VM, is part of the test suite.
+The transfer circuit exists in two differentially-tested forms proving the identical statement with identical public inputs: a \emph{wide} reference trace (32 rows $\times$ 22\,272 columns, all 72 Poseidon2 permutations side by side) and the production \emph{tall} trace (128 rows $\times$ 2\,643 columns plus 6 preprocessed selector columns), which runs the 64 Merkle-path compressions one per row instead of side by side. STARK proof size grows linearly with trace width but only logarithmically with height, so the tall layout yields substantially smaller proofs for the same statement; cross-verification between the two forms, and against the VM, is part of the test suite. (The dimensions above are the depth-32 reference configuration of \S\ref{sec:capacity}; the permutation and compression counts scale with tree depth, while the tall column count does not.)
 
 \subsection{Measured Performance}
 \label{sec:perf}
@@ -295,17 +299,19 @@ The following medians were measured on a consumer laptop, an Apple M3 Max (14 co
 \small
 \begin{tabular}{lrr}
  & \textbf{2-in/2-out} & \textbf{1-in/2-out} \\
-Prove (build the tx) & 127.2\,ms & 106.0\,ms \\
-Verify (network check) & 10.9\,ms & 11.0\,ms \\
-Transparent VM audit & 80.1\,$\mu$s & 46.2\,$\mu$s \\
+Prove (build the tx) & 107.4\,ms & 109.3\,ms \\
+Verify (network check) & 10.4\,ms & 10.4\,ms \\
+Transparent VM audit & 73.8\,$\mu$s & 46.4\,$\mu$s \\
 Proof size & 1015\,KB & 1015\,KB \\
-Verify throughput / core & $\sim$92/s & $\sim$91/s \\
+Verify throughput / core & $\sim$96/s & $\sim$96/s \\
 \end{tabular}
 \end{center}
 
-The identical proof sizes are the arity hiding of \S\ref{sec:arity} made visible: a single-input spend is byte-for-byte the same shape as a two-input spend. A full user transfer bundles two proofs, the gas note and the main transaction (\S\ref{sec:gas}), so a wallet builds a complete private payment in about 0.23\,s, and a validator core admits it in about 22\,ms of proof checking: roughly 45 complete transfers per second per core, or about 630 per second across this one laptop's cores, before consensus overhead.
+The identical proof sizes are the arity hiding of \S\ref{sec:arity} made visible: a single-input spend is byte-for-byte the same shape as a two-input spend. A full user transfer bundles two proofs, the gas note and the main transaction (\S\ref{sec:gas}), so a wallet builds a complete private payment in about 0.22\,s, and a validator core admits it in about 21\,ms of proof checking: roughly 48 complete transfers per second per core, or about 670 per second across this one laptop's cores, before consensus overhead.
 
-Set that against the point of sale. A contactless card tap budgets about half a second for the card-terminal exchange and typically completes online authorization in one to two seconds; an inserted chip card takes several. A ZCrypt payment (prove in about 0.23\,s, broadcast, and reach BFT finality at the reference deployment's 400\,ms block interval) lands in well under a second, with no settlement to follow: the committed block \emph{is} settlement, where a card authorization is only the first step of a clearing process that runs days. In throughput terms, global card networks average on the order of several thousand authorizations per second; at 630 verified transfers per second per laptop-class chip, matching that raw cryptographic load takes about a dozen such machines. Full privacy and post-quantum soundness turn out to cost less latency than the payment rails in every wallet today.
+Set that against the point of sale. A contactless card tap budgets about half a second for the card-terminal exchange and typically completes online authorization in one to two seconds; an inserted chip card takes several. A ZCrypt payment (prove in about 0.22\,s, broadcast, and reach BFT finality at the reference deployment's one-second block interval) lands in around a second, with no settlement to follow: the committed block \emph{is} settlement, where a card authorization is only the first step of a clearing process that runs days. In throughput terms, global card networks average on the order of several thousand authorizations per second; at about 670 verified transfers per second per laptop-class chip, matching that raw cryptographic load takes about a dozen such machines. Full privacy and post-quantum soundness turn out to cost less latency than the payment rails in every wallet today.
+
+These figures measure computation, and computation is not the binding resource at scale: bandwidth is. A complete transfer carries roughly 2\,MB of proof data, so a network sustaining even tens of transfers per second moves proofs at hundreds of megabytes per minute, and the CPU-bound throughput above will not be reached in practice. Proofs are checked at admission and at finalization but are not part of the committed state (the state root commits to trees and ledgers, not to proof bytes), so deep history can be pruned without weakening it; propagation cost, however, is irreducible in the present design, and the recursive aggregation sketched in \S\ref{sec:capacity} is the route to compressing it. The card comparison above is therefore a claim about latency and per-payment cryptographic cost, not a claim that a laptop replaces a card network.
 
 \section{Consensus and State}
 \label{sec:consensus}
@@ -320,13 +326,23 @@ All value flows through the shielded transfer; the remaining transaction types a
 
 Every block commits an application hash
 \[
-H\bigl(\mathit{root}_{\mathrm{nf}},\ \mathit{root}_{\mathrm{tree}},\ \mathit{root}_{\mathrm{stake}},\ \mathit{root}_{\mathrm{assets}},\ \mathit{root}_{\mathrm{escrow}}\bigr)
+\begin{aligned}
+H\bigl(&\mathit{root}_{\mathrm{nf}},\ \mathit{root}_{\mathrm{tree}},\ \mathit{root}_{\mathrm{stake}},\ \mathit{root}_{\mathrm{assets}},\\
+&\mathit{root}_{\mathrm{escrow}},\ \mathit{root}_{\mathrm{btc}},\ \mathit{root}_{\mathrm{immature}}\bigr)
+\end{aligned}
 \]
-over the nullifier set, the commitment tree, the complete staking ledger (stakes, delegations, rewards, unbonding queue, tombstones, validator keys), the asset registry (every ticker's supply counter and cap), and the escrow book. Total issuance is part of the staking digest, so the claim ``supply equals the emission schedule'' is checkable by anyone against a single committed hash. Full node state serializes to a compact snapshot written atomically at every commit; a node restarted from its snapshot reproduces the committed state root exactly, and a corrupt snapshot halts the node rather than silently rejoining from genesis.
+over the nullifier set, the commitment tree, the complete staking ledger (stakes, delegations, rewards, unbonding queue, tombstones, validator keys), the asset registry (every ticker's supply counter and cap), the escrow book, the Bitcoin SPV header chain (\S\ref{sec:bridge}), and the queue of immature bridge mints. Total issuance is part of the staking digest, so the claim ``supply equals the emission schedule'' is checkable by anyone against a single committed hash. Full node state serializes to a compact snapshot written atomically at every commit; a node restarted from its snapshot reproduces the committed state root exactly, and a corrupt snapshot halts the node rather than silently rejoining from genesis.
 
 \subsection{Dynamic Validator Set}
 
-The validator set is not configured; it is a pure function of the staking ledger. Each block, the application diffs the ledger's validator set before and after transaction application and pushes the resulting power changes to the consensus engine: a successful bond adds a block producer at a voting power of one per whole staked coin, an unbond or slash removes one, and delegation changes reweight power, all deterministically from state that is itself under the state root.
+The validator set is not configured; it is a pure function of the staking ledger, with one disclosed bootstrap exception described below. Each block, the application diffs the ledger's validator set before and after transaction application and pushes the resulting power changes to the consensus engine: a successful bond adds a block producer at a voting power of one per whole staked coin, an unbond or slash removes one, and delegation changes reweight power, all deterministically from state that is itself under the state root.
+
+\subsection{Bootstrap Liveness Guarantor}
+\label{sec:sentinel}
+
+A Byzantine fault-tolerant chain cannot finalize blocks until an honest supermajority of stake exists, which a network has not yet acquired at genesis. To bridge that gap, the genesis \texttt{app\_state} may designate one foundation validator as a \emph{sentinel}: for as long as it is active, the application holds its voting power at $\max(\mathrm{floor},\,2\cdot\mathrm{others}+1)$, just above two-thirds of the total, so the chain keeps producing final blocks even before an independent validator set exists. This is a deliberate, on-chain-visible centralization of the bootstrap phase: while the sentinel is active, that one validator's power is \emph{not} a function of its staked coins, and the network is not yet decentralized. Both the sentinel's identity and its inflated power are committed in the state root, so the arrangement is public rather than hidden.
+
+It is designed to dissolve rather than persist. The sentinel \emph{auto-retires} to its own ordinary staked power once external stake crosses a genesis-set threshold, spread across at least four distinct independent validators and sustained for a dwell window of blocks (so a transient stake spike by a single well-capitalized party cannot trip it), and it can additionally be retired early by a transaction signed by its own consensus key. After retirement the validator set is purely stake-weighted, with no privileged node. The mechanism is a temporary crutch with a committed, automatic end condition, not a standing authority; operators sizing a deployment choose the retirement threshold as a launch parameter.
 
 \section{Monetary System and Staking}
 \label{sec:econ}
@@ -339,11 +355,11 @@ The fixed 0.01 ZCRYPT gas burn (\S\ref{sec:gas}) and slashing burns are permanen
 
 \subsection{Bonding as Provable Burning}
 
-A validator joins by \emph{spending shielded coins into the burn key}. The bond transaction carries an ed25519-signed header (the consensus key that will sign blocks, the stake amount, and a reward address) together with a shielded spend whose first output is required to be the revealed-value commitment of exactly the stake, bound to $\mathit{pk}_{\mathrm{burn}}$. The stake thus provably leaves the pool. The amount is public, as a bond must be, but its history is not: the bonded coins are anonymous pool coins like any others. Minimum self-bond is 10{,}000 ZCRYPT. Delegation works identically, at any positive amount, to any bonded validator.
+A validator joins by \emph{spending shielded coins into the burn key}. The bond transaction carries an ed25519-signed header (the consensus key that will sign blocks, the stake amount, a reward address, the validator's commission, and a per-key monotonic nonce, all signed together with the chain identifier so the authorization is single-use and not replayable across chains or after a re-bond) together with a shielded spend whose first output is required to be the revealed-value commitment of exactly the stake, bound to $\mathit{pk}_{\mathrm{burn}}$. The stake thus provably leaves the pool. The amount is public, as a bond must be, but its history is not: the bonded coins are anonymous pool coins like any others. Minimum self-bond is 10{,}000 ZCRYPT. Delegation works identically, at any positive amount, to any bonded validator.
 
 \subsection{Rewards, Unbonding, Slashing}
 
-Epoch rewards are split by weight $w_v = (\mathrm{stake}_v + \mathrm{delegated}_v)\times \mathrm{blocks\ signed}_v$; an absent validator earns nothing regardless of stake. Validators take a 10\% commission on the delegated share; the rest is divided pro rata. Rewards accrue to a ledger keyed by reward address and are \emph{claimed} by a gasless transaction that mints coinbase coins directly into the shielded pool, at commitments deterministically derivable by the claimant's wallet, so even freshly-minted rewards enter circulation as ordinary anonymous coins.
+Epoch rewards are split by weight $w_v = (\mathrm{stake}_v + \mathrm{delegated}_v)\times \mathrm{blocks\ signed}_v$; an absent validator earns nothing regardless of stake. Each validator sets its own commission on the delegated share, chosen at bond time in basis points (defaulting to 10\%), so validators compete on it; the rest is divided pro rata. Rewards accrue to a ledger keyed by reward address and are \emph{claimed} by a gasless transaction that mints coinbase coins directly into the shielded pool, at commitments deterministically derivable by the claimant's wallet, so even freshly-minted rewards enter circulation as ordinary anonymous coins.
 
 Unbonding removes the validator (and cascades its delegations) into a queue released after 10 days of block time; returned stake reappears as claimable balance and re-enters the pool through the same claim path. Equivocation or light-client-attack evidence from the consensus engine burns 5\% of the offender's stake and all its delegations, force-unbonds the remainder through the queue, and permanently tombstones the validator's identity. Delegators share slash risk and cannot front-run it: undelegation passes through the same 10-day queue.
 
@@ -352,7 +368,7 @@ Unbonding removes the validator (and cascades its delegations) into a queue rele
 
 The pool is asset-generic. A 64-bit asset identifier lives \emph{inside} each commitment; the circuit enforces that a transaction is single-asset and conserves value, but the identifier never appears on the wire. An observer of a transfer cannot tell ZCRYPT from any other asset: transfers of every asset share one anonymity set.
 
-Assets are created in a first-come registry: a ticker (2--10 alphanumerics, case-insensitive) maps to an asset identifier by hash, with a declared decimal precision and an \emph{immutable} maximum supply. Minting happens only through the escrow mechanism of \S\ref{sec:bridge}, is authorized by the asset's registered mint authority (\S\ref{sec:mintauth}), and is consensus-capped at the registered maximum supply; the per-asset supply counter is part of the state root. Redemption burns tracked supply. The native asset is identifier 0 and is never registered. The zBTC ticker is special-cased at the registration chokepoint: consensus rejects any registration of it that does not carry exactly eight decimals and the 21-million cap, so the bridge asset's parameters are protocol-pinned rather than registrant-chosen.
+Assets are created in a first-come registry: a ticker (2--10 alphanumerics, case-insensitive) maps to an asset identifier by hash, with a declared decimal precision and an \emph{immutable} maximum supply. Minting happens only through the escrow mechanism of \S\ref{sec:bridge}, authorized either by the asset's registered threshold authority (\S\ref{sec:mintauth}) or, for zBTC, by an in-consensus Bitcoin SPV proof (\S\ref{sec:bridge}), and is consensus-capped at the registered maximum supply; the per-asset supply counter is part of the state root. Redemption burns tracked supply. The native asset is identifier 0 and is never registered. The zBTC ticker is special-cased at the registration chokepoint: consensus rejects any registration of it that does not carry exactly eight decimals, the 21-million cap, and the SPV mint form of \S\ref{sec:bridge}, so both the bridge asset's parameters and its trustless issuance are protocol-pinned rather than registrant-chosen.
 
 \subsection{Threshold Mint Authority}
 \label{sec:mintauth}
@@ -361,24 +377,42 @@ An asset's mint authority is an $M$-of-$N$ threshold of ML-DSA-65 keys~\cite{fip
 
 Authorities rotate on chain. Each asset carries a monotonic \emph{authority epoch}, folded into the state root. A rotation transaction presents the \emph{current} key set with $M$ signatures over (asset, current epoch, new commitment); on acceptance the registry swaps the commitment and increments the epoch. Epoch binding makes every rotation signature single-use: even a rotation back to a previous key set cannot replay an old authorization. Signers never reveal secrets on chain in either operation; only public keys and signatures appear.
 
-A single user issuing a personal asset simply uses a 1-of-1 authority derived from their wallet seed; the bridge treasury for zBTC uses a genuine multi-party set (2-of-3 in the reference deployment). The machinery is the same at every scale.
+A single user issuing a personal asset simply uses a 1-of-1 authority derived from their wallet seed, while a consortium asset uses a genuine multi-party set; the machinery is the same at every scale. The bridge asset zBTC is the deliberate exception: it carries no threshold authority at all, its issuance gated instead by the in-consensus Bitcoin SPV proof of \S\ref{sec:bridge}, so no set of signers can mint it.
 
 Because gas is always native (\S\ref{sec:gas}), asset transfers carry a zero fee field in the main proof and burn ZCRYPT in the bundled gas proof; the one exception is the bridge redemption path, where the in-transaction fee is paid in the asset being redeemed.
 
 \section{Bitcoin Interoperability}
 \label{sec:bridge}
 
-Bitcoin enters the pool as \textbf{zBTC}, a registered shielded asset with eight decimals and a 21M cap, minted and burned 1:1 against BTC through atomic swaps. The construction couples two hash-time-locked contracts with the \emph{same} SHA-256 hashlock, deliberately untagged, so one preimage satisfies both Bitcoin script's \texttt{OP\_SHA256} and ZCrypt's escrow check.
+Bitcoin enters the pool as \textbf{zBTC}, a registered shielded asset with eight decimals and a 21M cap, minted and burned 1:1 against BTC. Unlike federated or custodial wrapped bitcoin, zBTC is minted \emph{trustlessly}: no treasury, signer set, or price oracle authorizes issuance. Every validator verifies Bitcoin directly, through a simplified-payment-verification (SPV) client embedded in consensus, and mints only against a proof that real BTC was locked. The threshold authority of \S\ref{sec:mintauth} governs user-issued assets; zBTC is governed by the SPV gate described here, and consensus rejects any registration of the zBTC ticker that is not in this SPV form.
 
-\textbf{ZCrypt leg.} Consensus-level escrows lock a public $(\mathrm{value}, \mathrm{asset})$ pair under a hashlock and a block-height timeout. A \emph{mint} escrow, opened under the asset's threshold mint authority (\S\ref{sec:mintauth}; for zBTC, the bridge treasury), mints zBTC to the claimant's shield key upon presentation of the preimage before timeout, and mints nothing on expiry. A \emph{burn} escrow locks the redeemer's zBTC (a shielded spend into the burn key, value revealed by its blind); the claim finalizes the burn, and expiry refunds the coins to the redeemer. Escrow settlement coins use deterministic public blinds, so the swap amount is public, as an atomic swap requires, but the settled coins immediately re-enter the private pool.
+\subsection{An In-Consensus Bitcoin Light Client}
 
-\textbf{Bitcoin leg.} A standard P2WSH output whose witness script offers \texttt{OP\_SHA256}-preimage-plus-signature to the counterparty, or a signature to the refunder after an absolute \texttt{OP\_CHECKLOCKTIMEVERIFY} height.
+The chain maintains a Bitcoin block-header chain as part of its state, its digest folded into the state root. Anyone may submit batches of 80-byte headers through a permissionless relay transaction; the relayer is untrusted, since each header carries its own proof-of-work. Validators check, deterministically and identically, that each header links to its stored parent, meets the target its bits encode, obeys the difficulty-retargeting schedule (Bitcoin's exact 2015-interval timespan with the fourfold clamp), and post-dates its median-time-past, and they adopt the heaviest-work chain exactly as Bitcoin itself does. A production deployment pins a recent header as a checkpoint, so the chain tracks only headers past it rather than syncing from genesis. Rewriting this header chain would require out-mining the honest Bitcoin network, and a single honest relayer defeats one that withholds.
 
-\textbf{BTC $\to$ zBTC.} The depositor picks a $\geq$16-byte random preimage and funds the Bitcoin HTLC (claimable by the bridge operator, refundable to the depositor after $\sim$100 blocks). The operator opens a matching zBTC mint escrow (timeout $\sim$500 ZCrypt blocks, comfortably longer). The depositor claims the escrow, revealing the preimage on ZCrypt; the operator reads it from the chain and claims the BTC. If the operator never opens the escrow, the depositor refunds after the Bitcoin timeout; if the depositor never claims, the escrow expires and mints nothing.
+\subsection{The Trustless Mint}
 
-\textbf{zBTC $\to$ BTC.} Symmetric with roles reversed: the redeemer locks zBTC in a burn escrow, the operator funds a Bitcoin HTLC claimable by the redeemer, the redeemer's Bitcoin claim reveals the preimage, and the operator uses it to finalize the burn. Every failure path refunds; at no point does either side hold both legs.
+zBTC's registered authority is not a key-set commitment but a commitment to a single Bitcoin \emph{reserve} public key. To mint, a party submits an inclusion proof: the raw Bitcoin funding transaction together with a Merkle branch proving it sits in a block on the chain's best header chain. Consensus accepts it only if the block is buried at least a network-dependent minimum depth, the branch reconstructs the block's committed Merkle root, and the funded output pays the pay-to-witness-script-hash of exactly the swap's HTLC: the shared hashlock, the pinned reserve key as claimant, the depositor's refund key, and a safe refund locktime; and the locked satoshis must cover the minted base units 1:1. Binding the deposit to the reserve key is what makes the peg solvent rather than merely atomic. Because only the reserve can ultimately claim the deposited BTC, reserves grow in lockstep with supply, and the obvious attack (locking BTC one can reclaim oneself, minting zBTC, then taking the BTC back) is rejected outright. Each funding outpoint is recorded in a consensus set the first time it mints, so one deposit mints exactly once. No signature authorizes the mint's \emph{existence, amount, or backing}: those are a deterministic consequence of Bitcoin's own proof-of-work. The one signature involved selects the \emph{recipient}: the party opening the mint must present an ECDSA signature by the deposit's Bitcoin refund key over the funding outpoint and the chosen shielded recipient key, so only the depositor (who set that refund key, committed in the SPV-proven script) can direct where the zBTC is minted. This binds recipient to depositor and closes a front-running vector in which a third party, seeing the public deposit proof, opens the mint to themselves; it does not reintroduce any trusted authority over issuance. And because no key set can ever commit to a reserve-key authority, the arrangement is one-way; zBTC can never be rotated to discretionary issuance.
 
-The operator is a liquidity provider, not a custodian of the peg's integrity: supply correctness (mint $\leq$ the protocol-pinned cap, burn on redemption) is consensus-enforced, atomicity is enforced by the shared hashlock and timeouts, and the operator's only privilege (membership in the zBTC treasury's threshold authority) signs one exact escrow at a time and cannot create zBTC without simultaneously forfeiting BTC through the same hashlock.
+Reserve custody is the honest limit of this trustlessness. Consensus constrains issuance (no zBTC exists without a proof of reserve-bound BTC), but it does not constrain the reserve keyholder: the accumulated BTC is spendable by that key alone, so its compromise or loss leaves the zBTC supply intact but strands redemption. Because consensus only ever checks that deposits pay the pinned public key, that key can itself be held in threshold fashion (multi-party ECDSA among independent operators reconstructing no single point of failure) without any protocol change; how the reserve key is held is a deployment decision, and a deployment should publish it.
+
+\subsection{Maturity and Reorg Safety}
+
+An SPV proof attests that a deposit was confirmed, but Bitcoin offers only probabilistic finality: a sufficiently deep reorganization could orphan a confirmed block. Since a minted zBTC coin enters the shielded pool and becomes unlinkable, it cannot be clawed back after the fact, so the peg must \emph{prevent} an unbacked coin from ever being spent rather than cure it afterward. zBTC borrows Bitcoin's own coinbase-maturity rule: a newly minted coin is held \emph{immature}, outside the spendable pool and thus outside the anonymity set, until its backing deposit is buried beyond reorganization risk. Each block, consensus sweeps the immature set deterministically: a deposit buried to its maturity depth matures into a spendable coin, and a deposit whose block has been orphaned is handled as below.
+
+The maturity depth is \emph{scaled by value}. A reorganization deep enough to orphan a deposit costs, as a lower bound, its depth times the block reward in forgone honest mining, on top of the majority hashpower it demands, so the attack pays only when the unbacked value exceeds that cost. A flat depth would make a tiny shield wait as long as a large one; instead the required depth grows with the minted value, floored at the mint's minimum confirmations and capped near Bitcoin's hundred-block coinbase maturity. Small transfers mature within roughly an hour, and only large ones wait deep, precisely where an attack is worth mounting.
+
+Orphaning is not treated as an immediate void, because a benign reorganization typically re-mines the same deposit into a different block whereas a genuine double-spend omits it. On orphaning, consensus opens a grace window: within it, a relayer may \emph{re-anchor} the immature mint by submitting a fresh inclusion proof for the same deposit txid on the new best chain, moving its anchor forward so it resumes maturing. Only a deposit that never reappears, a real double-spend, fails to re-anchor, and its immature coin is voided when the grace elapses, burning the supply back. All of this is a pure function of the header chain committed in the state root, so every validator agrees on which coins mature, re-anchor, or void.
+
+\subsection{The Atomic Swap}
+
+Minting and redemption are two hash-time-locked contracts in the classic atomic-swap form~\cite{tiernolan}, sharing one deliberately untagged SHA-256 hashlock, so a single preimage satisfies both Bitcoin script's \texttt{OP\_SHA256} and ZCrypt's escrow check. On Bitcoin the contract is a standard P2WSH output offering preimage-plus-signature to the claimant, or a signature to the refunder after an absolute \texttt{OP\_CHECKLOCKTIMEVERIFY} height. On ZCrypt a consensus escrow locks a public $(\mathrm{value}, \mathrm{asset})$ pair under a hashlock and a block-height timeout; escrow settlement coins use deterministic public blinds, so the swap amount is public, as an atomic swap requires, but the settled coins re-enter the private pool.
+
+\textbf{BTC $\to$ zBTC.} The depositor picks a $\geq$16-byte random preimage and funds the Bitcoin HTLC (claimable by the reserve with the preimage, refundable to the depositor after its locktime), waits for the deposit to confirm, relays the intervening headers, and submits the mint proof. Consensus opens the mint escrow and, on the depositor's preimage-revealing claim, mints \emph{immature} zBTC; the reserve reads the revealed preimage from ZCrypt and sweeps the BTC. The zBTC matures once its deposit is deep enough. If the proof is never submitted the depositor refunds on Bitcoin, and if the claim never comes the escrow expires and mints nothing.
+
+\textbf{zBTC $\to$ BTC.} Symmetric with roles reversed: the redeemer locks zBTC in a burn escrow, a liquidity provider funds a Bitcoin HTLC claimable by the redeemer, the redeemer's Bitcoin claim reveals the preimage, and the provider uses it to finalize the burn, dropping tracked supply. Every failure path refunds, and at no point does either side hold both legs.
+
+Minting is thus trustless: no party can create zBTC without a proof of real, sufficiently-buried, reserve-bound BTC, and the protocol-pinned cap bounds supply regardless. Redemption is atomic and cannot cheat the redeemer, but it depends on a liquidity provider holding BTC to take the other side, which is a market property rather than a trust assumption in the peg's integrity. The construction removes the federation that federated wrapped-bitcoin designs rely on, at the cost of a maturity delay and a dependence on redemption liquidity.
 
 \section{Private In-Pool Swaps}
 \label{sec:swaps}
@@ -396,13 +430,13 @@ Privacy composes the same way as the bridge: the swapped amounts and hashlock ar
 
 The reference wallet is a desktop application whose backend embeds the full prover; no third party ever sees a witness.
 
-\textbf{Proving and sending.} The wallet maintains an incrementally-synced copy of the commitment-tree leaves, rebuilds the tree locally, and derives Merkle paths for its own coins. A payment selects up to two coins, builds the gas note and the main transaction, proves both (about 0.23\,s on a consumer laptop, \S\ref{sec:perf}), runs the auditability VM as a final cross-check, and broadcasts the bundle. Change always goes to a fresh hierarchical stealth sub-address, and every output slot carries a fixed-size note, real or cover, so delivery mode is not fingerprintable.
+\textbf{Proving and sending.} The wallet maintains an incrementally-synced copy of the commitment-tree leaves, rebuilds the tree locally, and derives Merkle paths for its own coins. A payment selects up to two coins, builds the gas note and the main transaction, proves both (about 0.22\,s on a consumer laptop, \S\ref{sec:perf}), runs the auditability VM as a final cross-check, and broadcasts the bundle. Change always goes to a fresh hierarchical stealth sub-address, and every output slot carries a fixed-size note, real or cover, so delivery mode is not fingerprintable.
 
 \textbf{Receiving.} Scanning fetches only transaction-bearing blocks and trial-decrypts every note against the account key, its stealth change accounts (with a gap limit), and any imported stealth seeds. Stealth payments arrive as an out-of-band note string; bearer coins are claimed and immediately swept to a fresh secret.
 
-\textbf{Private spent-status checks.} Asking a node ``is nullifier $X$ spent?'' would reveal coin ownership. The wallet never asks about fewer than 32 nullifiers at once: its real queries are shuffled among decoys drawn from a shared cross-wallet decoy pool plus fresh random values, and each answer is an authenticated SMT inclusion/non-inclusion proof checked against the committed root. The node learns that someone asked about a batch; it cannot tell which entries mattered, and it cannot lie.
+\textbf{Private spent-status checks.} Asking a node ``is nullifier $X$ spent?'' would reveal coin ownership. The wallet never asks about fewer than 32 nullifiers at once: its real queries are shuffled among fresh random decoy values, so the node learns only that someone asked about a batch and cannot tell which entries mattered. Each answer is an authenticated SMT inclusion/non-inclusion proof, which the wallet verifies against the registry root the node reports, deriving the spent/unspent status from the verified proof rather than from the node's bare word; an unverifiable or inconsistent answer is rejected rather than trusted. Removing the last sliver of trust, so the node also cannot answer against a registry root that consensus never committed, requires binding that root to the block application hash through validator-signed headers, a light-client step the reference wallet does not yet perform.
 
-\textbf{Network privacy and custody.} All node RPC can be routed over Tor (on by default, failing closed on misconfiguration). The mnemonic is encrypted at rest under an Argon2id-derived key (64\,MiB, 3 passes); the coin database is encrypted under a key derived from the seed. The wallet surfaces the full product: balances per asset, three payment instruments, view-key export, staking-reward claims, asset registration and minting, and both directions of the BTC bridge with automatic recovery of interrupted swaps.
+\textbf{Network privacy and custody.} All node RPC can be routed over Tor (on by default, failing closed on misconfiguration). The mnemonic is encrypted at rest under an Argon2id-derived key~\cite{argon2} (64\,MiB, 3 passes); the coin database is encrypted under a key derived from the seed. The wallet surfaces the full product: balances per asset, three payment instruments, view-key export, staking-reward claims, asset registration and minting, and both directions of the BTC bridge with automatic recovery of interrupted swaps.
 
 \section{Privacy Analysis}
 \label{sec:privacy}
@@ -430,13 +464,17 @@ The anonymity set deserves emphasis: because membership is proven against the wh
 
 \textbf{Replay and binding.} Proofs bind a chain-domain tag (no cross-chain replay), an anchor from a bounded recent window (no proofs against ancient state), and a transaction-binding hash covering all ciphertexts and the proof (no post-broadcast splicing). Phantom-coin nullifiers are keyed to the real input's nullifier, so padding can never collide across transactions even under spend-secret reuse.
 
-\textbf{Consensus economics.} Safety violations are punished by evidence-triggered slashing and permanent tombstoning; delegators share the penalty and cannot exit ahead of it. Validator power derives solely from provably-burned pool coins, so acquiring voting power has an on-chain, supply-visible cost.
+\textbf{Consensus economics.} Safety violations are punished by evidence-triggered slashing and permanent tombstoning; delegators share the penalty and cannot exit ahead of it. Once the bootstrap sentinel (\S\ref{sec:sentinel}) has retired, validator power derives solely from provably-burned pool coins, so acquiring voting power has an on-chain, supply-visible cost; while the sentinel is active, the foundation node holds a disclosed, state-root-committed supermajority that is the explicit trust assumption of the bootstrap phase.
 
 \textbf{Issuance authority.} Mint authorizations are ML-DSA-65 threshold signatures over the complete escrow parameters under a protocol context string, so an authorization fits exactly one issuance, cannot be repurposed as a rotation (rotations carry a distinct in-message tag), and cannot be replayed (the deterministic escrow identifier collides). Rotations are bound to a monotonic per-asset epoch committed in the state root, so no superseded key set retains any power. Malformed authorization bundles (out-of-range or duplicate signer indices, undecodable keys or signatures, trailing bytes) reject the bundle whole.
 
 \textbf{Quantum posture.} The value layer uses no discrete-logarithm assumption: proofs and spend authority are hash-based, and note confidentiality is lattice-based, protecting recorded ciphertexts against harvest-now-decrypt-later. The classical primitives that remain are peripheral and replaceable: ed25519 on validator consensus keys (an availability concern, not a custody concern) and secp256k1 on the Bitcoin leg of swaps, which is a property of Bitcoin, not of ZCrypt.
 
 \textbf{Assurance.} The circuit is differentially tested against an independent wide-trace implementation and against the transparent VM on valid and adversarial witnesses; wallets re-run the VM before broadcast; nodes reproduce their state root from persisted snapshots and refuse to start otherwise. The trusted computing base for ``no coin is created except by the rules'' is the circuit, the seven-opcode program that mirrors it, and the emission arithmetic: all small, and all public.
+
+\textbf{Machine-checked verification.} The differential tests above compare the circuit to its specification on sampled witnesses; a companion effort raises part of that assurance to machine-checked proofs in the Lean~4 proof assistant~\cite{lean4}, kernel-verified with no unproven step (no \texttt{sorry}). Two things are established. First, the transfer's value-integrity specification (the transparent VM of \S\ref{sec:vm}) and the arithmetic at the core of the circuit are formalized and proven directly: an accepted transfer creates no value (total outputs never exceed total inputs), and the multi-limb, range-checked carry that reconciles the circuit's field arithmetic with integer arithmetic provably cannot wrap, so conservation in the field is conservation over the integers. Modeling Poseidon2 as collision-resistant, the coin layer follows as theorems: a commitment binds its coin uniquely (value and asset cannot be forged into it), a nullifier binds the coin it cancels (distinct coins yield distinct nullifiers, and a re-spend yields the same nullifier the on-chain set rejects), the commitment fixes the owner key, and commitments, nullifiers, and key images are mutually domain-separated. Second, to connect the proofs to the source rather than to a re-transcription of it, the value-integrity core of the VM is mechanically extracted from its Rust to Lean using Charon and Aeneas~\cite{aeneas}, the Rust-to-Lean pipeline developed for the Ethereum Foundation's verification of Plonky3, and the no-inflation theorem is re-proved against that machine-generated model.
+
+We state the boundary precisely, because for a proof system the boundary is the point. What is verified is the transfer's \emph{specification} together with its arithmetic and coin-level logic, reduced to standard cryptographic assumptions: the collision-resistance of Poseidon2, the FRI soundness of \S\ref{sec:stark}, and the lattice assumptions of \S\ref{sec:kem}. Formal methods reduce a system to such assumptions; they do not discharge them, and every deployed system rests on assumptions of this kind. What is \emph{not} yet machine-checked is the full arithmetic constraint system, the AIR, itself: proving that the deployed constraints enforce exactly the specification and admit no under-constrained witness requires a formal model of AIR and STARK semantics, and is left to future work, with the differential tests the present bridge between specification and circuit. Machine-checked verification also does not substitute for external audit. The proofs use only the Lean core library, depend on no axioms beyond the standard hash assumption at the coin layer, and reproduce from the published artifact with a single build command.
 
 \section{Deployment Models}
 \label{sec:deployment}
@@ -470,9 +508,19 @@ Thanks to Vasily Pozdyshev for his feedback on institutional adoption, Jameson L
 \begin{thebibliography}{99}
 \bibitem{nakamoto2008bitcoin} S. Nakamoto, ``Bitcoin: A Peer-to-Peer Electronic Cash System,'' 2008.
 
+\bibitem{monero2013} N. van Saberhagen, ``CryptoNote v2.0,'' 2013.
+
 \bibitem{hopwood2016zcash} D. Hopwood, S. Bowe, T. Hornby, N. Wilcox, ``Zcash Protocol Specification,'' 2016.
 
-\bibitem{monero2013} Monero Project, ``CryptoNote v2.0,'' 2013.
+\bibitem{halo} S. Bowe, J. Grigg, D. Hopwood, ``Recursive Proof Composition without a Trusted Setup,'' IACR ePrint 2019/1021.
+
+\bibitem{penumbra} H. de Valence et al., ``The Penumbra Protocol,'' Penumbra Labs, 2024.
+
+\bibitem{namada} C. Goes, A. Sun Yin, A. Brink, ``Namada: Interchain Asset-Agnostic Privacy,'' 2022.
+
+\bibitem{poseidon2} L. Grassi, D. Khovratovich, M. Schofnegger, ``Poseidon2: A Faster Version of the Poseidon Hash Function,'' AFRICACRYPT 2023.
+
+\bibitem{fips202} National Institute of Standards and Technology, ``FIPS 202: SHA-3 Standard: Permutation-Based Hash and Extendable-Output Functions,'' 2015.
 
 \bibitem{stark} E. Ben-Sasson, I. Bentov, Y. Horesh, M. Riabzev, ``Scalable, Transparent, and Post-Quantum Secure Computational Integrity,'' IACR ePrint 2018/046.
 
@@ -480,37 +528,37 @@ Thanks to Vasily Pozdyshev for his feedback on institutional adoption, Jameson L
 
 \bibitem{plonky3} Polygon Zero / Plonky3 contributors, ``Plonky3: A Toolkit for Polynomial IOPs,'' 2024.
 
-\bibitem{poseidon2} L. Grassi, D. Khovratovich, M. Schofnegger, ``Poseidon2: A Faster Version of the Poseidon Hash Function,'' AFRICACRYPT 2023.
-
 \bibitem{fips203} National Institute of Standards and Technology, ``FIPS 203: Module-Lattice-Based Key-Encapsulation Mechanism Standard,'' 2024.
-
-\bibitem{fips204} National Institute of Standards and Technology, ``FIPS 204: Module-Lattice-Based Digital Signature Standard,'' 2024.
-
-\bibitem{rfc8439} Y. Nir, A. Langley, ``ChaCha20 and Poly1305 for IETF Protocols,'' RFC 8439, 2018.
 
 \bibitem{rfc5869} H. Krawczyk, P. Eronen, ``HMAC-based Extract-and-Expand Key Derivation Function (HKDF),'' RFC 5869, 2010.
 
-\bibitem{fips202} National Institute of Standards and Technology, ``FIPS 202: SHA-3 Standard: Permutation-Based Hash and Extendable-Output Functions,'' 2015.
-
-\bibitem{argon2} A. Biryukov, D. Dinu, D. Khovratovich, ``Argon2: The Memory-Hard Function for Password Hashing and Other Applications,'' RFC 9106, 2021.
-
-\bibitem{tendermint} E. Buchman, J. Kwon, Z. Milosevic, ``The Latest Gossip on BFT Consensus,'' arXiv:1807.04938; CometBFT, the maintained implementation.
+\bibitem{rfc8439} Y. Nir, A. Langley, ``ChaCha20 and Poly1305 for IETF Protocols,'' RFC 8439, 2018.
 
 \bibitem{bip39} M. Palatinus, P. Rusnak, A. Voisine, S. Bowe, ``BIP-39: Mnemonic Code for Generating Deterministic Keys,'' 2013.
 
 \bibitem{bip350} P. Wuille, G. Maxwell, ``BIP-350: Bech32m Format for v1+ Witness Addresses,'' 2020.
 
+\bibitem{tendermint} E. Buchman, J. Kwon, Z. Milosevic, ``The Latest Gossip on BFT Consensus,'' arXiv:1807.04938; CometBFT, the maintained implementation.
+
+\bibitem{fips204} National Institute of Standards and Technology, ``FIPS 204: Module-Lattice-Based Digital Signature Standard,'' 2024.
+
 \bibitem{tiernolan} T. Nolan, ``Alt Chains and Atomic Transfers,'' bitcointalk.org, 2013.
 
-\bibitem{chaum1983} D. Chaum, ``Blind Signatures for Untraceable Payments,'' Advances in Cryptology: CRYPTO '82, 1983.
-
-\bibitem{chaum1990} D. Chaum, A. Fiat, M. Naor, ``Untraceable Electronic Cash,'' Advances in Cryptology: CRYPTO '88, 1990.
+\bibitem{argon2} A. Biryukov, D. Dinu, D. Khovratovich, ``Argon2: The Memory-Hard Function for Password Hashing and Other Applications,'' RFC 9106, 2021.
 
 \bibitem{bis1242} R. Auer et al., ``Privacy-Enhancing Technologies for Digital Payments,'' BIS Working Papers No.~1242, January 2025.
 
 \bibitem{tourbillon} BIS Innovation Hub Swiss Centre, ``Project Tourbillon: Exploring Privacy, Security and Scalability for CBDCs,'' Bank for International Settlements, November 2023.
 
 \bibitem{ecash2} D. Chaum, T. Moser, ``eCash 2.0: Inalienably Private and Quantum-Resistant to Counterfeiting,'' 2022.
+
+\bibitem{chaum1983} D. Chaum, ``Blind Signatures for Untraceable Payments,'' Advances in Cryptology: CRYPTO '82, 1983.
+
+\bibitem{chaum1990} D. Chaum, A. Fiat, M. Naor, ``Untraceable Electronic Cash,'' Advances in Cryptology: CRYPTO '88, 1990.
+
+\bibitem{lean4} L. de Moura, S. Ullrich, ``The Lean 4 Theorem Prover and Programming Language,'' CADE 28, 2021.
+
+\bibitem{aeneas} S. Ho, J. Protzenko, ``Aeneas: Rust Verification by Functional Translation,'' Proc.\ ACM Program.\ Lang.\ (ICFP), 2022.
 
 \end{thebibliography}
 

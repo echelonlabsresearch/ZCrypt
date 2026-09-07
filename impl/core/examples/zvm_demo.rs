@@ -35,6 +35,9 @@ fn main() {
     let (inputs, root) = with_tree(vec![inp(100, 11, 7), inp(50, 22, 8)]);
     let outputs: Vec<OutCoin> = vec![(90, bl(33), spend_pubkey(&ss(1)), ASSET_ZCRYPT), (55, bl(44), spend_pubkey(&ss(2)), ASSET_ZCRYPT)];
     let fee = 5;
+    // Encrypted-notes digest bound into the proof's public inputs (any fixed value works
+    // for a demo, as long as prove and verify agree on it).
+    let enc_digest = [0u64; 8];
 
     println!("PROGRAM (bytecode):  {}", SHIELD_TRANSFER.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(" "));
     println!("  01 CHECK_RANGE  07 CHECK_MEMBERSHIP  03 CHECK_SINGLE_ASSET");
@@ -49,7 +52,7 @@ fn main() {
 
     // 2) ZK circuit on the SAME witness (bound to the chain id, like the node)
     let chain_id: &[u8] = b"zcrypt-devnet";
-    let (outs, nfs, r, proof) = prove(&inputs, &outputs, fee, chain_id).expect("prove");
+    let (outs, nfs, r, proof) = prove(&inputs, &outputs, fee, chain_id, &enc_digest).expect("prove");
     println!("Circuit result: proof {} bytes, anchor root {}", proof.len(), hex8(&r));
     println!("  nullifiers:   [{}, {}]", hex8(&nfs[0]), hex8(&nfs[1]));
     println!("  out commits:  [{}, {}]\n", hex8(&outs[0]), hex8(&outs[1]));
@@ -57,7 +60,7 @@ fn main() {
     // 3) Equivalence + proof verifies (against the shared tree root)
     println!("VM outputs == circuit outputs?  {}", vm.nullifiers == nfs && vm.output_commitments == outs);
     println!("root matches tree?               {}", r == root);
-    println!("circuit proof verifies?          {}", verify(&outs, &nfs, fee, &r, &proof, chain_id));
+    println!("circuit proof verifies?          {}", verify(&outs, &nfs, fee, &r, &proof, chain_id, &enc_digest));
 
     // 4) Adversarial: same program, but a coin that isn't a real pool leaf (its
     //    authentication path is corrupted) -> the two inputs no longer agree on one
@@ -65,7 +68,7 @@ fn main() {
     let (mut bad_inputs, _) = with_tree(vec![inp(100, 11, 7), inp(50, 22, 8)]);
     bad_inputs[0].path_siblings[0][0] ^= 1; // forge the membership path
     let vm_bad = zvm::run_shield_transfer(&bad_inputs, &outputs, fee);
-    let circ_bad = prove(&bad_inputs, &outputs, fee, chain_id);
+    let circ_bad = prove(&bad_inputs, &outputs, fee, chain_id, &enc_digest);
     println!("\nADVERSARIAL (coin not in the pool / forged path):");
     println!("  VM:      accept={} ({})", vm_bad.accept, vm_bad.reason);
     println!("  circuit: proof produced? {}", circ_bad.is_some());

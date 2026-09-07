@@ -19,7 +19,7 @@ const CHAIN: &[u8] = b"zcrypt-devnet";
 /// Bond `account` as a validator, run one epoch it fully participates in, and
 /// distribute — leaving one epoch's reward accrued to its reward address.
 fn accrue_one_epoch(node: &mut Node, account: &Account, consensus_pk: &[u8]) {
-    node.bond(consensus_pk.to_vec(), consensus_pk.to_vec(), 10_000 * ATOMIC, account.reward_address())
+    node.bond(consensus_pk.to_vec(), consensus_pk.to_vec(), 10_000 * ATOMIC, account.reward_address(), zcrypt_core::staking::DEFAULT_COMMISSION_BPS)
         .unwrap();
     for h in 1..=emission::EPOCH {
         node.set_height(h);

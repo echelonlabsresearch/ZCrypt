@@ -121,6 +121,16 @@ or `46657` for the 3-node). Toggle Tor OFF for localhost. Then walk:
 
 ## Phase 5 — Bridge (BTC ⇄ zBTC)
 
+> **Trustless mint (SPV).** zBTC minting has NO treasury and NO signers: the chain
+> itself runs a Bitcoin SPV header chain (tag 0x63 relays headers; every validator
+> verifies PoW + retargeting + heaviest-chain), and a mint (tag 0x64) requires a
+> merkle inclusion proof that real BTC — at least the minted base units, 1:1 — is
+> locked in an HTLC claimable only by the pinned reserve key. Esplora/bitcoind are
+> untrusted data transports; a lying endpoint can only stall, never forge. The
+> consensus Bitcoin network is set per deployment via `ZCRYPT_BTC_NET`
+> (regtest default | signet | mainnet [+ `ZCRYPT_BTC_CHECKPOINT`]).
+> Check the chain's Bitcoin view any time: `curl "<node>/abci_query?path=%22/spv/tip%22"`.
+
 ### 5a. Regtest (fast — validates the swap logic, instant blocks)
 
 ```sh

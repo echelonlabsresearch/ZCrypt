@@ -27,15 +27,34 @@ ZVM bytecode  ──broadcast──► mempool          ──socket────
 
 **Tx format:** raw ZVM bytecode bytes (same as `impl/core` `zvm::encode` output).
 
-## Quick start
+## Quick start (foundation VPS)
+
+One compose stack: **abci + cometbft + explorer + Caddy** (HTTPS host routing).
 
 ```bash
 cd chain
+cp .env.example .env   # set EXPLORER_DOMAIN, RPC_DOMAIN, ACME_EMAIL, genesis/SPV fields
+# DNS: explorer.* and rpc.* both A → this VPS public IP (before Let's Encrypt works)
 docker compose up --build -d
 ```
 
-- CometBFT RPC: `http://127.0.0.1:36657` (remapped from 26657 to avoid local collisions)
-- ABCI socket: internal only (`tcp://abci:26658` on the compose network)
+| What | Where |
+|------|--------|
+| Explorer (HTTPS) | `https://$EXPLORER_DOMAIN` (via Caddy) |
+| CometBFT RPC (HTTPS) | `https://$RPC_DOMAIN` (via Caddy) |
+| **P2P on host** | **`${FOUNDATION_P2P_PORT:-26656}` → container 26656** — open this in the VPS firewall for other validators |
+| Raw RPC on host | `127.0.0.1:36657` by default (local admin only; public clients use `rpc.*`) |
+| ABCI | internal only (`tcp://abci:26658`) |
+
+Optional profiles:
+
+```bash
+# Regtest bitcoind (local demos only — not for a public production host)
+docker compose --profile dev up -d
+
+# Bridge watcher (requires ZCRYPT_RESERVE_SEED in .env; pulls bitcoind if using defaults)
+ZCRYPT_RESERVE_SEED=... docker compose --profile bridge up -d
+```
 
 Query registry state:
 

@@ -5,7 +5,6 @@ import { CopyButton } from "./Share";
 interface Stealth {
   index: number;
   address: string;
-  backup: string;
 }
 
 /** Plain-language guide to every address / key type. */
@@ -45,7 +44,12 @@ export default function Addresses() {
   const [stealth, setStealth] = useState<Stealth[]>([]);
   const [viewKey, setViewKey] = useState("");
   const [showVk, setShowVk] = useState(false);
-  const [reveal, setReveal] = useState<Record<number, boolean>>({});
+  // Backup seeds are spend secrets: they are never bulk-fetched. Each is revealed one at a
+  // time, behind a fresh password check (reveal_stealth_backup), and held only in local state.
+  const [revealed, setRevealed] = useState<Record<number, string>>({});
+  const [pwFor, setPwFor] = useState<number | null>(null);
+  const [pw, setPw] = useState("");
+  const [revealErr, setRevealErr] = useState("");
   const [saved, setSaved] = useState("");
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState("");
@@ -70,6 +74,24 @@ export default function Addresses() {
     } finally {
       setBusy(false);
     }
+  }
+
+  async function revealBackup(index: number) {
+    setRevealErr("");
+    try {
+      const seed = await call<string>("reveal_stealth_backup", { index, password: pw });
+      setRevealed((r) => ({ ...r, [index]: seed }));
+      setPwFor(null);
+      setPw("");
+    } catch {
+      setRevealErr("Wrong password.");
+    }
+  }
+
+  function cancelReveal() {
+    setPwFor(null);
+    setPw("");
+    setRevealErr("");
   }
 
   return (
@@ -122,19 +144,37 @@ export default function Addresses() {
               <div style={{ fontSize: "0.72rem", opacity: 0.5 }}>Stealth #{s.index}</div>
               <code style={{ color: "var(--color-purple)", wordBreak: "break-all" }}>{s.address}</code>
               <div style={{ marginTop: "0.4rem" }}>
-                {reveal[s.index] ? (
+                {revealed[s.index] ? (
                   <div className="mono-box" style={{ color: "var(--color-yellow)", wordBreak: "break-all" }}>
-                    {s.backup}
+                    {revealed[s.index]}
+                  </div>
+                ) : pwFor === s.index ? (
+                  <div style={{ display: "flex", gap: "0.4rem", alignItems: "center", flexWrap: "wrap" }}>
+                    <input
+                      type="password"
+                      placeholder="Password to reveal"
+                      value={pw}
+                      autoFocus
+                      onChange={(e) => setPw(e.target.value)}
+                      onKeyDown={(e) => e.key === "Enter" && revealBackup(s.index)}
+                    />
+                    <button className="copy-btn" onClick={() => revealBackup(s.index)}>
+                      Reveal
+                    </button>
+                    <button className="btn-link" onClick={cancelReveal}>
+                      Cancel
+                    </button>
+                    {revealErr && <span style={{ color: "var(--color-red, #e66)", fontSize: "0.78rem" }}>{revealErr}</span>}
                   </div>
                 ) : (
-                  <button className="btn-link" onClick={() => setReveal((r) => ({ ...r, [s.index]: true }))}>
+                  <button className="btn-link" onClick={() => { setPwFor(s.index); setPw(""); setRevealErr(""); }}>
                     🔑 Reveal private key
                   </button>
                 )}
               </div>
               <div style={{ display: "flex", gap: "0.4rem", marginTop: "0.5rem", flexWrap: "wrap" }}>
                 <CopyButton text={s.address} label="⧉ Copy address" />
-                {reveal[s.index] && <CopyButton text={s.backup} label="⧉ Copy private key" />}
+                {revealed[s.index] && <CopyButton text={revealed[s.index]} label="⧉ Copy private key" />}
               </div>
             </div>
           </div>

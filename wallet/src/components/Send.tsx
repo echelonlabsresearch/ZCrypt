@@ -72,13 +72,14 @@ export default function Send({
     try {
       // --- Bitcoin (L1): a real on-chain BTC withdrawal ---
       if (isBtc) {
-        const amt = parseFloat(amount);
-        if (!amt || amt <= 0) throw new Error("Enter a valid BTC amount.");
-        if (btc && amt > btc.balance) throw new Error("Amount exceeds your BTC balance.");
+        const sats = toBaseAsset(amount, 8);
+        if (!sats || sats <= 0) throw new Error("Enter a valid BTC amount.");
+        const btcAmt = sats / 1e8;
+        if (btc && btcAmt > btc.balance) throw new Error("Amount exceeds your BTC balance.");
         if (!recipient.trim()) throw new Error("Enter a Bitcoin address.");
-        const txid = await call<string>("withdraw_btc", { address: recipient.trim(), btc: amt });
-        setOkMsg(`✓ Withdrew ${btcFmt(amt)} BTC — txid ${txid.slice(0, 16)}…`);
-        toast("BTC withdrawn", `${btcFmt(amt)} BTC sent on-chain`);
+        const txid = await call<string>("withdraw_btc", { address: recipient.trim(), btc: amount.trim() });
+        setOkMsg(`✓ Withdrew ${btcFmt(btcAmt)} BTC — txid ${txid.slice(0, 16)}…`);
+        toast("BTC withdrawn", `${btcFmt(btcAmt)} BTC sent on-chain`);
         setAmount("");
         setRecipient("");
         onSent();

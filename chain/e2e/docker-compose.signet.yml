@@ -1,12 +1,22 @@
 # Signet overlay: runs the bridge's bitcoind on SIGNET (real Bitcoin) instead of regtest.
 # Everything else (ZCrypt abci + cometbft devnet) is unchanged.
 #
-#   docker compose -f docker-compose.yml -f docker-compose.signet.yml up -d
+#   (run from chain/)  docker compose -f docker-compose.yml -f e2e/docker-compose.signet.yml up -d
 #
 # Signet data persists in a named volume so it only syncs once (~a few minutes, ~a few
 # hundred MB). You still fund the `demo` and `bridge` wallets from a signet faucet — a
 # real network's coins can't come from docker. RPC is on host port 38332.
 services:
+  # The consensus SPV header chain must enforce SIGNET rules (genesis-only config;
+  # ignored once the chain has persisted SPV state). The checkpoint pins a recent
+  # signet header (height % 2016 == 0) so the chain relays only headers past it
+  # instead of syncing ~300k from genesis. Consensus-critical: every validator of
+  # a given chain must use the identical value.
+  abci:
+    environment:
+      ZCRYPT_BTC_NET: signet
+      ZCRYPT_BTC_CHECKPOINT: "00000020a43a70691012662f7448f8e9c8bcb8625bf3be3061407ec86a1343c7020000007a92cf055f0e101177a485fa4b9c9b87a43ec815475f51b5f8ad7072aff76e7f45b7626aead6141dd916df45:314496"
+
   bitcoind:
     command:
       - -signet=1

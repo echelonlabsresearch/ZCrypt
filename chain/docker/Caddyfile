@@ -1,0 +1,19 @@
+# Foundation edge proxy — Host-based routing on ONE VPS.
+# DNS: explorer.* and rpc.* both A-record to this machine's public IP.
+# TLS: automatic via Let's Encrypt when DOMAIN names resolve here (ports 80+443 open).
+# Local / no DNS: set EXPLORER_DOMAIN=explorer.localhost RPC_DOMAIN=rpc.localhost
+#   and Caddy will use internal TLS (or HTTP if you use http:// prefixes).
+
+# Global options only when ACME_EMAIL is set (see docker-compose environment).
+# Without a real domain + email, Caddy still serves; public LE certs need DNS → this host.
+
+{$EXPLORER_DOMAIN:explorer.localhost} {
+	encode gzip
+	reverse_proxy explorer:8080
+}
+
+{$RPC_DOMAIN:rpc.localhost} {
+	# CometBFT JSON-RPC + /genesis for wallets and joining validators.
+	# WebSocket upgrades allowed for /websocket if clients need it.
+	reverse_proxy cometbft:26657
+}

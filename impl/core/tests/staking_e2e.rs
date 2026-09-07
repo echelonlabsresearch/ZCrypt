@@ -24,9 +24,9 @@ fn run(epochs: u64) -> (Node, u64, u64, u64) {
     // 20% foundation at genesis
     node.mint_foundation(addr(0xF0));
 
-    node.bond(pk(1), pk(1), 20_000 * ATOMIC, addr(1)).unwrap();
-    node.bond(pk(2), pk(2), 10_000 * ATOMIC, addr(2)).unwrap();
-    node.bond(pk(3), pk(3), 10_000 * ATOMIC, addr(3)).unwrap(); // never participates
+    node.bond(pk(1), pk(1), 20_000 * ATOMIC, addr(1), zcrypt_core::staking::DEFAULT_COMMISSION_BPS).unwrap();
+    node.bond(pk(2), pk(2), 10_000 * ATOMIC, addr(2), zcrypt_core::staking::DEFAULT_COMMISSION_BPS).unwrap();
+    node.bond(pk(3), pk(3), 10_000 * ATOMIC, addr(3), zcrypt_core::staking::DEFAULT_COMMISSION_BPS).unwrap(); // never participates
 
     let mut height = 0u64;
     for _ in 0..epochs {
@@ -71,7 +71,7 @@ fn issuance_never_exceeds_total_supply() {
     // mined portion ≤ 16.8M, always.
     let mut node = Node::new();
     node.mint_foundation(addr(0xF0));
-    node.bond(pk(1), pk(1), 10_000 * ATOMIC, addr(1)).unwrap();
+    node.bond(pk(1), pk(1), 10_000 * ATOMIC, addr(1), zcrypt_core::staking::DEFAULT_COMMISSION_BPS).unwrap();
     let mut height = 0u64;
     for _ in 0..500 {
         for _ in 0..emission::EPOCH {
@@ -96,7 +96,7 @@ fn deterministic_app_hash() {
 fn no_participation_no_emission() {
     // A bonded validator that signs nothing -> zero emission (can't mint for free).
     let mut node = Node::new();
-    node.bond(pk(1), pk(1), 10_000 * ATOMIC, addr(1)).unwrap();
+    node.bond(pk(1), pk(1), 10_000 * ATOMIC, addr(1), zcrypt_core::staking::DEFAULT_COMMISSION_BPS).unwrap();
     for _ in 0..3 {
         // advance an epoch with NO recorded signatures
         for h in 1..=emission::EPOCH {

@@ -2,6 +2,7 @@
 
 use base64::Engine;
 use serde_json::Value;
+use zcrypt_core::smt;
 use zcrypt_shield::Commitment;
 
 const B64: base64::engine::general_purpose::GeneralPurpose = base64::engine::general_purpose::STANDARD;
@@ -61,6 +62,101 @@ pub fn node_height(url: &str) -> Result<i64, String> {
         .unwrap_or(0))
 }
 
+/// CometBFT genesis chain id (`status.node_info.network`), used to bind shield proofs
+/// and staking signatures. Prefer this over a compile-time constant so multi-network
+/// binaries and genesis renames stay consistent with the node.
+pub fn chain_id_bytes(url: &str) -> Result<Vec<u8>, String> {
+    // Prefer the app's own binding when available (set at InitChain).
+    if let Ok(s) = query_str(url, "/chain_id") {
+        let s = s.trim();
+        if !s.is_empty() {
+            return Ok(s.as_bytes().to_vec());
+        }
+    }
+    let u = format!("{}/status", base(url));
+    let b: Value = agent().get(&u).call().map_err(|e| e.to_string())?.into_json().map_err(|e| e.to_string())?;
+    let chain_id = b["result"]["node_info"]["network"].as_str().unwrap_or("");
+    if chain_id.is_empty() {
+        return Err("status: missing chain id".to_string());
+    }
+    Ok(chain_id.as_bytes().to_vec())
+}
+
+// ---------------------------------------------------------------------------
+// Chain-id PINNING (FIX 2): trust the node's chain-id only on first contact,
+// then bind every future signature to that pinned domain.
+// ---------------------------------------------------------------------------
+
+/// App-data directory (where `keystore.json` lives) used to persist the pinned
+/// chain-id in `chain_id.txt`. Set once at startup via [`set_pin_dir`]. `None`
+/// means no persistence is configured: pinning is skipped and the live node
+/// answer is used directly (only reached in tests / pre-setup).
+static PIN_DIR: std::sync::RwLock<Option<String>> = std::sync::RwLock::new(None);
+
+/// Point chain-id pinning at the wallet's data dir (same dir as the keystore).
+pub fn set_pin_dir(dir: String) {
+    *PIN_DIR.write().unwrap() = Some(dir);
+}
+
+/// Path of the pinned-chain-id file, if a data dir has been configured.
+fn pin_path() -> Option<std::path::PathBuf> {
+    PIN_DIR
+        .read()
+        .unwrap()
+        .clone()
+        .map(|d| std::path::Path::new(&d).join("chain_id.txt"))
+}
+
+/// Chain-id for SIGNING, PINNED to the first chain this wallet ever connected to.
+///
+/// On the first successful read from the node the chain-id is written to
+/// `chain_id.txt` next to the keystore. Thereafter the policy is fail-closed:
+///   * node reachable, reports the SAME id      -> use it (it equals the pin);
+///   * node reachable, reports a DIFFERENT id    -> refuse (the node/operator
+///     swapped the chain under us — a signature made here could be replayed on
+///     the wrong chain);
+///   * node unreachable, a pin EXISTS            -> use the pinned id (the
+///     user-confirmed domain);
+///   * node unreachable, NO pin yet              -> refuse (never silently fall
+///     back to a hardcoded constant for signing).
+pub fn pinned_chain_id(url: &str) -> Result<Vec<u8>, String> {
+    let path = pin_path();
+    let pinned: Option<String> = path
+        .as_ref()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+
+    match chain_id_bytes(url) {
+        Ok(live_bytes) => {
+            let live = String::from_utf8_lossy(&live_bytes).trim().to_string();
+            match &pinned {
+                Some(p) if *p != live => Err(format!(
+                    "chain-id mismatch: this wallet is pinned to '{p}' but the node reports \
+                     '{live}'. Refusing to sign. Point the wallet at the correct node; only \
+                     delete the pinned chain_id.txt if you intend to switch chains."
+                )),
+                Some(_) => Ok(live_bytes), // matches the pin — safe to use
+                None => {
+                    // First successful contact: pin it for all future signing.
+                    if let Some(p) = &path {
+                        std::fs::write(p, &live)
+                            .map_err(|e| format!("could not pin chain-id to {}: {e}", p.display()))?;
+                    }
+                    Ok(live_bytes)
+                }
+            }
+        }
+        Err(e) => match pinned {
+            Some(p) => Ok(p.into_bytes()),
+            None => Err(format!(
+                "cannot determine chain-id for signing: node unreachable ({e}) and no chain-id \
+                 has been pinned yet. Connect to the node once to pin the chain, then retry."
+            )),
+        },
+    }
+}
+
 /// A tag that uniquely identifies the chain GENERATION the node is serving:
 /// `"{chain_id}:{earliest_block_hash}"`. The chain id alone is not enough — a devnet
 /// re-genesis (`docker compose down -v`) reuses the same chain id but produces a fresh
@@ -90,6 +186,11 @@ fn abci_query_hex(url: &str, path: &str) -> Result<String, String> {
 pub fn staking_u64(url: &str, path: &str) -> Result<u64, String> {
     let s = abci_query_hex(url, path)?;
     s.trim().parse::<u64>().map_err(|e| format!("staking query parse: {e}"))
+}
+
+/// Raw string value of an ABCI query (e.g. `/staking/validators` → "<hex>:<stake> …").
+pub fn query_str(url: &str, path: &str) -> Result<String, String> {
+    abci_query_hex(url, path)
 }
 
 /// Resolve a ticker to its asset id if it is already registered (None if free).
@@ -151,6 +252,17 @@ fn parse_leaves_hex(hexs: &str) -> Result<Vec<Commitment>, String> {
         out.push(c);
     }
     Ok(out)
+}
+
+/// Net-coin commitments of every immature SPV mint (freshly-shielded zBTC still
+/// maturing / still reorg-voidable). Same wire format as the leaf dump. A wallet uses
+/// this to keep a maturing coin (not in the tree yet, but pending here) out of its
+/// stale-coin reconcile, and to drop it only once a reorg voids it (it leaves this set
+/// without ever becoming a leaf). Errs if the node is too old to expose the endpoint —
+/// callers should then SKIP dropping non-leaf coins rather than risk losing a maturing one.
+pub fn fetch_pending_coins(url: &str) -> Result<Vec<Commitment>, String> {
+    let hexs = abci_query_hex(url, "/spv/pending_coins")?;
+    parse_leaves_hex(&hexs)
 }
 
 /// Commitment-tree size (leaf count).
@@ -218,19 +330,48 @@ pub fn find_index(leaves: &[Commitment], com: &Commitment) -> Option<u32> {
     leaves.iter().position(|c| c == com).map(|i| i as u32)
 }
 
+/// Ask the node whether a nullifier (by its registry key hex) is recorded as spent, and
+/// VERIFY the answer cryptographically before believing it.
+///
+/// The node returns a serialized SMT membership proof plus the nullifier-registry ROOT the
+/// proof was generated against. We recompute the root from the proof and require:
+///   1. the proof is for EXACTLY the key we asked about (no answering key A with a valid
+///      proof about key B), and
+///   2. the proof verifies against the reported root.
+/// Only then do we read the spent/unspent answer from the VERIFIED proof (`included` == the
+/// nullifier is in the registry == spent) — never from a bare boolean the node asserts.
+///
+/// Returns `None` ("no trusted answer") on any transport error, malformed response, key
+/// mismatch, or failed verification — we refuse to trust an unproven claim rather than fall
+/// back to the node's word.
+///
+/// HONESTY BOUND: this proves the node produced a valid SMT proof consistent with the root
+/// it reported. It does NOT yet prove that root is the CONSENSUS-committed one — that
+/// requires anchoring the registry root to the block `app_hash` via validator-signed headers
+/// (a light client), which is the remaining step for full trustlessness. This is a real
+/// improvement over trusting a bit, not a full "the node cannot lie" guarantee.
 fn prove_included(url: &str, key_hex: &str) -> Option<bool> {
     let u = format!("{}/abci_query?path=%22/prove/{}%22", base(url), key_hex);
-    agent()
-        .get(&u)
-        .call()
-        .ok()
-        .and_then(|r| r.into_json::<Value>().ok())
-        .and_then(|b| {
-            let v = b["result"]["response"]["value"].as_str()?.to_string();
-            let by = B64.decode(&v).ok()?;
-            let j: Value = serde_json::from_slice(&by).ok()?;
-            j["included"].as_bool()
-        })
+    let b: Value = agent().get(&u).call().ok()?.into_json::<Value>().ok()?;
+    let v = b["result"]["response"]["value"].as_str()?;
+    let by = B64.decode(v).ok()?;
+    let j: Value = serde_json::from_slice(&by).ok()?;
+
+    // Decode the serialized SMT proof and the root it was proven against.
+    let proof = smt::proof_from_bytes(&hex::decode(j["proof"].as_str()?).ok()?)?;
+    let root: [u8; 32] = hex::decode(j["root"].as_str()?).ok()?.try_into().ok()?;
+
+    // (1) The proof must be about the exact key we queried.
+    let want_key = hex::decode(key_hex).ok()?;
+    if proof.key.as_slice() != want_key.as_slice() {
+        return None;
+    }
+    // (2) The proof must verify against the reported root; else refuse to trust it.
+    if !smt::verify(&proof, &root) {
+        return None;
+    }
+    // Spent iff the nullifier is INCLUDED in the registry — from the verified proof.
+    Some(proof.included)
 }
 
 /// Is a nullifier (by its registry key hex) already recorded as spent?

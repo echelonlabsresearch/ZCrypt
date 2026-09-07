@@ -17,6 +17,10 @@
 //! stack (Pedersen commitments, range proofs, the native ZVM/mint path) has been
 //! removed — shield is the only value layer.
 
+/// Re-exported so integration tests and downstream crates (bridge, wallet) use the
+/// exact same `bitcoin` types/version as the consensus SPV module.
+pub use bitcoin;
+
 pub mod asset_registry;
 pub mod bech;
 pub mod emission;
@@ -30,5 +34,7 @@ pub mod nullifier;
 pub mod reconcile;
 pub mod shield_tx;
 pub mod smt;
+pub mod spv;
 pub mod staking;
+pub mod state_db;
 pub mod zvm;

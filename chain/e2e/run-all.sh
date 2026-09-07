@@ -2,7 +2,8 @@
 # Full live end-to-end run: stand up a FRESH 3-validator network (+ bitcoind) and
 # drive every real-network test against it — consensus, a real shield proof, the
 # whole product surface (send/receive/spend, stealth, bearer, assets, abuse cases,
-# bond→rewards→claim→spend→unbond), mnemonic recovery, and BTC<->zBTC both ways.
+# bond→rewards→claim→spend→unbond), mnemonic recovery, BTC<->zBTC both ways, and the
+# delegate + per-validator-commission + delegator BRIDGE-FEE accrual/claim value-capture path.
 #
 #   ./chain/e2e/run-all.sh              # fresh chain, run everything, leave it up
 #   KEEP=0 ./chain/e2e/run-all.sh       # tear the stack down at the end
@@ -15,7 +16,7 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CHAIN_DIR="$(cd "$HERE/.." && pwd)"
 IMPL_DIR="$(cd "$CHAIN_DIR/../impl" && pwd)"
-COMPOSE="docker compose -f $CHAIN_DIR/docker-compose.3node.yml"
+COMPOSE="docker compose -f $HERE/docker-compose.3node.yml"
 N0=http://localhost:46657
 N1=http://localhost:46667
 N2=http://localhost:46677
@@ -40,7 +41,8 @@ echo "  producing blocks ($h1 -> $h2)"
 say "3/7  Build the RPC test drivers (release)"
 ( cd "$IMPL_DIR" && cargo build --release -p zcrypt-bridge \
     --bin shield_flow_3node --bin product_flow_3node --bin recover_flow_3node \
-    --bin swap_demo --bin swap_pool_demo )
+    --bin swap_demo --bin swap_pool_demo --bin fee_flow_3node \
+    --bin public_roundtrip_e2e --bin public_bridge_adversarial --bin watcher_daemon_e2e )
 BIN="$IMPL_DIR/target/release"
 
 say "4/7  Consensus smoke (tx commit + 3-node app_hash agreement)"
@@ -52,17 +54,34 @@ say "5/7  A real ~1 MB shield proof, verified + committed by the live chain"
 say "5b/7 Mnemonic recover -> spend over the live chain"
 "$BIN/recover_flow_3node" "$N0"
 
-say "6/7  Full product surface (incl. bond -> block rewards -> claim -> spend -> unbond)"
-# Extract node0's validator ed25519 seed so the reward flow bonds a REAL validator.
+# Extract node0's validator ed25519 seed so the staking flows bond a REAL (signing) validator.
 VSEED=$(docker exec zcrypt-cometbft0 cat /testnet/node0/config/priv_validator_key.json \
   | python3 -c "import sys,json,base64; print(base64.b64decode(json.load(sys.stdin)['priv_key']['value'])[:32].hex())")
+
+say "6/8  Delegate + per-validator commission + delegator BRIDGE-FEE accrual + claim"
+# A validator bonds at a commission, a delegator delegates, a BTC->zBTC mint accrues a zBTC
+# fee to stakers, and after maturity+epoch that fee is split to the delegator (net of
+# commission) and claimed. Runs BEFORE product_flow so node0 is a clean first bond (it
+# unbonds node0 at the end).
+ZC_URL="$N0" BTC_URL="$BTC" VALIDATOR_SEED_HEX="$VSEED" "$BIN/fee_flow_3node"
+
+say "6b/8 Full product surface (incl. bond -> block rewards -> claim -> spend -> unbond)"
 VALIDATOR_SEED_HEX="$VSEED" "$BIN/product_flow_3node" "$N0"
 
-say "7/7  BTC <-> zBTC atomic swap, both directions, vs the 3-node chain + bitcoind"
+say "7/8  BTC <-> zBTC atomic swap, both directions, vs the 3-node chain + bitcoind"
 ZC_URL="$N0" BTC_URL="$BTC" "$BIN/swap_demo"
 
-say "7b/7 Private in-pool asset<->asset swap (shielded DEX) vs the 3-node chain"
+say "7b/8 Private in-pool asset<->asset swap (shielded DEX) vs the 3-node chain"
 ZC_URL="$N0" "$BIN/swap_pool_demo"
+
+say "8/8  PUBLIC bridge: cross-seed shield+redeem round-trip (on-chain redeem)"
+ZC_URL="$N0" BTC_URL="$BTC" "$BIN/public_roundtrip_e2e"
+
+say "8b/8 PUBLIC bridge: adversarial suite (attacks MUST be rejected)"
+ZC_URL="$N0" BTC_URL="$BTC" "$BIN/public_bridge_adversarial"
+
+say "8c/8 PUBLIC bridge: operator watcher DAEMON (autonomous settle + restart idempotency)"
+ZC_URL="$N0" BTC_URL="$BTC" "$BIN/watcher_daemon_e2e"
 
 say "FINAL  All 3 validators agree on the app_hash"
 H=$(curl -s "$N0/status" | grep -o '"latest_block_height":"[0-9]*"' | grep -o '[0-9]*'); TH=$((H-3))

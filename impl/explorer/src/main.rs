@@ -235,16 +235,26 @@ fn api_assets(node: &str) -> Value {
 }
 
 fn api_validators(node: &str) -> Value {
+    // Rich endpoint (newer nodes): full per-validator profile — stake breakdown,
+    // lifetime + unclaimed rewards, participation, delegations — plus chain-level
+    // staking context. Passed through verbatim.
+    let raw = abci(node, "/staking/validators_json");
+    if let Ok(v) = serde_json::from_str::<Value>(&raw) {
+        if v.get("validators").is_some() {
+            return v;
+        }
+    }
+    // Legacy fallback ("<pubkey_hex>:<stake>," list): stake only, no reward data.
     let raw = abci(node, "/staking/validators");
     let items: Vec<Value> = raw
         .split(',')
         .filter(|s| !s.is_empty())
         .map(|s| {
             let p: Vec<&str> = s.split(':').collect();
-            json!({ "addr": p.first().copied(), "stake": p.get(1).and_then(|x| x.parse::<u64>().ok()) })
+            json!({ "id": p.first().copied(), "stake": p.get(1).and_then(|x| x.parse::<u64>().ok()) })
         })
         .collect();
-    json!(items)
+    json!({ "validators": items, "legacy": true })
 }
 
 // ---- HTTP server (std only) --------------------------------------------------

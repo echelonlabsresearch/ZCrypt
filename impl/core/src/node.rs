@@ -31,8 +31,14 @@ fn gate(program: &[u8], ctx: &zvm::Ctx) -> Result<(), String> {
 pub struct Receipt {
     pub txbind: Hash,
     pub nullifiers: Vec<Hash>,
-    pub state_root: Hash,
 }
+// NOTE: this deliberately carries no state root. Computing one costs a full pass over every
+// component of consensus state (nullifier set, commitment tree, staking ledger, asset
+// registry, escrow book, Bitcoin header chain), and a per-transaction value is not something
+// consensus ever consumes: CometBFT compares only the app hash returned by `finalize_block`,
+// once per block. Building it per transaction multiplied that whole cost by the block's
+// transaction count for a field nothing read. The app hash is available from `state_root()`
+// at end of block, or the `/app/hash` query.
 
 pub struct Node {
     pub(crate) smt: Smt,
@@ -57,17 +63,128 @@ pub struct Node {
     assets: crate::asset_registry::AssetRegistry,
     /// Shield-native HTLC escrows for atomic swaps. Root folded into the app_hash.
     htlc: crate::htlc_shield::HtlcBook,
+    /// The consensus Bitcoin SPV header chain + claimed-deposit set — the
+    /// trustless zBTC mint gate. Root folded into the app_hash.
+    spv: crate::spv::HeaderChain,
+    /// SPV-minted coins awaiting Bitcoin-deposit maturity (coinbase-style). Held out
+    /// of the spendable tree; matured or voided each block by the SPV depth. Root
+    /// folded into the app_hash so every node agrees on pending/voided supply.
+    immature: Vec<ImmatureMint>,
     /// Sliding window of recent commitment-tree roots (anchors). A shield proof
     /// binds an in-circuit Merkle path to one root; the node accepts the spend only
     /// if that root is one it actually produced — so membership is anchored to real
     /// chain state (L1). The window lets a proof built a few blocks ago still verify
     /// after later coins have grown the tree.
     recent_roots: std::collections::VecDeque<Commitment>,
+    /// Optional foundation LIVENESS GUARANTOR ("sentinel"): a designated validator whose
+    /// voting power the app keeps strictly above 2/3 of the total, so it alone can always
+    /// commit blocks and the chain NEVER halts, even if every other validator leaves. Set
+    /// once at genesis when the genesis `app_state` opts in (`foundation_sentinel: true`);
+    /// `None` on chains that did not opt in (they behave as a normal BFT set). Derived
+    /// from consensus-committed staking state, so it is NOT part of the app_hash — every
+    /// node recomputes the identical sentinel power and CometBFT keeps the sets in lockstep.
+    sentinel: Option<Sentinel>,
 }
+
+/// The foundation liveness-guarantor validator (see [`Node::sentinel`]).
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub struct Sentinel {
+    /// The sentinel's ed25519 consensus pubkey (the CometBFT validator key).
+    pub key: Vec<u8>,
+    /// Its current CometBFT voting power (tracked so an update is emitted only on change).
+    pub power: i64,
+    /// Floor: its genesis power. Power never drops below this, so with no other validators
+    /// bonded it keeps its genesis weight instead of collapsing to 1.
+    pub floor: i64,
+    /// External-stake threshold (whole ZCRYPT, summed over NON-sentinel validators) at which
+    /// the sentinel AUTO-RETIRES — it stops inflating its power and drops to its own stake, so
+    /// the >2/3 liveness crutch is a bootstrap phase, not a permanent central authority. `0`
+    /// means never auto-decays (legacy/permanent). It can also be retired early by a
+    /// sentinel-signed disable tx ([`Node::disable_sentinel`]).
+    #[serde(default)]
+    pub decay_at_others: i64,
+    /// Set by a sentinel-signed disable tx; the next `sentinel_update` retires it (drops to own
+    /// power + emits the CometBFT update) and clears it. A flag (not an immediate clear) so the
+    /// retirement funnels through the single emit path.
+    #[serde(default)]
+    pub retire: bool,
+    /// AUTO-DECAY SAFETY: the minimum number of DISTINCT non-sentinel validators that must be
+    /// bonded before auto-decay may fire. Together with `decay_at_others` this stops a single
+    /// well-capitalized actor from retiring the liveness guarantor with one big stake in one
+    /// (or a few) keys, then capturing >2/3 once the sentinel is gone.
+    #[serde(default)]
+    pub decay_min_validators: i64,
+    /// AUTO-DECAY SAFETY: the decay condition (stake ≥ threshold AND validators ≥ minimum) must
+    /// hold for this many CONSECUTIVE blocks before auto-decay fires. A transient stake spike
+    /// that lapses before the dwell elapses resets the streak, so decay reflects sustained
+    /// external security, not an instantaneous snapshot. The explicit disable tx is exempt.
+    #[serde(default)]
+    pub decay_dwell_blocks: u64,
+    /// Runtime counter: consecutive blocks the decay condition has held. Reset to 0 whenever the
+    /// condition lapses; auto-decay fires once it reaches `decay_dwell_blocks`.
+    #[serde(default)]
+    pub decay_streak: u64,
+}
+
+/// Auto-decay safety defaults: require sustained stake across at least this many distinct
+/// non-sentinel validators, held for at least this many consecutive blocks, before the
+/// sentinel retires itself. Defense in depth against a transient single-party stake spike.
+pub const SENTINEL_DECAY_MIN_VALIDATORS: i64 = 4;
+pub const SENTINEL_DECAY_DWELL_BLOCKS: u64 = 1000;
 
 /// How many past commitment-tree roots a spend may anchor to. A proof older than
 /// this many appends must be rebuilt against a newer root.
 const ROOT_WINDOW: usize = 256;
+
+/// A zBTC coin minted by an SPV proof that is NOT yet spendable: it is held out of
+/// the commitment tree (so no spend can prove membership of it) until its backing
+/// Bitcoin deposit matures past reorg risk. If the deposit block is orphaned before
+/// then, the coin is voided (burned) and never enters circulation — this is what
+/// makes a double-spend reorg recoverable despite zBTC's privacy.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub struct ImmatureMint {
+    pub commitment: Commitment,
+    /// The FULL minted value (backed 1:1 by the deposit). The recipient's coin
+    /// (`commitment`) is for `value - fee`; the `fee` accrues to stakers at maturity.
+    /// Void burns the full `value`, so a reorg-voided mint contributes no fee.
+    pub value: u64,
+    /// The protocol bridge fee (in the bridged asset) skimmed to stakers on maturity.
+    #[serde(default)]
+    pub fee: u64,
+    pub asset_id: u64,
+    /// The Bitcoin block hash the backing deposit is CURRENTLY anchored to (updated by
+    /// a re-anchor if a benign reorg re-mines the deposit elsewhere).
+    pub deposit_block: Hash,
+    /// The deposit's Bitcoin txid — part of the outpoint used to re-anchor across reorgs.
+    #[serde(default)]
+    pub deposit_txid: Hash,
+    /// The deposit's output index (with `deposit_txid` forms the full claimed outpoint).
+    #[serde(default)]
+    pub deposit_vout: u32,
+    /// The escrow's hashlock — needed to re-verify a re-anchor proof pays the same HTLC.
+    #[serde(default)]
+    pub hashlock: Hash,
+    /// The escrow that minted it (for reference / dedup).
+    pub escrow_id: Hash,
+    /// If the anchored deposit block has been orphaned by a reorg, the Bitcoin tip
+    /// height at which we first noticed. The mint is VOIDED only if the tip advances
+    /// `reanchor_grace` blocks past this without a successful re-anchor — the window in
+    /// which a benign reorg's re-mined deposit can be re-proven. `None` = not orphaned.
+    #[serde(default)]
+    pub orphaned_at_btc: Option<u64>,
+}
+
+/// The outcome of one block's maturity sweep, surfaced for logging/queries.
+#[derive(Default, Clone, Debug)]
+pub struct MaturityReport {
+    /// Coins that matured (deposit deep enough) and entered the spendable tree.
+    pub matured: Vec<Commitment>,
+    /// Coins voided because their deposit block was reorged off the best BTC chain
+    /// (value burned, supply restored).
+    pub voided: Vec<Commitment>,
+    /// Total value burned by voids this block.
+    pub voided_value: u64,
+}
 
 /// A serializable snapshot of ALL consensus state — enough to reconstruct a `Node`
 /// byte-for-byte after a restart, so the chain resumes instead of replaying from
@@ -78,17 +195,30 @@ const ROOT_WINDOW: usize = 256;
 pub struct NodeSnapshot {
     /// Snapshot format version, so a future layout change can be detected/migrated
     /// rather than silently misparsed.
-    version: u32,
-    height: u64,
-    commitment_leaves: Vec<Commitment>,
-    smt_leaves: Vec<(Hash, Hash)>,
-    staking: crate::staking::Staking,
-    assets: crate::asset_registry::AssetRegistry,
-    htlc: crate::htlc_shield::HtlcBook,
-    recent_roots: Vec<Commitment>,
+    pub version: u32,
+    pub height: u64,
+    pub commitment_leaves: Vec<Commitment>,
+    pub smt_leaves: Vec<(Hash, Hash)>,
+    pub staking: crate::staking::Staking,
+    pub assets: crate::asset_registry::AssetRegistry,
+    pub htlc: crate::htlc_shield::HtlcBook,
+    pub recent_roots: Vec<Commitment>,
+    pub spv: crate::spv::HeaderChain,
+    pub immature: Vec<ImmatureMint>,
+    /// The foundation liveness-guarantor (v5+). `None` for chains without one.
+    pub sentinel: Option<Sentinel>,
 }
 
-const SNAPSHOT_VERSION: u32 = 1;
+/// v2 added the Bitcoin SPV header chain; v3 added the immature-mint (maturity) queue;
+/// v4 added the staking lifetime-earnings ledgers; v5 added the foundation sentinel; v6
+/// added PER-VALIDATOR commission (`Validator::commission_bps`). postcard is not
+/// self-describing, so a new field means a new version. The commission field changes the
+/// nested `Validator` layout, which positional migration cannot bridge, so v6 drops
+/// backward migration: an older state file refuses to load (relaunch fresh) rather than
+/// misparse. Consensus changes already require a fresh genesis, so this is consistent.
+const SNAPSHOT_VERSION: u32 = 9;
+/// Public mirror of the postcard snapshot format version (for `state_db` restore).
+pub const SNAPSHOT_VERSION_PUB: u32 = SNAPSHOT_VERSION;
 
 impl Default for Node {
     fn default() -> Self {
@@ -109,7 +239,10 @@ impl Node {
             staking: crate::staking::Staking::default(),
             assets: crate::asset_registry::AssetRegistry::default(),
             htlc: crate::htlc_shield::HtlcBook::default(),
+            spv: crate::spv::HeaderChain::default(),
+            immature: Vec::new(),
             recent_roots,
+            sentinel: None,
         }
     }
 
@@ -145,6 +278,9 @@ impl Node {
             assets: self.assets.clone(),
             htlc: self.htlc.clone(),
             recent_roots: self.recent_roots.iter().copied().collect(),
+            spv: self.spv.clone(),
+            immature: self.immature.clone(),
+            sentinel: self.sentinel.clone(),
         }
     }
 
@@ -167,7 +303,10 @@ impl Node {
             staking: snap.staking,
             assets: snap.assets,
             htlc: snap.htlc,
+            spv: snap.spv,
+            immature: snap.immature,
             recent_roots,
+            sentinel: snap.sentinel,
         };
         (node, height)
     }
@@ -177,18 +316,37 @@ impl Node {
         postcard::to_allocvec(&self.snapshot(height)).expect("snapshot serialization")
     }
 
+    /// Nullifier registry entries `(nullifier, txbind)` — source of truth for the SMT.
+    pub fn smt_leaf_entries(&self) -> Vec<(Hash, Hash)> {
+        self.smt.leaf_entries()
+    }
+
+    /// Number of nullifiers currently in the registry.
+    pub fn smt_len(&self) -> usize {
+        self.smt.len()
+    }
+
     /// Deserialize a `Node` (+ height) from snapshot bytes. Returns `Err` on a
     /// version mismatch or corruption, so the caller can refuse to start rather
     /// than silently losing state.
     pub fn from_snapshot_bytes(bytes: &[u8]) -> Result<(Self, u64), String> {
-        let snap: NodeSnapshot =
-            postcard::from_bytes(bytes).map_err(|e| format!("corrupt state snapshot: {e}"))?;
-        if snap.version != SNAPSHOT_VERSION {
-            return Err(format!(
-                "state snapshot version {} != expected {SNAPSHOT_VERSION}",
-                snap.version
-            ));
-        }
+        // The version is the leading varint; peek it first so an old layout is
+        // dispatched to its own (positional) deserializer instead of misparsing.
+        let (version, _) = postcard::take_from_bytes::<u32>(bytes)
+            .map_err(|e| format!("corrupt state snapshot: {e}"))?;
+        let snap: NodeSnapshot = match version {
+            SNAPSHOT_VERSION => {
+                postcard::from_bytes(bytes).map_err(|e| format!("corrupt state snapshot: {e}"))?
+            }
+            v => {
+                // v6 added per-validator commission (a nested-Validator layout change that
+                // positional postcard can't migrate). An older state file refuses to load:
+                // relaunch from a fresh genesis, which a commission change requires anyway.
+                return Err(format!(
+                    "state snapshot version {v} != expected {SNAPSHOT_VERSION} (no migration; relaunch fresh)"
+                ))
+            }
+        };
         Ok(Node::restore(snap))
     }
 
@@ -215,8 +373,39 @@ impl Node {
                 &self.staking.root(),
                 &self.assets.root(),
                 &self.htlc.root(),
+                &self.spv.root(),
+                &self.immature_root(),
             ],
         )
+    }
+
+    /// Digest of the pending immature-mint queue, folded into the app_hash so every
+    /// node agrees on which SPV mints are still awaiting maturity (i.e. not yet
+    /// spendable, and still reorg-voidable).
+    fn immature_root(&self) -> Hash {
+        let mut buf = Vec::with_capacity(self.immature.len() * 180);
+        for m in &self.immature {
+            for x in &m.commitment {
+                buf.extend_from_slice(&x.to_le_bytes());
+            }
+            buf.extend_from_slice(&m.value.to_le_bytes());
+            buf.extend_from_slice(&m.fee.to_le_bytes());
+            buf.extend_from_slice(&m.asset_id.to_le_bytes());
+            buf.extend_from_slice(&m.deposit_block);
+            buf.extend_from_slice(&m.deposit_txid);
+            buf.extend_from_slice(&m.deposit_vout.to_le_bytes());
+            buf.extend_from_slice(&m.hashlock);
+            buf.extend_from_slice(&m.escrow_id);
+            // Orphan-grace state is consensus-visible (it gates the void), so fold it in.
+            match m.orphaned_at_btc {
+                Some(h) => {
+                    buf.push(1);
+                    buf.extend_from_slice(&h.to_le_bytes());
+                }
+                None => buf.push(0),
+            }
+        }
+        crate::hash::h(b"ZC-IMMATURE", &[&buf])
     }
 
     // ---- shield-native HTLC escrows (atomic swaps) ----
@@ -248,6 +437,17 @@ impl Node {
             ..Default::default()
         };
         gate(zvm::HTLC_OPEN, &ctx)?;
+        // zBTC is SPV-only at the core layer — refuse threshold/discretionary opens.
+        if let Some(meta) = self.assets.meta(asset_id) {
+            if crate::asset_registry::canonical_ticker(&meta.ticker)
+                == crate::asset_registry::canonical_ticker(crate::asset_registry::ZBTC_TICKER)
+            {
+                return Err(format!(
+                    "'{}' is SPV-only; use htlc_open_spv with a Bitcoin deposit proof",
+                    crate::asset_registry::ZBTC_TICKER
+                ));
+            }
+        }
         // H2: reject early if this mint escrow would (on claim) breach the asset's
         // declared supply cap. This is a best-effort early check against currently
         // *minted* supply; the airtight ceiling is re-checked at `record_mint` on
@@ -259,7 +459,216 @@ impl Node {
                 self.assets.mint_headroom(asset_id)
             ));
         }
-        self.htlc.open(asset_id, value, hashlock, timeout_height, claim_pk)
+        // Personal / M-of-N minted assets are not SPV-backed, so no maturity: mint
+        // immediately on claim (spv_deposit = None).
+        self.htlc.open(asset_id, value, hashlock, timeout_height, claim_pk, None)
+    }
+
+    /// Submit a batch of raw Bitcoin headers (concatenated 80-byte headers) to the
+    /// consensus SPV chain. Anyone may relay; every validator verifies linkage,
+    /// proof-of-work, difficulty rules, and heaviest-chain fork choice identically.
+    /// Returns `(newly_accepted, tip_height)`.
+    pub fn submit_btc_headers(&mut self, bytes: &[u8]) -> Result<(usize, u64), String> {
+        let accepted = self.spv.submit_headers(bytes)?;
+        Ok((accepted, self.spv.tip_height()))
+    }
+
+    /// Open a **zBTC** mint escrow gated by a Bitcoin **SPV deposit proof** — the
+    /// trustless bridge mint. The asset's registered authority must be the SPV
+    /// sentinel `spv_authority(reserve_pk)`; the proof must show a confirmed BTC
+    /// deposit paying the HTLC P2WSH for exactly this `hashlock`, claimable by the
+    /// pinned reserve key, of at least `value` sats. On success the funding
+    /// outpoint is marked claimed (one deposit mints once) and the escrow opens.
+    #[allow(clippy::too_many_arguments)]
+    pub fn htlc_open_spv(
+        &mut self,
+        asset_id: u64,
+        value: u64,
+        hashlock: Hash,
+        timeout_height: u64,
+        claim_pk: zcrypt_shield::PubKey,
+        proof: &crate::spv::MintProof,
+        open_auth: &[u8],
+    ) -> Result<Hash, String> {
+        let authority = self.assets.meta(asset_id).and_then(|m| m.authority);
+        // Verify the deposit against the consensus header chain FIRST (pure read),
+        // then run the VM gate over the result — same single-source-of-truth shape
+        // as `burn_output_ok`. The detailed rejection reason is surfaced on failure.
+        let verified = match authority {
+            Some(auth) => self.spv.verify_mint_proof(&auth, value, &hashlock, proof),
+            None => Err("asset not registered / no mint authority".to_string()),
+        };
+        let ctx = zvm::Ctx { authority, spv_ok: verified.is_ok(), ..Default::default() };
+        if let Err(e) = gate(zvm::HTLC_OPEN_SPV, &ctx) {
+            return Err(match verified {
+                Err(detail) => detail,
+                Ok(_) => e,
+            });
+        }
+        let (outpoint, deposit_block) = verified.expect("gate passed implies verified");
+        // H1 recipient binding: only the depositor (holder of the HTLC refund key, which is
+        // committed in the SPV-proven script) may choose which shield key receives the mint.
+        // This is checked AFTER the deposit is verified (so we have the real outpoint) but
+        // BEFORE the outpoint is burned, so a failed/forged open never consumes the deposit.
+        crate::spv::verify_open_auth(&proof.refund_pk, &outpoint, &claim_pk, open_auth)?;
+        if value > self.assets.mint_headroom(asset_id) {
+            return Err(format!(
+                "htlc-open would exceed asset {asset_id} supply cap (headroom {})",
+                self.assets.mint_headroom(asset_id)
+            ));
+        }
+        // Tag the escrow with the deposit's Bitcoin block + full outpoint, so the minted
+        // coin is held IMMATURE against it (reorg-voidable / re-anchorable) instead of spendable.
+        let mut txid = [0u8; 32];
+        txid.copy_from_slice(&outpoint[..32]);
+        let vout = u32::from_le_bytes(outpoint[32..36].try_into().unwrap());
+        let deposit = crate::htlc_shield::SpvDeposit { block: deposit_block, txid, vout };
+        let id = self.htlc.open(asset_id, value, hashlock, timeout_height, claim_pk, Some(deposit))?;
+        // Only after the escrow exists: burn the deposit outpoint so it can never
+        // authorize a second mint.
+        self.spv.claim_outpoint(outpoint);
+        Ok(id)
+    }
+
+    /// The consensus Bitcoin header-chain tip (height, hash) — what a wallet
+    /// compares against its Bitcoin view to decide how many headers to relay.
+    pub fn btc_tip(&self) -> (u64, Hash) {
+        (self.spv.tip_height(), self.spv.tip_hash())
+    }
+
+    /// Process SPV-mint maturity against the current Bitcoin header chain. Call once
+    /// per block (deterministic — depends only on the app-hash-committed SPV state):
+    ///
+    ///  * **Mature** any immature mint whose deposit has reached its **value-scaled**
+    ///    maturity depth ([`crate::spv::HeaderChain::maturity_for`]): append its coin
+    ///    to the commitment tree (now spendable). Small mints mature fast; large ones
+    ///    wait deeper, since a reorg only pays when the value exceeds its cost.
+    ///  * **Orphan handling (inclusion re-verification):** if the deposit block is no
+    ///    longer on the best chain, do NOT void immediately — a benign reorg may have
+    ///    re-mined the deposit into a different block, which a relayer can prove via
+    ///    [`Self::reanchor_deposit`]. Start a grace window; only **VOID** (burn the
+    ///    supply back) if the Bitcoin tip advances `reanchor_grace` blocks past the
+    ///    orphaning with no re-anchor — i.e. a genuine double-spend where the tx is gone.
+    ///  * Otherwise leave it pending.
+    ///
+    /// Returns a report of what matured/voided this block.
+    pub fn process_btc_maturity(&mut self) -> MaturityReport {
+        let grace = self.spv.reanchor_grace();
+        let btc_tip = self.spv.tip_height();
+        let mut report = MaturityReport::default();
+        let mut still_pending = Vec::with_capacity(self.immature.len());
+        // Take the queue out so we can mutate the tree/registry while iterating.
+        let pending = std::mem::take(&mut self.immature);
+        for mut m in pending {
+            match self.spv.confirmations(&m.deposit_block) {
+                // Deposit not on the best chain: orphaned. Give a grace window for a
+                // re-anchor before voiding (distinguishes benign reorg from double-spend).
+                None => {
+                    let since = *m.orphaned_at_btc.get_or_insert(btc_tip);
+                    if btc_tip.saturating_sub(since) >= grace {
+                        let _ = self.assets.record_burn(m.asset_id, m.value);
+                        report.voided.push(m.commitment);
+                        report.voided_value += m.value;
+                    } else {
+                        still_pending.push(m); // waiting for a possible re-anchor
+                    }
+                }
+                // On the best chain and buried to its value-scaled depth → MATURE.
+                Some(conf) if conf >= self.spv.maturity_for(m.value) => {
+                    self.append_and_record(m.commitment);
+                    // Skim the bridge fee to stakers now that the mint is reorg-safe (a
+                    // voided mint never reaches here, so it never yields a fee).
+                    self.staking.accrue_bridge_fee(m.asset_id, m.fee);
+                    report.matured.push(m.commitment);
+                }
+                // On the best chain but not yet deep enough → keep waiting (and clear any
+                // stale orphan mark: the deposit is canonical again, e.g. after re-anchor).
+                Some(_) => {
+                    m.orphaned_at_btc = None;
+                    still_pending.push(m);
+                }
+            }
+        }
+        self.immature = still_pending;
+        report
+    }
+
+    /// **Re-anchor** an immature mint whose deposit was reorged out of its block but
+    /// re-mined into a new one (a benign reorg, not a double-spend). The relayer submits
+    /// a fresh SPV `proof` for the SAME deposit txid on the new best chain; consensus
+    /// re-verifies it (reserve key, inclusion, script, value — via
+    /// [`crate::spv::HeaderChain::verify_reanchor`], which skips the depth/claimed checks)
+    /// and moves the mint's anchor to the new block, clearing its orphan grace so it
+    /// resumes maturing. Fails if no immature mint matches the proof's txid, or the proof
+    /// doesn't validate on the best chain — so a genuine double-spend (tx absent) can
+    /// never be re-anchored and will be voided when its grace elapses.
+    pub fn reanchor_deposit(&mut self, proof: &crate::spv::MintProof) -> Result<Hash, String> {
+        let txid = proof.funding_txid().ok_or("reanchor: bad funding tx")?;
+        // Match the full outpoint (txid ‖ vout) so multi-output deposits cannot re-anchor
+        // the wrong vout.
+        let idx = self
+            .immature
+            .iter()
+            .position(|m| m.deposit_txid == txid && m.deposit_vout == proof.vout)
+            .ok_or("reanchor: no immature mint for this deposit outpoint")?;
+        let (asset_id, value, hashlock, expected_op) = {
+            let m = &self.immature[idx];
+            let mut op = [0u8; 36];
+            op[..32].copy_from_slice(&m.deposit_txid);
+            op[32..].copy_from_slice(&m.deposit_vout.to_le_bytes());
+            (m.asset_id, m.value, m.hashlock, op)
+        };
+        let authority = self
+            .assets
+            .meta(asset_id)
+            .and_then(|a| a.authority)
+            .ok_or("reanchor: asset has no SPV authority")?;
+        let (op, new_block) = self.spv.verify_reanchor(&authority, value, &hashlock, proof)?;
+        if op != expected_op {
+            return Err("reanchor: proof outpoint does not match the immature mint's deposit".to_string());
+        }
+        if !self.spv.is_claimed(&op) {
+            return Err("reanchor: deposit outpoint is not in the claimed set".to_string());
+        }
+        let m = &mut self.immature[idx];
+        m.deposit_block = new_block;
+        m.deposit_vout = proof.vout;
+        m.orphaned_at_btc = None; // re-anchored onto the canonical chain
+        Ok(txid)
+    }
+
+    /// Number of SPV mints still awaiting Bitcoin-deposit maturity (not yet spendable).
+    pub fn immature_count(&self) -> usize {
+        self.immature.len()
+    }
+
+    /// Total value held immature (minted but not yet spendable / still reorg-voidable).
+    pub fn immature_value(&self) -> u64 {
+        self.immature.iter().map(|m| m.value).sum()
+    }
+
+    /// The net-coin commitments of every immature SPV mint (the leaf each will become
+    /// once it matures). A wallet uses this to tell a legitimately-maturing zBTC coin
+    /// (not yet in the tree, but pending here) apart from a stale/dead-chain coin, so
+    /// it neither drops the coin early nor keeps it forever after a reorg voids it.
+    pub fn immature_commitments(&self) -> Vec<Commitment> {
+        self.immature.iter().map(|m| m.commitment).collect()
+    }
+
+    /// Read access to the SPV state (queries, tests).
+    pub fn spv(&self) -> &crate::spv::HeaderChain {
+        &self.spv
+    }
+
+    /// Install the Bitcoin network/checkpoint for the SPV chain. GENESIS-ONLY
+    /// configuration (a production node pins mainnet + a checkpoint here): calling
+    /// it after headers were accepted would fork the app_hash, so it refuses.
+    pub fn configure_btc_chain(&mut self, chain: crate::spv::HeaderChain) -> Result<(), String> {
+        if self.spv.header_count() > 1 || self.spv.claimed_count() > 0 {
+            return Err("BTC SPV chain already has state — configure only at genesis".to_string());
+        }
+        self.spv = chain;
+        Ok(())
     }
 
     /// Rotate an asset's mint authority to `new_commitment`, authorized by a threshold
@@ -302,6 +711,10 @@ impl Node {
         hashlock: Hash,
         timeout_height: u64,
         refund_pk: zcrypt_shield::PubKey,
+        // The user's 33-byte compressed Bitcoin payout key for a `0x67` redeem, or empty for a
+        // plain `0x5D` burn-lock. Bound into the proof either way, so the operator's watcher
+        // reads a payout key the coin's owner actually authorized.
+        btc_claim_pk: &[u8],
     ) -> Result<Hash, String> {
         // VM gate: program HTLC_BURN_LOCK = [CHECK_ASSET_REGISTERED, CHECK_BURN_OUTPUT].
         let expected =
@@ -312,8 +725,45 @@ impl Node {
             ..Default::default()
         };
         gate(zvm::HTLC_BURN_LOCK, &ctx)?;
+        if value == 0 {
+            return Err("escrow value must be positive".to_string());
+        }
+        // Anti-bypass: the lock spend must burn ≥ MIN_FEE gas (in-asset), so an escrow lock
+        // cannot be used to move value through output[1..] for free (see `bond_with_stake`).
+        if shield_tx.fee < crate::emission::MIN_FEE {
+            return Err(format!(
+                "burn-lock: spend must burn ≥ MIN_FEE ({}) gas; got {}",
+                crate::emission::MIN_FEE,
+                shield_tx.fee
+            ));
+        }
+        // A redeem's payout key must be a well-formed compressed secp256k1 point, or the
+        // operator's watcher would lock reserve BTC to an address nobody can ever claim.
+        if !btc_claim_pk.is_empty() {
+            if btc_claim_pk.len() != 33 {
+                return Err("burn-lock: btc_claim_pk must be 33 bytes (compressed)".to_string());
+            }
+            bitcoin::secp256k1::PublicKey::from_slice(btc_claim_pk)
+                .map_err(|e| format!("burn-lock: malformed btc_claim_pk: {e}"))?;
+        }
+        // Escrow id is deterministic; refuse before burning coins if it already exists.
+        let eid = crate::htlc_shield::escrow_id(asset_id, value, &hashlock, timeout_height, &refund_pk);
+        if self.htlc.get(&eid).is_some() {
+            return Err("escrow already exists".to_string());
+        }
+        // Bind every plaintext lock parameter to the proof. Without this a mempool observer can
+        // keep the proof and nullifiers and rewrite the hashlock, timeout, refund key or payout
+        // key to redirect the funds to themselves (see `lock_envelope`).
+        let kind = if btc_claim_pk.is_empty() {
+            crate::htlc_shield::ENV_BURN_LOCK
+        } else {
+            crate::htlc_shield::ENV_BURN_LOCK_BTC
+        };
+        let envelope = crate::htlc_shield::lock_envelope(
+            kind, asset_id, value, &hashlock, timeout_height, &refund_pk, &refund_pk, btc_claim_pk,
+        );
         // Verify + apply the shield spend (records nullifiers, appends outputs).
-        self.submit_shield(chain_id, shield_tx)?;
+        self.submit_shield_bound(chain_id, shield_tx, &envelope)?;
         self.htlc.lock_burn(asset_id, value, hashlock, timeout_height, refund_pk)
     }
 
@@ -346,7 +796,32 @@ impl Node {
             ..Default::default()
         };
         gate(zvm::HTLC_BURN_LOCK, &ctx)?;
-        self.submit_shield(chain_id, shield_tx)?;
+        if value == 0 {
+            return Err("escrow value must be positive".to_string());
+        }
+        // Anti-bypass: the lock spend must burn ≥ MIN_FEE gas (in-asset), so a swap lock cannot
+        // move value through output[1..] for free (see `bond_with_stake`).
+        if shield_tx.fee < crate::emission::MIN_FEE {
+            return Err(format!(
+                "swap-lock: spend must burn ≥ MIN_FEE ({}) gas; got {}",
+                crate::emission::MIN_FEE,
+                shield_tx.fee
+            ));
+        }
+        // Escrow id is keyed by counterparty (party_pk); pre-check before burning.
+        let eid =
+            crate::htlc_shield::escrow_id(asset_id, value, &hashlock, timeout_height, &counterparty_pk);
+        if self.htlc.get(&eid).is_some() {
+            return Err("escrow already exists".to_string());
+        }
+        // Bind the lock parameters to the proof: a swap lock names BOTH the counterparty who
+        // claims and the locker who is refunded, so leaving them unbound would let a front-runner
+        // redirect either leg of the trade to themselves (see `lock_envelope`).
+        let envelope = crate::htlc_shield::lock_envelope(
+            crate::htlc_shield::ENV_SWAP_LOCK,
+            asset_id, value, &hashlock, timeout_height, &counterparty_pk, &refund_pk, &[],
+        );
+        self.submit_shield_bound(chain_id, shield_tx, &envelope)?;
         self.htlc.lock_swap(asset_id, value, hashlock, timeout_height, counterparty_pk, refund_pk)
     }
 
@@ -373,16 +848,65 @@ impl Node {
             }
         };
         gate(zvm::HTLC_CLAIM, &ctx)?;
+        // H2 hard ceiling, re-checked BEFORE any state mutation. Peek the escrow and refuse an
+        // over-cap mint here, so `htlc.claim` never flips the escrow to `Claimed` for a mint
+        // that `record_mint` would then reject — which previously left the escrow stuck
+        // (Claimed, but nothing minted and no refund possible). Now an over-cap claim is a clean
+        // no-op error and the escrow stays `Open`, refundable on expiry.
+        if let Some(e) = self.htlc.get(escrow_id) {
+            if e.kind == crate::htlc_shield::EscrowKind::Mint {
+                let headroom = self.assets.mint_headroom(e.asset_id);
+                if e.value > headroom {
+                    return Err(format!(
+                        "mint {} would exceed asset {} supply cap (headroom {headroom})",
+                        e.value, e.asset_id
+                    ));
+                }
+            }
+        }
         let cl = self.htlc.claim(escrow_id, preimage, height)?;
         match cl.kind {
             crate::htlc_shield::EscrowKind::Mint => {
-                // H2 hard ceiling: refuse to mint past the declared cap. Enforced
-                // BEFORE appending the coin so an over-cap claim mints nothing and
-                // adds no spendable leaf. The escrow stays claimable only within cap.
+                // Cap already verified above; record the mint (now guaranteed to succeed) so the
+                // supply total advances before the coin is appended / held immature.
                 self.assets.record_mint(cl.asset_id, cl.value)?;
-                let c = crate::keys::htlc_commitment(&cl.party_pk, cl.value, cl.asset_id, escrow_id);
-                self.append_and_record(c);
-                Ok(Some(c))
+                match cl.spv_deposit {
+                    // SPV-backed mint: DON'T make it spendable yet. Hold it immature
+                    // (out of the commitment tree, so no spend can prove membership)
+                    // until its Bitcoin deposit matures past reorg risk. If the deposit
+                    // is orphaned first, `process_btc_maturity` voids it (burns the
+                    // supply back) — the coin never enters the anonymity set, so a
+                    // double-spend reorg is recoverable despite zBTC's privacy.
+                    //
+                    // Value capture: a bridge fee is skimmed to stakers. The full `value`
+                    // is minted and backed 1:1; the recipient's coin is `value - fee`, and
+                    // `fee` accrues to the staker fee pool when the deposit matures (never
+                    // when it is voided). This tethers bridge volume to the token.
+                    Some(deposit) => {
+                        let fee = crate::emission::bridge_fee(cl.value);
+                        let net = cl.value - fee;
+                        let c_net = crate::keys::htlc_commitment(&cl.party_pk, net, cl.asset_id, escrow_id);
+                        self.immature.push(ImmatureMint {
+                            commitment: c_net,
+                            value: cl.value, // full, backed 1:1 (net to recipient + fee to stakers)
+                            fee,
+                            asset_id: cl.asset_id,
+                            deposit_block: deposit.block,
+                            deposit_txid: deposit.txid,
+                            deposit_vout: deposit.vout,
+                            hashlock: ctx.hashlock,
+                            escrow_id: *escrow_id,
+                            orphaned_at_btc: None,
+                        });
+                        Ok(Some(c_net)) // the net commitment is known, but not yet a tree leaf
+                    }
+                    // Non-SPV (personal/M-of-N) mint: spendable immediately, no bridge fee.
+                    None => {
+                        let c = crate::keys::htlc_commitment(&cl.party_pk, cl.value, cl.asset_id, escrow_id);
+                        self.append_and_record(c);
+                        Ok(Some(c))
+                    }
+                }
             }
             crate::htlc_shield::EscrowKind::Burn => {
                 let _ = self.assets.record_burn(cl.asset_id, cl.value);
@@ -491,10 +1015,11 @@ impl Node {
         consensus_pubkey: Vec<u8>,
         stake: u64,
         reward_address: Hash,
+        commission_bps: u16,
     ) -> Result<(), String> {
         // VM gate: program BOND = [CHECK_MIN_STAKE].
         gate(zvm::BOND, &zvm::Ctx { stake, ..Default::default() })?;
-        self.staking.bond(validator_id, consensus_pubkey, stake, reward_address)
+        self.staking.bond(validator_id, consensus_pubkey, stake, reward_address, commission_bps)
     }
 
     /// **Coin-backed BOND.** The validator genuinely PLEDGES shielded ZCRYPT: `shield_tx`
@@ -513,9 +1038,32 @@ impl Node {
         validator_id: Vec<u8>,
         consensus_pubkey: Vec<u8>,
         reward_address: Hash,
+        commission_bps: u16,
     ) -> Result<(), String> {
         // VM gate: stake ≥ MIN_STAKE (checked before touching state).
         gate(zvm::BOND, &zvm::Ctx { stake, ..Default::default() })?;
+        // Pre-check every staking.bond rejection BEFORE the irreversible shield burn.
+        // Re-bond is refused: `Staking::bond` replaces self-stake, which would permanently
+        // destroy the previous pledge without unbonding credit. Unbond first to change
+        // commission or re-pledge.
+        if self.staking.is_validator(&validator_id) {
+            return Err(
+                "validator already bonded; unbond and wait for release before re-bonding or changing commission"
+                    .to_string(),
+            );
+        }
+        if self.staking.is_tombstoned(&validator_id) {
+            return Err("validator is tombstoned (slashed for misbehavior) and cannot re-bond".to_string());
+        }
+        if commission_bps > crate::staking::MAX_COMMISSION_BPS {
+            return Err(format!(
+                "commission {commission_bps} bps exceeds 100% ({})",
+                crate::staking::MAX_COMMISSION_BPS
+            ));
+        }
+        if stake > crate::emission::TOTAL_SUPPLY {
+            return Err(format!("stake {stake} exceeds total supply"));
+        }
         // The pledged value must be a native-ZCRYPT burn coin of exactly `stake`.
         let expected = zcrypt_shield::commit_asset(
             stake,
@@ -526,11 +1074,20 @@ impl Node {
         if shield_tx.output_commitments.first() != Some(&expected) {
             return Err("bond: output[0] is not the declared stake burn coin".to_string());
         }
-        // Verify + apply the shield spend (records the pledged coins' nullifiers and
-        // appends the burn coin + change to the tree), THEN record the validator. The
-        // gate above guarantees `staking.bond` cannot fail after this point.
+        // Universal-gas / anti-bypass: the pledge spend must burn at least MIN_FEE, exactly like
+        // the transfer path. Without this, a bonder could smuggle a full value transfer through
+        // the fee-agnostic escrow/staking path (output[1..]) and pay zero gas.
+        if shield_tx.fee < crate::emission::MIN_FEE {
+            return Err(format!(
+                "bond: pledge spend must burn ≥ MIN_FEE ({}) gas; got {}",
+                crate::emission::MIN_FEE,
+                shield_tx.fee
+            ));
+        }
+        // Verify + apply the shield spend, THEN record the validator (pre-checks above
+        // ensure staking.bond cannot fail after this point for policy reasons).
         self.submit_shield(chain_id, shield_tx)?;
-        self.staking.bond(validator_id, consensus_pubkey, stake, reward_address)
+        self.staking.bond(validator_id, consensus_pubkey, stake, reward_address, commission_bps)
     }
 
     /// **Coin-backed DELEGATE.** A delegator pledges shielded ZCRYPT toward an existing
@@ -574,6 +1131,14 @@ impl Node {
         );
         if shield_tx.output_commitments.first() != Some(&expected) {
             return Err("delegate: output[0] is not the declared stake burn coin".to_string());
+        }
+        // Anti-bypass: the pledge spend must burn ≥ MIN_FEE gas (see `bond_with_stake`).
+        if shield_tx.fee < crate::emission::MIN_FEE {
+            return Err(format!(
+                "delegate: pledge spend must burn ≥ MIN_FEE ({}) gas; got {}",
+                crate::emission::MIN_FEE,
+                shield_tx.fee
+            ));
         }
         self.submit_shield(chain_id, shield_tx)?;
         self.staking.delegate(validator_id, delegator_id, stake, reward_address)
@@ -636,6 +1201,10 @@ impl Node {
     pub fn unbonding_of(&self, validator_id: &[u8]) -> Vec<(u64, u64)> {
         self.staking.unbonding_of(validator_id)
     }
+    /// A staker's OWN pending unbondings (by reward address): `(stake, release_time)`.
+    pub fn unbonding_by_reward(&self, reward: &Hash) -> Vec<(u64, u64)> {
+        self.staking.unbonding_by_reward(reward)
+    }
 
     /// Record which validators signed the just-decided block (from CometBFT's
     /// `decided_last_commit`). Call once per block in `finalize_block`.
@@ -650,7 +1219,48 @@ impl Node {
         if height == 0 || height % crate::emission::EPOCH != 0 {
             return 0;
         }
+        // Distribute accrued bridge fees to stakers FIRST (both use this epoch's
+        // participation weights, and `distribute_epoch` clears participation at the end).
+        self.staking.distribute_fees();
         self.staking.distribute_epoch(height)
+    }
+
+    /// A staker's claimable bridge-fee balance for `asset_id` (real, asset-denominated
+    /// yield earned by staking ZCRYPT, proportional to stake × participation).
+    pub fn claimable_fee(&self, pk: &zcrypt_shield::PubKey, asset_id: u64) -> u64 {
+        self.staking.claimable_fee(&crate::keys::reward_address(pk), asset_id)
+    }
+
+    /// The next fee-claim coin index for `(pk, asset_id)` (for coin reconstruction).
+    pub fn fee_claim_index(&self, pk: &zcrypt_shield::PubKey, asset_id: u64) -> u64 {
+        self.staking.fee_claim_index_of(&crate::keys::reward_address(pk), asset_id)
+    }
+
+    /// Claim `amount` of accrued bridge-fee yield in `asset_id`, minting spendable coins
+    /// of that asset bound to `pk` into the pool (the staker's cut of bridge volume).
+    /// Trustless: coins are created only against a real consensus-agreed fee balance,
+    /// which was itself a portion of already-minted, fully-backed bridge supply, so this
+    /// materializes existing supply rather than issuing new (no `record_mint`).
+    pub fn claim_fee_rewards(
+        &mut self,
+        pk: &zcrypt_shield::PubKey,
+        asset_id: u64,
+        amount: u64,
+    ) -> Result<Vec<Commitment>, String> {
+        let addr = crate::keys::reward_address(pk);
+        // VM gate: same shape as a staking claim (positive, within the claimable balance).
+        let bal = self.staking.claimable_fee(&addr, asset_id);
+        gate(zvm::CLAIM, &zvm::Ctx { amount, claimable: bal, ..Default::default() })?;
+        self.staking.debit_fee(&addr, asset_id, amount)?;
+        // Mint the claimed fee as asset coins, split into circuit-provable chunks.
+        let mut coins = Vec::new();
+        for chunk in crate::keys::claim_chunks(amount, false) {
+            let index = self.staking.take_fee_claim_index(&addr, asset_id);
+            let c = crate::keys::fee_reward_commitment(pk, chunk, asset_id, index);
+            self.append_and_record(c);
+            coins.push(c);
+        }
+        Ok(coins)
     }
 
     /// Mint the one-time foundation allocation to `foundation_address` (genesis).
@@ -661,8 +1271,143 @@ impl Node {
     pub fn reward_balance(&self, reward_address: &Hash) -> u64 {
         self.staking.reward_balance(reward_address)
     }
+    /// Read-only view of the staking ledger (validators, lifetime earnings,
+    /// participation, delegations) — what the RPC/explorer layer serves.
+    pub fn staking(&self) -> &crate::staking::Staking {
+        &self.staking
+    }
+    /// Replay-protection nonce a UNBOND/UNDELEGATE from `signer_pk` must carry next.
+    pub fn auth_nonce(&self, signer_pk: &[u8; 32]) -> u64 {
+        self.staking.auth_nonce(signer_pk)
+    }
+    /// Advance `signer_pk`'s nonce after a successful signature-only staking tx.
+    pub fn bump_auth_nonce(&mut self, signer_pk: &[u8; 32]) {
+        self.staking.bump_auth_nonce(signer_pk)
+    }
     pub fn validator_set(&self) -> Vec<(Vec<u8>, u64)> {
         self.staking.validator_set()
+    }
+    /// `(consensus_pubkey, stake+delegated, commission_bps)` per bonded validator.
+    pub fn validator_set_full(&self) -> Vec<(Vec<u8>, u64, u16)> {
+        self.staking.validator_set_full()
+    }
+
+    /// Designate the foundation liveness-guarantor ("sentinel") — called once at genesis
+    /// when the genesis `app_state` opts in. `genesis_power` is the sentinel's initial
+    /// CometBFT voting power (its power floor). From then on `sentinel_update` keeps its
+    /// power above 2/3 of the total so the chain can never be halted by others leaving.
+    pub fn set_sentinel(&mut self, key: Vec<u8>, genesis_power: i64, decay_at_others: i64) {
+        self.sentinel = Some(Sentinel {
+            key,
+            power: genesis_power,
+            floor: genesis_power.max(1),
+            decay_at_others: decay_at_others.max(0),
+            retire: false,
+            decay_min_validators: SENTINEL_DECAY_MIN_VALIDATORS,
+            decay_dwell_blocks: SENTINEL_DECAY_DWELL_BLOCKS,
+            decay_streak: 0,
+        });
+    }
+
+    /// The sentinel's (consensus_pubkey, current_power), if one is designated.
+    pub fn sentinel_info(&self) -> Option<(Vec<u8>, i64)> {
+        self.sentinel.as_ref().map(|s| (s.key.clone(), s.power))
+    }
+
+    /// The sentinel key's OWN validator power (whole ZCRYPT of its bonded stake, floor 1) — the
+    /// power it drops to when it retires (auto-decay or disable).
+    fn sentinel_own_power(&self, key: &[u8]) -> i64 {
+        self.staking
+            .validator_set()
+            .into_iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, stake)| ((stake / crate::emission::ATOMIC).max(1)) as i64)
+            .unwrap_or(1)
+    }
+
+    /// Flag the sentinel for RETIREMENT — permitted only for the current sentinel key itself (the
+    /// disable tx is signed by it). The next `sentinel_update` (this block, in `finalize_block`)
+    /// drops it to its normal staked power, emits that CometBFT `ValidatorUpdate`, and clears it.
+    /// Errors if there is no sentinel or the requester is not it.
+    pub fn disable_sentinel(&mut self, requester_key: &[u8]) -> Result<(), String> {
+        let s = self.sentinel.as_mut().ok_or("no sentinel to disable")?;
+        if s.key != requester_key {
+            return Err("only the sentinel key itself may disable the sentinel".to_string());
+        }
+        s.retire = true;
+        Ok(())
+    }
+
+    /// Recompute the sentinel's voting power to `max(floor, 2*others + 1)`, where `others`
+    /// is the total voting power of every OTHER (bonded) validator. `2*others + 1` is
+    /// strictly greater than 2/3 of the total for any `others >= 0`, so the sentinel alone
+    /// always satisfies CometBFT's +2/3 commit threshold — the chain keeps producing blocks
+    /// even if every other validator goes offline. Returns `Some((key, new_power))` to emit
+    /// as a CometBFT `ValidatorUpdate` when the power changed this block, else `None`. Pure
+    /// function of consensus-committed staking state, so all nodes agree. No-op without a
+    /// sentinel. Call once per block in `finalize_block`, after applying staking changes.
+    ///
+    /// AUTO-DECAY: once external stake reaches `decay_at_others` (whole ZCRYPT across non-sentinel
+    /// validators), the sentinel RETIRES — it drops to its own staked power and is removed, so the
+    /// >2/3 liveness crutch is a bootstrap phase that ends once the network can secure itself.
+    pub fn sentinel_update(&mut self) -> Option<(Vec<u8>, i64)> {
+        let key = self.sentinel.as_ref()?.key.clone();
+        // Sum voting power of all validators EXCEPT the sentinel (matches abci voting_power:
+        // whole ZCRYPT staked, floor 1 per validator).
+        let non_sentinel: Vec<(Vec<u8>, u64)> = self
+            .staking
+            .validator_set()
+            .into_iter()
+            .filter(|(k, _)| *k != key)
+            .collect();
+        let others: i64 = non_sentinel
+            .iter()
+            .map(|(_, stake)| ((stake / crate::emission::ATOMIC).max(1)) as i64)
+            .sum();
+        // Number of DISTINCT non-sentinel validators actually bonded right now.
+        let n_others = non_sentinel.len() as i64;
+        let (decay_at, retire, min_vals, dwell) = {
+            let s = self.sentinel.as_ref().expect("checked above");
+            (s.decay_at_others, s.retire, s.decay_min_validators, s.decay_dwell_blocks)
+        };
+        // Auto-decay may only fire when external stake has reached the threshold AND is spread
+        // across at least `min_vals` distinct validators — and (below) only after the condition
+        // has held for `dwell` consecutive blocks. This defeats the "one whale spikes stake in a
+        // few keys, retires the sentinel, then captures >2/3" latch attack.
+        let condition = decay_at > 0 && others >= decay_at && n_others >= min_vals;
+        let dwell_satisfied = if condition {
+            let s = self.sentinel.as_mut().expect("checked above");
+            s.decay_streak = s.decay_streak.saturating_add(1);
+            s.decay_streak >= dwell
+        } else {
+            // Condition lapsed before the dwell elapsed: reset the streak (retirement stays
+            // reversible until it actually fires).
+            let s = self.sentinel.as_mut().expect("checked above");
+            s.decay_streak = 0;
+            false
+        };
+        // Retire on an explicit disable tx (authorized, immediate), OR once the auto-decay
+        // condition has been sustained for the full dwell window. Drop to normal staked power,
+        // emit it, and remove the sentinel.
+        if retire || dwell_satisfied {
+            let own = self.sentinel_own_power(&key);
+            self.sentinel = None;
+            let why = if retire {
+                "disabled by tx".to_string()
+            } else {
+                format!("external stake {others} ≥ threshold {decay_at} across {n_others} validators, sustained {dwell} blocks")
+            };
+            eprintln!("[sentinel] retired ({why}); dropping to own staked power {own}");
+            return Some((key, own));
+        }
+        let s = self.sentinel.as_mut().expect("checked above");
+        let desired = (2 * others + 1).max(s.floor);
+        if desired != s.power {
+            s.power = desired;
+            Some((key, desired))
+        } else {
+            None
+        }
     }
     /// Total issued as of the current height: the foundation's vested amount plus
     /// all block rewards distributed.
@@ -765,6 +1510,18 @@ impl Node {
         chain_id: &[u8],
         tx: &crate::shield_tx::ShieldTx,
     ) -> Result<Receipt, String> {
+        self.submit_shield_bound(chain_id, tx, &[])
+    }
+
+    /// [`Self::submit_shield`], additionally requiring the proof to be bound to `envelope`
+    /// (see [`crate::htlc_shield::lock_envelope`]). Escrow locks use this so their plaintext
+    /// lock parameters cannot be rewritten by a mempool front-runner.
+    pub fn submit_shield_bound(
+        &mut self,
+        chain_id: &[u8],
+        tx: &crate::shield_tx::ShieldTx,
+        envelope: &[u8],
+    ) -> Result<Receipt, String> {
         // L1 root binding: the proof's in-circuit Merkle membership is only meaningful
         // if its anchor root is one this node actually produced. Reject unknown anchors
         // BEFORE the expensive proof verification. This is what ties the whole-pool
@@ -777,7 +1534,7 @@ impl Node {
         // enforced here — it lives on the transfer path ([`Self::submit_transfer`], which
         // requires a bundled ZCRYPT gas note), so staking pledges and gas notes that
         // route through here stay gasless.
-        let nullifiers = crate::shield_tx::verify(chain_id, tx)?;
+        let nullifiers = crate::shield_tx::verify_bound(chain_id, tx, envelope)?;
         let txbind = crate::shield_tx::txbind(chain_id, tx);
         for nf in &nullifiers {
             if self.smt.contains(nf) {
@@ -796,7 +1553,6 @@ impl Node {
         Ok(Receipt {
             txbind,
             nullifiers,
-            state_root: self.state_root(),
         })
     }
 
@@ -831,10 +1587,21 @@ impl Node {
         chain_id: &[u8],
         tx: &crate::shield_tx::ShieldTx,
     ) -> Result<(), String> {
+        self.check_shield_bound(chain_id, tx, &[])
+    }
+
+    /// [`Self::check_shield`] with envelope binding, so a malleated lock transaction is
+    /// rejected at the mempool boundary rather than only at block execution.
+    pub fn check_shield_bound(
+        &self,
+        chain_id: &[u8],
+        tx: &crate::shield_tx::ShieldTx,
+        envelope: &[u8],
+    ) -> Result<(), String> {
         if !self.root_is_known(&tx.root) {
             return Err("shield-tx: unknown/expired commitment-tree anchor root".to_string());
         }
-        let nullifiers = crate::shield_tx::verify(chain_id, tx)?;
+        let nullifiers = crate::shield_tx::verify_bound(chain_id, tx, envelope)?;
         for nf in &nullifiers {
             if self.smt.contains(nf) {
                 return Err(format!("double-spend: nullifier {} already spent", hex8(nf)));
@@ -939,7 +1706,6 @@ impl Node {
         Ok(Receipt {
             txbind: main_txbind,
             nullifiers: main_nfs.into_iter().chain(gas_nfs).collect(),
-            state_root: self.state_root(),
         })
     }
 
@@ -966,6 +1732,51 @@ fn hex8(h: &Hash) -> String {
 mod tests {
     use super::*;
     use crate::hash::h;
+
+    #[test]
+    fn sentinel_power_always_exceeds_two_thirds_and_never_halts() {
+        let atomic = crate::emission::ATOMIC;
+        let mut node = Node::new();
+        let sentinel = vec![0xAAu8; 32];
+        node.set_sentinel(sentinel.clone(), 10, 0); // genesis power / floor; decay 0 = permanent
+
+        // No other validators: sentinel stays at its floor, no update emitted.
+        assert_eq!(node.sentinel_update(), None);
+
+        // A validator bonds 10,000 ZCRYPT (voting power 10,000). The sentinel re-weights
+        // to 2*10000 + 1 so it alone holds > 2/3 of the total.
+        let val = vec![0xBBu8; 32];
+        node.staking.bond(val.clone(), val.clone(), 10_000 * atomic, [0u8; 32], crate::staking::DEFAULT_COMMISSION_BPS).unwrap();
+        let (k, p) = node.sentinel_update().expect("sentinel re-weighted on bond");
+        assert_eq!(k, sentinel);
+        assert_eq!(p, 20_001);
+        let others = 10_000i64;
+        assert!(3 * p > 2 * (p + others), "sentinel must exceed 2/3 of total voting power");
+        // Idempotent: no spurious update when nothing changed.
+        assert_eq!(node.sentinel_update(), None);
+
+        // A second, huge validator bonds (1,000,000 power). Sentinel dominates it too.
+        let val2 = vec![0xCCu8; 32];
+        node.staking.bond(val2.clone(), val2.clone(), 1_000_000 * atomic, [0u8; 32], crate::staking::DEFAULT_COMMISSION_BPS).unwrap();
+        let (_, p2) = node.sentinel_update().expect("re-weighted on second bond");
+        let others2 = 10_000i64 + 1_000_000;
+        assert_eq!(p2, 2 * others2 + 1);
+        assert!(3 * p2 > 2 * (p2 + others2));
+
+        // Everyone leaves: the sentinel drops back to its floor and, as the only validator,
+        // keeps producing blocks — the chain never halts.
+        node.staking.unbond(&val, 0).unwrap();
+        node.staking.unbond(&val2, 0).unwrap();
+        let (_, p3) = node.sentinel_update().expect("re-weighted down when others leave");
+        assert_eq!(p3, 10, "back to the genesis floor once alone");
+    }
+
+    #[test]
+    fn no_sentinel_by_default() {
+        let mut node = Node::new();
+        assert!(node.sentinel_info().is_none());
+        assert_eq!(node.sentinel_update(), None); // no-op without a sentinel
+    }
 
     #[test]
     fn prove_batch_matches_individual() {
@@ -1002,15 +1813,11 @@ mod tests {
         }
         node.smt.insert(h(b"NF", &[b"x"]), h(b"TX", &[b"1"]));
         node.smt.insert(h(b"NF", &[b"y"]), h(b"TX", &[b"2"]));
-        node.bond(vec![1, 2, 3], vec![1, 2, 3], 10_000 * crate::emission::ATOMIC, [4u8; 32]).unwrap();
+        node.bond(vec![1, 2, 3], vec![1, 2, 3], 10_000 * crate::emission::ATOMIC, [4u8; 32], crate::staking::DEFAULT_COMMISSION_BPS).unwrap();
         let (keyset, signers) = crate::mint_auth::derive_keyset(b"test-treasury", 3, 2);
+        // Non-zBTC asset: zBTC is SPV-only and cannot open via threshold mint.
         let asset = node
-            .register_asset(
-                crate::asset_registry::ZBTC_TICKER,
-                crate::asset_registry::ZBTC_DECIMALS,
-                Some(keyset.commitment()),
-                crate::asset_registry::ZBTC_MAX_SUPPLY,
-            )
+            .register_asset("GOLD", 8, Some(keyset.commitment()), 21_000_000 * 100_000_000)
             .unwrap();
         let (value, lock, timeout, claim_pk) = (1_000u64, [1u8; 32], 100u64, [2u64; 8]);
         let msg = crate::mint_auth::mint_message(asset, value, &lock, timeout, &claim_pk);

@@ -46,14 +46,14 @@ fn stats(name: &str, ts: &[f64], unit: &str) {
 }
 
 fn bench(label: &str, ins: &[SpendWitness], outs: &[OutCoin], fee: u64) {
-    let _ = prove(ins, outs, fee, CHAIN).unwrap(); // warm up
+    let _ = prove(ins, outs, fee, CHAIN, &[0u64; 8]).unwrap(); // warm up
 
     let mut prove_ms = Vec::new();
     let mut proof = Vec::new();
     let mut kept = None;
     for _ in 0..12 {
         let t = Instant::now();
-        let p = prove(ins, outs, fee, CHAIN).unwrap();
+        let p = prove(ins, outs, fee, CHAIN, &[0u64; 8]).unwrap();
         prove_ms.push(t.elapsed().as_secs_f64() * 1000.0);
         proof = p.3.clone();
         kept = Some(p);
@@ -63,7 +63,7 @@ fn bench(label: &str, ins: &[SpendWitness], outs: &[OutCoin], fee: u64) {
     let mut verify_ms = Vec::new();
     for _ in 0..40 {
         let t = Instant::now();
-        assert!(verify(&o, &nf, fee, &root, &pr, CHAIN));
+        assert!(verify(&o, &nf, fee, &root, &pr, CHAIN, &[0u64; 8]));
         verify_ms.push(t.elapsed().as_secs_f64() * 1000.0);
     }
 

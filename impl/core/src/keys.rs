@@ -162,6 +162,13 @@ impl Address {
         let pk: PubKey = core::array::from_fn(|i| {
             u64::from_le_bytes(rest[i * 8..i * 8 + 8].try_into().unwrap())
         });
+        // Reject non-canonical limb encodings (limb >= FIELD_ORDER). Without this,
+        // `x` and `x + FIELD_ORDER` both reduce to the same on-chain `pk`, so distinct
+        // address byte-strings (and distinct bech32 strings) would alias to one coin.
+        // Mirror the on-chain `limbs_canonical` gate applied to commitments/nullifiers.
+        if !zcrypt_shield::limbs_canonical(&pk) {
+            return None;
+        }
         let ek = &rest[64..];
         kem::ek_from_bytes(ek)?; // validate it's a well-formed ML-KEM key
         Some(Address {
@@ -365,6 +372,17 @@ impl Account {
             asset_id,
         }
     }
+
+    /// Reconstruct the `index`-th bridge-fee coin of `value` in `asset_id` you claimed
+    /// as a staker — a normal spendable asset coin bound to your spend key.
+    pub fn fee_reward_coin(&self, value: u64, asset_id: u64, index: u64) -> Coin {
+        Coin {
+            value,
+            blind: fee_reward_blind(&self.pubkey(), asset_id, index),
+            spend_secret: self.spend_secret,
+            asset_id,
+        }
+    }
 }
 
 // Note layout: value(8 LE) ‖ blind(4×8 LE) ‖ asset_id(8 LE) = 48 bytes.
@@ -479,6 +497,25 @@ pub fn claim_blind(pk: &PubKey, index: u64) -> Blind {
 /// reconstructs from [`Account::reward_coin`].
 pub fn reward_commitment(pk: &PubKey, value: u64, index: u64) -> Commitment {
     zcrypt_shield::commit(value, &claim_blind(pk, index), pk)
+}
+
+/// Deterministic public blind for a claimed bridge-fee coin, keyed by `(pk, asset, index)`
+/// so it collides with neither reward nor HTLC coins.
+fn fee_reward_blind(pk: &PubKey, asset_id: u64, index: u64) -> Blind {
+    let d0 = h(b"ZC-FEE-BLIND", &[&pk_bytes(pk), &asset_id.to_le_bytes(), &index.to_le_bytes()]);
+    let d1 = h(b"ZC-FEE-BLN2", &[&pk_bytes(pk), &asset_id.to_le_bytes(), &index.to_le_bytes()]);
+    [
+        zcrypt_shield::field_limb(u64::from_le_bytes(d0[0..8].try_into().unwrap())),
+        zcrypt_shield::field_limb(u64::from_le_bytes(d0[8..16].try_into().unwrap())),
+        zcrypt_shield::field_limb(u64::from_le_bytes(d1[0..8].try_into().unwrap())),
+        zcrypt_shield::field_limb(u64::from_le_bytes(d1[8..16].try_into().unwrap())),
+    ]
+}
+
+/// The commitment the node mints for the `index`-th claimed bridge-fee coin of `value`
+/// in `asset_id` to `pk` — asset-typed, and reconstructed by [`Account::fee_reward_coin`].
+pub fn fee_reward_commitment(pk: &PubKey, value: u64, asset_id: u64, index: u64) -> Commitment {
+    zcrypt_shield::commit_asset(value, &fee_reward_blind(pk, asset_id, index), pk, asset_id)
 }
 
 /// A small dedicated ZCRYPT gas coin (1 ZCRYPT, ~100 transfers) reserved on an

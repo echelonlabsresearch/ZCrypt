@@ -40,6 +40,7 @@ pub const OP_CHECK_PREIMAGE: u8 = 0x1A; // SHA256(preimage) == hashlock
 pub const OP_CHECK_ASSET_REGISTERED: u8 = 0x1B; // asset id is registered
 pub const OP_CHECK_BURN_OUTPUT: u8 = 0x1C; // output[0] == declared burn coin
 pub const OP_CHECK_THRESHOLD_SIG: u8 = 0x1D; // ≥M valid ML-DSA sigs from the asset's key set
+pub const OP_CHECK_SPV_PROOF: u8 = 0x1E; // a verified Bitcoin SPV deposit proof (trustless mint)
 
 // ---- one canonical program per transaction type ----
 /// 0x57 bond a validator.
@@ -48,8 +49,11 @@ pub const BOND: &[u8] = &[OP_CHECK_MIN_STAKE, OP_HALT];
 pub const CLAIM: &[u8] = &[OP_CHECK_AMOUNT_POSITIVE, OP_CHECK_AMOUNT_LE_CLAIMABLE, OP_HALT];
 /// 0x59 register a shielded-asset ticker (first-mint-wins).
 pub const REGISTER: &[u8] = &[OP_CHECK_TICKER_VALID, OP_CHECK_TICKER_FREE, OP_HALT];
-/// 0x5A open a mint HTLC escrow (BTC→zBTC).
+/// 0x5A open a mint HTLC escrow with an M-of-N authorization (user-minted assets).
 pub const HTLC_OPEN: &[u8] = &[OP_CHECK_ASSET_HAS_AUTHORITY, OP_CHECK_THRESHOLD_SIG, OP_HALT];
+/// 0x64 open a **zBTC** mint HTLC escrow gated by a Bitcoin SPV deposit proof —
+/// the trustless bridge mint: no signer or treasury anywhere on the path.
+pub const HTLC_OPEN_SPV: &[u8] = &[OP_CHECK_ASSET_HAS_AUTHORITY, OP_CHECK_SPV_PROOF, OP_HALT];
 /// Rotate an asset's mint authority — same gate as a mint (the CURRENT key set must
 /// threshold-sign), just over a rotation message instead of a mint message.
 pub const ROTATE_AUTH: &[u8] = &[OP_CHECK_ASSET_HAS_AUTHORITY, OP_CHECK_THRESHOLD_SIG, OP_HALT];
@@ -80,6 +84,10 @@ pub struct Ctx {
     pub mint_keyset: Option<crate::mint_auth::MintKeySet>,
     pub mint_msg: Vec<u8>,
     pub mint_sigs: Vec<crate::mint_auth::SignerSig>,
+    /// Result of [`crate::spv::HeaderChain::verify_mint_proof`] over the submitted
+    /// Bitcoin deposit proof (precomputed by the node against consensus SPV state,
+    /// like `burn_output_ok`). Defaults false — fails closed.
+    pub spv_ok: bool,
     // htlc
     pub escrow_open: bool,
     pub height: u64,
@@ -115,6 +123,7 @@ pub fn evaluate(program: &[u8], ctx: &Ctx) -> Outcome {
             OP_CHECK_ASSET_HAS_AUTHORITY if ctx.authority.is_none() => return Outcome::reject("asset not registered / no mint authority"),
             OP_CHECK_CAPABILITY if ctx.authority != Some(mint_capability(&ctx.capability)) => return Outcome::reject("invalid mint capability"),
             OP_CHECK_THRESHOLD_SIG if !threshold_sig_ok(ctx) => return Outcome::reject("invalid mint authorization (M-of-N signatures)"),
+            OP_CHECK_SPV_PROOF if !ctx.spv_ok => return Outcome::reject("invalid Bitcoin SPV deposit proof"),
             OP_CHECK_ESCROW_OPEN if !ctx.escrow_open => return Outcome::reject("escrow missing or not open"),
             OP_CHECK_BEFORE_TIMEOUT if ctx.height >= ctx.timeout => return Outcome::reject("escrow timed out"),
             OP_CHECK_AT_OR_AFTER_TIMEOUT if ctx.height < ctx.timeout => return Outcome::reject("not yet timed out"),
@@ -123,7 +132,7 @@ pub fn evaluate(program: &[u8], ctx: &Ctx) -> Outcome {
             OP_CHECK_BURN_OUTPUT if !ctx.burn_output_ok => return Outcome::reject("output[0] is not the declared burn coin"),
             OP_HALT => break,
             // a guard byte that passed, or a no-op position
-            0x10..=0x1D => {}
+            0x10..=0x1E => {}
             _ => return Outcome::reject("unknown opcode"),
         }
     }
@@ -164,23 +173,24 @@ mod tests {
         let mut node = Node::new();
         // valid: at the minimum
         let ctx = Ctx { stake: MIN_STAKE, ..Default::default() };
-        assert_eq!(evaluate(BOND, &ctx).accept, node.bond(pk(1), pk(1), MIN_STAKE, [1; 32]).is_ok());
+        assert_eq!(evaluate(BOND, &ctx).accept, node.bond(pk(1), pk(1), MIN_STAKE, [1; 32], crate::staking::DEFAULT_COMMISSION_BPS).is_ok());
         // adversarial: below minimum
         let mut node2 = Node::new();
         let ctx = Ctx { stake: MIN_STAKE - 1, ..Default::default() };
-        assert_eq!(evaluate(BOND, &ctx).accept, node2.bond(pk(2), pk(2), MIN_STAKE - 1, [2; 32]).is_ok());
+        assert_eq!(evaluate(BOND, &ctx).accept, node2.bond(pk(2), pk(2), MIN_STAKE - 1, [2; 32], crate::staking::DEFAULT_COMMISSION_BPS).is_ok());
         assert!(!evaluate(BOND, &ctx).accept);
     }
 
     #[test]
     fn register_program_matches_node() {
         let mut node = Node::new();
-        // valid new ticker
+        // valid new ticker (zBTC needs an authority — SPV commitment in production)
+        let auth = Some([9u8; 32]);
         let ctx = Ctx { ticker: "zBTC".into(), ticker_taken: false, id_taken: false, ..Default::default() };
-        assert_eq!(evaluate(REGISTER, &ctx).accept, node.register_asset("zBTC", 8, None, 21_000_000 * 100_000_000).is_ok());
+        assert_eq!(evaluate(REGISTER, &ctx).accept, node.register_asset("zBTC", 8, auth, 21_000_000 * 100_000_000).is_ok());
         // adversarial: duplicate
         let ctx = Ctx { ticker: "zBTC".into(), ticker_taken: node.asset_id_of("zBTC").is_some(), ..Default::default() };
-        assert_eq!(evaluate(REGISTER, &ctx).accept, node.register_asset("zBTC", 8, None, 21_000_000 * 100_000_000).is_ok());
+        assert_eq!(evaluate(REGISTER, &ctx).accept, node.register_asset("zBTC", 8, auth, 21_000_000 * 100_000_000).is_ok());
         assert!(!evaluate(REGISTER, &ctx).accept);
         // adversarial: invalid ticker
         let mut n2 = Node::new();
@@ -192,7 +202,7 @@ mod tests {
     fn claim_program_matches_node() {
         let (account, _mn) = keys::new_account();
         let mut node = Node::new();
-        node.bond(pk(1), pk(1), MIN_STAKE, account.reward_address()).unwrap();
+        node.bond(pk(1), pk(1), MIN_STAKE, account.reward_address(), crate::staking::DEFAULT_COMMISSION_BPS).unwrap();
         for h in 1..=emission::EPOCH {
             node.set_height(h);
             node.record_block_signers(&[pk(1)]);
@@ -221,8 +231,9 @@ mod tests {
         let (account, _mn) = keys::new_account();
         let mut node = Node::new();
         let (keyset, signers) = mint_auth::derive_keyset(b"lp-treasury", 3, 2);
+        // Use a non-zBTC ticker: zBTC is SPV-only and rejects threshold opens.
         let asset =
-            node.register_asset("zBTC", 8, Some(keyset.commitment()), 21_000_000 * 100_000_000).unwrap();
+            node.register_asset("GOLD", 8, Some(keyset.commitment()), 21_000_000 * 100_000_000).unwrap();
         let lock = htlc_hashlock(b"x");
         let (value, timeout, pk) = (100u64, 50u64, account.pubkey());
         let authority = node.asset_meta(asset).and_then(|m| m.authority);
@@ -263,7 +274,7 @@ mod tests {
         let mut node = Node::new();
         let (keyset, signers) = mint_auth::derive_keyset(b"lp-treasury", 3, 2);
         let asset =
-            node.register_asset("zBTC", 8, Some(keyset.commitment()), 21_000_000 * 100_000_000).unwrap();
+            node.register_asset("GOLD", 8, Some(keyset.commitment()), 21_000_000 * 100_000_000).unwrap();
         let x = b"preimage";
         let lock = htlc_hashlock(x);
         node.set_height(10);

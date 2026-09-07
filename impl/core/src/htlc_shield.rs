@@ -56,6 +56,20 @@ pub enum EscrowKind {
     Swap,
 }
 
+/// The Bitcoin deposit backing an SPV-gated mint: the block it is proven into AND the
+/// full outpoint (txid ‖ vout). Carried on the escrow so that when the mint is claimed,
+/// the immature coin can be tracked against this block for maturity/void, and
+/// RE-ANCHORED to a new block for the **same** outpoint if a benign reorg re-mines the
+/// deposit elsewhere.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
+pub struct SpvDeposit {
+    pub block: Hash,
+    pub txid: Hash,
+    /// Output index within the funding tx (part of the claimed outpoint identity).
+    #[serde(default)]
+    pub vout: u32,
+}
+
 /// A fixed, unspendable "burn" public key: no `spend_secret` hashes to it under
 /// Poseidon2 (preimage resistance), so a coin bound to it can never be spent — the
 /// zBTC a `Burn` lock puts here is provably out of circulation.
@@ -78,7 +92,64 @@ pub struct HtlcEscrow {
     /// `Mint`/`Burn` it mirrors `party_pk` and is unused.
     #[serde(default)]
     pub refund_pk: PubKey,
+    /// For an SPV-gated **mint** escrow: the Bitcoin block + txid of the backing
+    /// deposit. When such an escrow is claimed, the minted coin is held IMMATURE and
+    /// tracked against this deposit, so a reorg that orphans it can void the coin
+    /// before it becomes spendable. `None` for non-SPV escrows (immediate mint).
+    #[serde(default)]
+    pub spv_deposit: Option<SpvDeposit>,
     pub state: EscrowState,
+}
+
+/// Envelope discriminants, matching the transaction tags that carry each lock kind. Folding
+/// the discriminant into [`lock_envelope`] domain-separates the three shapes, so an envelope
+/// authorized for one lock kind can never be replayed as another.
+pub const ENV_BURN_LOCK: u8 = 0x5D;
+pub const ENV_SWAP_LOCK: u8 = 0x62;
+pub const ENV_BURN_LOCK_BTC: u8 = 0x67;
+
+/// Canonical encoding of a lock transaction's **envelope**: every plaintext parameter that
+/// rides alongside the shield proof and steers where the locked value ultimately goes.
+///
+/// The proof itself binds only `value`, `blind` and `asset_id`, and only indirectly, via the
+/// burn coin at `output[0]`. Everything else here — the hashlock, the timeout, the refund key,
+/// and (for a `0x67` redeem) the Bitcoin payout key — used to be unauthenticated. That let a
+/// mempool observer copy a victim's transaction verbatim, keeping the proof and its nullifiers
+/// intact, rewrite these fields to point at themselves, and race it onto the chain. Two thefts
+/// followed: redirecting a redeem's Bitcoin payout, and redirecting a burn-lock's refund so the
+/// victim's coins re-materialize to the attacker at timeout.
+///
+/// Hashing this into the proof's public inputs (see [`crate::shield_tx::aux_digest`]) closes
+/// both: rewriting any field yields a digest the proof was not made against, so the malleated
+/// copy fails verification in the mempool and never reaches a block.
+///
+/// Fixed-width fields throughout, with the one variable-length field length-prefixed, so the
+/// encoding is unambiguous.
+pub fn lock_envelope(
+    kind: u8,
+    asset_id: u64,
+    value: u64,
+    hashlock: &Hash,
+    timeout_height: u64,
+    party_pk: &PubKey,
+    refund_pk: &PubKey,
+    btc_claim_pk: &[u8],
+) -> Vec<u8> {
+    let mut v = Vec::with_capacity(1 + 8 + 8 + 32 + 8 + 64 + 64 + 4 + btc_claim_pk.len());
+    v.push(kind);
+    v.extend_from_slice(&asset_id.to_le_bytes());
+    v.extend_from_slice(&value.to_le_bytes());
+    v.extend_from_slice(hashlock);
+    v.extend_from_slice(&timeout_height.to_le_bytes());
+    for x in party_pk {
+        v.extend_from_slice(&x.to_le_bytes());
+    }
+    for x in refund_pk {
+        v.extend_from_slice(&x.to_le_bytes());
+    }
+    v.extend_from_slice(&(btc_claim_pk.len() as u32).to_le_bytes());
+    v.extend_from_slice(btc_claim_pk);
+    v
 }
 
 /// Deterministic escrow id from the lock parameters (so both parties can address
@@ -110,6 +181,10 @@ pub struct Claim {
     pub refund_pk: PubKey,
     pub value: u64,
     pub asset_id: u64,
+    /// For an SPV mint escrow: the backing Bitcoin deposit (block + txid). `Some` ⇒ the
+    /// node holds the minted coin immature against this deposit (reorg-voidable, re-
+    /// anchorable) rather than appending it to the spendable tree immediately.
+    pub spv_deposit: Option<SpvDeposit>,
 }
 
 #[derive(Default, Clone, serde::Serialize, serde::Deserialize)]
@@ -128,6 +203,7 @@ impl HtlcBook {
         timeout_height: u64,
         party_pk: PubKey,
         refund_pk: PubKey,
+        spv_deposit: Option<SpvDeposit>,
     ) -> Result<Hash, String> {
         if value == 0 {
             return Err("escrow value must be positive".to_string());
@@ -146,13 +222,16 @@ impl HtlcBook {
                 timeout_height,
                 party_pk,
                 refund_pk,
+                spv_deposit,
                 state: EscrowState::Open,
             },
         );
         Ok(id)
     }
 
-    /// Open a **mint** escrow (BTC→zBTC): claiming mints zBTC to `claim_pk`.
+    /// Open a **mint** escrow (BTC→zBTC): claiming mints zBTC to `claim_pk`. For an
+    /// SPV-gated mint, pass `spv_deposit = Some(btc_block_hash)` so the minted coin
+    /// is held immature against that block; `None` mints immediately (personal assets).
     pub fn open(
         &mut self,
         asset_id: u64,
@@ -160,8 +239,9 @@ impl HtlcBook {
         hashlock: Hash,
         timeout_height: u64,
         claim_pk: PubKey,
+        spv_deposit: Option<SpvDeposit>,
     ) -> Result<Hash, String> {
-        self.insert(EscrowKind::Mint, asset_id, value, hashlock, timeout_height, claim_pk, claim_pk)
+        self.insert(EscrowKind::Mint, asset_id, value, hashlock, timeout_height, claim_pk, claim_pk, spv_deposit)
     }
 
     /// Open a **burn** escrow (zBTC→BTC): Alice's zBTC is already locked; claiming
@@ -174,7 +254,7 @@ impl HtlcBook {
         timeout_height: u64,
         refund_pk: PubKey,
     ) -> Result<Hash, String> {
-        self.insert(EscrowKind::Burn, asset_id, value, hashlock, timeout_height, refund_pk, refund_pk)
+        self.insert(EscrowKind::Burn, asset_id, value, hashlock, timeout_height, refund_pk, refund_pk, None)
     }
 
     /// Open a **swap** escrow (in-pool asset↔asset): the locker's coins are already
@@ -190,7 +270,7 @@ impl HtlcBook {
         counterparty_pk: PubKey,
         refund_pk: PubKey,
     ) -> Result<Hash, String> {
-        self.insert(EscrowKind::Swap, asset_id, value, hashlock, timeout_height, counterparty_pk, refund_pk)
+        self.insert(EscrowKind::Swap, asset_id, value, hashlock, timeout_height, counterparty_pk, refund_pk, None)
     }
 
     /// Claim with a preimage before the timeout. Returns the escrow's `(kind,
@@ -213,7 +293,7 @@ impl HtlcBook {
             return Err("preimage does not match the hashlock".to_string());
         }
         e.state = EscrowState::Claimed;
-        Ok(Claim { kind: e.kind, party_pk: e.party_pk, refund_pk: e.refund_pk, value: e.value, asset_id: e.asset_id })
+        Ok(Claim { kind: e.kind, party_pk: e.party_pk, refund_pk: e.refund_pk, value: e.value, asset_id: e.asset_id, spv_deposit: e.spv_deposit })
     }
 
     /// Expire an escrow after its timeout. A Mint escrow mints nothing (Alice is refunded
@@ -228,7 +308,7 @@ impl HtlcBook {
             return Err("escrow has not yet timed out".to_string());
         }
         e.state = EscrowState::Expired;
-        Ok(Claim { kind: e.kind, party_pk: e.party_pk, refund_pk: e.refund_pk, value: e.value, asset_id: e.asset_id })
+        Ok(Claim { kind: e.kind, party_pk: e.party_pk, refund_pk: e.refund_pk, value: e.value, asset_id: e.asset_id, spv_deposit: e.spv_deposit })
     }
 
     pub fn get(&self, id: &Hash) -> Option<&HtlcEscrow> {
@@ -259,6 +339,15 @@ impl HtlcBook {
             for x in &e.refund_pk {
                 buf.extend_from_slice(&x.to_le_bytes());
             }
+            match &e.spv_deposit {
+                Some(d) => {
+                    buf.push(1);
+                    buf.extend_from_slice(&d.block);
+                    buf.extend_from_slice(&d.txid);
+                    buf.extend_from_slice(&d.vout.to_le_bytes());
+                }
+                None => buf.push(0),
+            }
             buf.push(match e.state {
                 EscrowState::Open => 0,
                 EscrowState::Claimed => 1,
@@ -283,7 +372,7 @@ mod tests {
         let mut b = HtlcBook::default();
         let x = b"swap-preimage-123";
         let lock = htlc_hashlock(x);
-        let id = b.open(0xB7C, 100_000, lock, 200, pk(1)).unwrap();
+        let id = b.open(0xB7C, 100_000, lock, 200, pk(1), None).unwrap();
         // wrong preimage rejected
         assert!(b.claim(&id, b"wrong", 10).is_err());
         // correct preimage before timeout
@@ -301,7 +390,7 @@ mod tests {
     fn timeout_blocks_claim_and_allows_expire() {
         let mut b = HtlcBook::default();
         let x = b"abc";
-        let id = b.open(0xB7C, 50, htlc_hashlock(x), 100, pk(2)).unwrap();
+        let id = b.open(0xB7C, 50, htlc_hashlock(x), 100, pk(2), None).unwrap();
         // at/after timeout, claim is rejected even with the right preimage
         assert!(b.claim(&id, x, 100).is_err());
         // expire is rejected before timeout, allowed at/after
@@ -323,8 +412,8 @@ mod tests {
     fn deterministic_root_and_id() {
         let build = || {
             let mut b = HtlcBook::default();
-            b.open(0xB7C, 100, htlc_hashlock(b"x"), 200, pk(1)).unwrap();
-            b.open(0xE71, 200, htlc_hashlock(b"y"), 300, pk(2)).unwrap();
+            b.open(0xB7C, 100, htlc_hashlock(b"x"), 200, pk(1), None).unwrap();
+            b.open(0xE71, 200, htlc_hashlock(b"y"), 300, pk(2), None).unwrap();
             b.root()
         };
         assert_eq!(build(), build());

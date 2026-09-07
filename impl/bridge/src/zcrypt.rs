@@ -15,8 +15,9 @@ impl Zcrypt {
         Zcrypt { url: url.trim_end_matches('/').to_string() }
     }
 
-    fn agent() -> ureq::Agent {
-        ureq::builder().timeout(std::time::Duration::from_secs(60)).build()
+    /// HTTP agent for this node's URL, routed through Tor when configured (loopback direct).
+    fn agent(&self) -> ureq::Agent {
+        crate::proxied_agent(&self.url, 60)
     }
 
     /// Broadcast a raw tx (with its 1-byte tag). Returns the `tx_result.data`
@@ -26,7 +27,7 @@ impl Zcrypt {
             "jsonrpc": "2.0", "id": 1, "method": "broadcast_tx_commit",
             "params": { "tx": B64.encode(tx) }
         });
-        let resp: Value = Self::agent()
+        let resp: Value = self.agent()
             .post(&self.url)
             .send_json(body)
             .map_err(|e| e.to_string())?
@@ -53,7 +54,7 @@ impl Zcrypt {
     /// An ABCI query returning its (utf-8) string value.
     pub fn query(&self, path: &str) -> Result<String, String> {
         let u = format!("{}/abci_query?path=%22{}%22", self.url, path);
-        let b: Value = Self::agent().get(&u).call().map_err(|e| e.to_string())?.into_json().map_err(|e| e.to_string())?;
+        let b: Value = self.agent().get(&u).call().map_err(|e| e.to_string())?.into_json().map_err(|e| e.to_string())?;
         let r = &b["result"]["response"];
         if r["code"].as_i64().unwrap_or(0) != 0 {
             return Err(r["log"].as_str().unwrap_or("query error").to_string());
@@ -67,7 +68,7 @@ impl Zcrypt {
     }
 
     pub fn height(&self) -> Result<i64, String> {
-        let b: Value = Self::agent()
+        let b: Value = self.agent()
             .get(&format!("{}/status", self.url))
             .call()
             .map_err(|e| e.to_string())?
@@ -79,20 +80,27 @@ impl Zcrypt {
             .ok_or_else(|| "no height".to_string())
     }
 
-    /// All raw txs in a block (decoded).
-    pub fn block_txs(&self, height: i64) -> Vec<Vec<u8>> {
+    /// All raw txs in a block (decoded). Transport/JSON failures return `Err` so callers
+    /// do not treat an unreachable node as an empty block (which would skip settlements).
+    pub fn block_txs(&self, height: i64) -> Result<Vec<Vec<u8>>, String> {
         let u = format!("{}/block?height={}", self.url, height);
-        let b: Value = match Self::agent().get(&u).call().ok().and_then(|r| r.into_json().ok()) {
-            Some(b) => b,
-            None => return vec![],
-        };
-        b["result"]["block"]["data"]["txs"]
+        let b: Value = self
+            .agent()
+            .get(&u)
+            .call()
+            .map_err(|e| format!("block {height}: {e}"))?
+            .into_json()
+            .map_err(|e| format!("block {height} json: {e}"))?;
+        if b["result"]["block"].is_null() {
+            return Err(format!("block {height}: missing block in RPC response"));
+        }
+        Ok(b["result"]["block"]["data"]["txs"]
             .as_array()
             .cloned()
             .unwrap_or_default()
             .iter()
             .filter_map(|t| t.as_str().and_then(|s| B64.decode(s).ok()))
-            .collect()
+            .collect())
     }
 
     /// All commitment-tree leaves in order (the shield decoy pool).
@@ -117,7 +125,8 @@ impl Zcrypt {
     /// return the revealed preimage (the bytes after the 33-byte tag+id).
     pub fn find_claim_preimage(&self, escrow_id: &[u8; 32], from: i64, to: i64) -> Option<Vec<u8>> {
         for h in from..=to {
-            for tx in self.block_txs(h) {
+            let Ok(txs) = self.block_txs(h) else { continue };
+            for tx in txs {
                 if tx.first() == Some(&0x5B) && tx.len() > 33 && &tx[1..33] == escrow_id {
                     return Some(tx[33..].to_vec());
                 }

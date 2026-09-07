@@ -83,8 +83,11 @@ impl BaseAir<BabyBear> for CoinsAirTall {
         TALL_W
     }
     fn num_public_values(&self) -> usize {
-        // Identical to the wide circuit: outputs ‖ fee ‖ nullifiers ‖ root ‖ chain.
-        N_OUT * 8 + 1 + N_IN * 8 + 8 + 1
+        // Identical to the wide circuit: outputs ‖ fee ‖ nullifiers ‖ root ‖ chain ‖ enc_digest.
+        // The trailing 8-limb enc_notes digest is observed into the transcript (Fiat-Shamir), not
+        // constrained by the AIR — it binds the tx's encrypted notes to the proof so a relayer
+        // can't strip/replace them and lock the recipient out of a valid on-chain coin.
+        N_OUT * 8 + 1 + N_IN * 8 + 8 + 1 + 8
     }
     fn preprocessed_trace(&self) -> Option<RowMajorMatrix<BabyBear>> {
         let mut v = vec![BabyBear::ZERO; HEIGHT * NUM_SEL];
@@ -198,6 +201,11 @@ impl<AB: AirBuilder<F = BabyBear>> Air<AB> for CoinsAirTall {
                 let one_minus_act = AB::Expr::ONE - act.clone();
                 core_zero!(builder, one_minus_act.clone() * Into::<AB::Expr>::into(local[i * BLK]));
                 core_zero!(builder, one_minus_act * Into::<AB::Expr>::into(local[i * BLK + 1]));
+                // L1 defense-in-depth: pin the input commitment's padding lane [15] to
+                // 0, mirroring the output-coin constraint below. Real leaves are always
+                // built with lane[15]=0 (see `coin_input`), so this binds the last free
+                // preimage lane and denies a malleable second opening of a spent coin.
+                core_zero!(builder, Into::<AB::Expr>::into(local[i * BLK + 15]));
                 // OWNERSHIP: pk in the commitment (input[6..14]) == Poseidon2(ss).
                 for t in 0..8 {
                     core_zero!(builder, Into::<AB::Expr>::into(local[i * BLK + 6 + t]) - outs[pk_blk][t].into());
@@ -340,6 +348,7 @@ fn tall_trace(
     outputs: &[OutCoin],
     fee: u64,
     chain_id: &[u8],
+    enc_digest: &[u64; 8],
 ) -> Option<(RowMajorMatrix<BabyBear>, Vec<BabyBear>, Vec<Commitment>, Vec<Commitment>, Commitment)>
 {
     if !shape_ok(inputs, outputs, fee) {
@@ -503,6 +512,9 @@ fn tall_trace(
         pis.push(BabyBear::from_u64(x));
     }
     pis.push(BabyBear::from_u64(chain_domain(chain_id)));
+    for &x in enc_digest {
+        pis.push(BabyBear::from_u64(x));
+    }
 
     Some((trace, pis, out_commits, nullifiers, root))
 }
@@ -514,8 +526,9 @@ pub fn prove_tall(
     outputs: &[OutCoin],
     fee: u64,
     chain_id: &[u8],
+    enc_digest: &[u64; 8],
 ) -> Option<(Vec<Commitment>, Vec<Commitment>, Commitment, Vec<u8>)> {
-    let (trace, pis, out_commits, nullifiers, root) = tall_trace(inputs, outputs, fee, chain_id)?;
+    let (trace, pis, out_commits, nullifiers, root) = tall_trace(inputs, outputs, fee, chain_id, enc_digest)?;
     // Preprocessed columns are fixed & public; commit them with the deterministic
     // (fixed-seed) config so prover and verifier derive the same key without sharing.
     let (pp_data, _pp_vk) = setup_preprocessed(&verifier_config(), &CoinsAirTall, DEGREE_BITS)?;
@@ -532,6 +545,7 @@ pub fn verify_tall(
     root: &Commitment,
     proof_bytes: &[u8],
     chain_id: &[u8],
+    enc_digest: &[u64; 8],
 ) -> bool {
     if output_commits.len() != N_OUT || nullifiers.len() != N_IN {
         return false;
@@ -568,6 +582,9 @@ pub fn verify_tall(
         pis.push(BabyBear::from_u64(x));
     }
     pis.push(BabyBear::from_u64(chain_domain(chain_id)));
+    for &x in enc_digest {
+        pis.push(BabyBear::from_u64(x));
+    }
 
     let prev = std::panic::take_hook();
     std::panic::set_hook(Box::new(|_| {}));
@@ -627,17 +644,17 @@ mod tests {
         let outs = [oc(90, 33, 1), oc(55, 44, 2)];
 
         // WIDE reference (the retained circuit; production `prove` now routes to tall).
-        let (wo, wn, wr, wp) = prove_wide(&ins, &outs, 5, CHAIN).expect("wide prove");
-        assert!(verify_wide(&wo, &wn, 5, &wr, &wp, CHAIN), "wide verifies");
+        let (wo, wn, wr, wp) = prove_wide(&ins, &outs, 5, CHAIN, &[0u64; 8]).expect("wide prove");
+        assert!(verify_wide(&wo, &wn, 5, &wr, &wp, CHAIN, &[0u64; 8]), "wide verifies");
 
         // TALL.
-        let (to, tn, tr, tp) = prove_tall(&ins, &outs, 5, CHAIN).expect("tall prove");
+        let (to, tn, tr, tp) = prove_tall(&ins, &outs, 5, CHAIN, &[0u64; 8]).expect("tall prove");
         // Bit-exact PUBLIC OUTPUT PARITY with the wide circuit.
         assert_eq!(to, wo, "output commitments match wide");
         assert_eq!(tn, wn, "nullifiers match wide");
         assert_eq!(tr, wr, "anchor root matches wide");
         assert_eq!(tr, root);
-        assert!(verify_tall(&to, &tn, 5, &tr, &tp, CHAIN), "tall verifies");
+        assert!(verify_tall(&to, &tn, 5, &tr, &tp, CHAIN, &[0u64; 8]), "tall verifies");
 
         eprintln!(
             "[tall] full 2-in/2-out shield: WIDE proof {} bytes ({:.0} KB) | TALL proof {} bytes ({:.0} KB) | {:.2}x smaller",
@@ -647,31 +664,45 @@ mod tests {
         assert!(tp.len() < wp.len(), "tall proof must be smaller");
 
         // Cross-circuit sanity: each verifier rejects the other's proof.
-        assert!(!verify_tall(&wo, &wn, 5, &wr, &wp, CHAIN), "tall verify rejects a wide proof");
-        assert!(!verify_wide(&to, &tn, 5, &tr, &tp, CHAIN), "wide verify rejects a tall proof");
+        assert!(!verify_tall(&wo, &wn, 5, &wr, &wp, CHAIN, &[0u64; 8]), "tall verify rejects a wide proof");
+        assert!(!verify_wide(&to, &tn, 5, &tr, &tp, CHAIN, &[0u64; 8]), "wide verify rejects a tall proof");
     }
 
     #[test]
     fn tall_rejects_tampered_public_inputs() {
         let (ins, _root) = with_tree(vec![inp(100, 11, 7), inp(50, 22, 8)]);
-        let (o, n, r, p) = prove_tall(&ins, &[oc(90, 33, 1), oc(55, 44, 2)], 5, CHAIN).unwrap();
-        assert!(verify_tall(&o, &n, 5, &r, &p, CHAIN));
+        let (o, n, r, p) = prove_tall(&ins, &[oc(90, 33, 1), oc(55, 44, 2)], 5, CHAIN, &[0u64; 8]).unwrap();
+        assert!(verify_tall(&o, &n, 5, &r, &p, CHAIN, &[0u64; 8]));
         // wrong root
         let mut wrong = r;
         wrong[0] ^= 1;
-        assert!(!verify_tall(&o, &n, 5, &wrong, &p, CHAIN), "wrong root rejected");
+        assert!(!verify_tall(&o, &n, 5, &wrong, &p, CHAIN, &[0u64; 8]), "wrong root rejected");
         // wrong fee
-        assert!(!verify_tall(&o, &n, 6, &r, &p, CHAIN), "wrong fee rejected");
+        assert!(!verify_tall(&o, &n, 6, &r, &p, CHAIN, &[0u64; 8]), "wrong fee rejected");
         // tampered output commitment
         let mut bo = o.clone();
         bo[0][0] ^= 1;
-        assert!(!verify_tall(&bo, &n, 5, &r, &p, CHAIN), "tampered output rejected");
+        assert!(!verify_tall(&bo, &n, 5, &r, &p, CHAIN, &[0u64; 8]), "tampered output rejected");
         // tampered nullifier
         let mut bn = n.clone();
         bn[0][0] ^= 1;
-        assert!(!verify_tall(&o, &bn, 5, &r, &p, CHAIN), "tampered nullifier rejected");
+        assert!(!verify_tall(&o, &bn, 5, &r, &p, CHAIN, &[0u64; 8]), "tampered nullifier rejected");
         // wrong chain id (domain separation)
-        assert!(!verify_tall(&o, &n, 5, &r, &p, b"other-chain"), "wrong chain id rejected");
+        assert!(!verify_tall(&o, &n, 5, &r, &p, b"other-chain", &[0u64; 8]), "wrong chain id rejected");
+    }
+
+    #[test]
+    fn enc_notes_digest_is_bound_to_the_proof() {
+        // A proof made committing to one enc-notes digest must NOT verify under a different one —
+        // so a mempool relayer cannot strip/replace a tx's encrypted notes and keep it valid.
+        let (ins, _root) = with_tree(vec![inp(100, 11, 7), inp(50, 22, 8)]);
+        let dig = [1u64, 2, 3, 4, 5, 6, 7, 8];
+        let (o, n, r, p) = prove_tall(&ins, &[oc(90, 33, 1), oc(55, 44, 2)], 5, CHAIN, &dig).unwrap();
+        assert!(verify_tall(&o, &n, 5, &r, &p, CHAIN, &dig), "the committed digest verifies");
+        let mut other = dig;
+        other[0] ^= 1;
+        assert!(!verify_tall(&o, &n, 5, &r, &p, CHAIN, &other), "a different enc-digest is rejected");
+        assert!(!verify_tall(&o, &n, 5, &r, &p, CHAIN, &[0u64; 8]), "stripped notes (zero digest) rejected");
     }
 
     #[test]
@@ -679,10 +710,10 @@ mod tests {
         // 1-input spend: the 2nd slot is a value-0 dummy (arity fix) with a dummy path.
         let (ins, _root) = with_tree(vec![inp(100, 11, 7)]);
         let outs = [oc(90, 33, 1), oc(5, 44, 2)];
-        let (wo, wn, wr, _wp) = prove_wide(&ins, &outs, 5, CHAIN).expect("wide");
-        let (to, tn, tr, tp) = prove_tall(&ins, &outs, 5, CHAIN).expect("tall");
+        let (wo, wn, wr, _wp) = prove_wide(&ins, &outs, 5, CHAIN, &[0u64; 8]).expect("wide");
+        let (to, tn, tr, tp) = prove_tall(&ins, &outs, 5, CHAIN, &[0u64; 8]).expect("tall");
         assert_eq!((to.clone(), tn.clone(), tr), (wo, wn, wr), "single-input parity with wide");
-        assert!(verify_tall(&to, &tn, 5, &tr, &tp, CHAIN), "single-input tall verifies");
+        assert!(verify_tall(&to, &tn, 5, &tr, &tp, CHAIN, &[0u64; 8]), "single-input tall verifies");
     }
 
     #[test]
@@ -693,7 +724,7 @@ mod tests {
         let (ins, _root) = with_tree(vec![inp(100, 11, 7), inp(50, 22, 8)]);
         let outs = [oc(90, 33, 1), oc(55, 44, 2)];
         let vm = zvm::run_shield_transfer(&ins, &outs, 5);
-        let (to, tn, _tr, _tp) = prove_tall(&ins, &outs, 5, CHAIN).unwrap();
+        let (to, tn, _tr, _tp) = prove_tall(&ins, &outs, 5, CHAIN, &[0u64; 8]).unwrap();
         assert!(vm.accept);
         assert_eq!(vm.output_commitments, to, "VM and tall output commitments agree");
         assert_eq!(vm.nullifiers, tn, "VM and tall nullifiers agree");
@@ -705,8 +736,8 @@ mod tests {
         // over the per-coin cap, and a corrupted authentication path (no shared root).
         let mk = |ins: &[SpendWitness], o: [OutCoin; 2], fee: u64| {
             (
-                prove_wide(ins, &o, fee, CHAIN).is_none(),
-                prove_tall(ins, &o, fee, CHAIN).is_none(),
+                prove_wide(ins, &o, fee, CHAIN, &[0u64; 8]).is_none(),
+                prove_tall(ins, &o, fee, CHAIN, &[0u64; 8]).is_none(),
             )
         };
         let (nc, _) = with_tree(vec![inp(100, 1, 1), inp(1, 2, 2)]);
@@ -725,7 +756,92 @@ mod tests {
         let b = 3_000_000_000u64;
         let (ins, _root) = with_tree(vec![inp(a, 11, 7), inp(b, 22, 8)]);
         let out0 = a + b - 100 - 5;
-        let (to, tn, tr, tp) = prove_tall(&ins, &[oc(out0, 33, 1), oc(100, 44, 2)], 5, CHAIN).unwrap();
-        assert!(verify_tall(&to, &tn, 5, &tr, &tp, CHAIN));
+        let (to, tn, tr, tp) = prove_tall(&ins, &[oc(out0, 33, 1), oc(100, 44, 2)], 5, CHAIN, &[0u64; 8]).unwrap();
+        assert!(verify_tall(&to, &tn, 5, &tr, &tp, CHAIN, &[0u64; 8]));
+    }
+
+    #[test]
+    fn hiding_pcs_masks_opened_values() {
+        // ZK-LEAKAGE REGRESSION (M7). The hiding PCS is supposed to mask the committed
+        // trace so a proof leaks nothing about the witness (amounts, blinds, spend
+        // secrets). We cannot peek inside the PCS from here, so we assert the strongest
+        // property observable from OUTSIDE it: for a FIXED public statement (identical
+        // output commitments / nullifiers / root / fee / chain / digest), re-proving
+        // must draw FRESH masking randomness every time, so:
+        //   (a) any two proofs of that statement are byte-different, and
+        //   (b) no byte offset is constant across MANY independent proofs — the proof
+        //       is dominated by fresh per-proof randomness, not a deterministic image
+        //       of the witness. (Public inputs live OUTSIDE the proof bytes — they are
+        //       passed to `verify_tall` separately — so a byte that is constant here is
+        //       a masking/framing artifact, never the statement leaking through.)
+        // What this does NOT prove: that the masked openings are information-
+        // theoretically independent of the witness (that lives inside the PCS). It is a
+        // guard against the masking RNG regressing to a fixed/derived seed, which would
+        // silently void hiding while every proof still verified.
+        let (ins, root) = with_tree(vec![inp(100, 11, 7), inp(50, 22, 8)]);
+        let outs = [oc(90, 33, 1), oc(55, 44, 2)];
+
+        const N: usize = 8;
+        let mut proofs: Vec<Vec<u8>> = Vec::with_capacity(N);
+        let mut public_statement: Option<(Vec<Commitment>, Vec<Commitment>, Commitment)> = None;
+        for _ in 0..N {
+            let (o, n, r, p) = prove_tall(&ins, &outs, 5, CHAIN, &[0u64; 8]).expect("prove");
+            assert!(verify_tall(&o, &n, 5, &r, &p, CHAIN, &[0u64; 8]), "each proof verifies");
+            // Only the hidden masking may differ between iterations; the public
+            // statement is byte-for-byte identical every time.
+            match &public_statement {
+                Some((po, pn, pr)) => {
+                    assert_eq!((po, pn, pr), (&o, &n, &r), "public statement invariant across proofs");
+                }
+                None => public_statement = Some((o, n, r)),
+            }
+            proofs.push(p);
+        }
+        assert_eq!(public_statement.as_ref().unwrap().2, root);
+
+        // (a) masking is active: proofs of the same statement are all distinct.
+        for i in 0..N {
+            for j in (i + 1)..N {
+                assert_ne!(proofs[i], proofs[j], "proofs {i} and {j} are byte-identical — masking is OFF");
+            }
+        }
+
+        // (b) fresh randomness dominates: the fraction of byte offsets that are constant
+        // across ALL N proofs must be a small minority (deterministic postcard framing
+        // is a tiny share of a hiding proof). A regression to a fixed masking seed would
+        // drive this fraction toward 1.0.
+        let min_len = proofs.iter().map(|p| p.len()).min().unwrap();
+        assert!(min_len > 0);
+        let mut constant = 0usize;
+        for off in 0..min_len {
+            let b0 = proofs[0][off];
+            if proofs.iter().all(|p| p[off] == b0) {
+                constant += 1;
+            }
+        }
+        let frac = constant as f64 / min_len as f64;
+        eprintln!(
+            "[hiding] {N} proofs of one statement: {min_len} common bytes, {constant} constant across all ({:.4} fraction); lengths {:?}",
+            frac, proofs.iter().map(|p| p.len()).collect::<Vec<_>>(),
+        );
+        assert!(
+            frac < 0.5,
+            "{:.1}% of proof bytes are identical across {N} independent proofs of the same \
+             statement — the hiding mask is NOT carrying fresh randomness",
+            frac * 100.0,
+        );
+    }
+
+    #[test]
+    fn mainnet_grade_is_unconditional() {
+        // There is no lower-security build variant any more: the compiled FRI constants
+        // must meet the mainnet floor in EVERY build (tests included), and the startup
+        // guard must therefore never fire.
+        assert!(crate::fri_num_queries() >= crate::MAINNET_MIN_QUERIES);
+        assert!(crate::fri_pow_bits() >= crate::MAINNET_MIN_POW_BITS);
+        assert!(crate::conjectured_soundness_bits() >= crate::MAINNET_MIN_SOUNDNESS_BITS);
+        assert_eq!(crate::conjectured_soundness_bits(), crate::SOUNDNESS_BITS);
+        assert!(crate::is_mainnet_grade(), "shipped FRI constants must be mainnet-grade");
+        crate::assert_mainnet_grade(); // must NOT panic
     }
 }

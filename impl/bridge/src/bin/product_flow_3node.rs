@@ -44,7 +44,7 @@ fn pay_asset(addr: &keys::Address, value: u64, blind: [u64; 4], asset: u64) -> (
 /// 0x55 transfer bundles a ZCRYPT gas note + the main transfer, so scan both.
 fn scan_for(zc: &Zcrypt, who: &Account, from: i64, to: i64) -> Option<Coin> {
     for h in from..=to {
-        for raw in zc.block_txs(h) {
+        for raw in zc.block_txs(h).unwrap_or_default() {
             if raw.first() != Some(&0x55) {
                 continue;
             }
@@ -91,9 +91,11 @@ fn bond_tx(
     stake: u64,
     reward: [u8; 32],
     stake_blind: zcrypt_shield::Blind,
+    nonce: u64,
     pledge: &shield_tx::ShieldTx,
 ) -> Vec<u8> {
     use ed25519_dalek::Signer;
+    let commission: u16 = zcrypt_core::staking::DEFAULT_COMMISSION_BPS;
     let pk = sk.verifying_key().to_bytes();
     let mut msg = Vec::new();
     msg.extend_from_slice(b"ZCRYPT-BOND-v1");
@@ -101,11 +103,15 @@ fn bond_tx(
     msg.extend_from_slice(&pk);
     msg.extend_from_slice(&stake.to_le_bytes());
     msg.extend_from_slice(&reward);
+    msg.extend_from_slice(&commission.to_le_bytes());
+    msg.extend_from_slice(&nonce.to_le_bytes()); // replay-protection nonce
     let sig = sk.sign(&msg);
     let mut t = vec![0x57u8];
     t.extend_from_slice(&pk);
     t.extend_from_slice(&stake.to_le_bytes());
     t.extend_from_slice(&reward);
+    t.extend_from_slice(&commission.to_le_bytes());
+    t.extend_from_slice(&nonce.to_le_bytes());
     t.extend_from_slice(&sig.to_bytes());
     for limb in stake_blind {
         t.extend_from_slice(&limb.to_le_bytes()); // stake_blind (4×u64)
@@ -113,16 +119,18 @@ fn bond_tx(
     t.extend_from_slice(&shield_tx::to_bytes(pledge));
     t
 }
-fn unbond_tx(sk: &ed25519_dalek::SigningKey) -> Vec<u8> {
+fn unbond_tx(sk: &ed25519_dalek::SigningKey, nonce: u64) -> Vec<u8> {
     use ed25519_dalek::Signer;
     let pk = sk.verifying_key().to_bytes();
     let mut msg = Vec::new();
     msg.extend_from_slice(b"ZCRYPT-UNBOND-v1");
     msg.extend_from_slice(swap::CHAIN);
     msg.extend_from_slice(&pk);
+    msg.extend_from_slice(&nonce.to_le_bytes()); // replay-protection nonce
     let sig = sk.sign(&msg);
     let mut t = vec![0x5Eu8];
     t.extend_from_slice(&pk);
+    t.extend_from_slice(&nonce.to_le_bytes());
     t.extend_from_slice(&sig.to_bytes());
     t
 }
@@ -159,7 +167,7 @@ fn delegate_tx(
     t.extend_from_slice(&shield_tx::to_bytes(pledge));
     t
 }
-fn undelegate_tx(sk: &ed25519_dalek::SigningKey, target: &[u8]) -> Vec<u8> {
+fn undelegate_tx(sk: &ed25519_dalek::SigningKey, target: &[u8], nonce: u64) -> Vec<u8> {
     use ed25519_dalek::Signer;
     let pk = sk.verifying_key().to_bytes();
     let mut msg = Vec::new();
@@ -167,10 +175,12 @@ fn undelegate_tx(sk: &ed25519_dalek::SigningKey, target: &[u8]) -> Vec<u8> {
     msg.extend_from_slice(swap::CHAIN);
     msg.extend_from_slice(&pk);
     msg.extend_from_slice(target);
+    msg.extend_from_slice(&nonce.to_le_bytes()); // replay-protection nonce
     let sig = sk.sign(&msg);
     let mut t = vec![0x60u8];
     t.extend_from_slice(&pk);
     t.extend_from_slice(target);
+    t.extend_from_slice(&nonce.to_le_bytes());
     t.extend_from_slice(&sig.to_bytes());
     t
 }
@@ -249,20 +259,25 @@ fn main() {
     assert!(zc.broadcast(&mk_sweep(22, 0x72, &gs2)).is_err(), "bearer double-claim rejected");
     println!("[3] bearer sweep OK; double-claim rejected");
 
-    // ---- 4. Shielded asset GOLD: register, mint (capability/HTLC), spend ----
-    let cap: &[u8] = b"gold-cap-3node";
-    let _ = zc.broadcast(&swap::register_tx("GOLD", 2, &zcrypt_core::htlc_shield::mint_capability(cap), 1_000_000));
+    // ---- 4. Shielded asset GOLD: register, mint (1-of-1 M-of-N HTLC), spend ----
+    let (gold_ks, gold_signers) = zcrypt_core::mint_auth::derive_keyset(b"gold-cap-3node", 1, 1);
+    let _ = zc.broadcast(&swap::register_tx("GOLD", 2, &gold_ks.commitment(), 1_000_000));
     let gold: u64 = zc.query("/asset/by_ticker/GOLD").unwrap().trim().parse().unwrap();
     // ABUSE: registering GOLD again must be rejected (first-mint-wins).
     assert!(
-        zc.broadcast(&swap::register_tx("GOLD", 2, &zcrypt_core::htlc_shield::mint_capability(cap), 1_000_000)).is_err(),
+        zc.broadcast(&swap::register_tx("GOLD", 2, &gold_ks.commitment(), 1_000_000)).is_err(),
         "duplicate ticker rejected"
     );
     let preimage = b"gold-mint-preimage-3node";
     let lock = zcrypt_core::nullifier::htlc_hashlock(preimage);
     let timeout = zc.height().unwrap() as u64 + 100;
     let escrow = zcrypt_core::htlc_shield::escrow_id(gold, 500_000, &lock, timeout, &alice.pubkey());
-    zc.broadcast(&swap::open_tx(gold, 500_000, &lock, timeout, &alice.pubkey(), cap)).expect("htlc open");
+    let gold_msg = zcrypt_core::mint_auth::mint_message(gold, 500_000, &lock, timeout, &alice.pubkey());
+    let gold_auth = zcrypt_core::mint_auth::encode_auth(
+        &gold_ks,
+        &zcrypt_core::mint_auth::authorize(&gold_ks, &gold_signers, &gold_msg),
+    );
+    zc.broadcast(&swap::open_tx(gold, 500_000, &lock, timeout, &alice.pubkey(), &gold_auth)).expect("htlc open");
     zc.broadcast(&swap::claim_tx(&escrow, preimage)).expect("htlc claim mints GOLD");
     let gold_coin = alice.htlc_coin(500_000, gold, &escrow);
     let (g0, gn0) = pay_asset(&bob.normal_address(), 300_000, keys::random_blind(), gold);
@@ -299,16 +314,22 @@ fn main() {
             // Coin-backed BOND: fund the bonder, then PLEDGE the stake by spending that
             // coin into a burn coin of exactly `stake` (output[0]), change back (output[1]).
             // Bonding is gasless — the pledge burns only the stake (fee 0).
-            let fund = rewarder.own_coin(stake + 100, keys::random_blind());
+            // The pledge now pays MIN_FEE (M2), so fund covers stake + fee + change.
+            let fund = rewarder.own_coin(stake + FEE + 100, keys::random_blind());
             seed(&zc, &fund.commitment(), "bond stake funding");
             let stake_blind = keys::random_blind();
             let burn_out: OutCoin = (stake, stake_blind, zcrypt_core::htlc_shield::BURN_PK, 0);
             let cblind = keys::random_blind();
             let change_out = keys::out_coin(&rewarder.normal_address(), 100, cblind);
             let cnote = kem::ciphertext_to_bytes(&keys::encrypt_note(&rewarder.normal_address(), 100, cblind));
-            let pledge = build_shield_spend(&zc, &[fund], &[burn_out, change_out], 0, vec![vec![], cnote])
+            let pledge = build_shield_spend(&zc, &[fund], &[burn_out, change_out], FEE, vec![vec![], cnote])
                 .expect("build the stake pledge");
-            zc.broadcast(&bond_tx(&sk, stake, reward, stake_blind, &pledge)).expect("BOND accepted");
+            // BOND carries the signer's monotonic auth nonce (M3). Query it — a prior run
+            // (e.g. fee_flow's bond/unbond of this same node) may have already advanced it.
+            let bond_nonce: u64 = zc
+                .query(&format!("/staking/auth_nonce/{}", hex::encode(sk.verifying_key().to_bytes())))
+                .ok().and_then(|s| s.trim().parse().ok()).unwrap_or(0);
+            zc.broadcast(&bond_tx(&sk, stake, reward, stake_blind, bond_nonce, &pledge)).expect("BOND accepted");
             println!("[6] BOND accepted (pledged {stake} ZCRYPT into a burn coin); waiting for the reward epoch...");
 
             // ---- Coin-backed DELEGATE: a third party pledges 5,000 ZCRYPT toward the
@@ -322,14 +343,14 @@ fn main() {
             let del_reward = keys::reward_address(&delegator.pubkey());
             let del_stake = 5_000 * zcrypt_core::emission::ATOMIC; // below MIN_STAKE — fine for a delegation
             // Delegating is gasless too — the pledge burns only the delegated stake.
-            let dfund = delegator.own_coin(del_stake + 100, keys::random_blind());
+            let dfund = delegator.own_coin(del_stake + FEE + 100, keys::random_blind());
             seed(&zc, &dfund.commitment(), "delegation funding");
             let del_blind = keys::random_blind();
             let del_burn: OutCoin = (del_stake, del_blind, zcrypt_core::htlc_shield::BURN_PK, 0);
             let dcblind = keys::random_blind();
             let del_change = keys::out_coin(&delegator.normal_address(), 100, dcblind);
             let dcnote = kem::ciphertext_to_bytes(&keys::encrypt_note(&delegator.normal_address(), 100, dcblind));
-            let del_pledge = build_shield_spend(&zc, &[dfund], &[del_burn, del_change], 0, vec![vec![], dcnote])
+            let del_pledge = build_shield_spend(&zc, &[dfund], &[del_burn, del_change], FEE, vec![vec![], dcnote])
                 .expect("build the delegation pledge");
             zc.broadcast(&delegate_tx(&del_sk, &val_addr, del_stake, del_reward, del_blind, &del_pledge))
                 .expect("DELEGATE accepted");
@@ -361,19 +382,28 @@ fn main() {
             // Prove the share is genuine spendable value: claim it into a coin and spend it.
             let didx = staking_u64(&zc, &format!("/staking/claim_index/{}", pk_hex(&delegator.pubkey())));
             zc.broadcast(&claim_tx(&delegator.pubkey(), del_owed)).expect("delegator CLAIM mints coins");
-            // Claiming is gasless — the minted coin is the full reward; the SPEND pays ZCRYPT gas.
-            let del_reward_coin = delegator.reward_coin(del_owed, didx);
-            let (d0, dn0) = pay(&bob.normal_address(), del_owed, keys::random_blind());
+            // Claiming is gasless. The node splits a claim via `claim_chunks` (reserving a gas
+            // coin on the first claim if the amount is large enough), minting each chunk at a
+            // monotonic index from `didx`. Reconstruct the SAME chunks and spend the first
+            // real on-chain coin — assuming a single coin of `del_owed` breaks once the split
+            // kicks in (as it did once a co-delegator raised this delegator's reward).
+            let first_claim = didx == 0;
+            let spend_val = keys::claim_chunks(del_owed, first_claim)[0];
+            let del_reward_coin = delegator.reward_coin(spend_val, didx);
+            let (d0, dn0) = pay(&bob.normal_address(), spend_val, keys::random_blind());
             let (d1, dn1) = pay(&delegator.normal_address(), 0, keys::random_blind());
             let gcd = gas_for(&zc, &delegator);
             let dtx = swap::build_transfer(&zc, &[del_reward_coin], &[d0, d1], vec![dn0, dn1], &delegator, &gcd).unwrap();
             zc.broadcast(&dtx).expect("delegator reward coin is spendable");
-            println!("[6] delegator earned {del_owed} reward share, claimed + spent it");
+            println!("[6] delegator earned {del_owed} reward share; claimed + spent a {spend_val} coin");
 
             // Undelegate: the stake leaves the validator's power at once and locks in the
             // unbonding queue (returns to the delegator after the 10-day wait).
             let unbond_before = staking_u64(&zc, "/staking/unbonding_total");
-            zc.broadcast(&undelegate_tx(&del_sk, &val_addr)).expect("UNDELEGATE accepted");
+            let undel_nonce: u64 = zc
+                .query(&format!("/staking/auth_nonce/{}", hex::encode(del_sk.verifying_key().to_bytes())))
+                .ok().and_then(|s| s.trim().parse().ok()).unwrap_or(0);
+            zc.broadcast(&undelegate_tx(&del_sk, &val_addr, undel_nonce)).expect("UNDELEGATE accepted");
             let mut unbond_after = unbond_before;
             for _ in 0..15 {
                 unbond_after = staking_u64(&zc, "/staking/unbonding_total");
@@ -387,15 +417,25 @@ fn main() {
 
             let idx = staking_u64(&zc, &format!("/staking/claim_index/{}", pk_hex(&rewarder.pubkey())));
             zc.broadcast(&claim_tx(&rewarder.pubkey(), owed)).expect("CLAIM mints reward coins");
-            // Claiming is gasless — full reward minted; the SPEND pays ZCRYPT gas.
-            let reward_coin = rewarder.reward_coin(owed, idx);
-            let (r0, rn0) = pay(&bob.normal_address(), owed, keys::random_blind());
+            // Claiming is gasless. A large claim is split by `claim_chunks` (gas coin + rest on
+            // first claim), each chunk minted at a monotonic index from `idx` — reconstruct the
+            // SAME chunks and spend the first real on-chain coin (a single-coin assumption breaks
+            // once the claim is big enough to split).
+            let r_first = idx == 0;
+            let r_spend = keys::claim_chunks(owed, r_first)[0];
+            let reward_coin = rewarder.reward_coin(r_spend, idx);
+            let (r0, rn0) = pay(&bob.normal_address(), r_spend, keys::random_blind());
             let (r1, rn1) = pay(&rewarder.normal_address(), 0, keys::random_blind());
             let gcr = gas_for(&zc, &rewarder);
             let rtx = swap::build_transfer(&zc, &[reward_coin], &[r0, r1], vec![rn0, rn1], &rewarder, &gcr).unwrap();
             zc.broadcast(&rtx).expect("reward coin is spendable");
-            zc.broadcast(&unbond_tx(&sk)).expect("UNBOND accepted");
-            println!("[6] validator earned {owed} reward, claimed, spent it, then unbonded: OK");
+            let unbond_nonce: u64 = zc
+                .query(&format!("/staking/auth_nonce/{}", hex::encode(sk.verifying_key().to_bytes())))
+                .ok()
+                .and_then(|s| s.trim().parse().ok())
+                .unwrap_or(0);
+            zc.broadcast(&unbond_tx(&sk, unbond_nonce)).expect("UNBOND accepted");
+            println!("[6] validator earned {owed} reward, claimed, spent a {r_spend} coin, then unbonded: OK");
         }
         Err(_) => println!("[6] SKIPPED bond/reward/unbond (set VALIDATOR_SEED_HEX to enable)"),
     }

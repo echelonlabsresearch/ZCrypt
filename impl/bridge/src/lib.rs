@@ -27,6 +27,48 @@ use bitcoin::{
 use bitcoincore_rpc::{Auth, Client, RpcApi};
 use std::str::FromStr;
 
+/// SOCKS proxy for the bridge's outbound HTTP (the ZCrypt node RPC in `zcrypt.rs` and the
+/// Esplora API in `esplora.rs`). `None` = direct. Set from the wallet's Tor setting; remote
+/// hosts route through it, loopback always bypasses it (Tor can't reach a local process).
+/// NOTE: the bitcoind JSON-RPC (`bitcoincore-rpc`) is NOT covered — it has no client-side
+/// proxy and is your own, usually local, node.
+static TOR_PROXY: std::sync::RwLock<Option<String>> = std::sync::RwLock::new(None);
+
+/// Route the bridge's outbound HTTP through this SOCKS proxy (e.g. "socks5://127.0.0.1:9050").
+/// `None` reverts to direct. Loopback targets always bypass it.
+pub fn set_tor(proxy: Option<String>) {
+    *TOR_PROXY.write().unwrap() = proxy;
+}
+
+/// Whether `url`'s host is loopback (Tor is pointless and would break a local connection).
+fn is_loopback_url(url: &str) -> bool {
+    let host = url
+        .trim()
+        .trim_start_matches("http://")
+        .trim_start_matches("https://")
+        .split(['/', ':', '?'])
+        .next()
+        .unwrap_or("");
+    matches!(host, "localhost" | "127.0.0.1" | "::1" | "[::1]")
+}
+
+/// A `ureq` agent for reaching `target_url`, routed through the configured Tor SOCKS proxy
+/// for REMOTE hosts and direct for loopback. Fails CLOSED on a bad proxy string (points at
+/// an unusable port rather than leaking the real IP). Built per call — the bridge's request
+/// volume is low. Every bridge HTTP call MUST use this, never a bare `ureq::builder()`.
+pub(crate) fn proxied_agent(target_url: &str, timeout_secs: u64) -> ureq::Agent {
+    let mut b = ureq::builder().timeout(std::time::Duration::from_secs(timeout_secs));
+    if !is_loopback_url(target_url) {
+        if let Some(proxy) = TOR_PROXY.read().unwrap().clone() {
+            match ureq::Proxy::new(&proxy) {
+                Ok(p) => b = b.proxy(p),
+                Err(_) => b = b.proxy(ureq::Proxy::new("socks5://127.0.0.1:1").expect("static proxy")),
+            }
+        }
+    }
+    b.build()
+}
+
 /// Default Bitcoin network when none is configured (the devnet/demo stack).
 pub const NETWORK: Network = Network::Regtest;
 
@@ -91,6 +133,7 @@ impl Key {
 }
 
 /// A funded HTLC output on Bitcoin.
+#[derive(Debug, Clone)]
 pub struct HtlcUtxo {
     pub outpoint: OutPoint,
     pub value: Amount,
@@ -164,14 +207,14 @@ impl Btc {
         Ok(txid.to_string())
     }
 
-    /// Minimum confirmations to treat a Bitcoin tx as final, by network. Regtest is 0
-    /// (it self-mines instantly); signet/testnet use 1; mainnet uses 2 as a floor —
-    /// raise it for larger swaps. This is the number a real deposit/HTLC must reach
-    /// before the counterparty mints or claims against it.
+    /// Minimum confirmations to treat a Bitcoin tx as final — aligned with consensus
+    /// SPV `min_conf` so the bridge client never treats a deposit as final before the
+    /// mint gate would accept it (mainnet 6, signet 1, regtest 0 after self-mine).
     pub fn conf_target(&self) -> u32 {
         match self.network {
             Network::Regtest => 0,
-            Network::Bitcoin => 2,
+            Network::Bitcoin => zcrypt_core::spv::min_conf_for(zcrypt_core::spv::BtcNet::Mainnet) as u32,
+            Network::Signet => zcrypt_core::spv::min_conf_for(zcrypt_core::spv::BtcNet::Signet) as u32,
             _ => 1,
         }
     }
@@ -383,6 +426,13 @@ impl Btc {
         } else {
             Sequence::ENABLE_LOCKTIME_NO_RBF
         };
+        if fee >= utxo.value {
+            return Err(format!(
+                "HTLC spend fee {} sats >= utxo value {} sats",
+                fee.to_sat(),
+                utxo.value.to_sat()
+            ));
+        }
         let mut tx = Transaction {
             version: bitcoin::transaction::Version::TWO,
             lock_time: locktime,
@@ -433,10 +483,42 @@ pub trait BtcBackend {
     fn claim(&self, utxo: &HtlcUtxo, preimage: &[u8], key: &Key, dest: &Address, fee: Amount) -> Result<Txid, String>;
     /// Current chain tip height (for locktime math).
     fn height(&self) -> Result<u64, String>;
+    /// Bitcoin network this backend is talking to (drives race-safe timeout profiles).
+    fn network(&self) -> Network;
     /// The preimage revealed in a claim transaction (witness item 1).
     fn preimage_from_claim(&self, txid: &Txid) -> Option<Vec<u8>>;
     /// Wait until `txid` is confirmed (mines on regtest; waits for real confs otherwise).
     fn confirm(&self, txid: &Txid) -> Result<(), String>;
+    /// Estimated fee rate (sat/vB) for confirmation within ~`target` blocks. Used to
+    /// price HTLC claim/refund spends dynamically — a hardcoded fee can fall below the
+    /// mempool min-relay rate on a busy mainnet and strand a claim past its CLTV timelock.
+    fn fee_rate_sat_vb(&self, target: u32) -> Result<f64, String>;
+    /// If the HTLC `utxo` has been spent via its CLAIM branch (revealing the preimage), return
+    /// that preimage; `None` if still unspent or spent via the refund branch. Lets the redeem
+    /// watcher detect the user's BTC claim and finalize the burn autonomously, without being
+    /// handed the claim txid. `since_height` bounds any block scan (the lock's funding height).
+    fn find_htlc_spend_preimage(&self, utxo: &HtlcUtxo, since_height: u64) -> Result<Option<Vec<u8>>, String>;
+
+    /// Confirmations of `txid` on this backend's best chain (0 if unconfirmed/unknown). Used
+    /// by the operator watcher to DEFER sweeping a deposit until it is buried past the mint's
+    /// maturity + reorg-void grace (M4), so a benign reorg that voids an immature mint can
+    /// never strand an already-swept deposit. Only the operator's node backend needs this;
+    /// the default is "unsupported" (the self-custody user wallet never runs the sweep).
+    fn tx_confirmations(&self, _txid: &Txid) -> Result<u64, String> {
+        Err("tx_confirmations not supported by this backend".to_string())
+    }
+
+    // ---- SPV proof material (UNTRUSTED transport: headers carry their own
+    // proof-of-work and the merkle proof is re-verified by every validator, so a
+    // lying backend can only fail to deliver, never forge a mint) ----
+
+    /// The raw 80-byte header at `height` on this backend's best chain.
+    fn block_header(&self, height: u64) -> Result<[u8; 80], String>;
+    /// The raw bytes of a confirmed transaction.
+    fn raw_tx(&self, txid: &Txid) -> Result<Vec<u8>, String>;
+    /// A `merkleblock` inclusion proof for a confirmed transaction (bitcoind's
+    /// `gettxoutproof` / Esplora's `merkleblock-proof` — identical wire format).
+    fn txout_proof(&self, txid: &Txid) -> Result<Vec<u8>, String>;
 }
 
 impl BtcBackend for Btc {
@@ -449,11 +531,78 @@ impl BtcBackend for Btc {
     fn height(&self) -> Result<u64, String> {
         Btc::height(self)
     }
+    fn network(&self) -> Network {
+        self.network
+    }
     fn preimage_from_claim(&self, txid: &Txid) -> Option<Vec<u8>> {
         Btc::preimage_from_claim(self, txid)
     }
     fn confirm(&self, txid: &Txid) -> Result<(), String> {
         Btc::confirm(self, txid)
+    }
+    fn fee_rate_sat_vb(&self, target: u32) -> Result<f64, String> {
+        // Regtest has no fee market; use a nominal 1 sat/vB.
+        if self.is_regtest() {
+            return Ok(1.0);
+        }
+        // `estimatesmartfee` returns `feerate` in BTC/kvB; convert to sat/vB.
+        let res: serde_json::Value = self
+            .rpc
+            .call("estimatesmartfee", &[serde_json::json!(target)])
+            .map_err(|e| e.to_string())?;
+        let sat_vb = res["feerate"].as_f64().unwrap_or(0.0) * 100_000_000.0 / 1000.0;
+        Ok(if sat_vb >= 1.0 { sat_vb } else { 2.0 })
+    }
+    fn find_htlc_spend_preimage(&self, utxo: &HtlcUtxo, since_height: u64) -> Result<Option<Vec<u8>>, String> {
+        let tip = self.height()?;
+        let want_txid = utxo.outpoint.txid.to_string();
+        for h in since_height..=tip {
+            let hash = self.rpc.get_block_hash(h).map_err(|e| e.to_string())?;
+            // getblock verbosity 2 → full tx bodies with vin + witnesses.
+            let block: serde_json::Value = self
+                .rpc
+                .call("getblock", &[serde_json::json!(hash.to_string()), serde_json::json!(2)])
+                .map_err(|e| e.to_string())?;
+            for tx in block["tx"].as_array().into_iter().flatten() {
+                for vin in tx["vin"].as_array().into_iter().flatten() {
+                    if vin["txid"].as_str() == Some(want_txid.as_str())
+                        && vin["vout"].as_u64() == Some(utxo.outpoint.vout as u64)
+                    {
+                        // Claim witness = [sig, PREIMAGE, selector=1, script]; refund has an empty item 1.
+                        let pre = vin["txinwitness"].as_array().and_then(|w| w.get(1)).and_then(|x| x.as_str());
+                        return Ok(match pre {
+                            Some(hexpre) if !hexpre.is_empty() => Some(hex::decode(hexpre).map_err(|e| e.to_string())?),
+                            _ => None, // spent via refund — no preimage
+                        });
+                    }
+                }
+            }
+        }
+        Ok(None) // not spent yet
+    }
+    fn tx_confirmations(&self, txid: &Txid) -> Result<u64, String> {
+        match self.rpc.get_raw_transaction_info(txid, None) {
+            Ok(info) => Ok(info.confirmations.unwrap_or(0) as u64),
+            Err(_) => Ok(0), // unknown / not yet in a block
+        }
+    }
+    fn block_header(&self, height: u64) -> Result<[u8; 80], String> {
+        let hash = self.rpc.get_block_hash(height).map_err(|e| e.to_string())?;
+        let header = self.rpc.get_block_header(&hash).map_err(|e| e.to_string())?;
+        bitcoin::consensus::encode::serialize(&header)
+            .try_into()
+            .map_err(|_| "header is not 80 bytes".to_string())
+    }
+    fn raw_tx(&self, txid: &Txid) -> Result<Vec<u8>, String> {
+        let tx = self.rpc.get_raw_transaction(txid, None).map_err(|e| e.to_string())?;
+        Ok(bitcoin::consensus::encode::serialize(&tx))
+    }
+    fn txout_proof(&self, txid: &Txid) -> Result<Vec<u8>, String> {
+        let hex_proof: String = self
+            .rpc
+            .call("gettxoutproof", &[serde_json::json!([txid.to_string()])])
+            .map_err(|e| e.to_string())?;
+        hex::decode(hex_proof.trim()).map_err(|e| e.to_string())
     }
 }
 
@@ -462,6 +611,7 @@ pub mod hdwallet;
 pub mod selfcustody;
 pub mod swap;
 pub mod txbuilder;
+pub mod watcher;
 pub mod zcrypt;
 
 /// A fixed P2WPKH address whose private key nobody uses — mining here burns the

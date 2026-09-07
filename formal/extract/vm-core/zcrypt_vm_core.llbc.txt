@@ -1,0 +1,423 @@
+// Full name: zcrypt_vm_core::COIN_CAP
+pub fn COIN_CAP() -> u64
+{
+    let _0: u64; // return
+
+    storage_live(_0)
+    _0 = const 4503599627370496u64
+    return
+}
+
+// Full name: zcrypt_vm_core::COIN_CAP
+pub const COIN_CAP: u64 = COIN_CAP()
+
+// Full name: zcrypt_vm_core::FEE_CAP
+pub fn FEE_CAP() -> u64
+{
+    let _0: u64; // return
+
+    storage_live(_0)
+    _0 = const 67108864u64
+    return
+}
+
+// Full name: zcrypt_vm_core::FEE_CAP
+pub const FEE_CAP: u64 = FEE_CAP()
+
+// Full name: zcrypt_vm_core::range_ok
+pub fn range_ok(in0: u64, in1: u64, out0: u64, out1: u64, fee: u64) -> bool
+{
+    let _0: bool; // return
+    let in0: u64; // arg #1
+    let in1: u64; // arg #2
+    let out0: u64; // arg #3
+    let out1: u64; // arg #4
+    let fee: u64; // arg #5
+    let _6: bool; // anonymous local
+    let _7: u64; // anonymous local
+    let _8: bool; // anonymous local
+    let _9: u64; // anonymous local
+    let _10: bool; // anonymous local
+    let _11: u64; // anonymous local
+    let _12: bool; // anonymous local
+    let _13: u64; // anonymous local
+    let _14: u64; // anonymous local
+
+    storage_live(_0)
+    storage_live(_6)
+    storage_live(_7)
+    _7 = copy in0
+    _6 = move _7 < copy COIN_CAP
+    if move _6 {
+        storage_dead(_7)
+        storage_live(_8)
+        storage_live(_9)
+        _9 = copy in1
+        _8 = move _9 < copy COIN_CAP
+        if move _8 {
+            storage_dead(_9)
+            storage_live(_10)
+            storage_live(_11)
+            _11 = copy out0
+            _10 = move _11 < copy COIN_CAP
+            if move _10 {
+                storage_dead(_11)
+                storage_live(_12)
+                storage_live(_13)
+                _13 = copy out1
+                _12 = move _13 < copy COIN_CAP
+                if move _12 {
+                    storage_dead(_13)
+                    storage_live(_14)
+                    _14 = copy fee
+                    _0 = move _14 < copy FEE_CAP
+                    storage_dead(_14)
+                    storage_dead(_12)
+                    storage_dead(_10)
+                    storage_dead(_8)
+                    storage_dead(_6)
+                    storage_dead(fee)
+                    storage_dead(out1)
+                    storage_dead(out0)
+                    storage_dead(in1)
+                    storage_dead(in0)
+                    return
+                } else {
+                    storage_dead(_13)
+                }
+            } else {
+                storage_dead(_11)
+            }
+        } else {
+            storage_dead(_9)
+        }
+    } else {
+        storage_dead(_7)
+    }
+    _0 = const false
+    storage_dead(_12)
+    storage_dead(_10)
+    storage_dead(_8)
+    storage_dead(_6)
+    storage_dead(fee)
+    storage_dead(out1)
+    storage_dead(out0)
+    storage_dead(in1)
+    storage_dead(in0)
+    return
+}
+
+// Full name: zcrypt_vm_core::conservation_ok
+pub fn conservation_ok(in0: u64, in1: u64, out0: u64, out1: u64, fee: u64) -> bool
+{
+    let _0: bool; // return
+    let in0: u64; // arg #1
+    let in1: u64; // arg #2
+    let out0: u64; // arg #3
+    let out1: u64; // arg #4
+    let fee: u64; // arg #5
+    let _6: u64; // anonymous local
+    let _7: u64; // anonymous local
+    let _8: u64; // anonymous local
+    let _9: (u64, bool); // anonymous local
+    let _10: u64; // anonymous local
+    let _11: u64; // anonymous local
+    let _12: u64; // anonymous local
+    let _13: u64; // anonymous local
+    let _14: (u64, bool); // anonymous local
+    let _15: u64; // anonymous local
+    let _16: (u64, bool); // anonymous local
+
+    storage_live(_0)
+    storage_live(_9)
+    storage_live(_14)
+    storage_live(_16)
+    storage_live(_6)
+    storage_live(_7)
+    _7 = copy in0
+    storage_live(_8)
+    _8 = copy in1
+    _9 = copy _7 checked.+ copy _8
+    assert(move _9.1 == false) (overflow) else panic
+    ↳⚡ storage_dead(_16)
+        storage_dead(_14)
+        storage_dead(_9)
+        storage_dead(fee)
+        storage_dead(out1)
+        storage_dead(out0)
+        storage_dead(in1)
+        storage_dead(in0)
+        unwind_continue
+    _6 = move _9.0
+    storage_dead(_8)
+    storage_dead(_7)
+    storage_live(_10)
+    storage_live(_11)
+    storage_live(_12)
+    _12 = copy out0
+    storage_live(_13)
+    _13 = copy out1
+    _14 = copy _12 checked.+ copy _13
+    assert(move _14.1 == false) (overflow) else panic
+    ↳⚡ storage_dead(_16)
+        storage_dead(_14)
+        storage_dead(_9)
+        storage_dead(fee)
+        storage_dead(out1)
+        storage_dead(out0)
+        storage_dead(in1)
+        storage_dead(in0)
+        unwind_continue
+    _11 = move _14.0
+    storage_dead(_13)
+    storage_dead(_12)
+    storage_live(_15)
+    _15 = copy fee
+    _16 = copy _11 checked.+ copy _15
+    assert(move _16.1 == false) (overflow) else panic
+    ↳⚡ storage_dead(_16)
+        storage_dead(_14)
+        storage_dead(_9)
+        storage_dead(fee)
+        storage_dead(out1)
+        storage_dead(out0)
+        storage_dead(in1)
+        storage_dead(in0)
+        unwind_continue
+    _10 = move _16.0
+    storage_dead(_15)
+    storage_dead(_11)
+    _0 = move _6 == move _10
+    storage_dead(_10)
+    storage_dead(_6)
+    storage_dead(_16)
+    storage_dead(_14)
+    storage_dead(_9)
+    storage_dead(fee)
+    storage_dead(out1)
+    storage_dead(out0)
+    storage_dead(in1)
+    storage_dead(in0)
+    return
+}
+
+// Full name: zcrypt_vm_core::single_asset_ok
+pub fn single_asset_ok(a_in0: u64, a_in1: u64, a_out0: u64, a_out1: u64) -> bool
+{
+    let _0: bool; // return
+    let a_in0: u64; // arg #1
+    let a_in1: u64; // arg #2
+    let a_out0: u64; // arg #3
+    let a_out1: u64; // arg #4
+    let _5: bool; // anonymous local
+    let _6: u64; // anonymous local
+    let _7: u64; // anonymous local
+    let _8: bool; // anonymous local
+    let _9: u64; // anonymous local
+    let _10: u64; // anonymous local
+    let _11: u64; // anonymous local
+    let _12: u64; // anonymous local
+
+    storage_live(_0)
+    storage_live(_5)
+    storage_live(_6)
+    _6 = copy a_in1
+    storage_live(_7)
+    _7 = copy a_in0
+    _5 = move _6 == move _7
+    if move _5 {
+        storage_dead(_7)
+        storage_dead(_6)
+        storage_live(_8)
+        storage_live(_9)
+        _9 = copy a_out0
+        storage_live(_10)
+        _10 = copy a_in0
+        _8 = move _9 == move _10
+        if move _8 {
+            storage_dead(_10)
+            storage_dead(_9)
+            storage_live(_11)
+            _11 = copy a_out1
+            storage_live(_12)
+            _12 = copy a_in0
+            _0 = move _11 == move _12
+            storage_dead(_12)
+            storage_dead(_11)
+            storage_dead(_8)
+            storage_dead(_5)
+            storage_dead(a_out1)
+            storage_dead(a_out0)
+            storage_dead(a_in1)
+            storage_dead(a_in0)
+            return
+        } else {
+            storage_dead(_10)
+            storage_dead(_9)
+        }
+    } else {
+        storage_dead(_7)
+        storage_dead(_6)
+    }
+    _0 = const false
+    storage_dead(_8)
+    storage_dead(_5)
+    storage_dead(a_out1)
+    storage_dead(a_out0)
+    storage_dead(a_in1)
+    storage_dead(a_in0)
+    return
+}
+
+// Full name: zcrypt_vm_core::accepts
+pub fn accepts(in0: u64, in1: u64, out0: u64, out1: u64, fee: u64, a_in0: u64, a_in1: u64, a_out0: u64, a_out1: u64) -> bool
+{
+    let _0: bool; // return
+    let in0: u64; // arg #1
+    let in1: u64; // arg #2
+    let out0: u64; // arg #3
+    let out1: u64; // arg #4
+    let fee: u64; // arg #5
+    let a_in0: u64; // arg #6
+    let a_in1: u64; // arg #7
+    let a_out0: u64; // arg #8
+    let a_out1: u64; // arg #9
+    let _10: bool; // anonymous local
+    let _11: u64; // anonymous local
+    let _12: u64; // anonymous local
+    let _13: u64; // anonymous local
+    let _14: u64; // anonymous local
+    let _15: u64; // anonymous local
+    let _16: bool; // anonymous local
+    let _17: u64; // anonymous local
+    let _18: u64; // anonymous local
+    let _19: u64; // anonymous local
+    let _20: u64; // anonymous local
+    let _21: u64; // anonymous local
+    let _22: u64; // anonymous local
+    let _23: u64; // anonymous local
+    let _24: u64; // anonymous local
+    let _25: u64; // anonymous local
+
+    storage_live(_0)
+    storage_live(_10)
+    storage_live(_11)
+    _11 = copy in0
+    storage_live(_12)
+    _12 = copy in1
+    storage_live(_13)
+    _13 = copy out0
+    storage_live(_14)
+    _14 = copy out1
+    storage_live(_15)
+    _15 = copy fee
+    _10 = range_ok(move _11, move _12, move _13, move _14, move _15)
+    ↳⚡ storage_dead(a_out1)
+        storage_dead(a_out0)
+        storage_dead(a_in1)
+        storage_dead(a_in0)
+        storage_dead(fee)
+        storage_dead(out1)
+        storage_dead(out0)
+        storage_dead(in1)
+        storage_dead(in0)
+        unwind_continue
+    if move _10 {
+        storage_dead(_15)
+        storage_dead(_14)
+        storage_dead(_13)
+        storage_dead(_12)
+        storage_dead(_11)
+        storage_live(_16)
+        storage_live(_17)
+        _17 = copy in0
+        storage_live(_18)
+        _18 = copy in1
+        storage_live(_19)
+        _19 = copy out0
+        storage_live(_20)
+        _20 = copy out1
+        storage_live(_21)
+        _21 = copy fee
+        _16 = conservation_ok(move _17, move _18, move _19, move _20, move _21)
+        ↳⚡ storage_dead(a_out1)
+            storage_dead(a_out0)
+            storage_dead(a_in1)
+            storage_dead(a_in0)
+            storage_dead(fee)
+            storage_dead(out1)
+            storage_dead(out0)
+            storage_dead(in1)
+            storage_dead(in0)
+            unwind_continue
+        if move _16 {
+            storage_dead(_21)
+            storage_dead(_20)
+            storage_dead(_19)
+            storage_dead(_18)
+            storage_dead(_17)
+            storage_live(_22)
+            _22 = copy a_in0
+            storage_live(_23)
+            _23 = copy a_in1
+            storage_live(_24)
+            _24 = copy a_out0
+            storage_live(_25)
+            _25 = copy a_out1
+            _0 = single_asset_ok(move _22, move _23, move _24, move _25)
+            ↳⚡ storage_dead(a_out1)
+                storage_dead(a_out0)
+                storage_dead(a_in1)
+                storage_dead(a_in0)
+                storage_dead(fee)
+                storage_dead(out1)
+                storage_dead(out0)
+                storage_dead(in1)
+                storage_dead(in0)
+                unwind_continue
+            storage_dead(_25)
+            storage_dead(_24)
+            storage_dead(_23)
+            storage_dead(_22)
+            storage_dead(_16)
+            storage_dead(_10)
+            storage_dead(a_out1)
+            storage_dead(a_out0)
+            storage_dead(a_in1)
+            storage_dead(a_in0)
+            storage_dead(fee)
+            storage_dead(out1)
+            storage_dead(out0)
+            storage_dead(in1)
+            storage_dead(in0)
+            return
+        } else {
+            storage_dead(_21)
+            storage_dead(_20)
+            storage_dead(_19)
+            storage_dead(_18)
+            storage_dead(_17)
+        }
+    } else {
+        storage_dead(_15)
+        storage_dead(_14)
+        storage_dead(_13)
+        storage_dead(_12)
+        storage_dead(_11)
+    }
+    _0 = const false
+    storage_dead(_16)
+    storage_dead(_10)
+    storage_dead(a_out1)
+    storage_dead(a_out0)
+    storage_dead(a_in1)
+    storage_dead(a_in0)
+    storage_dead(fee)
+    storage_dead(out1)
+    storage_dead(out0)
+    storage_dead(in1)
+    storage_dead(in0)
+    return
+}
+
+

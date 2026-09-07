@@ -12,7 +12,7 @@ services:
   # ---- ABCI apps (one per validator, each with its own persisted state) ----
   abci0:
     build:
-      context: ..
+      context: ../..
       dockerfile: chain/docker/Dockerfile
       args:
         ABCI_FEATURES: devnet
@@ -21,9 +21,8 @@ services:
     environment:
       ABCI_PORT: "26658"
       ZCRYPT_STATE_FILE: /data/zcrypt-state.bin
-      # production: the foundation cold key's reward address (64 hex) — REQUIRED by
-      # non-devnet builds; identical on every validator (consensus at genesis)
-      ZCRYPT_FOUNDATION_ADDR: ${ZCRYPT_FOUNDATION_ADDR:-}
+      # The abci does NOT read ZCRYPT_FOUNDATION_ADDR — the foundation address is the
+      # genesis app_state's `foundation_addr` (cometbft-init bakes it in at genesis).
       # devnet-only: accelerate the foundation vesting pacing (1 = real schedule)
       ZCRYPT_VESTING_ACCEL: ${ZCRYPT_VESTING_ACCEL:-1}
     volumes:
@@ -32,7 +31,7 @@ services:
 
   abci1:
     build:
-      context: ..
+      context: ../..
       dockerfile: chain/docker/Dockerfile
       args:
         ABCI_FEATURES: devnet
@@ -41,9 +40,8 @@ services:
     environment:
       ABCI_PORT: "26658"
       ZCRYPT_STATE_FILE: /data/zcrypt-state.bin
-      # production: the foundation cold key's reward address (64 hex) — REQUIRED by
-      # non-devnet builds; identical on every validator (consensus at genesis)
-      ZCRYPT_FOUNDATION_ADDR: ${ZCRYPT_FOUNDATION_ADDR:-}
+      # The abci does NOT read ZCRYPT_FOUNDATION_ADDR — the foundation address is the
+      # genesis app_state's `foundation_addr` (cometbft-init bakes it in at genesis).
       # devnet-only: accelerate the foundation vesting pacing (1 = real schedule)
       ZCRYPT_VESTING_ACCEL: ${ZCRYPT_VESTING_ACCEL:-1}
     volumes:
@@ -52,7 +50,7 @@ services:
 
   abci2:
     build:
-      context: ..
+      context: ../..
       dockerfile: chain/docker/Dockerfile
       args:
         ABCI_FEATURES: devnet
@@ -61,9 +59,8 @@ services:
     environment:
       ABCI_PORT: "26658"
       ZCRYPT_STATE_FILE: /data/zcrypt-state.bin
-      # production: the foundation cold key's reward address (64 hex) — REQUIRED by
-      # non-devnet builds; identical on every validator (consensus at genesis)
-      ZCRYPT_FOUNDATION_ADDR: ${ZCRYPT_FOUNDATION_ADDR:-}
+      # The abci does NOT read ZCRYPT_FOUNDATION_ADDR — the foundation address is the
+      # genesis app_state's `foundation_addr` (cometbft-init bakes it in at genesis).
       # devnet-only: accelerate the foundation vesting pacing (1 = real schedule)
       ZCRYPT_VESTING_ACCEL: ${ZCRYPT_VESTING_ACCEL:-1}
     volumes:
@@ -76,10 +73,12 @@ services:
     container_name: zcrypt-cometbft-init
     user: "0"
     environment:
-      CHAIN_ID: zcrypt-devnet
+      CHAIN_ID: zcrypt-1
+      # Baked into genesis app_state so a published genesis.json fully describes the chain.
+      ZCRYPT_FOUNDATION_ADDR: ${ZCRYPT_FOUNDATION_ADDR:-}
     entrypoint: ["/bin/sh", "/init.sh"]
     volumes:
-      - ./docker/testnet-init.sh:/init.sh:ro
+      - ../docker/testnet-init.sh:/init.sh:ro
       - testnet-data:/testnet
     networks: [zcrypt-net]
 
@@ -98,7 +97,7 @@ services:
       NODE_INDEX: "0"
     entrypoint: ["/bin/sh", "/start.sh"]
     volumes:
-      - ./docker/cometbft-node-start.sh:/start.sh:ro
+      - ../docker/cometbft-node-start.sh:/start.sh:ro
       - testnet-data:/testnet
     ports:
       - "46657:26657"
@@ -118,7 +117,7 @@ services:
       NODE_INDEX: "1"
     entrypoint: ["/bin/sh", "/start.sh"]
     volumes:
-      - ./docker/cometbft-node-start.sh:/start.sh:ro
+      - ../docker/cometbft-node-start.sh:/start.sh:ro
       - testnet-data:/testnet
     ports:
       - "46667:26657"
@@ -138,7 +137,7 @@ services:
       NODE_INDEX: "2"
     entrypoint: ["/bin/sh", "/start.sh"]
     volumes:
-      - ./docker/cometbft-node-start.sh:/start.sh:ro
+      - ../docker/cometbft-node-start.sh:/start.sh:ro
       - testnet-data:/testnet
     ports:
       - "46677:26657"

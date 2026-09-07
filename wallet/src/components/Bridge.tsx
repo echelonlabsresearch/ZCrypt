@@ -1,13 +1,17 @@
 import { useCallback, useEffect, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
-import { call } from "../lib/api";
+import { call, toBaseAsset } from "../lib/api";
 import { CopyButton } from "./Share";
 
 interface Status {
   btc_connected: boolean;
   btc_balance: number;
   zbtc_asset: number;
+  /** Spendable zBTC (matured — in the on-chain tree). */
   zbtc_balance: number;
+  /** Freshly-shielded zBTC still MATURING (held out of the spendable pool by the
+   *  deep-reorg defense until its BTC deposit is buried past reorg risk). */
+  zbtc_maturing: number;
   btc_network: string;
   deposit_address: string;
   lp_address: string;
@@ -51,6 +55,21 @@ export default function Bridge({
   useEffect(() => {
     if (active) load();
   }, [active, load]);
+
+  // While any zBTC is maturing, relay fresh Bitcoin headers to the chain and refresh,
+  // so the deposit's confirmations climb toward maturity and the coin becomes spendable.
+  useEffect(() => {
+    if (!active || !status || (status.zbtc_maturing ?? 0) <= 0) return;
+    const t = setInterval(async () => {
+      try {
+        await call<string>("bridge_mature");
+      } catch {
+        /* best-effort */
+      }
+      await load();
+    }, 15_000);
+    return () => clearInterval(t);
+  }, [active, status, load]);
 
   // Live swap progress: the backend emits "swap-progress" as each atomic-swap step settles.
   useEffect(() => {
@@ -97,14 +116,19 @@ export default function Bridge({
   async function shield() {
     setErr("");
     setFixMsg("");
-    const btc = parseFloat(shieldAmt);
-    if (!btc || btc <= 0) return setErr("Enter a BTC amount to shield.");
+    let sats: number;
+    try {
+      sats = toBaseAsset(shieldAmt, 8);
+    } catch {
+      return setErr("Enter a valid BTC amount to shield.");
+    }
+    if (sats <= 0) return setErr("Enter a BTC amount to shield.");
     setBusy("shield");
     setProgress({ percent: 0, phase: "Starting the atomic swap…" });
     try {
-      const zbtc = Math.round(btc * ZBTC_BASE); // 1:1 demo peg
-      await call<number>("swap_shield_btc", { zbtcAmount: zbtc, btc });
-      onSwapped(`Shielded ${btc} BTC → ${btc} zBTC`);
+      // 1:1 peg — consensus-enforced (SPV: minted base units ≤ locked sats)
+      await call<number>("swap_shield_btc", { zbtcAmount: sats, btc: shieldAmt.trim() });
+      onSwapped(`Shielded ${shieldAmt.trim()} BTC → ${shieldAmt.trim()} zBTC`);
       await load();
     } catch (e) {
       setErr(String(e));
@@ -117,17 +141,22 @@ export default function Bridge({
   async function redeem() {
     setErr("");
     setFixMsg("");
-    const btc = parseFloat(redeemAmt);
-    if (!btc || btc <= 0) return setErr("Enter a zBTC amount to redeem.");
+    let sats: number;
+    try {
+      sats = toBaseAsset(redeemAmt, 8);
+    } catch {
+      return setErr("Enter a valid zBTC amount to redeem.");
+    }
+    if (sats <= 0) return setErr("Enter a zBTC amount to redeem.");
     setBusy("redeem");
     setProgress({ percent: 0, phase: "Starting the atomic swap…" });
     try {
       // The backend redeems in rounds when the balance is fragmented, each round
       // burning a small zBTC fee, so the amount actually redeemed can be a hair under
       // the request. Report what really went out (returned in base units).
-      const redeemedBase = await call<number>("swap_redeem_btc", { btc });
+      const redeemedBase = await call<number>("swap_redeem_btc", { btc: redeemAmt.trim() });
       const got = redeemedBase / ZBTC_BASE;
-      const note = redeemedBase < Math.round(btc * ZBTC_BASE) ? " (per-round zBTC fees deducted)" : "";
+      const note = redeemedBase < sats ? " (per-round zBTC fees deducted)" : "";
       onSwapped(`Redeemed ${zfmt(redeemedBase)} zBTC → ${got.toFixed(8)} BTC${note}`);
       await load();
     } catch (e) {
@@ -160,12 +189,52 @@ export default function Bridge({
             </div>
           </div>
           <div className="bridge-stat">
-            <span className="util">Shielded zBTC</span>
+            <span className="util">Shielded zBTC (spendable)</span>
             <div className="reward-amount" style={{ fontSize: "1.5rem" }}>
               {status ? `${zfmt(status.zbtc_balance)} zBTC` : "…"}
             </div>
           </div>
+          <div
+            className="bridge-stat"
+            style={
+              status && (status.zbtc_maturing ?? 0) > 0
+                ? { borderColor: "var(--color-amber, #d99a00)", background: "rgba(217,154,0,0.06)" }
+                : undefined
+            }
+          >
+            <span className="util">Shielded zBTC (maturing)</span>
+            <div
+              className="reward-amount"
+              style={{
+                fontSize: "1.5rem",
+                color:
+                  status && (status.zbtc_maturing ?? 0) > 0
+                    ? "var(--color-amber, #d99a00)"
+                    : "var(--color-text-dim)",
+              }}
+            >
+              {status ? `${(status.zbtc_maturing ?? 0) > 0 ? "⏳ " : ""}${zfmt(status.zbtc_maturing ?? 0)} zBTC` : "…"}
+            </div>
+          </div>
         </div>
+
+        {status && (status.zbtc_maturing ?? 0) > 0 && (
+          <div
+            className="card"
+            style={{ marginTop: "0.75rem", background: "var(--bg-grid)", borderLeft: "3px solid var(--color-amber, #d99a00)" }}
+          >
+            <div style={{ fontWeight: "bold" }}>
+              ⏳ {zfmt(status.zbtc_maturing)} zBTC maturing
+            </div>
+            <div style={{ fontSize: "0.72rem", color: "var(--color-text-dim)", marginTop: 4 }}>
+              Freshly-shielded zBTC is held out of the spendable pool until its Bitcoin
+              deposit is buried past reorg risk (the deep-reorg defense) — so a chain
+              reorg can still void it before it can be spent. It becomes spendable/redeemable
+              automatically once the deposit matures (near-instant on regtest, up to ~a few
+              hours on mainnet). This tab keeps relaying Bitcoin headers to advance it.
+            </div>
+          </div>
+        )}
 
         {status && (status.deposit_address || status.lp_address) && (
           <div className="card" style={{ marginTop: "1rem", background: "var(--bg-grid)" }}>

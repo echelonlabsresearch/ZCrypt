@@ -116,20 +116,58 @@ fn os_rng() -> MaskRng {
     MaskRng::try_from_rng(&mut SysRng).expect("OS entropy unavailable for proof masking")
 }
 
-/// Build the STARK config from three RNGs (input-MMCS hiding, FRI-MMCS hiding, and
-/// quotient blinding — kept independent so their masks don't correlate).
-/// FRI query count. Default targets ~128-bit *conjectured* soundness (list-decoding).
-/// `high-security` roughly doubles queries for a thicker unique-decoding margin
-/// (larger proofs / slower prove — intended for mainnet builds).
-#[cfg(feature = "high-security")]
+/// FRI query count. Fixed at the mainnet-grade value: there is deliberately NO
+/// lower-security build variant (the former `high-security` cargo feature is gone), so
+/// every binary (node, wallet, tools, tests) produces and verifies one proof format.
+/// 112 queries · log_blowup 2 + 20 pow bits → 244 conjectured (list-decoding) bits.
 const FRI_NUM_QUERIES: usize = 112;
-#[cfg(not(feature = "high-security"))]
-const FRI_NUM_QUERIES: usize = 56;
 
-#[cfg(feature = "high-security")]
+/// Proof-of-work grinding bits, applied on both the commit and the query phase.
 const FRI_POW_BITS: usize = 20;
-#[cfg(not(feature = "high-security"))]
-const FRI_POW_BITS: usize = 16;
+
+/// FRI code-rate exponent (blowup = 2^this). Shared by every config so the compiled
+/// [`conjectured_soundness_bits`] below matches `fri_params.conjectured_soundness_bits()`.
+const FRI_LOG_BLOWUP: usize = 2;
+
+/// Mainnet FRI floor. The compiled constants above meet it by construction; the floor
+/// is kept (and re-checked at node startup via [`assert_mainnet_grade`]) so a future
+/// edit that lowers the constants can never ship silently.
+pub const MAINNET_MIN_QUERIES: usize = 112;
+pub const MAINNET_MIN_POW_BITS: usize = 20;
+pub const MAINNET_MIN_SOUNDNESS_BITS: usize = 128;
+
+/// The FRI query count baked into THIS binary.
+pub const fn fri_num_queries() -> usize { FRI_NUM_QUERIES }
+/// The FRI proof-of-work bits baked into THIS binary.
+pub const fn fri_pow_bits() -> usize { FRI_POW_BITS }
+/// Conjectured (list-decoding) FRI soundness bits of the compiled parameters:
+/// `log_blowup·num_queries + query_pow`. Mirrors `FriParameters::conjectured_soundness_bits`
+/// exactly (same formula, same inputs) so callers need not build a full config to read it.
+pub const fn conjectured_soundness_bits() -> usize {
+    FRI_LOG_BLOWUP * FRI_NUM_QUERIES + FRI_POW_BITS
+}
+
+/// True iff the COMPILED FRI parameters meet the mainnet floor. Non-panicking twin of
+/// [`assert_mainnet_grade`]. Always `true` for the shipped constants.
+pub fn is_mainnet_grade() -> bool {
+    fri_num_queries() >= MAINNET_MIN_QUERIES
+        && fri_pow_bits() >= MAINNET_MIN_POW_BITS
+        && conjectured_soundness_bits() >= MAINNET_MIN_SOUNDNESS_BITS
+}
+
+/// Panic unless this binary was compiled with mainnet-grade FRI parameters. Called once
+/// at mainnet node startup (from the ABCI crate) so a binary whose FRI constants were
+/// lowered refuses to run on mainnet rather than serve under-parameterised proofs.
+pub fn assert_mainnet_grade() {
+    assert!(
+        is_mainnet_grade(),
+        "shield proofs are BELOW mainnet grade: compiled FRI = {} queries / pow {} / {} \
+         conjectured soundness bits; mainnet requires >= {} queries, >= {} pow bits, >= {} \
+         soundness bits: the FRI constants in zcrypt-shield were lowered; restore them",
+        fri_num_queries(), fri_pow_bits(), conjectured_soundness_bits(),
+        MAINNET_MIN_QUERIES, MAINNET_MIN_POW_BITS, MAINNET_MIN_SOUNDNESS_BITS,
+    );
+}
 
 fn make_config(rng_input: MaskRng, rng_challenge: MaskRng, rng_pcs: MaskRng) -> ZkConfig {
     let byte_hash = ByteHash {};
@@ -143,13 +181,19 @@ fn make_config(rng_input: MaskRng, rng_challenge: MaskRng, rng_pcs: MaskRng) -> 
     let challenge_mmcs = ChallengeHidingMmcs::new(mk_mmcs(rng_challenge));
     let dft = Dft::default();
     let fri_params = FriParameters {
-        log_blowup: 2, log_final_poly_len: 1, max_log_arity: 2,
+        log_blowup: FRI_LOG_BLOWUP, log_final_poly_len: 1, max_log_arity: 2,
         num_queries: FRI_NUM_QUERIES,
         commit_proof_of_work_bits: FRI_POW_BITS,
         query_proof_of_work_bits: FRI_POW_BITS,
         mmcs: challenge_mmcs,
     };
-    debug_assert!(fri_params.conjectured_soundness_bits() >= 100);
+    // Hard floor enforced in RELEASE builds too (was a debug_assert): a binary whose
+    // FRI parameters fall under the conjectured-soundness floor must never build a proof.
+    assert!(
+        fri_params.conjectured_soundness_bits() >= 100,
+        "FRI parameters below the 100-bit conjectured-soundness floor: {} bits",
+        fri_params.conjectured_soundness_bits(),
+    );
     let pcs = HidingPcs::new(dft, val_mmcs, fri_params, 4, rng_pcs);
     ZkConfig::new(pcs, Challenger::from_hasher(vec![], byte_hash))
 }
@@ -218,13 +262,9 @@ const ACT_OFF: usize = PATH_DIR_OFF + N_IN * DEPTH;
 const W: usize = ACT_OFF + N_IN;
 type LL = GenericPoseidon2LinearLayersBabyBear;
 
-/// Conjectured soundness bits from the active FRI parameters.
-/// Default: queries=56 · log_blowup=2 + pow=16 → 128.
-/// `high-security`: queries=112 · 2 + pow=20 → 244 (conjectured list-decoding).
-#[cfg(feature = "high-security")]
-pub const SOUNDNESS_BITS: usize = 244;
-#[cfg(not(feature = "high-security"))]
-pub const SOUNDNESS_BITS: usize = 128;
+/// Conjectured soundness bits from the active FRI parameters:
+/// queries=112 · log_blowup=2 + pow=20 → 244 (conjectured list-decoding).
+pub const SOUNDNESS_BITS: usize = conjectured_soundness_bits();
 pub type Commitment = [u64; 8];
 
 /// BabyBear field modulus (`15·2^27 + 1`). A commitment / nullifier limb is a field
@@ -385,10 +425,12 @@ struct CoinsAir;
 impl BaseAir<BabyBear> for CoinsAir {
     fn width(&self) -> usize { W }
     fn num_public_values(&self) -> usize {
-        // output commits + fee + nullifiers + Merkle-anchor root + chain domain.
+        // output commits + fee + nullifiers + Merkle-anchor root + chain domain + enc_digest.
         // The spent coins are NOT public — they are hidden leaves proven via the
-        // in-circuit path. chain_domain binds the proof to a consensus chain_id.
-        N_OUT * 8 + 1 + N_IN * 8 + 8 + 1
+        // in-circuit path. chain_domain binds the proof to a consensus chain_id; the trailing
+        // 8-limb enc_notes digest binds the tx's encrypted notes (observed into the transcript,
+        // not constrained) so they can't be stripped/replaced in the mempool.
+        N_OUT * 8 + 1 + N_IN * 8 + 8 + 1 + 8
     }
 }
 
@@ -451,6 +493,10 @@ impl<AB: AirBuilder<F = BabyBear>> Air<AB> for CoinsAir {
                 let one_minus_act = AB::Expr::ONE - act.clone();
                 builder.assert_zero(one_minus_act.clone() * Into::<AB::Expr>::into(row[i * BLK]));
                 builder.assert_zero(one_minus_act * Into::<AB::Expr>::into(row[i * BLK + 1]));
+                // L1 defense-in-depth: pin the input commitment's padding lane [15] to 0,
+                // mirroring the output-coin constraint below (kept in parity with the tall
+                // production AIR). Real leaves are always built with lane[15]=0.
+                builder.assert_zero(row[i * BLK + 15].into());
                 // OWNERSHIP: pk bound in the commitment (input[6..14]) == Poseidon2(ss).
                 // Kept unconditional (a pad still binds pk = Poseidon2(ss=0), trivially).
                 // Together with the Merkle path below, this proves the prover knows the
@@ -616,6 +662,24 @@ pub fn nullifier(spend_secret: &SpendSecret, value: u64, blind: &Blind) -> Commi
 pub fn nullifier_asset(spend_secret: &SpendSecret, value: u64, blind: &Blind, asset_id: u64) -> Commitment {
     native_commit(&nf_input(spend_secret, value, blind, asset_id))
 }
+
+/// Domain tag for [`secret_coin_tag`], written into the nullifier block's one free
+/// lane. The canonical nullifier always leaves that lane zero, so a non-zero tag is a
+/// different permutation input: the tag and the coin's published nullifier are
+/// distinct values, and neither is computable from the other.
+const COIN_TAG_DOMAIN: u64 = 0x00_C0_1A_67;
+
+/// A **secret** per-coin tag: the same binding tuple as the nullifier
+/// (`spend_secret, value, blind, asset`) hashed under a separate domain. Unlike the
+/// nullifier it is never published, so it can key derivations that must stay hidden
+/// from chain observers (see [`dummy_witness`]) while inheriting the nullifier's
+/// per-coin uniqueness. Recovering it needs the coin's spend secret and blind, so it
+/// is not computable from anything the chain reveals.
+fn secret_coin_tag(spend_secret: &SpendSecret, value: u64, blind: &Blind, asset_id: u64) -> Commitment {
+    let mut s = nf_input(spend_secret, value, blind, asset_id);
+    s[WIDTH - 1] = BabyBear::from_u64(COIN_TAG_DOMAIN);
+    native_commit(&s)
+}
 pub fn compress2(l: &Commitment, r: &Commitment) -> Commitment {
     let mut input = [BabyBear::ZERO; WIDTH];
     for i in 0..8 { input[i] = BabyBear::from_u64(l[i]); input[8 + i] = BabyBear::from_u64(r[i]); }
@@ -655,31 +719,39 @@ fn shared_root(inputs: &[SpendWitness]) -> Option<Commitment> {
 /// slots with these dummies so it still publishes `N_IN` genuine-looking nullifiers,
 /// making it indistinguishable on-chain from a full spend.
 ///
-/// The dummy's `(spend_secret, blind)` is derived by absorbing each *real* input's
-/// canonical **nullifier** and the slot index into Poseidon2, so:
+/// The dummy's `(spend_secret, blind)` is derived by absorbing the slot index and each
+/// *real* input's [`secret_coin_tag`] into Poseidon2, so:
 ///   * it is **pseudo-random and unpredictable** to anyone without the (hidden) real
-///     keys — the published dummy nullifier leaks nothing;
-///   * it is **unique per real coin** (the real nullifier is unique per coin, and a
+///     keys — the tag is keyed on the real coin's `spend_secret` and `blind`, neither of
+///     which ever appears on-chain, so the published dummy nullifier leaks nothing;
+///   * it is **unique per real coin** (the tag binds the same
+///     `(spend_secret, value, blind, asset)` tuple that makes a nullifier unique, and a
 ///     coin spends exactly once), so dummy nullifiers never collide across txs — even
 ///     when a wallet reuses one spend key across many coins — and recording them is safe;
 ///   * it is **identical for the prover and the transparent VM twin** (both call this),
 ///     so `VM ≡ circuit` still holds on short spends.
+///
+/// It must NOT be keyed on the real input's *nullifier*: that value is published in the
+/// very same transaction, so any observer could rerun the derivation, match it against
+/// the padding slot to learn the spend was short, and then recover the tx's otherwise
+/// hidden asset id by trying candidates. That was a real leak; see the regression test
+/// `dummy_nullifier_is_not_recomputable_from_public_data`.
 ///
 /// Its value is 0 (conservation-neutral) and its Merkle path is empty — membership is
 /// left unproven in-circuit (the `active` flag gates that off), which is sound because
 /// a value-0 input can neither create value nor name a real coin.
 pub(crate) fn dummy_witness(real: &[SpendWitness], j: usize, asset: u64) -> SpendWitness {
     const DOMAIN: u64 = 0xD0_11_D0_11; // "dummy" domain separator
-    // Absorb (domain ‖ slot ‖ each real input's canonical nullifier) into a Poseidon2
-    // chain. Keying on the nullifier (not just the spend key) makes the dummy unique
-    // per coin, so reusing one spend key across coins can't yield colliding dummies.
+    // Absorb (domain ‖ slot ‖ each real input's secret per-coin tag) into a Poseidon2
+    // chain. The tag binds the whole coin tuple, so reusing one spend key across coins
+    // can't yield colliding dummies; it is secret, so observers can't replay this.
     let mut acc: Commitment = [0u64; 8];
     acc[0] = field_limb(DOMAIN ^ j as u64);
     for r in real {
-        let nf = nullifier_asset(&r.spend_secret, r.value, &r.blind, r.asset_id);
+        let tag = secret_coin_tag(&r.spend_secret, r.value, &r.blind, r.asset_id);
         let mut blk = [BabyBear::ZERO; WIDTH];
         for k in 0..8 { blk[k] = BabyBear::from_u64(acc[k]); }
-        for k in 0..8 { blk[8 + k] = BabyBear::from_u64(nf[k]); }
+        for k in 0..8 { blk[8 + k] = BabyBear::from_u64(tag[k]); }
         acc = native_commit(&blk);
     }
     // Expand the 8-limb digest into a full spend_secret + blind with counter blocks.
@@ -735,6 +807,7 @@ pub fn prove_wide(
     outputs: &[OutCoin],
     fee: u64,
     chain_id: &[u8],
+    enc_digest: &[u64; 8],
 ) -> Option<(Vec<Commitment>, Vec<Commitment>, Commitment, Vec<u8>)> {
     if !shape_ok(inputs, outputs, fee) { return None; }
     let n_real = inputs.len();
@@ -853,6 +926,7 @@ pub fn prove_wide(
     for nf in &nullifiers { for &x in nf { pis.push(BabyBear::from_u64(x)); } }
     for &x in &root { pis.push(BabyBear::from_u64(x)); }
     pis.push(BabyBear::from_u64(chain_domain(chain_id)));
+    for &x in enc_digest { pis.push(BabyBear::from_u64(x)); }
 
     let config = prover_config();
     let proof = p3_prove(&config, &CoinsAir, trace, &pis);
@@ -869,6 +943,7 @@ pub fn verify_wide(
     root: &Commitment,
     proof_bytes: &[u8],
     chain_id: &[u8],
+    enc_digest: &[u64; 8],
 ) -> bool {
     if output_commits.len() != N_OUT || nullifiers.len() != N_IN { return false; }
     // CANONICAL-ENCODING GATE (defense in depth for the SMT-key double-spend, C2):
@@ -886,6 +961,7 @@ pub fn verify_wide(
     for nf in nullifiers { for &x in nf { pis.push(BabyBear::from_u64(x)); } }
     for &x in root { pis.push(BabyBear::from_u64(x)); }
     pis.push(BabyBear::from_u64(chain_domain(chain_id)));
+    for &x in enc_digest { pis.push(BabyBear::from_u64(x)); }
 
     let prev = std::panic::take_hook();
     std::panic::set_hook(Box::new(|_| {}));
@@ -906,8 +982,9 @@ pub fn prove(
     outputs: &[OutCoin],
     fee: u64,
     chain_id: &[u8],
+    enc_digest: &[u64; 8],
 ) -> Option<(Vec<Commitment>, Vec<Commitment>, Commitment, Vec<u8>)> {
-    tall::prove_tall(inputs, outputs, fee, chain_id)
+    tall::prove_tall(inputs, outputs, fee, chain_id, enc_digest)
 }
 
 /// Verify a shielded-pool proof. **Production entry point** — the tall-circuit
@@ -920,8 +997,9 @@ pub fn verify(
     root: &Commitment,
     proof_bytes: &[u8],
     chain_id: &[u8],
+    enc_digest: &[u64; 8],
 ) -> bool {
-    tall::verify_tall(output_commits, nullifiers, fee, root, proof_bytes, chain_id)
+    tall::verify_tall(output_commits, nullifiers, fee, root, proof_bytes, chain_id, enc_digest)
 }
 
 #[cfg(test)]
@@ -987,9 +1065,9 @@ mod tests {
     #[test]
     fn pool_spend_verifies_hidden() {
         let (ins, root) = with_tree(vec![inp(100, 11, 7, 3), inp(50, 22, 8, 5)]);
-        let (o, nf, r, p) = prove(&ins, &[oc(90, 33, 1), oc(55, 44, 2)], 5, TEST_CHAIN).unwrap();
+        let (o, nf, r, p) = prove(&ins, &[oc(90, 33, 1), oc(55, 44, 2)], 5, TEST_CHAIN, &[0u64; 8]).unwrap();
         assert_eq!(r, root, "proof anchors on the shared tree root");
-        assert!(verify(&o, &nf, 5, &r, &p, TEST_CHAIN));
+        assert!(verify(&o, &nf, 5, &r, &p, TEST_CHAIN, &[0u64; 8]));
         // the spent coin's commitment never appears in the proof's public inputs —
         // only the tree root does, so the spend hides among the WHOLE pool.
         let spent = tc(100, 11, 7);
@@ -1002,11 +1080,11 @@ mod tests {
         // root — the membership binding is what stops a proof-only verifier from
         // accepting a coin that isn't in the tree.
         let (ins, _root) = with_tree(vec![inp(100, 11, 7, 3), inp(50, 22, 8, 5)]);
-        let (o, nf, r, p) = prove(&ins, &[oc(90, 33, 1), oc(55, 44, 2)], 5, TEST_CHAIN).unwrap();
-        assert!(verify(&o, &nf, 5, &r, &p, TEST_CHAIN));
+        let (o, nf, r, p) = prove(&ins, &[oc(90, 33, 1), oc(55, 44, 2)], 5, TEST_CHAIN, &[0u64; 8]).unwrap();
+        assert!(verify(&o, &nf, 5, &r, &p, TEST_CHAIN, &[0u64; 8]));
         let mut wrong = r;
         wrong[0] ^= 1;
-        assert!(!verify(&o, &nf, 5, &wrong, &p, TEST_CHAIN), "a mismatched anchor root must fail");
+        assert!(!verify(&o, &nf, 5, &wrong, &p, TEST_CHAIN, &[0u64; 8]), "a mismatched anchor root must fail");
     }
 
     #[test]
@@ -1018,7 +1096,7 @@ mod tests {
         let (mut ins, _root) = with_tree(vec![inp(100, 11, 7, 3), inp(50, 22, 8, 5)]);
         ins[0].path_siblings[0][0] ^= 1; // corrupt the authentication path
         // Now input 0 recomputes to a different root than input 1 → no shared root.
-        assert!(prove(&ins, &[oc(90, 33, 1), oc(55, 44, 2)], 5, TEST_CHAIN).is_none());
+        assert!(prove(&ins, &[oc(90, 33, 1), oc(55, 44, 2)], 5, TEST_CHAIN, &[0u64; 8]).is_none());
     }
 
     #[test]
@@ -1037,9 +1115,9 @@ mod tests {
             value: 100, blind: bl(11), spend_secret: ss(7), asset_id: ASSET_ZCRYPT,
             path_siblings: sib, path_dirs: dir,
         };
-        let (o, nf, r, p) = prove(&[a], &[oc(95, 33, 1), oc(0, 44, 2)], 5, TEST_CHAIN).unwrap();
+        let (o, nf, r, p) = prove(&[a], &[oc(95, 33, 1), oc(0, 44, 2)], 5, TEST_CHAIN, &[0u64; 8]).unwrap();
         assert_ne!(r, real_root, "a corrupted path recomputes to a different root");
-        assert!(!verify(&o, &nf, 5, &real_root, &p, TEST_CHAIN), "must not verify against the true pool root");
+        assert!(!verify(&o, &nf, 5, &real_root, &p, TEST_CHAIN, &[0u64; 8]), "must not verify against the true pool root");
     }
 
     #[test]
@@ -1050,8 +1128,8 @@ mod tests {
         assert!(a > (1 << BITS) && (a >> SHIFT) > 0); // genuinely multi-limb
         let (ins, _root) = with_tree(vec![inp(a, 11, 7, 3), inp(b, 22, 8, 5)]);
         let out0 = a + b - 100 - 5;
-        let (o, nf, r, p) = prove(&ins, &[oc(out0, 33, 1), oc(100, 44, 2)], 5, TEST_CHAIN).unwrap();
-        assert!(verify(&o, &nf, 5, &r, &p, TEST_CHAIN));
+        let (o, nf, r, p) = prove(&ins, &[oc(out0, 33, 1), oc(100, 44, 2)], 5, TEST_CHAIN, &[0u64; 8]).unwrap();
+        assert!(verify(&o, &nf, 5, &r, &p, TEST_CHAIN, &[0u64; 8]));
     }
 
     #[test]
@@ -1060,15 +1138,15 @@ mod tests {
         // 2^SHIFT, which must borrow one unit from the high limb (the carry path).
         let v = 1u64 << SHIFT;
         let (ins, _root) = with_tree(vec![inp(v, 11, 7, 3), inp(0, 22, 8, 5)]);
-        let (o, nf, r, p) = prove(&ins, &[oc(v - 1, 33, 1), oc(1, 44, 2)], 0, TEST_CHAIN).unwrap();
-        assert!(verify(&o, &nf, 0, &r, &p, TEST_CHAIN), "carry across the limb boundary must verify");
+        let (o, nf, r, p) = prove(&ins, &[oc(v - 1, 33, 1), oc(1, 44, 2)], 0, TEST_CHAIN, &[0u64; 8]).unwrap();
+        assert!(verify(&o, &nf, 0, &r, &p, TEST_CHAIN, &[0u64; 8]), "carry across the limb boundary must verify");
     }
 
     #[test]
     fn over_the_two_limb_cap_is_rejected() {
         // A value above 2^(2·BITS)-1 has a high limb out of range -> rejected.
         let (ins, _root) = with_tree(vec![inp(MAX_COIN_VALUE + 1, 11, 7, 3), inp(0, 22, 8, 5)]);
-        assert!(prove(&ins, &[oc(0, 33, 1), oc(0, 44, 2)], 0, TEST_CHAIN).is_none());
+        assert!(prove(&ins, &[oc(0, 33, 1), oc(0, 44, 2)], 0, TEST_CHAIN, &[0u64; 8]).is_none());
     }
 
     #[test]
@@ -1078,17 +1156,17 @@ mod tests {
         // distinct nullifiers — so a 1-input spend looks exactly like a 2-input one
         // on-chain (no all-zero NULL_NF sentinel gives the input count away).
         let (ins, _root) = with_tree(vec![inp(100, 11, 7, 3)]);
-        let (o, nf, r, p) = prove(&ins, &[oc(90, 33, 1), oc(5, 44, 2)], 5, TEST_CHAIN).unwrap();
+        let (o, nf, r, p) = prove(&ins, &[oc(90, 33, 1), oc(5, 44, 2)], 5, TEST_CHAIN, &[0u64; 8]).unwrap();
         assert_eq!(nf.len(), N_IN);
         assert_ne!(nf[0], NULL_NF, "the real input publishes a real nullifier");
         assert_ne!(nf[1], NULL_NF, "the dummy slot ALSO publishes a real nullifier (no sentinel)");
         assert_ne!(nf[0], nf[1], "the two nullifiers are distinct");
-        assert!(verify(&o, &nf, 5, &r, &p, TEST_CHAIN));
+        assert!(verify(&o, &nf, 5, &r, &p, TEST_CHAIN, &[0u64; 8]));
 
         // Structural indistinguishability: a genuine 2-input spend has the same shape —
         // two non-null, distinct, canonical nullifiers.
         let (ins2, _) = with_tree(vec![inp(100, 11, 7, 3), inp(50, 22, 8, 5)]);
-        let (_o2, nf2, _r2, _p2) = prove(&ins2, &[oc(90, 33, 1), oc(55, 44, 2)], 5, TEST_CHAIN).unwrap();
+        let (_o2, nf2, _r2, _p2) = prove(&ins2, &[oc(90, 33, 1), oc(55, 44, 2)], 5, TEST_CHAIN, &[0u64; 8]).unwrap();
         assert_eq!(nf2.len(), nf.len());
         for n in nf.iter().chain(nf2.iter()) {
             assert_ne!(*n, NULL_NF);
@@ -1103,18 +1181,61 @@ mod tests {
         // agree), but spends of DIFFERENT coins get different dummies (no collision).
         let (a1, _) = with_tree(vec![inp(100, 11, 7, 3)]);
         let (a2, _) = with_tree(vec![inp(100, 11, 7, 3)]); // same coin
-        let da = prove(&a1, &[oc(90, 33, 1), oc(5, 44, 2)], 5, TEST_CHAIN).unwrap().1[1];
-        let db = prove(&a2, &[oc(90, 33, 1), oc(5, 44, 2)], 5, TEST_CHAIN).unwrap().1[1];
+        let da = prove(&a1, &[oc(90, 33, 1), oc(5, 44, 2)], 5, TEST_CHAIN, &[0u64; 8]).unwrap().1[1];
+        let db = prove(&a2, &[oc(90, 33, 1), oc(5, 44, 2)], 5, TEST_CHAIN, &[0u64; 8]).unwrap().1[1];
         assert_eq!(da, db, "same real input ⇒ same dummy nullifier (deterministic)");
         let (c, _) = with_tree(vec![inp(100, 11, 9, 3)]); // different spend secret
-        let dc = prove(&c, &[oc(90, 33, 1), oc(5, 44, 2)], 5, TEST_CHAIN).unwrap().1[1];
+        let dc = prove(&c, &[oc(90, 33, 1), oc(5, 44, 2)], 5, TEST_CHAIN, &[0u64; 8]).unwrap().1[1];
         assert_ne!(da, dc, "different real input ⇒ different dummy nullifier (no collision)");
         // The bug this guards: two DIFFERENT coins that REUSE one spend key (same s=7,
         // different value) must still get different dummies — else a wallet spending
         // both in separate 1-input txs would self-collide as a false double-spend.
         let (e, _) = with_tree(vec![inp(200, 11, 7, 3)]); // same key s=7, value 200 not 100
-        let de = prove(&e, &[oc(190, 33, 1), oc(5, 44, 2)], 5, TEST_CHAIN).unwrap().1[1];
-        assert_ne!(da, de, "same key, different coin ⇒ different dummy (keyed on the nullifier)");
+        let de = prove(&e, &[oc(190, 33, 1), oc(5, 44, 2)], 5, TEST_CHAIN, &[0u64; 8]).unwrap().1[1];
+        assert_ne!(da, de, "same key, different coin ⇒ different dummy (tag binds the whole coin)");
+    }
+
+    #[test]
+    fn dummy_nullifier_is_not_recomputable_from_public_data() {
+        // REGRESSION (arity leak). The dummy was once keyed on the real input's
+        // canonical nullifier — a value published in the very same transaction. That
+        // let any observer replay the derivation, match it against the padding slot to
+        // learn the spend used one coin rather than two, and then recover the tx's
+        // hidden asset id by trying candidates. Replay that exact attack here, using
+        // ONLY values the chain reveals, and assert it no longer reproduces the dummy.
+        let (ins, _) = with_tree(vec![inp(100, 11, 7, 3)]);
+        let (_o, nf, _r, _p) =
+            prove(&ins, &[oc(90, 33, 1), oc(5, 44, 2)], 5, TEST_CHAIN, &[0u64; 8]).unwrap();
+
+        // The old derivation, verbatim, over public inputs: the published nf[0].
+        const DOMAIN: u64 = 0xD0_11_D0_11;
+        let mut acc: Commitment = [0u64; 8];
+        acc[0] = field_limb(DOMAIN ^ 1u64); // padding slot j = 1
+        let mut blk = [BabyBear::ZERO; WIDTH];
+        for k in 0..8 { blk[k] = BabyBear::from_u64(acc[k]); }
+        for k in 0..8 { blk[8 + k] = BabyBear::from_u64(nf[0][k]); }
+        acc = native_commit(&blk);
+        let expand = |ctr: u64| -> Commitment {
+            let mut b = [BabyBear::ZERO; WIDTH];
+            for k in 0..8 { b[k] = BabyBear::from_u64(acc[k]); }
+            b[8] = BabyBear::from_u64(ctr);
+            native_commit(&b)
+        };
+        let guessed_ss: SpendSecret = core::array::from_fn(|k| expand(0)[k % 8]);
+        let guessed_blind: Blind = core::array::from_fn(|k| expand(1)[k % 8]);
+        let guessed = nullifier_asset(&guessed_ss, 0, &guessed_blind, ASSET_ZCRYPT);
+
+        assert_ne!(
+            guessed, nf[1],
+            "the padding nullifier must not be derivable from the published one"
+        );
+
+        // And the secret tag that now keys it is itself distinct from the nullifier,
+        // so publishing one never hands out the other.
+        let real_nf = nullifier_asset(&ss(7), 100, &bl(11), ASSET_ZCRYPT);
+        let tag = secret_coin_tag(&ss(7), 100, &bl(11), ASSET_ZCRYPT);
+        assert_eq!(real_nf, nf[0], "sanity: nf[0] is the real coin's nullifier");
+        assert_ne!(tag, real_nf, "the secret tag is domain-separated from the nullifier");
     }
 
     #[test]
@@ -1123,8 +1244,8 @@ mod tests {
         // input -> a coin spent in a 1-input tx can't be re-spent in a 2-input tx.
         let (ia, _) = with_tree(vec![inp(100, 11, 7, 3)]);
         let (ib, _) = with_tree(vec![inp(100, 11, 7, 8), inp(50, 22, 9, 2)]);
-        let a = prove(&ia, &[oc(90, 33, 1), oc(5, 44, 2)], 5, TEST_CHAIN).unwrap();
-        let b = prove(&ib, &[oc(140, 3, 1), oc(5, 4, 2)], 5, TEST_CHAIN).unwrap();
+        let a = prove(&ia, &[oc(90, 33, 1), oc(5, 44, 2)], 5, TEST_CHAIN, &[0u64; 8]).unwrap();
+        let b = prove(&ib, &[oc(140, 3, 1), oc(5, 4, 2)], 5, TEST_CHAIN, &[0u64; 8]).unwrap();
         assert_eq!(a.1[0], b.1[0], "same coin+secret -> same nullifier regardless of arity");
     }
 
@@ -1133,12 +1254,12 @@ mod tests {
         // The pad is value 0, so it can't conjure inputs: 100 in, 200 out is rejected
         // (conservation holds over the real input alone).
         let (ins, _root) = with_tree(vec![inp(100, 11, 7, 3)]);
-        assert!(prove(&ins, &[oc(150, 33, 1), oc(50, 44, 2)], 0, TEST_CHAIN).is_none());
+        assert!(prove(&ins, &[oc(150, 33, 1), oc(50, 44, 2)], 0, TEST_CHAIN, &[0u64; 8]).is_none());
     }
 
     #[test]
     fn zero_inputs_rejected() {
-        assert!(prove(&[], &[oc(0, 33, 1), oc(0, 44, 2)], 0, TEST_CHAIN).is_none());
+        assert!(prove(&[], &[oc(0, 33, 1), oc(0, 44, 2)], 0, TEST_CHAIN, &[0u64; 8]).is_none());
     }
 
     #[test]
@@ -1157,22 +1278,22 @@ mod tests {
             value: 100, blind: bl(11), spend_secret: ss(999), asset_id: ASSET_ZCRYPT,
             path_siblings: sib, path_dirs: dir,
         };
-        let (o, nf, r, p) = prove(&[attacker], &[oc(95, 33, 1), oc(0, 44, 2)], 5, TEST_CHAIN).unwrap();
+        let (o, nf, r, p) = prove(&[attacker], &[oc(95, 33, 1), oc(0, 44, 2)], 5, TEST_CHAIN, &[0u64; 8]).unwrap();
         assert_ne!(r, real_root, "wrong secret ⇒ different leaf ⇒ different root");
-        assert!(!verify(&o, &nf, 5, &real_root, &p, TEST_CHAIN), "cannot spend a coin you don't own");
+        assert!(!verify(&o, &nf, 5, &real_root, &p, TEST_CHAIN, &[0u64; 8]), "cannot spend a coin you don't own");
     }
 
     #[test]
     fn non_conserving_unprovable() {
         let (ins, _root) = with_tree(vec![inp(100, 1, 1, 0), inp(1, 2, 2, 0)]);
-        assert!(prove(&ins, &[oc(100, 3, 1), oc(1, 4, 2)], 5, TEST_CHAIN).is_none());
+        assert!(prove(&ins, &[oc(100, 3, 1), oc(1, 4, 2)], 5, TEST_CHAIN, &[0u64; 8]).is_none());
     }
 
     #[test]
     fn wrong_fee_rejected() {
         let (ins, _root) = with_tree(vec![inp(100, 11, 7, 3), inp(50, 22, 8, 5)]);
-        let (o, nf, r, p) = prove(&ins, &[oc(90, 33, 1), oc(55, 44, 2)], 5, TEST_CHAIN).unwrap();
-        assert!(!verify(&o, &nf, 6, &r, &p, TEST_CHAIN));
+        let (o, nf, r, p) = prove(&ins, &[oc(90, 33, 1), oc(55, 44, 2)], 5, TEST_CHAIN, &[0u64; 8]).unwrap();
+        assert!(!verify(&o, &nf, 6, &r, &p, TEST_CHAIN, &[0u64; 8]));
     }
 
     #[test]
@@ -1180,10 +1301,10 @@ mod tests {
         // chain_domain is a STARK public input: a proof for chain A must not
         // verify under chain B's tag.
         let (ins, _root) = with_tree(vec![inp(100, 11, 7, 3), inp(50, 22, 8, 5)]);
-        let (o, nf, r, p) = prove(&ins, &[oc(90, 33, 1), oc(55, 44, 2)], 5, TEST_CHAIN).unwrap();
-        assert!(verify(&o, &nf, 5, &r, &p, TEST_CHAIN));
+        let (o, nf, r, p) = prove(&ins, &[oc(90, 33, 1), oc(55, 44, 2)], 5, TEST_CHAIN, &[0u64; 8]).unwrap();
+        assert!(verify(&o, &nf, 5, &r, &p, TEST_CHAIN, &[0u64; 8]));
         assert!(
-            !verify(&o, &nf, 5, &r, &p, b"other-chain"),
+            !verify(&o, &nf, 5, &r, &p, b"other-chain", &[0u64; 8]),
             "proof must not verify under a different chain_id"
         );
     }
@@ -1217,19 +1338,19 @@ mod tests {
         // no longer a fixed public constant). Both must still verify.
         let (ins, _root) = with_tree(vec![inp(100, 11, 7, 3), inp(50, 22, 8, 5)]);
         let outs = [oc(90, 33, 1), oc(55, 44, 2)];
-        let (o1, n1, rt1, p1) = prove(&ins, &outs, 5, TEST_CHAIN).unwrap();
-        let (_o2, _n2, _rt2, p2) = prove(&ins, &outs, 5, TEST_CHAIN).unwrap();
+        let (o1, n1, rt1, p1) = prove(&ins, &outs, 5, TEST_CHAIN, &[0u64; 8]).unwrap();
+        let (_o2, _n2, _rt2, p2) = prove(&ins, &outs, 5, TEST_CHAIN, &[0u64; 8]).unwrap();
         assert_ne!(p1, p2, "proof bytes must differ — masking RNG must be fresh per proof");
-        assert!(verify(&o1, &n1, 5, &rt1, &p1, TEST_CHAIN));
-        assert!(verify(&o1, &n1, 5, &rt1, &p2, TEST_CHAIN));
+        assert!(verify(&o1, &n1, 5, &rt1, &p1, TEST_CHAIN, &[0u64; 8]));
+        assert!(verify(&o1, &n1, 5, &rt1, &p2, TEST_CHAIN, &[0u64; 8]));
     }
 
     #[test]
     fn nullifier_canonical() {
         let (ia, _) = with_tree(vec![inp(100, 11, 7, 3), inp(50, 22, 8, 5)]);
         let (ib, _) = with_tree(vec![inp(100, 11, 7, 1), inp(50, 22, 8, 2)]);
-        let a = prove(&ia, &[oc(90, 33, 1), oc(55, 44, 2)], 5, TEST_CHAIN).unwrap();
-        let b = prove(&ib, &[oc(80, 3, 1), oc(65, 4, 2)], 5, TEST_CHAIN).unwrap();
+        let a = prove(&ia, &[oc(90, 33, 1), oc(55, 44, 2)], 5, TEST_CHAIN, &[0u64; 8]).unwrap();
+        let b = prove(&ib, &[oc(80, 3, 1), oc(65, 4, 2)], 5, TEST_CHAIN, &[0u64; 8]).unwrap();
         assert_eq!(a.1[0], b.1[0]); // same coin+secret, different tree position -> same nf
     }
 
@@ -1242,8 +1363,8 @@ mod tests {
         // Two zBTC input coins -> two zBTC outputs + a zBTC fee. A whole-pool spend
         // over a non-native asset verifies, with conservation in that asset.
         let (ins, _root) = with_tree(vec![inpa(100, 11, 7, 3, ZBTC), inpa(50, 22, 8, 5, ZBTC)]);
-        let (o, nf, r, p) = prove(&ins, &[oca(90, 33, 1, ZBTC), oca(55, 44, 2, ZBTC)], 5, TEST_CHAIN).unwrap();
-        assert!(verify(&o, &nf, 5, &r, &p, TEST_CHAIN));
+        let (o, nf, r, p) = prove(&ins, &[oca(90, 33, 1, ZBTC), oca(55, 44, 2, ZBTC)], 5, TEST_CHAIN, &[0u64; 8]).unwrap();
+        assert!(verify(&o, &nf, 5, &r, &p, TEST_CHAIN, &[0u64; 8]));
         // the spent zBTC coin's commitment is never revealed — only the tree root is.
         assert!(!o.contains(&tca(100, 11, 7, ZBTC)), "spent coin stays hidden in the pool");
     }
@@ -1253,10 +1374,10 @@ mod tests {
         // Inputs are zBTC but an output claims native ZCRYPT -> mixing assets is
         // rejected (you cannot alchemize one asset into another).
         let (ins, _root) = with_tree(vec![inpa(100, 11, 7, 3, ZBTC), inpa(50, 22, 8, 5, ZBTC)]);
-        assert!(prove(&ins, &[oca(90, 33, 1, ZBTC), oc(55, 44, 2)], 5, TEST_CHAIN).is_none());
+        assert!(prove(&ins, &[oca(90, 33, 1, ZBTC), oc(55, 44, 2)], 5, TEST_CHAIN, &[0u64; 8]).is_none());
         // Mismatched input assets are likewise rejected.
         let (mixed, _root) = with_tree(vec![inpa(100, 11, 7, 3, ZBTC), inp(50, 22, 8, 5)]);
-        assert!(prove(&mixed, &[oca(90, 33, 1, ZBTC), oca(55, 44, 2, ZBTC)], 5, TEST_CHAIN).is_none());
+        assert!(prove(&mixed, &[oca(90, 33, 1, ZBTC), oca(55, 44, 2, ZBTC)], 5, TEST_CHAIN, &[0u64; 8]).is_none());
     }
 
     #[test]

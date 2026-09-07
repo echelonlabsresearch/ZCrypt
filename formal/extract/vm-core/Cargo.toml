@@ -1,0 +1,13 @@
+[package]
+name = "zcrypt_vm_core"
+version = "0.1.0"
+edition = "2021"
+
+# The pure, extractable arithmetic core of the shield-transfer VM
+# (shield/src/zvm.rs::execute), carved out with NO external crates and NO generics so
+# the Charon -> Aeneas -> Lean pipeline can process it. The Poseidon2-dependent arms
+# (membership, nullifiers, commitments) are deliberately excluded: they call an external
+# crate and are the documented extraction wall.
+
+[lib]
+path = "src/lib.rs"

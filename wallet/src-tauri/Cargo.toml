@@ -21,6 +21,8 @@ zcrypt-bridge = { path = "../../impl/bridge" }
 bitcoin = "0.32"
 rand = "0.8"
 argon2 = "0.5"
+ed25519-dalek = "2"   # sign validator BOND/DELEGATE txs
+sha2 = "0.10"         # validator/delegator id = SHA256(pubkey)[..20]
 
 # zcrypt-shield (pulled via zcrypt-core) needs the patched p3-util + nightly
 # (see ../rust-toolchain.toml).

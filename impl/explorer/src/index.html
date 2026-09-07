@@ -217,6 +217,16 @@
   td.mono { font-family: var(--mono); overflow-wrap: anywhere; }
   .num { font-family: var(--mono); font-variant-numeric: tabular-nums; text-align: right; color: var(--cyan); white-space: nowrap; }
 
+  /* --- validators --- */
+  .val-stats { margin: 0 0 14px; }
+  #view-validators tbody tr { cursor: pointer; }
+  #view-validators tbody tr:hover { background: rgba(45,212,232,.05); }
+  .val-note { color: var(--muted); font-size: .8rem; margin-top: 10px; font-style: italic; }
+  .uptime { display: inline-flex; align-items: center; gap: 8px; }
+  .upbar { width: 52px; height: 5px; border-radius: 4px; background: var(--panel-3); overflow: hidden; flex: 0 0 auto; }
+  .upbar i { display: block; height: 100%; background: var(--ok); }
+  .upbar i.low { background: var(--amber); }
+
   .empty-note { color: var(--muted); padding: 30px; text-align: center; font-size: .9rem; }
   .foot { margin-top: 46px; color: var(--faint2); font-size: .79rem; text-align: center; line-height: 1.6; }
 
@@ -535,15 +545,125 @@ async function loadAssets() {
 }
 $("#asset-q").addEventListener("input", renderAssets);
 
+// --- validators ---
+let valCtx = null; // last /api/validators payload; the detail modal reads from it
+
+const shortHex = (h) => h && h.length > 20 ? `${h.slice(0, 10)}…${h.slice(-6)}` : (h || "-");
+const valPower = (v) => (v.power ?? v.stake ?? 0);
+const valWeight = (v) => valPower(v) * (v.signed_this_epoch ?? 0);
+
+function uptimeCell(v, prog) {
+  if (!prog) return `<span class="uptime" title="epoch just started">–</span>`;
+  const pct = Math.min(100, Math.round(100 * (v.signed_this_epoch ?? 0) / prog));
+  return `<span class="uptime"><span class="upbar"><i class="${pct < 90 ? "low" : ""}" style="width:${pct}%"></i></span>${pct}%</span>`;
+}
+
+function loadValidatorsInto(d) {
+  valCtx = d;
+  const vs = d.validators || [];
+  if (!vs.length) { $("#view-validators").innerHTML = `<div class="empty-note">no bonded validators</div>`; return; }
+  if (d.legacy) {
+    // Old node: only "<pubkey>:<stake>" is available.
+    $("#view-validators").innerHTML =
+      `<div class="table-wrap"><table><thead><tr><th>Validator</th><th class="num">Stake (ZCRYPT)</th></tr></thead><tbody>` +
+      vs.map(x => `<tr><td class="mono">${esc(x.id)}</td><td class="num">${fmtAtomic(x.stake)}</td></tr>`).join("") +
+      `</tbody></table></div>` +
+      `<div class="val-note">This node predates the validator-detail API; rewards data is unavailable.</div>`;
+    return;
+  }
+  const totalPower = vs.reduce((a, x) => a + valPower(x), 0);
+  const prog = d.epoch_progress ?? 0;
+  const ctx =
+    `<div class="stats val-stats">` +
+    stat("Total staked", fmtCompact(d.total_staked), "ZCRYPT bonded + delegated") +
+    stat("Unbonding", fmtCompact(d.total_unbonding), "locked 10 days") +
+    stat("Epoch reward", fmtAtomic(d.epoch_reward), `ZCRYPT every ${d.epoch_blocks} blocks`) +
+    stat("Epoch progress", `${prog} / ${d.epoch_blocks}`, "blocks into this epoch") +
+    stat("Commission", `${d.commission_percent}%`, "on delegated rewards") +
+    `</div>`;
+  const rows = vs.map((v, i) =>
+    `<tr onclick="openValidatorModal(${i})">` +
+    `<td class="mono" title="${esc(v.id)}">${esc(shortHex(v.id))}</td>` +
+    `<td class="num">${fmtAtomic(v.stake)}</td>` +
+    `<td class="num">${fmtAtomic(v.delegated)}</td>` +
+    `<td class="num">${totalPower ? (100 * valPower(v) / totalPower).toFixed(1) : "0.0"}%</td>` +
+    `<td>${uptimeCell(v, prog)}</td>` +
+    `<td class="num">${fmtAtomic(v.earned)}</td>` +
+    `<td class="num">${fmtAtomic(v.unclaimed)}</td>` +
+    `<td><span class="go">&rsaquo;</span></td></tr>`).join("");
+  $("#view-validators").innerHTML = ctx +
+    `<div class="table-wrap"><table><thead><tr>` +
+    `<th>Validator</th><th class="num">Self-stake</th><th class="num">Delegated</th>` +
+    `<th class="num">Power</th><th>Uptime</th>` +
+    `<th class="num" title="Lifetime block rewards credited to this validator's reward address">Rewards earned</th>` +
+    `<th class="num" title="Accrued but not yet claimed into spendable coins (includes returned unbonded stake)">Unclaimed</th>` +
+    `<th></th></tr></thead><tbody>${rows}</tbody></table></div>` +
+    `<div class="val-note">All amounts in ZCRYPT. Click a validator for its full profile: rewards, delegations, participation.</div>`;
+}
+
 async function loadValidators() {
-  try {
-    const v = await get("/api/validators");
-    $("#view-validators").innerHTML = v.length
-      ? `<div class="table-wrap"><table><thead><tr><th>Validator address</th><th class="num">Stake (ZCRYPT)</th></tr></thead><tbody>` +
-        v.map(x => `<tr><td class="mono">${esc(x.addr)}</td><td class="num">${fmtAtomic(x.stake)}</td></tr>`).join("") +
-        `</tbody></table></div>`
-      : `<div class="empty-note">no bonded validators</div>`;
-  } catch (e) { $("#view-validators").innerHTML = `<div class="empty-note">unreachable</div>`; }
+  try { loadValidatorsInto(await get("/api/validators")); }
+  catch (e) { $("#view-validators").innerHTML = `<div class="empty-note">unreachable</div>`; }
+}
+
+// Per-asset bridge-fee earnings, mapped through the asset registry when it is
+// already loaded (ticker + decimals), raw atomic otherwise.
+function feeEarnedRows(fees) {
+  return (fees || []).map(f => {
+    const a = allAssets.find(x => String(x.asset_id) === String(f.asset_id));
+    const shown = a ? fmtMinted(f.amount, a.decimals, a.ticker) : `${(f.amount ?? 0).toLocaleString()} atomic · asset #${esc(f.asset_id)}`;
+    return `<div class="kk">bridge fees</div><div class="vv">${shown}</div>`;
+  }).join("");
+}
+
+function openValidatorModal(i) {
+  const d = valCtx; if (!d || d.legacy) return;
+  const v = (d.validators || [])[i]; if (!v) return;
+  if (!allAssets.length) loadAssets(); // best-effort ticker mapping for fee earnings
+  const vs = d.validators || [];
+  const totalPower = vs.reduce((a, x) => a + valPower(x), 0);
+  const totalWeight = vs.reduce((a, x) => a + valWeight(x), 0);
+  const estNext = totalWeight ? Math.floor((d.epoch_reward ?? 0) * valWeight(v) / totalWeight) : 0;
+  const prog = d.epoch_progress ?? 0;
+  $("#modal-title").textContent = `Validator ${shortHex(v.id)}`;
+  let h = `<div class="tx"><div class="tx-top"><span class="tx-type">Rewards</span></div><div class="kv">` +
+    `<div class="kk">lifetime earned</div><div class="vv">${fmtAtomic(v.earned)} ZCRYPT</div>` +
+    `<div class="kk">unclaimed</div><div class="vv">${fmtAtomic(v.unclaimed)} ZCRYPT</div>` +
+    `<div class="kk">est. next epoch</div><div class="vv">${fmtAtomic(estNext)} ZCRYPT</div>` +
+    feeEarnedRows(v.fee_earned) + `</div>` +
+    `<div class="explains">Lifetime earned counts every block reward ever credited to this validator's reward
+address (claiming does not reduce it). Unclaimed is what is still sitting on the ledger, and also receives
+returned stake after unbonding. The next-epoch estimate assumes participation stays as it is now.</div></div>`;
+  h += `<div class="tx"><div class="tx-top"><span class="tx-type">Stake &amp; participation</span></div><div class="kv">` +
+    `<div class="kk">self-stake</div><div class="vv">${fmtAtomic(v.stake)} ZCRYPT</div>` +
+    `<div class="kk">delegated</div><div class="vv">${fmtAtomic(v.delegated)} ZCRYPT</div>` +
+    `<div class="kk">voting power</div><div class="vv">${fmtAtomic(valPower(v))} ZCRYPT` +
+    ` (${totalPower ? (100 * valPower(v) / totalPower).toFixed(2) : "0"}% of the network)</div>` +
+    `<div class="kk">signed this epoch</div><div class="vv">${v.signed_this_epoch ?? 0} of ${prog} block${prog === 1 ? "" : "s"}</div>` +
+    `<div class="kk">commission</div><div class="vv">${d.commission_percent}% on delegated rewards</div>` +
+    `</div></div>`;
+  h += `<div class="tx"><div class="tx-top"><span class="tx-type">Identity</span></div><div class="kv">` +
+    `<div class="kk">validator id</div><div class="vv">${esc(v.id)}</div>` +
+    `<div class="kk">consensus pubkey</div><div class="vv">${esc(v.consensus_pubkey)}</div>` +
+    `<div class="kk">reward address</div><div class="vv">${esc(v.reward_address)}</div>` +
+    `</div></div>`;
+  if ((v.delegations || []).length) {
+    h += `<div class="tx"><div class="tx-top"><span class="tx-type">Delegations</span>` +
+      `<span class="tx-tag">${v.delegations.length}</span></div>` +
+      `<div class="table-wrap" style="margin-top:12px"><table><thead><tr><th>Delegator</th><th class="num">Stake (ZCRYPT)</th></tr></thead><tbody>` +
+      v.delegations.map(x => `<tr><td class="mono">${esc(x.delegator)}</td><td class="num">${fmtAtomic(x.stake)}</td></tr>`).join("") +
+      `</tbody></table></div></div>`;
+  }
+  if ((v.unbonding || []).length) {
+    h += `<div class="tx"><div class="tx-top"><span class="tx-type">Unbonding</span></div>` +
+      `<div class="table-wrap" style="margin-top:12px"><table><thead><tr><th class="num">Stake (ZCRYPT)</th><th>Releases</th></tr></thead><tbody>` +
+      v.unbonding.map(x => `<tr><td class="num">${fmtAtomic(x.stake)}</td>` +
+        `<td>${new Date((x.release_time ?? 0) * 1000).toLocaleString()}</td></tr>`).join("") +
+      `</tbody></table></div></div>`;
+  }
+  $("#modal-body").innerHTML = h;
+  $("#modal-body").scrollTop = 0;
+  $("#modal").style.display = "flex";
 }
 
 document.querySelectorAll(".tab").forEach(tab => tab.onclick = () => {
@@ -571,6 +691,9 @@ setInterval(() => {
   tick++;
   loadOverview();
   if (!hideEmpty || tick % 4 === 0) loadBlocks();
+  // Keep the validator table (uptime, rewards) fresh while it's on screen; the
+  // pinned detail modal is left alone so it never shifts under the reader.
+  if ($("#view-validators").style.display !== "none" && tick % 2 === 0) loadValidators();
 }, 5000);
 </script>
 </body>

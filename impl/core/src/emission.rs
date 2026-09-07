@@ -28,6 +28,23 @@ pub const ATOMIC: u64 = 1_000_000;
 /// administrative actions (claim / unbond / undelegate) debit it from the value they
 /// release. A flat floor — a sender may always pay more.
 pub const MIN_FEE: u64 = ATOMIC / 100; // 0.01 ZCRYPT = 10,000 atomic units
+
+/// Bridge value-capture fee, in basis points of the bridged amount (10 bps = 0.1%).
+/// A small proportional cut of every zBTC mint is retained by the protocol (taken at
+/// maturity, in the bridged asset) and distributed to ZCRYPT stakers by the same weight
+/// the block reward uses. This is what tethers Bitcoin bridge volume to the token: since
+/// the fee cannot be sized in ZCRYPT without a price oracle, it is taken in-asset and
+/// paid to stakers as real, asset-denominated yield, so staking demand (and thus locked
+/// ZCRYPT supply) grows with bridge throughput rather than bypassing the token. Oracle-
+/// free, and it only ever redistributes value that is already fully backed 1:1.
+pub const BRIDGE_FEE_BPS: u64 = 10;
+
+/// The protocol's cut of a `value`-unit bridge mint (floor division; zero for dust
+/// smaller than `10_000 / BRIDGE_FEE_BPS` base units, which is correct — a fee below one
+/// base unit rounds to nothing). The user receives `value - bridge_fee(value)`.
+pub fn bridge_fee(value: u64) -> u64 {
+    (value as u128 * BRIDGE_FEE_BPS as u128 / 10_000) as u64
+}
 /// Total supply, in atomic units.
 pub const TOTAL_SUPPLY: u64 = 21_000_000 * ATOMIC;
 /// Foundation allocation (20%), released on the [`foundation_vested`] schedule.

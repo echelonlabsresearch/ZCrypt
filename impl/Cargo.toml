@@ -13,6 +13,16 @@ version = "2.0.0"
 edition = "2021"
 license = "MIT"
 
+# Tests generate STARK proofs (proving, not just verifying) — at opt-level 0 a
+# single shield proof takes minutes. Optimize the crates under test and all
+# dependencies (Plonky3, the shield prover) so the e2e suites run in minutes,
+# not hours; workspace compile times stay tolerable.
+[profile.test]
+opt-level = 2
+
+[profile.dev.package."*"]
+opt-level = 3
+
 [workspace.dependencies]
 sha3 = "0.10"
 sha2 = "0.10"

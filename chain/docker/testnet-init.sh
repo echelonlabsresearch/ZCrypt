@@ -5,7 +5,7 @@
 set -eu
 
 OUT=/testnet
-CHAIN_ID="${CHAIN_ID:-zcrypt-devnet}"
+CHAIN_ID="${CHAIN_ID:-zcrypt-1}"
 
 if [ -f "$OUT/.initialized" ]; then
   echo "[init] testnet already initialized at $OUT"
@@ -50,9 +50,11 @@ while [ "$i" -lt 3 ]; do
   sed -i 's|^addr_book_strict =.*|addr_book_strict = false|' "$CFG"
   sed -i 's|^allow_duplicate_ip =.*|allow_duplicate_ip = true|' "$CFG"
 
-  # Inject the ZCrypt registry app_state (IDENTICAL on every node => same app_hash).
-  sed -i 's/"app_hash": ""/"app_hash": "",\
-  "app_state": { "registry": { "minted_total": 0, "leaves": [] } }/' "$GEN"
+  # Inject the ZCrypt genesis app_state (IDENTICAL on every node => same app_hash): the
+  # empty registry SMT plus the foundation reward address (empty => dev-seed fallback), so
+  # a published genesis.json fully describes the chain.
+  FADDR="${ZCRYPT_FOUNDATION_ADDR:-}"
+  sed -i "s|\"app_hash\": \"\"|\"app_hash\": \"\", \"app_state\": { \"registry\": { \"minted_total\": 0, \"leaves\": [] }, \"foundation_addr\": \"$FADDR\" }|" "$GEN"
 
   echo "[init] node$i -> abci$i configured"
   i=$((i + 1))

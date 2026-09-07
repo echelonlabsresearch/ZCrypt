@@ -144,7 +144,7 @@ fn main() {
     let mut received = None;
     for _ in 0..20 {
         for h in h_before..=zc.height().unwrap_or(h_after) {
-            for raw in zc.block_txs(h) {
+            for raw in zc.block_txs(h).unwrap_or_default() {
                 if raw.first() != Some(&0x55) {
                     continue;
                 }

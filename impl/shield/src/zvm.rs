@@ -242,12 +242,12 @@ mod tests {
     /// caller can corrupt a path to exercise the membership-reject agreement).
     fn assert_equiv_built(inputs: Vec<SpendWitness>, outputs: Vec<OutCoin>, fee: u64) {
         let vm = run_shield_transfer(&inputs, &outputs, fee);
-        let circuit = prove(&inputs, &outputs, fee, TEST_CHAIN);
+        let circuit = prove(&inputs, &outputs, fee, TEST_CHAIN, &[0u64; 8]);
         match (vm.accept, &circuit) {
             (true, Some((outs, nfs, root, proof))) => {
                 assert_eq!(&vm.nullifiers, nfs, "VM and circuit nullifiers must match");
                 assert_eq!(&vm.output_commitments, outs, "VM and circuit outputs must match");
-                assert!(verify(outs, nfs, fee, root, proof, TEST_CHAIN), "the proof the circuit produced must verify");
+                assert!(verify(outs, nfs, fee, root, proof, TEST_CHAIN, &[0u64; 8]), "the proof the circuit produced must verify");
             }
             (false, None) => { /* both reject — agreement */ }
             (a, c) => panic!(
@@ -307,13 +307,13 @@ mod tests {
         let inputs = with_tree(vec![inp(100, 11, 7, 3), inp(50, 22, 8, 5)]);
         let outputs = vec![oc(90, 33, 1), oc(55, 44, 2)];
         let vm = run_shield_transfer(&inputs, &outputs, 5);
-        let (outs, nfs, root, proof) = prove(&inputs, &outputs, 5, TEST_CHAIN).unwrap();
+        let (outs, nfs, root, proof) = prove(&inputs, &outputs, 5, TEST_CHAIN, &[0u64; 8]).unwrap();
         assert_eq!(outs, vm.output_commitments);
-        assert!(verify(&outs, &nfs, 5, &root, &proof, TEST_CHAIN));
+        assert!(verify(&outs, &nfs, 5, &root, &proof, TEST_CHAIN, &[0u64; 8]));
 
         let mut tampered = outs.clone();
         tampered[0][0] ^= 1; // a commitment the VM did NOT compute
-        assert!(!verify(&tampered, &nfs, 5, &root, &proof, TEST_CHAIN), "circuit is bound to the VM's outputs");
+        assert!(!verify(&tampered, &nfs, 5, &root, &proof, TEST_CHAIN, &[0u64; 8]), "circuit is bound to the VM's outputs");
     }
 
     #[test]

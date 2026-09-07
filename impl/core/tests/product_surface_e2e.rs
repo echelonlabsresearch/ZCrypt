@@ -56,6 +56,18 @@ fn build_shield(
     fee: u64,
     notes: Vec<Vec<u8>>,
 ) -> Result<ShieldTx, String> {
+    build_shield_bound(node, inputs, outs, fee, notes, &[])
+}
+
+/// [`build_shield`] with the proof bound to an escrow-lock envelope (what every lock tx does).
+fn build_shield_bound(
+    node: &Node,
+    inputs: &[Coin],
+    outs: [OutCoin; 2],
+    fee: u64,
+    notes: Vec<Vec<u8>>,
+    envelope: &[u8],
+) -> Result<ShieldTx, String> {
     let leaves = node.commitment_leaves();
     let mut spends = Vec::new();
     for c in inputs {
@@ -73,7 +85,8 @@ fn build_shield(
             path_dirs,
         });
     }
-    shield_tx::build(CHAIN, &spends, &outs, fee, notes).ok_or_else(|| "prove failed".to_string())
+    shield_tx::build_bound(CHAIN, &spends, &outs, fee, notes, envelope)
+        .ok_or_else(|| "prove failed".to_string())
 }
 
 /// Scan a just-applied tx's encrypted notes and return the coin `who` can receive.
@@ -104,7 +117,7 @@ fn full_product_surface_happy_path() {
 
     // ---- 2. Bond a validator, run an epoch, receive block rewards ----
     let cons_pk = b"alice-consensus-key";
-    node.bond(cons_pk.to_vec(), cons_pk.to_vec(), 10_000 * ATOMIC, alice.reward_address()).unwrap();
+    node.bond(cons_pk.to_vec(), cons_pk.to_vec(), 10_000 * ATOMIC, alice.reward_address(), zcrypt_core::staking::DEFAULT_COMMISSION_BPS).unwrap();
     assert!(node.is_validator(cons_pk));
     for h in 1..=emission::EPOCH {
         node.set_height(h);
@@ -266,7 +279,13 @@ fn shielded_swap_end_to_end() {
         let burn_out: OutCoin = (value, burn_blind, BURN_PK, asset);
         let chg_out: OutCoin = (chg, chg_blind, locker.pubkey(), asset);
         let note = kem::ciphertext_to_bytes(&keys::encrypt_note_asset(&locker.normal_address(), chg, chg_blind, asset));
-        let stx = build_shield(node, &[coin.clone()], [burn_out, chg_out], FEE, vec![vec![1; 8], note]).unwrap();
+        // The lock parameters are bound into the proof, so a front-runner cannot rewrite the
+        // counterparty or refund key and redirect either leg of the trade.
+        let env = zcrypt_core::htlc_shield::lock_envelope(
+            zcrypt_core::htlc_shield::ENV_SWAP_LOCK,
+            asset, value, &lock, timeout, &counterparty.pubkey(), &locker.pubkey(), &[],
+        );
+        let stx = build_shield_bound(node, &[coin.clone()], [burn_out, chg_out], FEE, vec![vec![1; 8], note], &env).unwrap();
         node.swap_lock(CHAIN, &stx, value, burn_blind, asset, lock, timeout, counterparty.pubkey(), locker.pubkey()).unwrap()
     };
 
@@ -373,8 +392,8 @@ fn product_surface_abuse_cases() {
     );
 
     // --- (d) Bond below the minimum stake is rejected ---
-    assert!(node.bond(b"v".to_vec(), b"v".to_vec(), 1, [0u8; 32]).is_err(), "stake below MIN_STAKE");
-    node.bond(b"v".to_vec(), b"v".to_vec(), 10_000 * ATOMIC, [1u8; 32]).unwrap();
+    assert!(node.bond(b"v".to_vec(), b"v".to_vec(), 1, [0u8; 32], zcrypt_core::staking::DEFAULT_COMMISSION_BPS).is_err(), "stake below MIN_STAKE");
+    node.bond(b"v".to_vec(), b"v".to_vec(), 10_000 * ATOMIC, [1u8; 32], zcrypt_core::staking::DEFAULT_COMMISSION_BPS).unwrap();
     // Unbond works once; a second unbond of the same key fails.
     assert!(node.unbond(b"v").is_ok());
     assert!(node.unbond(b"v").is_err(), "double unbond");
@@ -442,7 +461,7 @@ fn coin_backed_bond_pledges_coins_and_unbonding_returns_them() {
     let stx = build_shield(&node, &[fund.clone()], [burn_out, change_out], fee, vec![vec![], vec![]]).unwrap();
 
     let reward = keys::reward_address(&bonder.pubkey());
-    node.bond_with_stake(CHAIN, &stx, stake, stake_blind, b"val".to_vec(), b"val".to_vec(), reward)
+    node.bond_with_stake(CHAIN, &stx, stake, stake_blind, b"val".to_vec(), b"val".to_vec(), reward, zcrypt_core::staking::DEFAULT_COMMISSION_BPS)
         .expect("coin-backed bond accepted");
     assert!(node.is_validator(b"val"));
 
@@ -462,7 +481,7 @@ fn coin_backed_bond_pledges_coins_and_unbonding_returns_them() {
         vec![vec![], vec![]],
     ).unwrap();
     assert!(
-        node.bond_with_stake(CHAIN, &normal, stake, stake_blind, b"v2".to_vec(), b"v2".to_vec(), reward).is_err(),
+        node.bond_with_stake(CHAIN, &normal, stake, stake_blind, b"v2".to_vec(), b"v2".to_vec(), reward, zcrypt_core::staking::DEFAULT_COMMISSION_BPS).is_err(),
         "output[0] must be the declared stake burn coin"
     );
     assert!(!node.is_validator(b"v2"), "rejected bond records no validator");
@@ -512,7 +531,7 @@ fn coin_backed_delegation_shares_rewards_and_returns_stake() {
     let vchange = keys::out_coin(&validator.normal_address(), 100, keys::random_blind());
     let vtx = build_shield(&node, &[vfund], [vburn, vchange], fee, vec![vec![], vec![]]).unwrap();
     let vreward = keys::reward_address(&validator.pubkey());
-    node.bond_with_stake(CHAIN, &vtx, vstake, vblind, b"val".to_vec(), b"val".to_vec(), vreward)
+    node.bond_with_stake(CHAIN, &vtx, vstake, vblind, b"val".to_vec(), b"val".to_vec(), vreward, zcrypt_core::staking::DEFAULT_COMMISSION_BPS)
         .expect("bond");
     assert!(node.is_validator(b"val"));
 

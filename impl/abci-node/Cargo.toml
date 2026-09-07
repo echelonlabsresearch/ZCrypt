@@ -12,11 +12,10 @@ path = "src/main.rs"
 # unbacked commitment to the tree — an "infinite money" primitive that must NEVER
 # be reachable on a value-bearing network. Build devnets with `--features devnet`.
 devnet = []
-# Thicker FRI soundness margin (propagates to zcrypt-shield).
-high-security = ["zcrypt-core/high-security"]
 
 [dependencies]
 zcrypt-core = { path = "../core" }
+zcrypt-shield = { path = "../shield" }
 serde_json.workspace = true
 hex.workspace = true
 tendermint-abci = "0.40.4"
