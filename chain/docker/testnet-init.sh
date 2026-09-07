@@ -41,8 +41,8 @@ while [ "$i" -lt 3 ]; do
   sed -i 's|^laddr = "tcp://127.0.0.1:26657"|laddr = "tcp://0.0.0.0:26657"|' "$CFG"
   sed -i 's|^cors_allowed_origins = \[\]|cors_allowed_origins = ["*"]|' "$CFG"
 
-  # Shield proofs are ~5 MB (the L1 in-circuit Merkle path enlarges the STARK), which
-  # base64-encode past the default 1 MB RPC/mempool limits — raise both.
+  # Shield proofs are ~1 MB (tall-skinny STARK trace), which base64-encode past the default
+  # 1 MB RPC/mempool limits (and a tx bundles two proofs) — raise both.
   sed -i 's|^max_body_bytes =.*|max_body_bytes = 30000000|' "$CFG"
   sed -i 's|^max_tx_bytes =.*|max_tx_bytes = 12000000|' "$CFG"
 
@@ -51,10 +51,12 @@ while [ "$i" -lt 3 ]; do
   sed -i 's|^allow_duplicate_ip =.*|allow_duplicate_ip = true|' "$CFG"
 
   # Inject the ZCrypt genesis app_state (IDENTICAL on every node => same app_hash): the
-  # empty registry SMT plus the foundation reward address (empty => dev-seed fallback), so
-  # a published genesis.json fully describes the chain.
+  # empty registry SMT, the foundation reward address (empty => dev-seed fallback), and the
+  # zBTC reserve pubkey (`zbtc_reserve_pk`, registered by the node at InitChain; empty =>
+  # no zBTC on this chain), so a published genesis.json fully describes the chain.
   FADDR="${ZCRYPT_FOUNDATION_ADDR:-}"
-  sed -i "s|\"app_hash\": \"\"|\"app_hash\": \"\", \"app_state\": { \"registry\": { \"minted_total\": 0, \"leaves\": [] }, \"foundation_addr\": \"$FADDR\" }|" "$GEN"
+  ZBTC_PK="${ZCRYPT_RESERVE_PK:-}"
+  sed -i "s|\"app_hash\": \"\"|\"app_hash\": \"\", \"app_state\": { \"registry\": { \"minted_total\": 0, \"leaves\": [] }, \"foundation_addr\": \"$FADDR\", \"zbtc_reserve_pk\": \"$ZBTC_PK\" }|" "$GEN"
 
   echo "[init] node$i -> abci$i configured"
   i=$((i + 1))

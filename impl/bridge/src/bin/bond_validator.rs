@@ -11,6 +11,19 @@
 //!   ZCRYPT_REWARD_MNEMONIC="word word ..." # derive the reward address from a wallet phrase
 //!   cargo run --release -p zcrypt-bridge --bin bond_validator -- http://localhost:56657 [stake_whole_zcrypt]
 //!
+//! WALLET TWO-STEP BOND (`sign`): the desktop wallet prepares a bond (`bond_request`: chain
+//! id, reward address, stake, commission) and asks the validator HOST for a signature; the
+//! consensus private key never enters the wallet. Run ON THE HOST:
+//!
+//!   VALIDATOR_SEED_HEX=<64 hex> bond_validator sign \
+//!       --chain-id zcrypt-1 --reward <64 hex> --stake <base units> --commission-bps <bps> \
+//!       [--nonce <u64> | --node http://127.0.0.1:26657]     # nonce fetched from the node if omitted
+//!
+//! Prints ONLY the 128-hex ed25519 signature on stdout (pubkey + nonce go to stderr), over
+//! exactly the wallet's message:
+//!   "ZCRYPT-BOND-v1" || chain_id || consensus_pubkey(32) || stake_le(8) || reward(32) ||
+//!   commission_bps_le(2) || nonce_le(8)
+//!
 //! Devnet only for the STAKE FUNDING: the stake coin is minted via SEED (0x56), which a
 //! production (non-devnet) node rejects — there you must instead pledge a coin your
 //! wallet already holds (a wallet "Bond" flow is the follow-up for that).
@@ -32,24 +45,16 @@ fn bond_tx(
     nonce: u64,
     pledge: &shield_tx::ShieldTx,
 ) -> Vec<u8> {
-    use ed25519_dalek::Signer;
     let pk = sk.verifying_key().to_bytes();
-    let mut msg = Vec::new();
-    msg.extend_from_slice(b"ZCRYPT-BOND-v1");
-    msg.extend_from_slice(swap::CHAIN);
-    msg.extend_from_slice(&pk);
-    msg.extend_from_slice(&stake.to_le_bytes());
-    msg.extend_from_slice(&reward);
-    msg.extend_from_slice(&commission.to_le_bytes());
-    msg.extend_from_slice(&nonce.to_le_bytes()); // replay-protection nonce
-    let sig = sk.sign(&msg);
+    // Same message the wallet's two-step flow signs on the host (`bond_validator sign`).
+    let sig = swap::sign_bond(sk, swap::CHAIN, stake, &reward, commission, nonce);
     let mut t = vec![0x57u8];
     t.extend_from_slice(&pk);
     t.extend_from_slice(&stake.to_le_bytes());
     t.extend_from_slice(&reward);
     t.extend_from_slice(&commission.to_le_bytes());
     t.extend_from_slice(&nonce.to_le_bytes());
-    t.extend_from_slice(&sig.to_bytes());
+    t.extend_from_slice(&sig);
     for limb in stake_blind {
         t.extend_from_slice(&limb.to_le_bytes());
     }
@@ -57,7 +62,91 @@ fn bond_tx(
     t
 }
 
+/// The validator's consensus signing key from `VALIDATOR_SEED_HEX` (first 32 bytes of
+/// `priv_validator_key.json`, hex).
+fn consensus_key_from_env() -> ed25519_dalek::SigningKey {
+    let hexseed = std::env::var("VALIDATOR_SEED_HEX")
+        .expect("set VALIDATOR_SEED_HEX (first 32 bytes of priv_validator_key.json, hex)");
+    let raw = hex::decode(hexseed.trim()).expect("VALIDATOR_SEED_HEX: invalid hex");
+    let seed32: [u8; 32] = raw[..32].try_into().expect("VALIDATOR_SEED_HEX: need >= 32 bytes");
+    ed25519_dalek::SigningKey::from_bytes(&seed32)
+}
+
+/// `bond_validator sign ...`: print the host signature for the wallet's two-step bond.
+fn sign_subcommand(args: &[String]) {
+    let mut chain_id: Option<String> = None;
+    let mut reward: Option<[u8; 32]> = None;
+    let mut stake: Option<u64> = None;
+    let mut commission: Option<u16> = None;
+    let mut nonce: Option<u64> = None;
+    let mut node: Option<String> = None;
+    let mut i = 0;
+    let mut val = |i: &mut usize| -> String {
+        *i += 1;
+        args.get(*i).cloned().unwrap_or_else(|| {
+            eprintln!("bond_validator sign: missing value for {}", args[*i - 1]);
+            std::process::exit(2)
+        })
+    };
+    while i < args.len() {
+        match args[i].as_str() {
+            "--chain-id" => chain_id = Some(val(&mut i)),
+            "--reward" => {
+                reward = Some(
+                    hex::decode(val(&mut i).trim())
+                        .ok()
+                        .and_then(|b| b.try_into().ok())
+                        .unwrap_or_else(|| {
+                            eprintln!("bond_validator sign: --reward must be 64 hex chars");
+                            std::process::exit(2)
+                        }),
+                )
+            }
+            "--stake" => stake = Some(val(&mut i).trim().parse().expect("--stake: base units (u64)")),
+            "--commission-bps" => commission = Some(val(&mut i).trim().parse().expect("--commission-bps: u16")),
+            "--nonce" => nonce = Some(val(&mut i).trim().parse().expect("--nonce: u64")),
+            "--node" => node = Some(val(&mut i)),
+            other => {
+                eprintln!("bond_validator sign: unknown option {other}");
+                std::process::exit(2)
+            }
+        }
+        i += 1;
+    }
+    let sk = consensus_key_from_env();
+    let pk_hex = hex::encode(sk.verifying_key().to_bytes());
+    let (chain_id, reward, stake, commission) = match (chain_id, reward, stake, commission) {
+        (Some(c), Some(r), Some(s), Some(k)) => (c, r, s, k),
+        _ => {
+            eprintln!("usage: bond_validator sign --chain-id <id> --reward <64hex> --stake <base units> --commission-bps <bps> [--nonce <u64> | --node <url>]");
+            std::process::exit(2)
+        }
+    };
+    let nonce = match nonce {
+        Some(n) => n,
+        None => {
+            let url = node.unwrap_or_else(|| "http://127.0.0.1:26657".to_string());
+            Zcrypt::new(&url)
+                .query(&format!("/staking/auth_nonce/{pk_hex}"))
+                .ok()
+                .and_then(|s| s.trim().parse().ok())
+                .unwrap_or_else(|| {
+                    eprintln!("bond_validator sign: could not fetch the auth nonce from {url}; pass --nonce");
+                    std::process::exit(2)
+                })
+        }
+    };
+    let sig = swap::sign_bond(&sk, chain_id.as_bytes(), stake, &reward, commission, nonce);
+    eprintln!("consensus pubkey: {pk_hex}\nnonce: {nonce}\nchain: {chain_id}  stake: {stake}  commission_bps: {commission}");
+    println!("{}", hex::encode(sig));
+}
+
 fn main() {
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    if argv.first().map(String::as_str) == Some("sign") {
+        sign_subcommand(&argv[1..]);
+        return;
+    }
     let url = std::env::args().nth(1).unwrap_or_else(|| "http://localhost:46657".to_string());
     let stake: u64 = std::env::args()
         .nth(2)
@@ -71,11 +160,7 @@ fn main() {
     let zc = Zcrypt::new(&url);
 
     // 1. Validator consensus key (the identity CometBFT signs blocks with).
-    let hexseed = std::env::var("VALIDATOR_SEED_HEX")
-        .expect("set VALIDATOR_SEED_HEX (first 32 bytes of priv_validator_key.json, hex)");
-    let raw = hex::decode(hexseed.trim()).expect("VALIDATOR_SEED_HEX: invalid hex");
-    let seed32: [u8; 32] = raw[..32].try_into().expect("VALIDATOR_SEED_HEX: need >= 32 bytes");
-    let sk = ed25519_dalek::SigningKey::from_bytes(&seed32);
+    let sk = consensus_key_from_env();
     let val_pk = sk.verifying_key();
     // The /staking/validators set is keyed by the ed25519 consensus pubkey (32B) hex.
     let val_pk_hex = hex::encode(val_pk.to_bytes());

@@ -28,12 +28,13 @@ fn main() {
     // deposits claimable by it — no treasury, no signers, nothing to trust.
     let bridge_key = Key::from_bytes(&[0xB1; 32]);
 
-    // register zBTC in SPV form (idempotent-ish: ignore "already registered")
+    // zBTC is bound to this reserve pubkey in GENESIS (ZCRYPT_RESERVE_PK = 0xB1 dev key).
     let reserve_pk: [u8; 33] = bridge_key.pk.inner.serialize();
-    // zBTC is pinned in GENESIS (`zbtc_reserve_pk`, from ZCRYPT_RESERVE_PK when the chain is
-    // created); this legacy gasless registration is rejected and ignored on such a chain.
-    let _ = zc.broadcast(&swap::register_spv_tx(asset_ticker, 8, &reserve_pk, 21_000_000 * 100_000_000, &[]));
-    let asset: u64 = zc.query(&format!("/asset/by_ticker/{asset_ticker}")).unwrap().trim().parse().unwrap();
+    let _ = asset_ticker;
+    let asset: u64 = swap::ensure_zbtc_registered(&zc).unwrap_or_else(|e| {
+        eprintln!("{e}\n    this driver's reserve pubkey: {}", hex::encode(reserve_pk));
+        std::process::exit(2)
+    });
     println!("zBTC asset_id = {asset}");
 
     // seed a zBTC pool so shield spends hide among a non-trivial shielded pool

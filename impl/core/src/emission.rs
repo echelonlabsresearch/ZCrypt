@@ -21,12 +21,15 @@
 /// Atomic units per ZCRYPT (6 decimals).
 pub const ATOMIC: u64 = 1_000_000;
 
-/// Minimum transaction fee: **0.01 ZCRYPT**. ZCRYPT is the universal gas asset — every
+/// Minimum transaction fee: **0.01 ZCRYPT**. ZCRYPT is the universal gas asset: every
 /// action that moves value pays at least this, and the fee is **burned** (removed from
 /// supply). Enforced as a consensus rule (not in the circuit, which proves conservation
-/// for any fee): a shield spend must carry `fee ≥ MIN_FEE`, and the fee-less
-/// administrative actions (claim / unbond / undelegate) debit it from the value they
-/// release. A flat floor — a sender may always pay more.
+/// for any fee): a shield spend must carry `fee >= MIN_FEE`, and state-creating actions
+/// (REGISTER, HTLC_OPEN, the escrow locks) carry a ZCRYPT gas note that burns exactly
+/// this. CLAIM / UNBOND / UNDELEGATE are gasless by design (a claim must take the FULL
+/// claimable balance and is bounded by reward accrual; unbond/undelegate are signed and
+/// nonce-protected), so they do not debit the released value. A flat floor: a sender may
+/// always pay more.
 pub const MIN_FEE: u64 = ATOMIC / 100; // 0.01 ZCRYPT = 10,000 atomic units
 
 /// Bridge value-capture fee, in basis points of the bridged amount (10 bps = 0.1%).

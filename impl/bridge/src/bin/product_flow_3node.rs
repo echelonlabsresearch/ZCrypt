@@ -1,6 +1,6 @@
 //! Drive the FULL product surface against a LIVE chain over RPC — every flow builds
 //! a real tx, broadcasts it, and only "passes" if the node's consensus path accepts
-//! (and for shield txs, VERIFIES the ~5 MB proof). Point it at node0 of the 3-node
+//! (and for shield txs, VERIFIES the ~1 MB proof). Point it at node0 of the 3-node
 //! stack to prove the whole product works under real multi-node consensus.
 //!
 //!   cargo run --release -p zcrypt-bridge --bin product_flow_3node -- http://localhost:46657

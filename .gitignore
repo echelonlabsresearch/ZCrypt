@@ -44,3 +44,6 @@ node_key.json
 
 # separate repository (github.com/zcryptnetwork/prelaunch-website), not part of this tree
 zcryptlaunchholdingpage/
+
+# operator secrets mounted into containers (reserve key etc.)
+chain/secrets/

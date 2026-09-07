@@ -57,6 +57,10 @@ pub fn build_and_sign(
     if amount == 0 {
         return Err("amount must be positive".into());
     }
+    // Bridge M4: never trust a fee oracle blindly. Clamp the rate, and below refuse a fee
+    // that would eat more than a quarter of the amount (dust-level amounts excepted by the
+    // relay floor). The chosen fee is returned in `SignedTx.fee` so a UI can show it.
+    let fee_rate_sat_vb = crate::cap_fee_rate(fee_rate_sat_vb);
     // Spend confirmed coins only, largest first (fewest inputs).
     let mut avail: Vec<&WalletUtxo> = utxos.iter().filter(|u| u.utxo.confirmed).collect();
     avail.sort_by(|a, b| b.utxo.value.cmp(&a.utxo.value));
@@ -96,6 +100,15 @@ pub fn build_and_sign(
         in_total - amount - if in_total >= amount + fee_one_out { fee_one_out } else { fee_two_out }
     };
     let _ = change;
+    // Bridge M4: refuse to pay more than a quarter of the amount in fees (the relay floor for
+    // a 1-in/2-out P2WPKH tx at 1 sat/vB is the only exception, for dust-level amounts).
+    let floor = est_fee(chosen.len(), 2, 1.0);
+    if fee > (amount / crate::MAX_FEE_FRACTION_DEN).max(floor) {
+        return Err(format!(
+            "refusing to build: fee {fee} sats exceeds a quarter of the {amount}-sat amount \
+             (fee rate {fee_rate_sat_vb:.1} sat/vB); lower the rate or move a larger amount"
+        ));
+    }
 
     // Build the unsigned skeleton (RBF-enabled, no locktime).
     let input: Vec<TxIn> = chosen

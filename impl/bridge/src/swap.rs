@@ -4,7 +4,7 @@
 //! escrow. The bridge reads the preimage *from whichever chain reveals it first*
 //! and uses it to settle the other, so neither side can take without giving.
 
-use bitcoin::{Address, Amount, OutPoint, PublicKey};
+use bitcoin::{Address, Amount, OutPoint, PublicKey, ScriptBuf};
 use zcrypt_core::keys::{Account, Coin};
 use zcrypt_core::nullifier::htlc_hashlock;
 use zcrypt_core::shield_tx::{self, Spend};
@@ -66,6 +66,101 @@ const _: () = assert!(ZC_HTLC_CLAIM_SECS + 24 * 3600 < BTC_HTLC_LOCK_SECS);
 const _: () = assert!(ZC_REDEEM_TIMEOUT_BLOCKS * ZC_BLOCK_TIME_SECS > BTC_HTLC_LOCK_SECS);
 const _: () = assert!(BTC_HTLC_LOCKTIME_BLOCKS >= 144); // ≥ mainnet SPV locktime_margin
 const _: () = assert!(LOCKTIME_HARD_BLOCKS < LOCKTIME_ALERT_BLOCKS);
+
+// ---- Redeem direction (zBTC -> BTC): the operator locks BTC the USER claims. ----
+//
+// Theft scenario this guards against (bridge H1): the user burn-locks zBTC with a SHORT
+// ZCrypt escrow, the operator locks BTC with its usual (long) refund lock, the user lets
+// the ZC escrow expire (zBTC refunded to them) and THEN claims the BTC. The operator's
+// finalize fails ("escrow not open") and the reserve is drained. The BTC lock the operator
+// funds must therefore expire BEFORE the ZC escrow does, with time to spare for the
+// operator to land the ZC burn claim after the user's BTC claim confirms:
+//
+//   btc_lock_secs + REDEEM_FINALIZE_SLA_SECS  <=  (timeout_height - zc_tip) * ZC_BLOCK_TIME
+//
+// [`redeem_btc_locktime_for`] derives the lock from the escrow's remaining life and REFUSES
+// to fund when that leaves the user less than [`min_user_claim_blocks`].
+
+/// Operator time budget after the user's BTC claim confirms: read the preimage, submit the
+/// ZC burn claim, survive a transient outage. Mainnet value; see [`redeem_finalize_sla_secs`].
+pub const REDEEM_FINALIZE_SLA_SECS: u64 = 6 * 3600;
+/// Minimum BTC lock (blocks) the operator will fund on mainnet: the user's claim window.
+pub const MIN_USER_CLAIM_BLOCKS_MAINNET: u64 = 144;
+// The default operator redeem lock (504 blocks) plus the finalize SLA fits inside the
+// default ZC redeem escrow with the user's minimum window to spare.
+const _: () = assert!(
+    504 * BTC_BLOCK_TIME_SECS + REDEEM_FINALIZE_SLA_SECS + MIN_USER_CLAIM_BLOCKS_MAINNET * BTC_BLOCK_TIME_SECS
+        <= ZC_REDEEM_TIMEOUT_BLOCKS * ZC_BLOCK_TIME_SECS
+);
+
+/// Operator finalize budget (seconds) by network.
+pub fn redeem_finalize_sla_secs(network: bitcoin::Network) -> u64 {
+    match network {
+        bitcoin::Network::Bitcoin => REDEEM_FINALIZE_SLA_SECS,
+        bitcoin::Network::Signet => 3600,
+        _ => 60,
+    }
+}
+
+/// The shortest BTC lock the operator will fund for a redeem (blocks): below this the user
+/// could not reliably claim before the operator's refund, so the redeem is refused instead.
+pub fn min_user_claim_blocks(network: bitcoin::Network) -> u64 {
+    match network {
+        bitcoin::Network::Bitcoin => MIN_USER_CLAIM_BLOCKS_MAINNET,
+        bitcoin::Network::Signet => 36,
+        _ => 10,
+    }
+}
+
+/// Minimum ZC escrow life (blocks) a redeem must have LEFT when the operator locks BTC:
+/// the user's minimum claim window plus the operator's finalize SLA. The daemon's
+/// `WATCHER_FINALIZE_MARGIN` can only raise this floor, never lower it.
+pub fn min_redeem_margin_blocks(network: bitcoin::Network) -> u64 {
+    (min_user_claim_blocks(network) * BTC_BLOCK_TIME_SECS + redeem_finalize_sla_secs(network)) / ZC_BLOCK_TIME_SECS
+}
+
+/// The BTC HTLC refund locktime the operator may fund for a redeem escrow that times out at
+/// ZC height `timeout_height`, given the current tips: the network's redeem lock, SHRUNK so
+/// it (plus the finalize SLA) always expires before the ZC escrow. `Err` when the escrow's
+/// remaining life leaves the user less than [`min_user_claim_blocks`]: refuse to lock.
+pub fn redeem_btc_locktime_for(
+    network: bitcoin::Network,
+    btc_tip: u64,
+    zc_tip: u64,
+    timeout_height: u64,
+) -> Result<u32, String> {
+    let remaining_zc = timeout_height.saturating_sub(zc_tip);
+    let remaining_secs = remaining_zc * ZC_BLOCK_TIME_SECS;
+    let sla = redeem_finalize_sla_secs(network);
+    let budget_secs = remaining_secs.saturating_sub(sla);
+    let max_lock = budget_secs / BTC_BLOCK_TIME_SECS;
+    let lock = btc_redeem_lock_blocks(network).min(max_lock);
+    let min_lock = min_user_claim_blocks(network);
+    if lock < min_lock {
+        return Err(format!(
+            "redeem: escrow timeout {timeout_height} leaves only {remaining_zc} ZC blocks (tip {zc_tip}); \
+             after the {sla}s finalize SLA the BTC lock could be at most {max_lock} blocks, below the \
+             {min_lock}-block minimum claim window: refusing to lock reserve BTC"
+        ));
+    }
+    let lt = btc_tip.checked_add(lock).ok_or("btc tip + lock overflow")?;
+    u32::try_from(lt).map_err(|_| "btc locktime overflow".to_string())
+}
+
+/// The daemon's DEFAULT finalize margin (ZC blocks a redeem escrow must have left before the
+/// operator locks BTC): the network's full redeem window, i.e. what an honest wallet's burn
+/// escrow carries (`zc_redeem_timeout_blocks`). Mainnet: 475,200 (the value the production
+/// compose ships). Any smaller escrow still gets a proportionally SHORTER BTC lock from
+/// [`redeem_btc_locktime_for`], and anything under [`min_redeem_margin_blocks`] is refused.
+pub fn default_finalize_margin(network: bitcoin::Network) -> u64 {
+    zc_redeem_timeout_blocks(network)
+}
+
+/// Smallest redeem the operator serves (sats): mirrors the consensus minimum deposit, so a
+/// redeem is always worth more than the fee to claim it (bridge M5).
+pub fn min_redeem_sats(network: bitcoin::Network) -> u64 {
+    zcrypt_core::spv::min_deposit_sats(spv_net(network))
+}
 
 /// Map a bitcoin crate network to the consensus SPV network enum.
 pub fn spv_net(network: bitcoin::Network) -> zcrypt_core::spv::BtcNet {
@@ -189,9 +284,17 @@ const HTLC_SPEND_VSIZE: u64 = 200;
 /// below the mempool min-relay rate on a busy mainnet and strand the swap. `target` is the
 /// desired confirmation window in blocks; a 500-sat floor keeps tiny-mempool cases relayable.
 fn htlc_spend_fee(backend: &dyn BtcBackend, target: u32) -> Result<Amount, String> {
-    let rate = backend.fee_rate_sat_vb(target)?.max(1.0);
+    let rate = crate::cap_fee_rate(backend.fee_rate_sat_vb(target)?);
     let sats = (rate * HTLC_SPEND_VSIZE as f64).ceil() as u64;
     Ok(Amount::from_sat(sats.max(500)))
+}
+
+/// [`htlc_spend_fee`] additionally capped against the value being spent (never more than a
+/// quarter of it, except the 500-sat relay floor): a fee oracle cannot make a claim or
+/// refund burn the HTLC in fees (bridge M4).
+pub fn htlc_spend_fee_for(backend: &dyn BtcBackend, target: u32, value_sat: u64) -> Result<Amount, String> {
+    let fee = htlc_spend_fee(backend, target)?.to_sat();
+    Ok(Amount::from_sat(crate::cap_fee_for_value(fee, value_sat, 500)?))
 }
 
 // ---- ZCrypt tx payload builders (match the ABCI tags) ----
@@ -271,6 +374,56 @@ pub fn register_spv_tx(ticker: &str, decimals: u8, reserve_pk: &[u8; 33], max_su
     t.extend_from_slice(&max_supply.to_le_bytes());
     t.extend_from_slice(reserve_pk);
     t
+}
+
+// ---- Validator BOND authentication (signed on the validator HOST, never in the wallet) ----
+
+/// The BOND (0x57) authentication message, byte-identical to the wallet's `bond_message`
+/// and to what consensus verifies with `verify_strict`:
+/// `"ZCRYPT-BOND-v1" ‖ chain_id ‖ consensus_pubkey(32) ‖ stake_le(8) ‖ reward(32) ‖
+///  commission_bps_le(2) ‖ nonce_le(8)`.
+pub fn bond_message(chain_id: &[u8], pk: &[u8; 32], stake: u64, reward: &[u8; 32], commission_bps: u16, nonce: u64) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(14 + chain_id.len() + 32 + 8 + 32 + 2 + 8);
+    msg.extend_from_slice(b"ZCRYPT-BOND-v1");
+    msg.extend_from_slice(chain_id);
+    msg.extend_from_slice(pk);
+    msg.extend_from_slice(&stake.to_le_bytes());
+    msg.extend_from_slice(reward);
+    msg.extend_from_slice(&commission_bps.to_le_bytes());
+    msg.extend_from_slice(&nonce.to_le_bytes()); // replay-protection nonce
+    msg
+}
+
+/// Sign a BOND message with the validator's ed25519 consensus key (the first 32 bytes of
+/// `priv_validator_key.json`). This is the `bond_validator sign` step of the wallet's
+/// two-step bond: the wallet prepares the parameters, the HOST produces this signature,
+/// the wallet funds the pledge and broadcasts. Returns the 64-byte signature.
+pub fn sign_bond(
+    sk: &ed25519_dalek::SigningKey,
+    chain_id: &[u8],
+    stake: u64,
+    reward: &[u8; 32],
+    commission_bps: u16,
+    nonce: u64,
+) -> [u8; 64] {
+    use ed25519_dalek::Signer;
+    let pk = sk.verifying_key().to_bytes();
+    sk.sign(&bond_message(chain_id, &pk, stake, reward, commission_bps, nonce)).to_bytes()
+}
+
+/// The zBTC asset id on this chain. zBTC is bound to its reserve key in GENESIS
+/// (`zbtc_reserve_pk`), so nothing here registers it: if the chain has no zBTC this fails
+/// with instructions for the chain operator. Use instead of the old fire-and-forget
+/// `register_spv_tx` broadcast.
+pub fn ensure_zbtc_registered(zc: &Zcrypt) -> Result<u64, String> {
+    match zc.query("/asset/by_ticker/zBTC") {
+        Ok(s) if !s.trim().is_empty() => s.trim().parse().map_err(|e| format!("zBTC asset id: {e}")),
+        _ => Err("zBTC is not registered on this chain. It must be bound at genesis: set \
+                  ZCRYPT_RESERVE_PK to the operator's 33-byte compressed reserve pubkey (hex) \
+                  before the chain is created (print it with `cargo run -p zcrypt-bridge --bin \
+                  reserve_pubkey`). A running chain cannot add zBTC."
+            .to_string()),
+    }
 }
 
 /// Build a Bitcoin header-relay tx (0x63): concatenated raw 80-byte headers.
@@ -754,8 +907,6 @@ pub fn btc_to_zbtc_progress(
         ));
     }
     let lock = htlc_hashlock(preimage);
-    // The BRIDGE claims the BTC leg (step 4), so price its claim from the bridge backend.
-    let fee = htlc_spend_fee(b.bridge, 3)?;
 
     // 1. Alice locks BTC (claimable by the RESERVE key w/ preimage, refund Alice later).
     progress(10, "Locking your BTC in a hashlocked HTLC…");
@@ -805,6 +956,9 @@ pub fn btc_to_zbtc_progress(
     if revealed != preimage {
         return Err("on-chain preimage mismatch".to_string());
     }
+    // The BRIDGE claims the BTC leg, so price its claim from the bridge backend (capped
+    // against the locked value: a lying fee oracle cannot eat the HTLC).
+    let fee = htlc_spend_fee_for(b.bridge, 3, utxo.value.to_sat())?;
     let txid = b.bridge.claim(&utxo, &revealed, b.bridge_key, b.bridge_dest, fee)?;
     b.bridge.confirm(&txid)?; // regtest mines; real networks wait for confirmations
     println!("  [btc] bridge took the BTC with the revealed preimage ({txid})");
@@ -841,6 +995,11 @@ pub fn btc_to_zbtc_progress(
 /// `reserve_pk` (with the preimage) or refundable to the user's own `user_refund` key after
 /// the timelock, prove it via SPV, and claim the minted zBTC. Returns the user's zBTC coin.
 /// The operator's watcher ([`reserve_claim_revealed`]) later sweeps the locked BTC.
+///
+/// Privacy (H3): the 0x64 open publishes `user.pubkey()` as the zBTC claimer and
+/// `user_refund.pk` inside the Bitcoin HTLC. Pass a FRESH stealth sub-account as `user` and
+/// a per-deposit key from [`crate::refund_key_for`] as `user_refund`, never the reusable
+/// Normal-address account, or every deposit is linkable to the same identity on both chains.
 #[allow(clippy::too_many_arguments)]
 pub fn btc_to_zbtc_public_progress(
     zc: &Zcrypt,
@@ -875,6 +1034,62 @@ pub fn btc_to_zbtc_public_progress(
         shield_timeouts(net, user_btc.height()?, zc.height()? as u64)?;
     let script = htlc_script(&lock, reserve_pk, &user_refund.pk, btc_locktime);
     let utxo = user_btc.fund_htlc(&script, btc_amount)?;
+    resume_public_shield(
+        zc, user_btc, user_refund, reserve_pk, user, asset, preimage, &utxo, btc_locktime, zc_timeout, zbtc_value, progress,
+    )
+}
+
+/// Find an HTLC funding that already landed for `script` (at least `min_value`), so a
+/// deposit whose flow aborted after broadcast (confirmation wait timed out, process died)
+/// can be RESUMED with [`resume_public_shield`] instead of funded a second time (bridge
+/// L3; the operator uses the same check before funding a redeem, bridge H2). `Ok(None)`
+/// when nothing is there OR the backend cannot look addresses up.
+pub fn find_funded_htlc(backend: &dyn BtcBackend, script: &ScriptBuf, min_value: Amount) -> Result<Option<HtlcUtxo>, String> {
+    match backend.htlc_utxos(script) {
+        Ok(utxos) => Ok(utxos.into_iter().find(|u| u.value >= min_value)),
+        Err(e) if e.contains("not supported") => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// The resumable tail of a public shield: given an ALREADY-FUNDED HTLC `utxo` (locked to
+/// `reserve_pk` with `user_refund` as the refund key and CLTV `btc_locktime`), prove the
+/// deposit, open the mint escrow and claim the zBTC. This is exactly what
+/// [`btc_to_zbtc_public_progress`] does after funding, exposed so a wallet can pick a
+/// deposit back up from the funding UTXO alone (bridge L3). `zc_timeout` is the ZC escrow
+/// timeout to request; pass the value from [`shield_timeouts`] at the current tip.
+#[allow(clippy::too_many_arguments)]
+pub fn resume_public_shield(
+    zc: &Zcrypt,
+    user_btc: &dyn BtcBackend,
+    user_refund: &Key,
+    reserve_pk: &PublicKey,
+    user: &Account,
+    asset: u64,
+    preimage: &[u8],
+    utxo: &HtlcUtxo,
+    btc_locktime: u32,
+    zc_timeout: u64,
+    zbtc_value: u64,
+    progress: &dyn Fn(u8, &str),
+) -> Result<Coin, String> {
+    if preimage.len() != PREIMAGE_LEN {
+        return Err(format!("HTLC preimage must be exactly {PREIMAGE_LEN} bytes (got {})", preimage.len()));
+    }
+    let lock = htlc_hashlock(preimage);
+    let expected_script = htlc_script(&lock, reserve_pk, &user_refund.pk, btc_locktime);
+    if utxo.script != expected_script {
+        return Err("resume: the funded UTXO's script does not match this preimage/keys/locktime".to_string());
+    }
+    if zbtc_value > utxo.value.to_sat() {
+        return Err(format!(
+            "cannot mint {zbtc_value} zBTC base units against {} locked sats — the SPV \
+             gate enforces 1:1 backing",
+            utxo.value.to_sat()
+        ));
+    }
+    // Confirmed enough for the mint gate? (A resumed deposit may still be shallow.)
+    user_btc.confirm(&utxo.outpoint.txid)?;
 
     // 2. Prove the deposit. The proof pins the OPERATOR's reserve_pk (which must match the
     //    zBTC asset's registered authority) and the user's refund_pk. Consensus re-verifies
@@ -1023,6 +1238,130 @@ pub struct WatchReport {
     /// True if any deposit is in `critical` or a sweep failed while already soft-at-risk.
     /// Operator frontends should refuse new shield deposits while this is set.
     pub pause_new_shields: bool,
+    /// Every consensus-accepted deposit locked to this reserve seen in the scanned range,
+    /// claimed or not: the caller keeps tracking them with [`reanchor_reorged_deposits`]
+    /// until they are buried past any reorg-void risk.
+    pub tracked: Vec<TrackedDeposit>,
+}
+
+/// A deposit the operator keeps an eye on until its immature mint can no longer be voided:
+/// if a benign Bitcoin reorg re-mines the funding tx into another block, the watcher
+/// submits a fresh proof (0x65 re-anchor) so the mint follows the deposit instead of being
+/// voided after the grace window (bridge M2). JSON-serializable for the daemon state file.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TrackedDeposit {
+    /// Escrow id (hex).
+    pub escrow_id: String,
+    /// The accepted `MintProof` (hex of `to_bytes`); a re-anchor reuses everything but the
+    /// merkle block.
+    pub proof_hex: String,
+    /// Block the mint is currently anchored to (hex, internal byte order).
+    pub deposit_block: String,
+    /// Minted value (drives the maturity depth).
+    pub value: u64,
+    /// The deposit HTLC's refund CLTV.
+    pub btc_locktime: u32,
+}
+
+/// Outcome of one re-anchor pass.
+#[derive(Default, Debug)]
+pub struct ReanchorReport {
+    /// Deposits re-anchored to a new block THIS pass.
+    pub reanchored: Vec<[u8; 32]>,
+    /// Deposits dropped from tracking: buried past all void risk, or already matured.
+    pub settled: Vec<[u8; 32]>,
+    /// Per-deposit non-fatal failures (kept for the next pass).
+    pub errors: Vec<([u8; 32], String)>,
+    /// The backend cannot report a tx's block, so nothing could be checked.
+    pub unsupported: bool,
+}
+
+/// OPERATOR watcher: for every tracked deposit, compare the block the mint is anchored to
+/// with the block the operator's Bitcoin backend currently has the funding tx in. On a
+/// mismatch (the deposit was re-mined by a reorg) build a fresh proof and submit a 0x65
+/// re-anchor before consensus voids the immature mint. Deposits buried deeper than the
+/// maturity + reorg-grace depth are dropped from `tracked` (they can no longer be voided).
+pub fn reanchor_reorged_deposits(
+    zc: &Zcrypt,
+    backend: &dyn BtcBackend,
+    tracked: &mut Vec<TrackedDeposit>,
+) -> ReanchorReport {
+    use bitcoin::hashes::Hash as _;
+    let net = spv_net(backend.network());
+    let mut report = ReanchorReport::default();
+    let mut keep = Vec::with_capacity(tracked.len());
+    let mut relayed = false;
+    for t in tracked.drain(..) {
+        let Some(eid) = hex::decode(&t.escrow_id).ok().and_then(|b| <[u8; 32]>::try_from(b).ok()) else {
+            continue; // corrupt entry: drop
+        };
+        let Some(proof) = hex::decode(&t.proof_hex).ok().and_then(|b| MintProof::from_bytes(&b)) else {
+            report.errors.push((eid, "tracked deposit: corrupt proof, dropped".to_string()));
+            continue;
+        };
+        let Some(txid_bytes) = proof.funding_txid() else {
+            report.errors.push((eid, "tracked deposit: corrupt funding tx, dropped".to_string()));
+            continue;
+        };
+        let txid = bitcoin::Txid::from_byte_array(txid_bytes);
+        let current = match backend.tx_block_hash(&txid) {
+            Ok(h) => h,
+            Err(e) if e.contains("not supported") => {
+                report.unsupported = true;
+                keep.push(t);
+                continue;
+            }
+            Err(e) => {
+                report.errors.push((eid, format!("block lookup: {e}")));
+                keep.push(t);
+                continue;
+            }
+        };
+        let anchored = hex::decode(&t.deposit_block).ok().and_then(|b| <[u8; 32]>::try_from(b).ok());
+        match current {
+            None => keep.push(t), // reorged out and not yet re-mined: nothing to prove yet
+            Some(h) if Some(h) != anchored => {
+                // Re-mined into a different block: re-anchor with a fresh merkle proof.
+                let outcome = (|| -> Result<(), String> {
+                    let merkle_block = backend.txout_proof(&txid)?;
+                    let fresh = MintProof { merkle_block, ..proof.clone() };
+                    if fresh.deposit_block_hash() != Some(h) {
+                        return Err("fresh merkle proof is not for the block the backend reports".to_string());
+                    }
+                    if !relayed {
+                        let _ = relay_btc_headers(zc, backend); // the new block must be on the SPV chain
+                        relayed = true;
+                    }
+                    zc.broadcast(&reanchor_tx(&fresh)).map(|_| ())
+                })();
+                match outcome {
+                    Ok(()) => {
+                        report.reanchored.push(eid);
+                        keep.push(TrackedDeposit { deposit_block: hex::encode(h), ..t });
+                    }
+                    // No immature mint left for this outpoint: it matured (or was already voided
+                    // and re-opened); either way there is nothing to follow any more.
+                    Err(e) if e.contains("immature") || e.contains("no pending") => report.settled.push(eid),
+                    Err(e) => {
+                        report.errors.push((eid, e));
+                        keep.push(t);
+                    }
+                }
+            }
+            Some(_) => {
+                // Still in its block: stop tracking once buried past any void risk.
+                let confs = backend.tx_confirmations(&txid).unwrap_or(0);
+                let deep = zcrypt_core::spv::safe_sweep_conf(net, t.value) + zcrypt_core::spv::reanchor_grace_for(net);
+                if confs >= deep {
+                    report.settled.push(eid);
+                } else {
+                    keep.push(t);
+                }
+            }
+        }
+    }
+    *tracked = keep;
+    report
 }
 
 /// OPERATOR shield watcher: scan ZCrypt blocks `from..=to` for deposits locked to `reserve.pk`
@@ -1079,6 +1418,19 @@ pub fn reserve_claim_revealed(
                 Ok(_) => {} // rejected / garbage / mismatched — ignore
                 Err(e) => report.errors.push((eid, format!("escrow query: {e}"))),
             }
+        }
+    }
+
+    // Every accepted deposit is handed back for reorg tracking (claimed or not).
+    for (eid, (proof, _lock, btc_locktime, value)) in &ours {
+        if let Some(bh) = proof.deposit_block_hash() {
+            report.tracked.push(TrackedDeposit {
+                escrow_id: hex::encode(eid),
+                proof_hex: hex::encode(proof.to_bytes()),
+                deposit_block: hex::encode(bh),
+                value: *value,
+                btc_locktime: *btc_locktime,
+            });
         }
     }
 
@@ -1160,7 +1512,7 @@ pub fn reserve_claim_revealed(
             };
             let outcome = (|| -> Result<bitcoin::Txid, String> {
                 let utxo = htlc_utxo_from_proof(&proof, &lock)?;
-                let fee = htlc_spend_fee(operator_btc, effective_fee_target)?;
+                let fee = htlc_spend_fee_for(operator_btc, effective_fee_target, utxo.value.to_sat())?;
                 let txid = operator_btc.claim(&utxo, preimage, reserve, dest, fee)?;
                 operator_btc.confirm(&txid)?;
                 Ok(txid)
@@ -1309,18 +1661,27 @@ pub fn reserve_lock_for_redeem(
             btc_amount.to_sat()
         ));
     }
-    let zc_tip = zc.height()? as u64;
-    if info.timeout_height < zc_tip + min_finalize_margin {
+    let net = operator_btc.network();
+    if info.value < min_redeem_sats(net) {
         return Err(format!(
-            "redeem: escrow timeout {} too soon (tip {zc_tip} + finalize margin {min_finalize_margin}) — \
+            "redeem: escrow value {} sats is below the {}-sat minimum (uneconomic to claim)",
+            info.value,
+            min_redeem_sats(net)
+        ));
+    }
+    let zc_tip = zc.height()? as u64;
+    let margin = min_finalize_margin.max(min_redeem_margin_blocks(net));
+    if info.timeout_height < zc_tip + margin {
+        return Err(format!(
+            "redeem: escrow timeout {} too soon (tip {zc_tip} + finalize margin {margin}) — \
              a short-timeout burn could refund the zBTC before the operator finalizes; refusing to lock BTC",
             info.timeout_height
         ));
     }
-    // Operator refund must unlock before the ZC burn times out (capital recovery) but
-    // leave the user a long claim window — network redeem profile, not shield profile.
-    let net = operator_btc.network();
-    let btc_locktime = (operator_btc.height()? + btc_redeem_lock_blocks(net)) as u32;
+    // The BTC refund lock is DERIVED from the escrow's remaining life so it (plus the
+    // finalize SLA) always expires before the ZC escrow: the user can never refund the zBTC
+    // and still claim the BTC (bridge H1). Refuses if the user would get too short a window.
+    let btc_locktime = redeem_btc_locktime_for(net, operator_btc.height()?, zc_tip, info.timeout_height)?;
     // Bind the BTC HTLC to the escrow's OWN hashlock (not a caller-supplied value).
     let script = htlc_script(&info.hashlock, user_btc_pk, &reserve.pk, btc_locktime);
     operator_btc.fund_htlc(&script, btc_amount)
@@ -1335,7 +1696,7 @@ pub fn redeem_user_claim(
     preimage: &[u8],
     user_dest: &Address,
 ) -> Result<bitcoin::Txid, String> {
-    let fee = htlc_spend_fee(user_btc, 3)?;
+    let fee = htlc_spend_fee_for(user_btc, 3, utxo.value.to_sat())?;
     let txid = user_btc.claim(utxo, preimage, user_btc_key, user_dest, fee)?;
     user_btc.confirm(&txid)?;
     Ok(txid)
@@ -1383,6 +1744,9 @@ pub struct RedeemLock {
     pub escrow_id: [u8; 32],
     pub utxo: HtlcUtxo,
     pub hashlock: [u8; 32],
+    /// The BTC HTLC's refund CLTV: after it the operator may take the BTC back if the user
+    /// never claimed (bridge M5).
+    pub btc_locktime: u32,
 }
 
 /// The result of one autonomous redeem-watcher pass.
@@ -1398,15 +1762,39 @@ pub struct RedeemReport {
     pub errors: Vec<([u8; 32], String)>,
 }
 
-/// OPERATOR autonomous REDEEM watcher: scan ZCrypt blocks `from..=to` for `0x67` redeem burn-locks
-/// and, for each valid one, lock the matching RESERVE BTC (1:1) claimable by the user's ON-CHAIN
-/// `btc_claim_pk`. It trusts NOTHING off-chain — it re-derives the escrow id, confirms consensus
-/// accepted the burn ([`query_escrow`]), enforces asset==zBTC, value==btc paid, the escrow's own
-/// hashlock, and a finalize-margin on the timeout, and is idempotent via `already_funded`. The
-/// returned locks are then claimed by the users; the operator finalizes each with
-/// [`reserve_finalize_redeem`] once it sees the user's BTC claim.
+/// One validated redeem the operator has decided to fund. No BTC has moved yet: the daemon
+/// persists this as a funding INTENT before broadcasting, so a crash between broadcast and
+/// state save can never lead to funding the same escrow twice (bridge H2).
+#[derive(Clone, Debug)]
+pub struct RedeemPlan {
+    pub escrow_id: [u8; 32],
+    pub hashlock: [u8; 32],
+    pub value: u64,
+    pub script: ScriptBuf,
+    pub btc_locktime: u32,
+}
+
+/// Outcome of a planning pass over a block range.
+#[derive(Default)]
+pub struct RedeemPlanReport {
+    pub plans: Vec<RedeemPlan>,
+    /// Redeems refused after validation (permanent: bad asset/value/hashlock/timeout).
+    pub rejected: Vec<([u8; 32], String)>,
+    /// Transient failures (escrow query) to retry later.
+    pub errors: Vec<([u8; 32], String)>,
+    /// Redeems skipped because `skip` already contained them.
+    pub skipped: usize,
+}
+
+/// OPERATOR redeem watcher, planning half: scan ZCrypt blocks `from..=to` for `0x67` redeem
+/// burn-locks and validate each against consensus WITHOUT moving BTC. It trusts NOTHING
+/// off-chain: re-derives the escrow id, confirms consensus accepted the burn
+/// ([`query_escrow`]), enforces asset==zBTC, value==btc paid, the escrow's own hashlock, the
+/// minimum redeem value, and a finalize margin; and derives a BTC lock that always expires
+/// before the ZC escrow ([`redeem_btc_locktime_for`], bridge H1). Escrows in `skip` are not
+/// re-planned (already funded / permanently rejected).
 #[allow(clippy::too_many_arguments)]
-pub fn reserve_serve_redeems(
+pub fn plan_redeems(
     zc: &Zcrypt,
     operator_btc: &dyn BtcBackend,
     reserve: &Key,
@@ -1414,11 +1802,14 @@ pub fn reserve_serve_redeems(
     to: i64,
     zbtc_asset: u64,
     min_finalize_margin: u64,
-    already_funded: &mut std::collections::HashSet<[u8; 32]>,
-) -> Result<RedeemReport, String> {
+    skip: &std::collections::HashSet<[u8; 32]>,
+) -> Result<RedeemPlanReport, String> {
     use zcrypt_core::htlc_shield::escrow_id as derive_escrow_id;
     let zc_tip = zc.height()? as u64;
-    let mut report = RedeemReport::default();
+    let net = operator_btc.network();
+    let btc_tip = operator_btc.height()?;
+    let margin = min_finalize_margin.max(min_redeem_margin_blocks(net));
+    let mut report = RedeemPlanReport::default();
     for h in from..=to {
         let txs = zc.block_txs(h)?;
         for tx in txs {
@@ -1429,8 +1820,8 @@ pub fn reserve_serve_redeems(
                 continue;
             };
             let eid = derive_escrow_id(asset, value, &hashlock, timeout, &refund_pk);
-            if already_funded.contains(&eid) {
-                report.already_funded += 1;
+            if skip.contains(&eid) {
+                report.skipped += 1;
                 continue;
             }
             let info = match query_escrow(zc, &eid) {
@@ -1450,8 +1841,10 @@ pub fn reserve_serve_redeems(
                 Some("burn-lock hashlock disagrees with the escrow".to_string())
             } else if info.value != value {
                 Some(format!("burn-lock value {value} disagrees with the escrow {}", info.value))
-            } else if info.timeout_height < zc_tip + min_finalize_margin {
-                Some(format!("escrow timeout {} too soon (tip {zc_tip} + margin {min_finalize_margin})", info.timeout_height))
+            } else if info.value < min_redeem_sats(net) {
+                Some(format!("value {} below the {}-sat minimum redeem", info.value, min_redeem_sats(net)))
+            } else if info.timeout_height < zc_tip + margin {
+                Some(format!("escrow timeout {} too soon (tip {zc_tip} + margin {margin})", info.timeout_height))
             } else {
                 None
             };
@@ -1459,24 +1852,78 @@ pub fn reserve_serve_redeems(
                 report.rejected.push((eid, r));
                 continue;
             }
-            // Claim the funding slot BEFORE broadcast so a crash mid-fund does not
-            // double-fund on restart. On fund failure, release the slot for retry.
-            already_funded.insert(eid);
-            let outcome = (|| -> Result<HtlcUtxo, String> {
-                let btc_pk = PublicKey::from_slice(&btc_pk_ser).map_err(|e| e.to_string())?;
-                let btc_locktime =
-                    (operator_btc.height()? + btc_redeem_lock_blocks(operator_btc.network())) as u32;
-                let script = htlc_script(&info.hashlock, &btc_pk, &reserve.pk, btc_locktime);
-                operator_btc.fund_htlc(&script, Amount::from_sat(info.value))
-            })();
-            match outcome {
-                Ok(utxo) => {
-                    report.locked.push(RedeemLock { escrow_id: eid, utxo, hashlock });
-                }
+            let btc_locktime = match redeem_btc_locktime_for(net, btc_tip, zc_tip, info.timeout_height) {
+                Ok(lt) => lt,
                 Err(e) => {
-                    already_funded.remove(&eid);
-                    report.errors.push((eid, e));
+                    report.rejected.push((eid, e));
+                    continue;
                 }
+            };
+            let btc_pk = match PublicKey::from_slice(&btc_pk_ser) {
+                Ok(pk) => pk,
+                Err(e) => {
+                    report.rejected.push((eid, format!("bad user btc key: {e}")));
+                    continue;
+                }
+            };
+            let script = htlc_script(&info.hashlock, &btc_pk, &reserve.pk, btc_locktime);
+            report.plans.push(RedeemPlan { escrow_id: eid, hashlock, value: info.value, script, btc_locktime });
+        }
+    }
+    Ok(report)
+}
+
+/// OPERATOR redeem watcher, funding half: lock reserve BTC for one [`RedeemPlan`]. Looks
+/// for an EXISTING funding of the same HTLC first (a previous attempt that broadcast but
+/// was not recorded) and reuses it instead of funding again (bridge H2). Returns the UTXO,
+/// still UNCONFIRMED, plus whether it was reused; the caller persists the txid, then waits
+/// for confirmations with `confirm`.
+pub fn fund_redeem_plan(operator_btc: &dyn BtcBackend, plan: &RedeemPlan) -> Result<(HtlcUtxo, bool), String> {
+    if let Some(existing) = find_funded_htlc(operator_btc, &plan.script, Amount::from_sat(plan.value))? {
+        return Ok((existing, true));
+    }
+    let utxo = operator_btc.fund_htlc_unconfirmed(&plan.script, Amount::from_sat(plan.value))?;
+    Ok((utxo, false))
+}
+
+/// OPERATOR autonomous REDEEM watcher: [`plan_redeems`] + [`fund_redeem_plan`] + confirm,
+/// for one-shot callers (the e2e drivers). Idempotent via `already_funded`. The daemon
+/// uses the two halves directly so it can persist each funding intent before broadcast.
+#[allow(clippy::too_many_arguments)]
+pub fn reserve_serve_redeems(
+    zc: &Zcrypt,
+    operator_btc: &dyn BtcBackend,
+    reserve: &Key,
+    from: i64,
+    to: i64,
+    zbtc_asset: u64,
+    min_finalize_margin: u64,
+    already_funded: &mut std::collections::HashSet<[u8; 32]>,
+) -> Result<RedeemReport, String> {
+    let planned = plan_redeems(zc, operator_btc, reserve, from, to, zbtc_asset, min_finalize_margin, already_funded)?;
+    let mut report = RedeemReport {
+        already_funded: planned.skipped,
+        rejected: planned.rejected,
+        errors: planned.errors,
+        ..Default::default()
+    };
+    for plan in planned.plans {
+        // Claim the funding slot BEFORE broadcast; release it only if nothing was sent.
+        already_funded.insert(plan.escrow_id);
+        let outcome = fund_redeem_plan(operator_btc, &plan).and_then(|(utxo, _reused)| {
+            operator_btc.confirm(&utxo.outpoint.txid)?;
+            Ok(utxo)
+        });
+        match outcome {
+            Ok(utxo) => report.locked.push(RedeemLock {
+                escrow_id: plan.escrow_id,
+                utxo,
+                hashlock: plan.hashlock,
+                btc_locktime: plan.btc_locktime,
+            }),
+            Err(e) => {
+                already_funded.remove(&plan.escrow_id);
+                report.errors.push((plan.escrow_id, e));
             }
         }
     }
@@ -1526,8 +1973,6 @@ pub fn zbtc_to_btc_progress(
         ));
     }
     let lock = htlc_hashlock(preimage);
-    // ALICE claims the BTC leg (step 3), so price her claim from Alice's backend.
-    let fee = htlc_spend_fee(b.alice, 3)?;
     if coins.is_empty() {
         return Err("no zBTC coins to redeem".to_string());
     }
@@ -1581,15 +2026,18 @@ pub fn zbtc_to_btc_progress(
     let escrow_id = escrow_id_from(&data)?;
     println!("  [zc]  Alice locked {} zBTC in burn escrow {}", zbtc_value, hex::encode(escrow_id));
 
-    // 2. Bridge locks BTC claimable by Alice with the preimage.
+    // 2. Bridge locks BTC claimable by Alice with the preimage. The lock is derived from the
+    // escrow's remaining life (same rule as the operator daemon, bridge H1).
     progress(40, "Bridge locking BTC for you to claim…");
-    let btc_locktime = (b.bridge.height()? + btc_redeem_lock_blocks(net)) as u32;
+    let btc_locktime = redeem_btc_locktime_for(net, b.bridge.height()?, zc.height()? as u64, zc_timeout)?;
     let script = htlc_script(&lock, &b.alice_key.pk, &b.bridge_key.pk, btc_locktime);
     let utxo = b.bridge.fund_htlc(&script, btc_amount)?;
     println!("  [btc] bridge locked {} BTC in HTLC {}", btc_amount.to_btc(), utxo.outpoint.txid);
 
     // 3. Alice claims the BTC (to her own wallet), revealing the preimage on Bitcoin.
+    // ALICE claims the BTC leg, so price her claim from Alice's backend (value-capped).
     progress(65, "Claiming your BTC (revealing the preimage)…");
+    let fee = htlc_spend_fee_for(b.alice, 3, utxo.value.to_sat())?;
     let claim_txid = b.alice.claim(&utxo, preimage, b.alice_key, b.alice_dest, fee)?;
     // Confirm Alice's claim before the bridge reads the preimage from it and burns the
     // zBTC — on a real network an unconfirmed claim could still be replaced.
@@ -1906,6 +2354,167 @@ mod public_shield_tests {
             burn > op_lock,
             "user zBTC burn must outlive operator BTC refund so user recovers if operator ghosts"
         );
+    }
+
+    #[test]
+    fn redeem_lock_is_derived_from_escrow_life_and_short_escrows_are_refused() {
+        for net in [Network::Bitcoin, Network::Signet, Network::Regtest] {
+            let btc_tip = 800_000u64;
+            let zc_tip = 5_000u64;
+            // An honest wallet's escrow (network redeem window) gets the full network lock.
+            let honest = zc_tip + zc_redeem_timeout_blocks(net);
+            let lt = redeem_btc_locktime_for(net, btc_tip, zc_tip, honest).expect("honest escrow funds");
+            assert_eq!(lt as u64 - btc_tip, btc_redeem_lock_blocks(net), "{net:?}: full lock");
+            // The lock plus the finalize SLA always expires before the ZC escrow.
+            let lock_secs = (lt as u64 - btc_tip) * BTC_BLOCK_TIME_SECS + redeem_finalize_sla_secs(net);
+            assert!(lock_secs <= (honest - zc_tip) * ZC_BLOCK_TIME_SECS, "{net:?}: lock outlives escrow");
+            // The audit's theft: a burn with a 36h escrow against an 84h BTC lock. Now the
+            // lock SHRINKS to fit, and a too-short escrow is refused outright.
+            let short = zc_tip + min_redeem_margin_blocks(net) - 1;
+            assert!(redeem_btc_locktime_for(net, btc_tip, zc_tip, short).is_err(), "{net:?}: short escrow refused");
+            let just_enough = zc_tip + min_redeem_margin_blocks(net);
+            let lt2 = redeem_btc_locktime_for(net, btc_tip, zc_tip, just_enough).expect("minimum escrow funds");
+            assert!(lt2 as u64 - btc_tip >= min_user_claim_blocks(net));
+            let lock2 = (lt2 as u64 - btc_tip) * BTC_BLOCK_TIME_SECS + redeem_finalize_sla_secs(net);
+            assert!(lock2 <= (just_enough - zc_tip) * ZC_BLOCK_TIME_SECS);
+        }
+        // The daemon's margin floor is at least the user's claim window plus the SLA.
+        assert!(min_redeem_margin_blocks(Network::Bitcoin) >= MIN_USER_CLAIM_BLOCKS_MAINNET * BTC_BLOCK_TIME_SECS);
+    }
+
+    #[test]
+    fn fee_caps_bound_a_lying_oracle() {
+        assert_eq!(crate::cap_fee_rate(1_000_000.0), crate::MAX_FEE_RATE_SAT_VB);
+        assert_eq!(crate::cap_fee_rate(0.1), 1.0);
+        assert_eq!(crate::cap_fee_rate(f64::NAN), 1.0);
+        // A 100k-sat HTLC never pays more than 25k in fees, whatever the estimator says.
+        assert_eq!(crate::cap_fee_for_value(90_000, 100_000, 500).unwrap(), 25_000);
+        // The relay floor survives on small values...
+        assert_eq!(crate::cap_fee_for_value(5_000, 1_500, 500).unwrap(), 500);
+        // ...but dust that the floor would consume is refused.
+        assert!(crate::cap_fee_for_value(5_000, 400, 500).is_err());
+    }
+
+    /// A backend that only answers the funding-discovery questions, counting broadcasts.
+    struct MockBtc {
+        existing: Vec<HtlcUtxo>,
+        broadcasts: std::cell::Cell<u32>,
+    }
+    impl crate::BtcBackend for MockBtc {
+        fn fund_htlc(&self, script: &ScriptBuf, amount: Amount) -> Result<HtlcUtxo, String> {
+            self.fund_htlc_unconfirmed(script, amount)
+        }
+        fn fund_htlc_unconfirmed(&self, script: &ScriptBuf, amount: Amount) -> Result<HtlcUtxo, String> {
+            self.broadcasts.set(self.broadcasts.get() + 1);
+            Ok(HtlcUtxo { outpoint: OutPoint::null(), value: amount, script: script.clone() })
+        }
+        fn htlc_utxos(&self, script: &ScriptBuf) -> Result<Vec<HtlcUtxo>, String> {
+            Ok(self.existing.iter().filter(|u| &u.script == script).cloned().collect())
+        }
+        fn claim(&self, _: &HtlcUtxo, _: &[u8], _: &Key, _: &Address, _: Amount) -> Result<bitcoin::Txid, String> {
+            Err("mock".into())
+        }
+        fn height(&self) -> Result<u64, String> {
+            Ok(800_000)
+        }
+        fn network(&self) -> Network {
+            Network::Bitcoin
+        }
+        fn preimage_from_claim(&self, _: &bitcoin::Txid) -> Option<Vec<u8>> {
+            None
+        }
+        fn confirm(&self, _: &bitcoin::Txid) -> Result<(), String> {
+            Ok(())
+        }
+        fn fee_rate_sat_vb(&self, _: u32) -> Result<f64, String> {
+            Ok(1.0)
+        }
+        fn find_htlc_spend_preimage(&self, _: &HtlcUtxo, _: u64) -> Result<Option<Vec<u8>>, String> {
+            Ok(None)
+        }
+        fn block_header(&self, _: u64) -> Result<[u8; 80], String> {
+            Err("mock".into())
+        }
+        fn raw_tx(&self, _: &bitcoin::Txid) -> Result<Vec<u8>, String> {
+            Err("mock".into())
+        }
+        fn txout_proof(&self, _: &bitcoin::Txid) -> Result<Vec<u8>, String> {
+            Err("mock".into())
+        }
+    }
+
+    #[test]
+    fn funding_reuses_an_existing_htlc_instead_of_paying_twice() {
+        let reserve = Key::from_bytes(&[7u8; 32]);
+        let user = Key::from_bytes(&[9u8; 32]);
+        let lock = htlc_hashlock(&[3u8; 32]);
+        let script = htlc_script(&lock, &user.pk, &reserve.pk, 800_100);
+        let plan = RedeemPlan { escrow_id: [1u8; 32], hashlock: lock, value: 50_000, script: script.clone(), btc_locktime: 800_100 };
+
+        // Nothing on the address yet: exactly one broadcast.
+        let fresh = MockBtc { existing: vec![], broadcasts: std::cell::Cell::new(0) };
+        let (utxo, reused) = fund_redeem_plan(&fresh, &plan).unwrap();
+        assert!(!reused);
+        assert_eq!(fresh.broadcasts.get(), 1);
+        assert_eq!(utxo.value, Amount::from_sat(50_000));
+
+        // A previous attempt already funded it (crash after broadcast): NO second broadcast.
+        let funded = MockBtc {
+            existing: vec![HtlcUtxo { outpoint: OutPoint::null(), value: Amount::from_sat(50_000), script: script.clone() }],
+            broadcasts: std::cell::Cell::new(0),
+        };
+        let (_utxo, reused) = fund_redeem_plan(&funded, &plan).unwrap();
+        assert!(reused, "existing funding is reused");
+        assert_eq!(funded.broadcasts.get(), 0, "never funds the same escrow twice");
+
+        // An underfunded stray output does not count; a different script is not ours.
+        let other = htlc_script(&lock, &user.pk, &reserve.pk, 800_200);
+        let strays = MockBtc {
+            existing: vec![
+                HtlcUtxo { outpoint: OutPoint::null(), value: Amount::from_sat(1), script: script.clone() },
+                HtlcUtxo { outpoint: OutPoint::null(), value: Amount::from_sat(50_000), script: other },
+            ],
+            broadcasts: std::cell::Cell::new(0),
+        };
+        assert!(find_funded_htlc(&strays, &script, Amount::from_sat(50_000)).unwrap().is_none());
+        // ...and a resume lookup finds a real funding by script (bridge L3).
+        assert!(find_funded_htlc(&funded, &script, Amount::from_sat(50_000)).unwrap().is_some());
+    }
+
+    #[test]
+    fn bond_signature_matches_the_wallet_layout() {
+        use ed25519_dalek::Verifier;
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[0x5Au8; 32]);
+        let reward = [0x33u8; 32];
+        let (stake, commission, nonce) = (10_000u64 * 100_000_000, 1_000u16, 7u64);
+        let sig = sign_bond(&sk, b"zcrypt-1", stake, &reward, commission, nonce);
+        // Rebuild the message independently, field by field, exactly as the wallet does.
+        let mut msg = Vec::new();
+        msg.extend_from_slice(b"ZCRYPT-BOND-v1");
+        msg.extend_from_slice(b"zcrypt-1");
+        msg.extend_from_slice(&sk.verifying_key().to_bytes());
+        msg.extend_from_slice(&stake.to_le_bytes());
+        msg.extend_from_slice(&reward);
+        msg.extend_from_slice(&commission.to_le_bytes());
+        msg.extend_from_slice(&nonce.to_le_bytes());
+        assert_eq!(msg.len(), 14 + 8 + 32 + 8 + 32 + 2 + 8);
+        sk.verifying_key()
+            .verify_strict(&msg, &ed25519_dalek::Signature::from_bytes(&sig))
+            .expect("host signature verifies against the wallet's layout");
+        // Any field change (here: the nonce) breaks it.
+        let mut wrong = msg.clone();
+        let n = wrong.len();
+        wrong[n - 1] ^= 1;
+        assert!(sk.verifying_key().verify(&wrong, &ed25519_dalek::Signature::from_bytes(&sig)).is_err());
+    }
+
+    #[test]
+    fn default_finalize_margin_matches_compose_and_floor() {
+        // chain/docker-compose.yml ships WATCHER_FINALIZE_MARGIN=475200 for mainnet.
+        assert_eq!(default_finalize_margin(Network::Bitcoin), 475_200);
+        for net in [Network::Bitcoin, Network::Signet, Network::Regtest] {
+            assert!(default_finalize_margin(net) >= min_redeem_margin_blocks(net), "{net:?}");
+        }
     }
 
     #[test]

@@ -17,6 +17,15 @@ services:
       ZCRYPT_BTC_NET: signet
       ZCRYPT_BTC_CHECKPOINT: "00000020a43a70691012662f7448f8e9c8bcb8625bf3be3061407ec86a1343c7020000007a92cf055f0e101177a485fa4b9c9b87a43ec815475f51b5f8ad7072aff76e7f45b7626aead6141dd916df45:314496"
 
+  # zBTC is bound IN GENESIS to the reserve pubkey of the key signet_swap_e2e derives from
+  # its mnemonic (seed = H("ZC-SIGNET-E2E", mnemonic), reserve = H("BTCBRDG", seed)). Print it
+  # BEFORE the first `up`, from the driver's cached phrase:
+  #   cargo run -p zcrypt-bridge --bin reserve_pubkey -- --signet-e2e-mnemonic-file signet_e2e.mnemonic
+  # A chain created without it has no zBTC and must be reset (down -v) to add it.
+  cometbft:
+    environment:
+      ZCRYPT_RESERVE_PK: ${ZCRYPT_RESERVE_PK:?set ZCRYPT_RESERVE_PK to the signet reserve pubkey (see e2e/docker-compose.signet.yml)}
+
   bitcoind:
     command:
       - -signet=1

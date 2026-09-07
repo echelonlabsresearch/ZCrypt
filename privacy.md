@@ -4,14 +4,17 @@ What ZCrypt hides, how, and where the honest edges are.
 
 ## What an observer sees
 
-A shielded transfer (`0x55`) publishes exactly:
+A shielded transfer (`0x55`) is a bundle of two shield transactions, the gas
+transaction and the main transaction, and publishes exactly:
 
-* two nullifiers (one per input, phantoms included),
-* two fresh output commitments,
-* an anchor root (a recent root of the global commitment tree),
-* two encrypted notes (ML-KEM-768 ciphertexts),
-* a STARK proof (~1 MB),
-* a publicly verified 0.01 ZCRYPT gas burn.
+* two nullifiers per transaction (one per input, phantoms included), four in all,
+* two fresh output commitments per transaction, four in all,
+* an anchor root (a recent block-boundary root of the global commitment tree),
+* two encrypted notes per transaction, every note the same fixed size (ML-KEM-768
+  ciphertext plus AEAD payload, padded), enforced by consensus,
+* a STARK proof per transaction (about 1 MB each),
+* the 0.01 ZCRYPT gas burn, revealed as a public opening of the burn coin, and a fee
+  of exactly zero on the main transaction (there is no fee choice to fingerprint).
 
 That is the whole record. No sender, no recipient, no amount, no asset type, no
 link to any prior transaction. Paste any transfer into the explorer: it renders
@@ -65,29 +68,48 @@ conservation so hiding the type never permits alchemy between types.
 ## Selective disclosure, not backdoors
 
 A **view key** is the ML-KEM decryption key with no spend secret. Give it to an
-auditor and they can decrypt the notes sent to your Normal address: amounts and
-memos, nothing else. They cannot spend, and they cannot see stealth or bearer
-activity. Compliance is a choice the key holder makes, scoped to exactly one
-address class, and revocable by rotating addresses.
+auditor and they can decrypt the notes sent to your Normal address: the value, the
+blinding factor and the asset of each incoming coin, nothing else (notes carry no
+memo field). They cannot spend, they cannot see whether a coin was later spent, and
+they cannot see stealth, change or bearer activity. Compliance is a choice the key
+holder makes, scoped to exactly one address class, and revocable by rotating
+addresses. Limits worth knowing: the key is permanent for that address (there is no
+time-boxed or per-transaction viewing key yet) and there is no outgoing viewing key.
 
 ## The deliberate transparency boundaries
 
 Privacy applies to value in motion. Three things are public on purpose, because
 each is a promise someone must be able to verify:
 
-* **Staking**: bonds, stakes, and reward payouts are public (the reward math is
-  the security budget). The origin coins of a bond are anonymous; the accrued
-  reward becomes anonymous again the moment it is claimed and spent.
+* **Staking**: bonds, stakes, delegations, and reward payouts are public (the reward
+  math is the security budget). The origin coins of a bond are anonymous; the accrued
+  reward becomes anonymous again the moment it is claimed and spent. A claim always
+  takes the full claimable balance and names the recipient key in the clear.
 * **Foundation vesting**: claims against the vesting schedule are public so the
   community can hold the foundation to it. The claimed coins then vanish into
   the pool like any other.
-* **Escrow values**: an atomic swap requires both sides to see the locked
-  amount. Which coins funded the lock stays hidden behind the whole-pool proof.
+* **Escrow values**: an atomic swap or bridge escrow requires both sides to see the
+  locked amount, the asset, the hashlock and the parties' keys; a BTC deposit escrow
+  also embeds the raw Bitcoin transaction and its inclusion proof. Which coins funded
+  a lock stays hidden behind the whole-pool proof, but the escrow itself is not
+  private, and the in-pool swap is not yet a private swap.
+* **The key you hand out.** A Normal address contains the spend public key. Every
+  transparent action above (claim, bond, delegate, mint, bridge escrow, swap) publishes
+  the key it acts for, so anyone who has your Normal address can recognise those
+  actions as yours. Use a stealth address for anything you do not want tied to the
+  address you give people; the wallet is moving its own transparent actions onto
+  fresh stealth keys for the same reason.
 
 ## Network layer
 
-The wallet routes all RPC through Tor by default and fails closed if the proxy
-is missing: your network observer learns nothing your chain observer could not.
+The wallet routes all node RPC and Esplora traffic through Tor by default (hostnames
+are resolved inside Tor) and fails closed if the proxy is missing or misconfigured. Two
+edges remain honest ones: the node RPC is plain HTTP unless you point the wallet at an
+HTTPS edge or an onion service, so a Tor exit can read (not forge) what a wallet sends
+to a clearnet node; and the wallet checks whether its coins are spent by asking the node
+about nullifier keys in decoy batches, which a node operator can correlate across
+sessions. Both are being closed on the wallet side (HTTPS-or-onion enforcement, local
+spent detection from downloaded blocks).
 
 ## Honest edges
 

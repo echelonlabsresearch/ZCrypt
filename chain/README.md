@@ -33,27 +33,37 @@ One compose stack: **abci + cometbft + explorer + Caddy** (HTTPS host routing).
 
 ```bash
 cd chain
-cp .env.example .env   # set EXPLORER_DOMAIN, RPC_DOMAIN, ACME_EMAIL, genesis/SPV fields
-# DNS: explorer.* and rpc.* both A → this VPS public IP (before Let's Encrypt works)
+cp .env.example .env   # set EXPLORER_DOMAIN, RPC_DOMAIN, ACME_EMAIL, genesis/SPV fields, ZCRYPT_RESERVE_PK
+# DNS: explorer.* and rpc.* both A -> this VPS public IP (before Let's Encrypt works)
 docker compose up --build -d
+docker logs zcrypt-cometbft 2>&1 | grep '\[genesis\]'   # genesis sha256: publish it for validators
 ```
 
 | What | Where |
 |------|--------|
 | Explorer (HTTPS) | `https://$EXPLORER_DOMAIN` (via Caddy) |
-| CometBFT RPC (HTTPS) | `https://$RPC_DOMAIN` (via Caddy) |
-| **P2P on host** | **`${FOUNDATION_P2P_PORT:-26656}` → container 26656** — open this in the VPS firewall for other validators |
+| CometBFT RPC (HTTPS) | `https://$RPC_DOMAIN` (via Caddy: allow-listed endpoints, per-IP rate limits, 8 MB bodies) |
+| **P2P on host** | **`${FOUNDATION_P2P_PORT:-26656}` -> container 26656**: open this in the VPS firewall for other validators |
 | Raw RPC on host | `127.0.0.1:36657` by default (local admin only; public clients use `rpc.*`) |
-| ABCI | internal only (`tcp://abci:26658`) |
+| ABCI | internal only (`tcp://abci:26658`), runs as an unprivileged user |
+
+Endpoints the edge forwards: `/status`, `/health`, `/genesis`, `/genesis_chunked`,
+`/abci_query`, `/block`, `/block_results`, `/blockchain`, `/commit`, `/validators`, `/tx`,
+`/tx_search`, `/header`, `/header_by_hash`, `/consensus_params`, the three
+`/broadcast_tx_*` endpoints, and JSON-RPC `POST /`. Everything else is 404 at the edge.
 
 Optional profiles:
 
 ```bash
-# Regtest bitcoind (local demos only — not for a public production host)
+# Regtest bitcoind (local demos only; bound to 127.0.0.1, credentials from .env)
 docker compose --profile dev up -d
 
-# Bridge watcher (requires ZCRYPT_RESERVE_SEED in .env; pulls bitcoind if using defaults)
-ZCRYPT_RESERVE_SEED=... docker compose --profile bridge up -d
+# Bridge watcher: the reserve key is a Docker SECRET file, never an env var
+umask 077; mkdir -p secrets
+cargo run --release -p zcrypt-bridge --bin reserve_pubkey -- \
+  --wallet-seed-file <custody seed file> --write-derived-key secrets/reserve.key   # prints the pubkey for ZCRYPT_RESERVE_PK
+# .env: BTC_URL / BTC_USER / BTC_PASS of YOUR bitcoind (bitcoin network)
+docker compose --profile bridge up -d
 ```
 
 Query registry state:
@@ -100,13 +110,24 @@ ABCI protocol; it was replaced with `tendermint-abci` (ABCI 2.0).
 
 ## Genesis
 
-On first start, `cometbft-entrypoint.sh` injects:
+On first start, `cometbft-entrypoint.sh` validates every input against a strict pattern
+and injects (with `jq` when the image has it, otherwise by validated substitution):
 
 ```json
 "app_state": {
-  "registry": { "minted_total": 0, "leaves": [] }
+  "registry": { "minted_total": 0, "leaves": [] },
+  "foundation_addr": "<64 hex>",
+  "foundation_sentinel": true,
+  "foundation_sentinel_decay": 1000000,
+  "btc_net": "mainnet",
+  "btc_checkpoint": "<160 hex header>:<height>",
+  "zbtc_reserve_pk": "<66 hex compressed secp256k1 key>"
 }
 ```
 
-`init_chain` loads this into the registry (`Node::from_state`).
-```
+and raises the evidence window (`max_age_num_blocks` / `max_age_duration`) to 12 days so
+equivocation evidence outlives the 10-day unbonding period. `init_chain` reads all of it:
+the registry, the foundation reward address, the sentinel, the Bitcoin SPV anchor, and the
+zBTC reserve key (zBTC is registered against it at genesis; a later REGISTER of the ticker
+is rejected). The entrypoint prints and stores the genesis SHA-256 for validators.
+

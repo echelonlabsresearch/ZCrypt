@@ -13,20 +13,22 @@ commands from `wallet/`.
 
 ```sh
 cd impl
-cargo test -p zcrypt-core   --release     # ~121 tests: circuit, VM, staking, vesting, e2e
-cargo test -p zcrypt-shield --release     # 40 tests: STARK shield circuit
-cargo test -p zcrypt-abci-node --release  # 9 tests: node persistence, bond/claim auth
-cargo test -p zcrypt-bridge  --lib        # 7 tests: HD (BIP-84 vectors), signing, self-custody
+cargo test --workspace --locked           # ~280 tests: circuit, VM, consensus, SPV, persistence, bridge
+cargo test -p zcrypt-abci-node --locked --features devnet   # SEED gating, BOND/UNBOND auth
+cargo clippy --workspace --all-targets --locked             # must add no NEW lint classes (see ci.yml)
+cargo deny --config ../deny.toml check                      # advisories, licenses, sources
+cargo audit                                                 # no known vulnerabilities
 
-# Bridge live-data smoke (hits public Esplora — needs internet):
+# Bridge live-data smoke (hits public Esplora, needs internet):
 cargo test -p zcrypt-bridge --lib esplora -- --ignored --nocapture
 
 # Wallet compiles (backend + frontend types):
-cd ../wallet/src-tauri && cargo build
-cd .. && npx tsc --noEmit
+cd ../wallet/src-tauri && cargo build --locked && cargo deny --config ../../deny.toml check
+cd .. && npx tsc --noEmit && npm audit --audit-level=high
 ```
 
-**PASS:** every `test result: ok`, both builds clean, tsc silent.
+**PASS:** every `test result: ok`, deny/audit clean, both builds clean, tsc silent.
+`.github/workflows/ci.yml` runs exactly this on every push.
 
 ---
 
@@ -43,9 +45,9 @@ KEEP=0 ./e2e/run-all.sh        # builds, runs everything, tears down (KEEP=1 to 
 Or step through it:
 
 ```sh
-docker compose -f docker-compose.3node.yml up --build -d
+docker compose -f e2e/docker-compose.3node.yml up --build -d
 ./e2e/consensus-smoke.sh       # waits on 46657/46667/46677, checks block production + app_hash
-docker compose -f docker-compose.3node.yml down -v
+docker compose -f e2e/docker-compose.3node.yml down -v
 ```
 
 **PASS:** `run-all.sh` exits 0; consensus-smoke reports all three validators on the same
@@ -60,8 +62,8 @@ cycle, live against 3-node consensus.
 
 ```sh
 cd chain
-docker compose -f docker-compose.3node.yml down -v
-ZCRYPT_VESTING_ACCEL=259200 docker compose -f docker-compose.3node.yml up -d
+docker compose -f e2e/docker-compose.3node.yml down -v
+ZCRYPT_VESTING_ACCEL=259200 docker compose -f e2e/docker-compose.3node.yml up -d
 # wait ~15s for blocks, then:
 cd ../impl
 cargo run --release -p zcrypt-bridge --bin foundation_flow_3node
@@ -135,12 +137,15 @@ or `46657` for the 3-node). Toggle Tor OFF for localhost. Then walk:
 
 ```sh
 cd chain
-git checkout docker-compose.yml            # ensure ABCI_FEATURES: devnet
-docker compose up -d                       # ZCrypt devnet + regtest bitcoind (auto-funds)
+# .env: ABCI_FEATURES=devnet, ZCRYPT_BTC_NET=regtest, ZCRYPT_RESERVE_PK=<reserve pubkey>
+docker compose --profile dev up -d         # ZCrypt devnet + regtest bitcoind (127.0.0.1:18443)
 ```
+zBTC is registered from genesis against `ZCRYPT_RESERVE_PK` (the public key of the
+reserve seed your wallet / watcher uses; the watcher prints it at startup). A first-come
+REGISTER of the zBTC ticker is rejected once genesis carries the key.
 Wallet settings: `btc_network=regtest`, `btc_url=http://localhost:18443`,
-`btc_selfcustody=false`. In the ₿⇄zBTC tab: register zBTC → **Shield** 0.01 BTC (instant) →
-**Redeem** it back.
+`btc_selfcustody=false`. In the ₿⇄zBTC tab: **Shield** 0.01 BTC (instant) → **Redeem**
+it back.
 
 **PASS:** shield mints zBTC 1:1; redeem returns BTC (minus fees); balances conserve.
 
@@ -148,8 +153,8 @@ Wallet settings: `btc_network=regtest`, `btc_url=http://localhost:18443`,
 
 ```sh
 cd chain
-docker compose -f docker-compose.yml -f docker-compose.signet.yml up -d
-alias BCLI='docker compose -f docker-compose.yml -f docker-compose.signet.yml exec -T bitcoind bitcoin-cli -signet -rpcuser=zcrypt -rpcpassword=zcrypt'
+docker compose -f docker-compose.yml -f e2e/docker-compose.signet.yml --profile dev up -d
+alias BCLI='docker compose -f docker-compose.yml -f e2e/docker-compose.signet.yml exec -T bitcoind bitcoin-cli -signet -rpcuser=$BTC_USER -rpcpassword=$BTC_PASS'
 BCLI getblockchaininfo | grep -E '"blocks"|"headers"'   # wait until equal (synced)
 ```
 Note: on signet the **wallet's** BTC is self-custody via Esplora (no node needed by the
@@ -174,17 +179,26 @@ BTC (minus fees); no bitcoind is used by the wallet side.
 
 Before deploying a public testnet, clear each of these:
 
-1. **Chain id** set to the testnet id in all three: `impl/abci-node/src/main.rs`,
-   `impl/bridge/src/swap.rs`, `wallet/src-tauri/src/main.rs`, plus compose `CHAIN_ID`. Rebuild.
-2. **Production build** if the testnet should be faucet-free: `ABCI_FEATURES=""` in
-   `chain/docker/Dockerfile` / compose. (Or keep `devnet` for a faucet testnet — decide.)
-3. **Foundation address**: if `ABCI_FEATURES=""`, run the offline key ceremony
+1. **Chain id**: the node takes it from the genesis (`CHAIN_ID` in `chain/.env`) and pins it
+   in its RocksDB meta; the compiled `DEFAULT_CHAIN_ID` in `impl/abci-node/src/main.rs` and the
+   bridge / wallet constants (`impl/bridge/src/swap.rs`, `wallet/src-tauri/src/main.rs`) must
+   name the same id. Rebuild after changing them.
+2. **Production build** if the testnet should be faucet-free: `ABCI_FEATURES=` (empty) in
+   `chain/.env` (the default). Keep `devnet` only for a faucet testnet, and never let a devnet
+   image reach a value-bearing chain.
+3. **Foundation address**: for a production build, run the offline key ceremony
    (`cargo run -p zcrypt-core --example foundation_keys new`) and set `ZCRYPT_FOUNDATION_ADDR`.
-4. **RPC hardening**: reverse proxy + TLS in front of RPC/explorer; firewall everything else;
-   change bitcoind's `zcrypt/zcrypt` creds if the bridge LP runs a node.
-5. **Re-run Phase 0** after any code/config change.
+4. **zBTC reserve key**: set `ZCRYPT_RESERVE_PK` (public key) in `chain/.env` so the peg is
+   bound from genesis; keep the reserve SEED in `chain/secrets/reserve.key` (0600), never in
+   `.env`.
+5. **RPC hardening**: the foundation compose already fronts RPC/explorer with Caddy (TLS,
+   allow-listed endpoints, rate limits, 8 MB bodies) and binds the raw RPC and bitcoind to
+   127.0.0.1; firewall everything except 80/443/26656. Use your own bitcoind credentials.
+6. **Genesis fingerprint**: publish `genesis.sha256` (printed by the foundation entrypoint)
+   so validators can set `GENESIS_SHA256`.
+7. **Re-run Phase 0** after any code/config change.
 
-**PASS:** all four set, Phase 0 still green. You're clear to deploy the public testnet.
+**PASS:** all set, Phase 0 still green. You're clear to deploy the public testnet.
 
 ---
 
@@ -195,5 +209,6 @@ Before deploying a public testnet, clear each of these:
   coin, Fund again (devnet) to get a 2nd coin.
 - **Bridge = demo topology**: your wallet plays both user and LP (accounts 0/1 under one
   seed). A real deployment splits these into separate operators with distinct custody.
-- **Bridge watcher / real custody**: the two-party deposit watcher and distributed treasury
-  custody (MAINNET.md steps 3, 6) are for mainnet, not this testnet UAT.
+- **Bridge watcher / real custody**: the watcher daemon runs the public bridge (profile
+  `bridge` in the foundation compose, reserve key as a Docker secret); threshold / HSM custody
+  of the reserve key is still future work, so bridged value stays bounded by trust in one key.

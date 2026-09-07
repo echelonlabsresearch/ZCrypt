@@ -1,8 +1,9 @@
 # ZCrypt mainnet launch runbook
 
-Everything below assumes the repo state as of 2026-07-21 (vesting + 1s blocks landed).
-Order matters: steps 1 and 2 change consensus constants, so they happen BEFORE the
-first block ever exists. Once block 1 is signed, these are fixed forever.
+Everything below assumes the repo state as of 2026-09-07 (post-audit fixes: genesis-bound
+zBTC reserve key, digest-pinned validator image, secrets out of the environment).
+Order matters: steps 1, 2 and 5 fix consensus constants and genesis fields, so they happen
+BEFORE the first block ever exists. Once block 1 is signed, these are fixed forever.
 
 ## 1. Foundation key ceremony (offline, tonight)
 
@@ -23,21 +24,31 @@ It prints a 24-word mnemonic and a line `ZCRYPT_FOUNDATION_ADDR=<64 hex>`.
   paste it into a chat, never store it on a networked disk. It IS the 4.2M.
 * The `ZCRYPT_FOUNDATION_ADDR` value is public and safe to share: it goes into the
   VPS environment. It cannot be reversed to the key.
-* To later CLAIM vested tranches: restore the mnemonic into the wallet (Restore
-  from mnemonic) on a trusted machine. The Rewards tab shows the vested, claimable
-  amount and the Claim button mints it into your spendable balance. The claim path
-  is the same one live-tested on 2026-07-21.
+* To later CLAIM vested tranches, prefer the COLD flow: a CLAIM (tag `0x58`) is
+  `pk || amount` with no signature and no gas, and consensus insists on the FULL
+  claimable balance, so the only secret involved is knowing the reward address's
+  public key. Build the claim payload on the air-gapped machine (or anywhere; it
+  contains no secret), broadcast it from any online node, and let the minted coins
+  land on the foundation key's Normal address. Nothing in that flow needs the
+  mnemonic online. Restore the mnemonic into a networked wallet ONLY when you spend
+  the claimed coins, on a dedicated trusted machine, and lock it again afterwards.
+  Keep the foundation seed and the bridge reserve seed on DIFFERENT devices: the
+  operator wallet that runs the bridge must never hold the foundation mnemonic.
 
 ## 2. Production chain id: `zcrypt-1` (DONE, already committed)
 
 The chain id is baked into every signature and shield proof, so all copies must
 match. These are already set to `zcrypt-1` in the repo (verify before building):
 
-* `impl/abci-node/src/main.rs:30`  `const CHAIN_ID: &[u8] = b"zcrypt-1";`
-* `impl/bridge/src/swap.rs:16`     `pub const CHAIN: &[u8] = b"zcrypt-1";`
-* `wallet/src-tauri/src/main.rs:43` `const CHAIN: &[u8] = b"zcrypt-1";`
-* compose: `CHAIN_ID: zcrypt-1` in `chain/docker-compose.yml` (and the validator
-  compose + join scripts default to `zcrypt-1`).
+* `impl/abci-node/src/main.rs`  `const DEFAULT_CHAIN_ID: &[u8] = b"zcrypt-1";` (the node
+  takes the authoritative id from the genesis at InitChain and pins it in its RocksDB
+  meta and a `.chain_id` sidecar; the constant is only the pre-genesis default).
+* `impl/bridge/src/swap.rs`     `pub const CHAIN: &[u8] = b"zcrypt-1";`
+* `wallet/src-tauri/src/main.rs` the wallet's `CHAIN` constant / pinned chain id.
+* compose: `CHAIN_ID=zcrypt-1` in `chain/.env` (and the validator compose + join
+  scripts default to `zcrypt-1`).
+* Proofs bind a 5-limb hash of the chain id and staking signatures bind the full id, so
+  a transaction for one id is invalid on any other.
 
 The devnet stack keeps its own id (`e2e/docker-compose.3node.yml`) so a test chain
 never collides with mainnet.
@@ -49,26 +60,27 @@ a domain A-record (for TLS), ports 80/443 open, 26656 open (validator P2P).
 
 ```sh
 git clone <your repo> zcrypt && cd zcrypt/chain
-
-# The compose already builds PRODUCTION (ABCI_FEATURES=""): no 0x56 faucet, no
-# dev-seed fallback, no vesting accelerator, and ZCRYPT_FOUNDATION_ADDR mandatory.
-
-# the address from step 1, identical on every validator you ever add
-export ZCRYPT_FOUNDATION_ADDR=<64 hex from the ceremony>
-
-# SPV mint gate (Bitcoin bridge). A production build FAILS CLOSED without these:
-# it refuses to run on regtest, and mainnet requires a checkpoint (it will not sync
-# ~900k headers from the Bitcoin genesis). Generate + independently verify it (step 7):
-export ZCRYPT_BTC_NET=mainnet
-export ZCRYPT_BTC_CHECKPOINT=$(./mainnet-checkpoint.sh | grep -o '[0-9a-f]*:[0-9]*')  # VERIFY before trusting
+cp .env.example .env
+# Fill in .env (all of these are validated by the entrypoint before they touch genesis):
+#   ZCRYPT_FOUNDATION_ADDR   the address from step 1 (identical on every validator)
+#   ZCRYPT_BTC_NET=mainnet   + ZCRYPT_BTC_CHECKPOINT (step 7). A production build FAILS
+#                            CLOSED without them: it refuses regtest and will not sync
+#                            ~900k headers from the Bitcoin genesis.
+#   ZCRYPT_RESERVE_PK        the zBTC reserve PUBLIC key (step 5): zBTC is registered
+#                            from genesis against it, so nobody can race you for the peg.
+#   EXPLORER_DOMAIN / RPC_DOMAIN / ACME_EMAIL for the HTTPS edge.
+# ABCI_FEATURES stays EMPTY (production): no 0x56 faucet, no dev-seed fallback, no
+# vesting accelerator, foundation address mandatory.
 
 docker compose build
 docker compose up -d
+docker logs zcrypt-cometbft 2>&1 | grep '\[genesis\]'    # prints the genesis sha256: PUBLISH IT
 ```
 
-The bitcoind container is regtest-only demo infrastructure and is gated behind the
-`dev` compose profile, so it does NOT start here (the mainnet bridge is node-free:
-the wallet is a self-custody HD wallet on an Esplora API). Never expose port 18443.
+The bitcoind container is regtest-only demo infrastructure behind the `dev` compose
+profile (bound to 127.0.0.1 even then), so it does NOT start here: the mainnet bridge
+is node-free for users (self-custody HD wallet on an Esplora API), and the operator's
+watcher talks to the operator's own bitcoind via `BTC_URL`.
 
 Blocks start immediately (1s target). Sanity checks:
 
@@ -83,18 +95,14 @@ If any validator was started with a different ZCRYPT_FOUNDATION_ADDR the chain
 halts at height 1 with an app_hash mismatch (fails safe, seen live in testing).
 Fix the env, `docker compose down -v`, up again.
 
-Explorer (systemd, on the VPS):
-
-```sh
-cd ../impl && cargo build --release -p zcrypt-explorer
-EXPLORER_NODE=http://localhost:36657 EXPLORER_PORT=8080 ./target/release/zcrypt-explorer
-```
-
-Reverse proxy (nginx/caddy): `rpc.yourdomain -> 127.0.0.1:36657`,
-`explorer.yourdomain -> 127.0.0.1:8080`, TLS via Let's Encrypt. Firewall: allow
-80/443/26656/ssh, deny everything else (the RPC's CORS is `*` and bitcoind's
-credentials are weak defaults; neither may face the internet raw). Do NOT expose
-26658 (ABCI) or 18443 (bitcoind) at all.
+The explorer and the HTTPS edge are part of the compose stack: Caddy terminates TLS
+for `EXPLORER_DOMAIN` and `RPC_DOMAIN`, forwards only the allow-listed RPC endpoints
+(status, genesis, abci_query, block/blockchain/commit/validators/tx lookups and the
+broadcast endpoints; JSON-RPC POST at `/`), caps request bodies at 8 MB, and rate-limits
+per client IP (30 broadcasts and 600 reads per minute). The raw RPC is published on
+127.0.0.1:36657 only, CORS is off, and the ABCI socket is never published. Firewall:
+allow 80/443/26656/ssh, deny everything else. Do NOT expose 26658 (ABCI) or 18443
+(bitcoind) at all, and do not set `FOUNDATION_RPC_PORT` to a public interface.
 
 ## 4. Getting rewards to YOUR wallet (day 1, in order)
 
@@ -107,11 +115,14 @@ The genesis CometBFT validator produces blocks but earns nothing until bonded.
 2. Restore the FOUNDATION mnemonic into the wallet (trusted machine). Rewards tab
    shows 50,000 claimable (the liquid tranche). Claim it: you now hold spendable
    shielded ZCRYPT and the explorer shows `50k claimed`.
-3. Bond the genesis validator, pledging 10,000 of those coins, with YOUR wallet
-   account as the reward address. The bond needs the validator's consensus key:
-   the first 32 bytes of `priv_validator_key.json` (in the cometbft volume) as
-   hex, via `VALIDATOR_SEED_HEX`. The product-flow driver does exactly this bond
-   (see running.md "Validators"), or use the wallet if you have wired bonding there.
+3. Bond the genesis validator, pledging 10,000 of those coins, with a fresh reward
+   address from your wallet. Bonding is two-step so the consensus key never leaves
+   the node: in the wallet open Rewards, Become a validator, Prepare bond (it shows
+   chain id, reward address, stake, commission, nonce); on the node host run
+   `VALIDATOR_SEED_HEX=<first 32 bytes of priv_validator_key.json, hex> bond_validator sign ...`
+   with those values (chain/README-validator.md, section 3); paste the printed
+   signature into the wallet and submit. The product-flow driver performs the same
+   bond non-interactively (see running.md "Validators").
 4. Verify: `/staking/validators` lists the validator with its stake, and after
    the first 100-block epoch (about 100 s) `/staking/claimable/<pk>` grows by 14
    ZCRYPT per epoch. The wallet Rewards tab claims it whenever you like.
@@ -126,19 +137,29 @@ Bitcoin SPV proof (raw tx + merkle inclusion + proof-of-work headers), so a lyin
 data source can never forge unbacked zBTC. The exposure is on BTC-side execution and
 custody. The code-level money-critical items are now fixed (dynamic HTLC fee, mainnet
 Esplora default, network/endpoint mismatch guard, fail-closed SPV net + checkpoint).
-Two residual risks remain that are process, not code, and you accept them at launch:
+Two residual risks remain that are process, not code, and you accept them at launch
+(the 2026-09-07 audit's bridge findings, from timestamp-typed locktimes to the watcher's
+redeem margin, are fixed in code; see AUDIT-2026-09-07.md):
 
-1. RESERVE KEY (single hot key). zBTC's mint authority is the SPV sentinel over ONE
-   Bitcoin key, derived from the operator wallet's mnemonic (`H("BTCBRDG", seed)`).
-   Whoever runs `bridge_init` first PERMANENTLY binds zBTC to their seed's reserve key:
-   the authority is one-way and can never be rotated. That key can sweep every bridged
-   BTC, so guard the operator mnemonic exactly like the foundation key (cold, offline,
-   paper). There is no multisig/HSM custody yet: treat total bridged value as bounded by
-   how much you trust one hot key, and keep it small until real custody lands.
-2. NO TWO-PARTY DEPOSIT WATCHER. The wallet swap still drives both the user and the
-   LP side from one process (LP = account 1 under the same seed). It is safe for a
-   self-service user swapping their own BTC, but there is no independent LP or deposit
-   watcher, and the redeem LP wallet must be pre-funded with real BTC by hand.
+1. RESERVE KEY (single hot key). zBTC's mint authority is the consensus SPV gate over
+   ONE Bitcoin key. Its PUBLIC key is fixed in the genesis `app_state`
+   (`zbtc_reserve_pk`, from `ZCRYPT_RESERVE_PK`), so the peg is bound before block 1
+   and nobody can race a REGISTER for the ticker; the authority is one-way and cannot
+   be rotated, so get the custody key right before genesis. The SECRET seed lives only
+   where the watcher daemon runs, as a Docker secret file (`chain/secrets/reserve.key`,
+   0600, `ZCRYPT_RESERVE_KEY_FILE`), never in `.env`, never in a container environment,
+   and never in the same wallet as the foundation mnemonic. That key can sweep every
+   bridged BTC: there is no multisig/HSM custody yet, so treat total bridged value as
+   bounded by how much you trust one hot key, and keep it small until real custody lands.
+   Consensus now also enforces the deposit rules the operator relies on: height-typed
+   CLTV locktimes within a bounded window, 32-byte preimages (OP_SIZE in the script),
+   a minimum deposit, and escrow claims gated on the Bitcoin refund lock.
+2. ONE OPERATOR. The public bridge is settled by a single watcher daemon
+   (`--profile bridge`): it sweeps deposits, funds redeem HTLCs from its bitcoind wallet
+   and finalizes on claim. If it is offline, deposits still mint (consensus SPV) but
+   redeems wait; if its bitcoind wallet is empty, redeems wait. Fund the operator wallet
+   by hand, monitor the daemon, and keep `WATCHER_FINALIZE_MARGIN` at or above the
+   daemon's floor (it refuses to start below it).
 
 ### 7. Bitcoin SPV checkpoint (do tonight, before bring-up)
 
@@ -158,13 +179,23 @@ at all: they download that genesis and the abci configures the identical Bitcoin
 InitChain automatically. A validator that somehow read a different checkpoint fails closed
 rather than silently forking.
 
-### Registering zBTC on mainnet
+### Registering zBTC on mainnet (genesis, not a transaction)
 
-`bridge_init` (wallet Bridge tab, first run) registers zBTC with the reserve pubkey
-derived from the currently-open wallet's seed. Do this ONCE, from the wallet holding the
-mnemonic you intend to be the permanent reserve custodian, on a mainnet-configured wallet
-(`btc_network=bitcoin`, mainnet `esplora_url`). The 21M cap, 8 decimals, and ticker are
-protocol-pinned. It is one-way: get the custody wallet right before you click it.
+zBTC is registered by the node at InitChain from the genesis field `zbtc_reserve_pk`.
+Produce the value BEFORE bring-up: generate the custody seed on the custody machine, then
+run `reserve_pubkey --wallet-seed-file <seed file> --write-derived-key chain/secrets/reserve.key`
+(it writes the DERIVED reserve key, mode 0600, and prints the 66-hex compressed public
+key); copy that public key into `ZCRYPT_RESERVE_PK` in `.env`. The 21M cap,
+8 decimals, and ticker are protocol-pinned. Once genesis carries the key, a REGISTER tx
+for the zBTC ticker is rejected, and the wallet's `bridge_init` is not needed on mainnet.
+
+### Validator image provenance
+
+Validators run the image by DIGEST, signed with cosign by the "Publish ABCI image"
+workflow (`.github/workflows/image.yml`). After each release: take the digest from the
+workflow summary, verify its signature (`chain/README-validator.md`), and commit it into
+`chain/docker-compose.validator.yml`. Also publish the genesis fingerprint printed by the
+foundation entrypoint (`genesis.sha256`) so validators can set `GENESIS_SHA256`.
 
 ### Fee model (unchanged decision)
 
@@ -175,7 +206,10 @@ model before it matters.
 
 * Foundation mnemonic (paper, offline) - the 4.2M.
 * Your wallet mnemonic (paper) - your spendable coins + reward address.
-* `priv_validator_key.json` + `node_key.json` (cometbft volume) - the validator
+* `priv_validator_key.json` + `node_key.json` (cometbft volume): the validator
   identity.
-* The two docker volumes (abci state + cometbft data) - hourly snapshot is
-  plenty; state also replays from peers.
+* `chain/secrets/reserve.key` (bridge operator only): the derived reserve key. Back it up
+  offline like a mnemonic; never into a backup that leaves the host unencrypted.
+* The two docker volumes (abci RocksDB state + cometbft data): hourly snapshot is
+  plenty; state also replays from peers. `ZCRYPT_BACKUP_EVERY` (default 1000 blocks)
+  controls the postcard backup file the node writes beside the DB.

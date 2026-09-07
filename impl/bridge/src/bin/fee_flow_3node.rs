@@ -138,10 +138,11 @@ fn main() {
     let btc = Btc::connect(&btc_url, "zcrypt", "zcrypt", "demo", zcrypt_bridge::NETWORK).unwrap();
     let bridge_key = Key::from_bytes(&[0xB1; 32]);
     let reserve_pk: [u8; 33] = bridge_key.pk.inner.serialize();
-    // zBTC is pinned in GENESIS (`zbtc_reserve_pk`, from ZCRYPT_RESERVE_PK when the chain is
-    // created); this legacy gasless registration is rejected and ignored on such a chain.
-    let _ = zc.broadcast(&swap::register_spv_tx("zBTC", 8, &reserve_pk, 21_000_000 * 100_000_000, &[]));
-    let asset: u64 = zc.query("/asset/by_ticker/zBTC").unwrap().trim().parse().unwrap();
+    // zBTC is bound to this reserve pubkey in GENESIS (ZCRYPT_RESERVE_PK = 0xB1 dev key).
+    let asset: u64 = swap::ensure_zbtc_registered(&zc).unwrap_or_else(|e| {
+        eprintln!("{e}\n    this driver's reserve pubkey: {}", hex::encode(reserve_pk));
+        std::process::exit(2)
+    });
 
     // --- bond node0's validator at 20% commission ---
     let commission: u16 = 2000; // 20% — makes the validator-vs-delegator split visible

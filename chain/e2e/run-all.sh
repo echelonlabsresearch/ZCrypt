@@ -24,6 +24,19 @@ BTC=http://localhost:28443
 
 say() { printf '\n\033[1;36m== %s ==\033[0m\n' "$*"; }
 
+say "0/7  Build the RPC test drivers (release)"
+( cd "$IMPL_DIR" && cargo build --release -p zcrypt-bridge \
+    --bin reserve_pubkey \
+    --bin shield_flow_3node --bin product_flow_3node --bin recover_flow_3node \
+    --bin swap_demo --bin swap_pool_demo --bin fee_flow_3node \
+    --bin public_roundtrip_e2e --bin public_bridge_adversarial --bin watcher_daemon_e2e )
+BIN="$IMPL_DIR/target/release"
+# zBTC is bound to its reserve pubkey in GENESIS: derive it from the dev reserve key every
+# regtest driver uses (Key::from_bytes([0xB1; 32])) BEFORE the chain is created.
+export ZCRYPT_RESERVE_PK
+ZCRYPT_RESERVE_PK="$("$BIN/reserve_pubkey" --key "$(printf 'b1%.0s' $(seq 32))")"
+echo "  genesis zbtc_reserve_pk = $ZCRYPT_RESERVE_PK"
+
 say "1/7  Fresh 3-node network + bitcoind (build if needed)"
 $COMPOSE down -v >/dev/null 2>&1 || true
 $COMPOSE up --build -d
@@ -37,13 +50,6 @@ h1=$(curl -s "$N0/status" | grep -o '"latest_block_height":"[0-9]*"' | grep -o '
 h2=$(curl -s "$N0/status" | grep -o '"latest_block_height":"[0-9]*"' | grep -o '[0-9]*')
 [ "$h2" -gt "$h1" ] || { echo "FAIL: no block production"; exit 1; }
 echo "  producing blocks ($h1 -> $h2)"
-
-say "3/7  Build the RPC test drivers (release)"
-( cd "$IMPL_DIR" && cargo build --release -p zcrypt-bridge \
-    --bin shield_flow_3node --bin product_flow_3node --bin recover_flow_3node \
-    --bin swap_demo --bin swap_pool_demo --bin fee_flow_3node \
-    --bin public_roundtrip_e2e --bin public_bridge_adversarial --bin watcher_daemon_e2e )
-BIN="$IMPL_DIR/target/release"
 
 say "4/7  Consensus smoke (tx commit + 3-node app_hash agreement)"
 bash "$HERE/consensus-smoke.sh"

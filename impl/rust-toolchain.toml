@@ -1,2 +1,10 @@
+# Pinned by DATE so every validator, CI runner, and Docker image compiles the same
+# compiler (an unpinned "nightly" drifts daily and makes the consensus binary
+# non-reproducible). Nightly is required only by the vendored p3-util
+# (`#![feature(maybe_uninit_slice)]`, see impl/Cargo.toml). Bump deliberately, in one
+# commit, together with chain/docker/Dockerfile (RUST_NIGHTLY) and
+# wallet/rust-toolchain.toml, and re-run the full test suite.
 [toolchain]
-channel = "nightly"
+channel = "nightly-2025-10-12"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

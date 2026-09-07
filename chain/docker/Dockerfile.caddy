@@ -1,0 +1,7 @@
+# Edge proxy with the rate-limit plugin (stock Caddy has no rate limiting). Built by
+# docker compose (service `caddy`); pinned to a Caddy 2.10 minor so the plugin ABI matches.
+FROM caddy:2.10-builder-alpine AS builder
+RUN xcaddy build --with github.com/mholt/caddy-ratelimit
+
+FROM caddy:2.10-alpine
+COPY --from=builder /usr/bin/caddy /usr/bin/caddy

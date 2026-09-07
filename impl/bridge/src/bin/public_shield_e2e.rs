@@ -31,10 +31,11 @@ fn main() {
     let reserve = Key::from_bytes(&[0xB1; 32]);
     let reserve_pk = reserve.pk; // the ONLY thing the user is given (public)
     let reserve_ser: [u8; 33] = reserve.pk.inner.serialize();
-    // zBTC is pinned in GENESIS (`zbtc_reserve_pk`, from ZCRYPT_RESERVE_PK when the chain is
-    // created); this legacy gasless registration is rejected and ignored on such a chain.
-    let _ = zc.broadcast(&swap::register_spv_tx("zBTC", 8, &reserve_ser, 21_000_000 * 100_000_000, &[]));
-    let asset: u64 = zc.query("/asset/by_ticker/zBTC").unwrap().trim().parse().unwrap();
+    // zBTC is bound to this reserve pubkey in GENESIS (ZCRYPT_RESERVE_PK = 0xB1 dev key).
+    let asset: u64 = swap::ensure_zbtc_registered(&zc).unwrap_or_else(|e| {
+        eprintln!("{e}\n    this driver's reserve pubkey: {}", hex::encode(reserve_ser));
+        std::process::exit(2)
+    });
     println!("[operator] registered zBTC (asset {asset}) bound to reserve pubkey {}", hex::encode(reserve_ser));
     // Seed a decoy pool so the shield spend hides in a non-trivial shielded set.
     for k in 0..24u64 {

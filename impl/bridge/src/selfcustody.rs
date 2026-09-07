@@ -67,6 +67,54 @@ impl SelfCustodyBtc {
         self.hd.receive_address(0)
     }
 
+    /// Gap-limit scan of one chain (0 = receive, 1 = change): the index right after the
+    /// last address with on-chain history, stopping once `GAP` consecutive unused
+    /// addresses have been seen (so a restored wallet lands on the same index a running
+    /// one would).
+    fn first_unused_index(&self, change: u32) -> Result<u32, String> {
+        const GAP: u32 = 20;
+        let mut last_used: Option<u32> = None;
+        let mut unused_run = 0u32;
+        let mut index = 0u32;
+        while unused_run < GAP {
+            let addr = self.hd.address(change, index)?.to_string();
+            if self.esplora.address_used(&addr)? {
+                last_used = Some(index);
+                unused_run = 0;
+            } else {
+                unused_run += 1;
+            }
+            index += 1;
+        }
+        Ok(last_used.map(|u| u + 1).unwrap_or(0))
+    }
+
+    /// A FRESH (never used) receiving address. Reusing one Bitcoin address for every
+    /// bridge deposit lets an observer cluster all of a user's activity; rotate instead
+    /// (privacy H3). Falls back to index 0 only if the endpoint cannot be reached.
+    pub fn fresh_receive_address(&self) -> Result<Address, String> {
+        let i = self.first_unused_index(0).unwrap_or(0);
+        self.hd.receive_address(i)
+    }
+
+    /// A FRESH change address (see [`Self::fresh_receive_address`]).
+    pub fn fresh_change_address(&self) -> Result<Address, String> {
+        let i = self.first_unused_index(1).unwrap_or(0);
+        self.hd.change_address(i)
+    }
+
+    /// The fee (satoshis) and rate (sat/vB) a funding of `amount` would pay right now, so a
+    /// UI can show the user BEFORE signing (bridge M4). Uses the same capped estimator the
+    /// real build uses.
+    pub fn estimate_fund_fee(&self, amount: Amount) -> Result<(u64, f64), String> {
+        let utxos = self.esplora.wallet_utxos(&self.hd)?;
+        let fee_rate = self.esplora.fee_rate_sat_vb(self.conf_target().max(3))?;
+        let dest = self.hd.receive_address(0)?.script_pubkey();
+        let change = self.hd.change_address(0)?.script_pubkey();
+        let signed = txbuilder::build_and_sign(&self.hd, &utxos, dest, amount.to_sat(), change, fee_rate)?;
+        Ok((signed.fee, fee_rate))
+    }
+
     /// Confirmed + unconfirmed balance (satoshis), summed over the wallet's UTXOs.
     /// Does a full gap-limit scan (many Esplora calls) — use for spending decisions.
     pub fn balance_sats(&self) -> Result<u64, String> {
@@ -101,17 +149,53 @@ impl SelfCustodyBtc {
     }
 
     /// Fund an HTLC: build a tx from our own UTXOs paying `amount` to the HTLC's P2WSH
-    /// address (change back to our change/0 address), sign locally, broadcast via
+    /// address (change back to a FRESH change address), sign locally, broadcast via
     /// Esplora, and block until confirmed. Returns the funding UTXO (output 0).
+    ///
+    /// If the confirmation wait times out the funding is still on the network; recover it
+    /// with [`crate::swap::find_funded_htlc`] + [`crate::swap::resume_public_shield`]
+    /// instead of funding again (bridge L3).
     pub fn fund_htlc(&self, script: &ScriptBuf, amount: Amount) -> Result<HtlcUtxo, String> {
+        let utxo = self.fund_htlc_unconfirmed(script, amount)?;
+        self.esplora.wait_confirmed(&utxo.outpoint.txid.to_string(), self.conf_target()).map_err(|e| {
+            format!(
+                "{e}; the funding tx {} IS broadcast: resume from it rather than funding again",
+                utxo.outpoint.txid
+            )
+        })?;
+        Ok(utxo)
+    }
+
+    /// Build, sign and broadcast the HTLC funding tx; return its UTXO without waiting for
+    /// confirmations (the caller persists the txid, then waits).
+    pub fn fund_htlc_unconfirmed(&self, script: &ScriptBuf, amount: Amount) -> Result<HtlcUtxo, String> {
         let dest = htlc_address(script, self.network).script_pubkey();
-        let change = self.hd.change_address(0)?.script_pubkey();
+        let change = self.fresh_change_address()?.script_pubkey();
         let utxos = self.esplora.wallet_utxos(&self.hd)?;
         let fee_rate = self.esplora.fee_rate_sat_vb(self.conf_target().max(3))?;
         let signed = txbuilder::build_and_sign(&self.hd, &utxos, dest, amount.to_sat(), change, fee_rate)?;
         self.esplora.broadcast(&signed.hex)?;
-        self.esplora.wait_confirmed(&signed.txid.to_string(), self.conf_target())?;
         Ok(HtlcUtxo { outpoint: signed.vout0, value: amount, script: script.clone() })
+    }
+
+    /// Unspent outputs at the HTLC's P2WSH address (confirmed or not), via Esplora.
+    pub fn htlc_utxos(&self, script: &ScriptBuf) -> Result<Vec<HtlcUtxo>, String> {
+        let addr = htlc_address(script, self.network).to_string();
+        let mut out = Vec::new();
+        for u in self.esplora.address_utxos(&addr)? {
+            let txid = Txid::from_str(&u.txid).map_err(|e| e.to_string())?;
+            out.push(HtlcUtxo {
+                outpoint: bitcoin::OutPoint { txid, vout: u.vout },
+                value: Amount::from_sat(u.value),
+                script: script.clone(),
+            });
+        }
+        Ok(out)
+    }
+
+    /// The block `txid` is confirmed in (internal byte order), or `None` while unconfirmed.
+    pub fn tx_block_hash(&self, txid: &Txid) -> Result<Option<[u8; 32]>, String> {
+        Ok(self.esplora.tx_status(&txid.to_string())?.map(|(_, h)| h))
     }
 
     /// Spend an HTLC's **claim** branch with `preimage`, signed by `claim`, paying `dest`.
@@ -224,6 +308,21 @@ impl crate::BtcBackend for SelfCustodyBtc {
     }
     fn fee_rate_sat_vb(&self, target: u32) -> Result<f64, String> {
         self.esplora.fee_rate_sat_vb(target)
+    }
+    fn fund_htlc_unconfirmed(&self, script: &ScriptBuf, amount: Amount) -> Result<HtlcUtxo, String> {
+        SelfCustodyBtc::fund_htlc_unconfirmed(self, script, amount)
+    }
+    fn htlc_utxos(&self, script: &ScriptBuf) -> Result<Vec<HtlcUtxo>, String> {
+        SelfCustodyBtc::htlc_utxos(self, script)
+    }
+    fn refund(&self, utxo: &HtlcUtxo, key: &Key, locktime: u32, dest: &Address, fee: Amount) -> Result<Txid, String> {
+        SelfCustodyBtc::refund(self, utxo, key, locktime, dest, fee)
+    }
+    fn tx_block_hash(&self, txid: &Txid) -> Result<Option<[u8; 32]>, String> {
+        SelfCustodyBtc::tx_block_hash(self, txid)
+    }
+    fn tx_confirmations(&self, txid: &Txid) -> Result<u64, String> {
+        Ok(self.esplora.confirmations(&txid.to_string())? as u64)
     }
     fn find_htlc_spend_preimage(&self, utxo: &HtlcUtxo, _since_height: u64) -> Result<Option<Vec<u8>>, String> {
         // Esplora exposes the spender directly — no block scan needed.

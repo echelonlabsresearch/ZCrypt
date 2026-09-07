@@ -76,6 +76,11 @@ services:
       CHAIN_ID: zcrypt-1
       # Baked into genesis app_state so a published genesis.json fully describes the chain.
       ZCRYPT_FOUNDATION_ADDR: ${ZCRYPT_FOUNDATION_ADDR:-}
+      # zBTC is bound to its reserve pubkey IN GENESIS (`zbtc_reserve_pk`); a running chain
+      # cannot add it. Default: the dev reserve key the e2e drivers use, Key::from_bytes([0xB1;32])
+      # (print with `cargo run -p zcrypt-bridge --bin reserve_pubkey -- --key b1b1...b1`).
+      # reorg_defense_3node needs the 0x07 key instead: override ZCRYPT_RESERVE_PK for that run.
+      ZCRYPT_RESERVE_PK: ${ZCRYPT_RESERVE_PK:-03eef017846ec31a44edc6c7e8d26347f9914749ff5ca31eeb51841d501e74ed70}
     entrypoint: ["/bin/sh", "/init.sh"]
     volumes:
       - ../docker/testnet-init.sh:/init.sh:ro

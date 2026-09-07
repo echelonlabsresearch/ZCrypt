@@ -1,5 +1,5 @@
 import { useEffect, useState, useCallback } from "react";
-import { call, fmt, fmtAsset, trunc, copy } from "./lib/api";
+import { call, fmt, fmtAsset, trunc, copy, copySensitive } from "./lib/api";
 import Balance from "./components/Balance";
 import Send from "./components/Send";
 import Receive from "./components/Receive";
@@ -241,9 +241,9 @@ export default function App() {
                 <button
                   className="copy-btn"
                   style={copiedSeed ? { background: "var(--color-green)", color: "var(--color-bg)", borderColor: "var(--color-green)" } : undefined}
-                  onClick={() => { copy(seedPhrase); setCopiedSeed(true); setTimeout(() => setCopiedSeed(false), 1800); }}
+                  onClick={() => { copySensitive(seedPhrase); setCopiedSeed(true); setTimeout(() => setCopiedSeed(false), 1800); }}
                 >
-                  {copiedSeed ? "✓ Copied!" : "📋 Copy phrase"}
+                  {copiedSeed ? "✓ Copied (clipboard clears in 60 s)" : "📋 Copy phrase"}
                 </button>
                 <ul className="danger-list">
                   <li>Never share your phrase with anyone.</li>

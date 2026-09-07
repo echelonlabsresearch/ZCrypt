@@ -80,11 +80,12 @@ fn main() {
     let refund_key = Key::from_bytes(&[9u8; 32]);
     let alice = Account::from_seed([0x42; 32]);
 
-    // Register zBTC (SPV form). Idempotent — ignore "already registered".
-    // zBTC is pinned in GENESIS (`zbtc_reserve_pk`, from ZCRYPT_RESERVE_PK when the chain is
-    // created); this legacy gasless registration is rejected and ignored on such a chain.
-    let _ = nodes[0].broadcast(&swap::register_spv_tx("zBTC", 8, &reserve, 21_000_000 * 100_000_000, &[]));
-    let asset: u64 = q(&nodes, "/asset/by_ticker/zBTC").trim().parse().expect("zBTC registered");
+    // zBTC must be bound to THIS reserve pubkey in genesis: start the fresh 3-node stack with
+    // ZCRYPT_RESERVE_PK=$(reserve_pubkey --key 0707...07) (32 x 0x07, i.e. testutil::test_pk(7)).
+    let asset: u64 = swap::ensure_zbtc_registered(&nodes[0]).unwrap_or_else(|e| {
+        eprintln!("{e}\n    this demo's reserve pubkey: {}", hex::encode(reserve));
+        std::process::exit(2)
+    });
     println!("[setup] zBTC asset_id = {asset}");
     println!("[setup] chain BTC SPV tip = {}", q(&nodes, "/spv/tip"));
     let start_tip = q(&nodes, "/spv/height").trim().parse::<u64>().unwrap_or(0);

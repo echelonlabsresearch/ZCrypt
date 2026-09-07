@@ -11,6 +11,17 @@
 #
 # The defaults below point at the public foundation. To join a DIFFERENT chain (e.g. a
 # local test foundation), drop a `.env` next to this file overriding GENESIS_URL / SEED_*.
+#
+# Supply chain: the ABCI image is referenced by DIGEST (immutable) and signed with cosign
+# by the repository's "Publish ABCI image" workflow (.github/workflows/image.yml), so the
+# signing identity is that repository. Verify before trusting it (README-validator.md):
+#   cosign verify ghcr.io/echelonlabsresearch/zcrypt-abci@sha256:<digest> \
+#     --certificate-identity-regexp '^https://github.com/echelonlabsresearch/' \
+#     --certificate-oidc-issuer https://token.actions.githubusercontent.com
+# To update: take the digest printed in the workflow run summary (or
+# `docker buildx imagetools inspect ghcr.io/echelonlabsresearch/zcrypt-abci:vX.Y.Z`), verify
+# its signature, then replace the sha256 below in one commit. If the repository moves to
+# another GitHub org, change the owner here, in README-validator.md and in image.yml.
 
 name: zcrypt-validator
 
@@ -18,8 +29,10 @@ services:
   # This validator's own ABCI state machine. The foundation address (and everything else)
   # comes from the downloaded genesis, so there is nothing to configure here.
   validator-abci:
-    # Published image so downloaders need no source. Falls back to a local build.
-    image: ${ZCRYPT_ABCI_IMAGE:-ghcr.io/zcryptnetwork/zcrypt-abci:latest}
+    # Digest-pinned published image so downloaders need no source and cannot be served a
+    # different binary under the same tag. `ZCRYPT_ABCI_IMAGE` overrides (e.g. a local build).
+    # PLACEHOLDER DIGEST: replace with the digest of the first signed release image.
+    image: ${ZCRYPT_ABCI_IMAGE:-ghcr.io/echelonlabsresearch/zcrypt-abci@sha256:0000000000000000000000000000000000000000000000000000000000000000}
     build:
       context: ..
       dockerfile: chain/docker/Dockerfile
@@ -33,42 +46,51 @@ services:
     restart: unless-stopped
     environment:
       ABCI_PORT: "26658"
+      ZCRYPT_STATE_DB: /data/zcrypt-state.db
       ZCRYPT_STATE_FILE: /data/zcrypt-state.bin
+      ZCRYPT_BACKUP_EVERY: ${ZCRYPT_BACKUP_EVERY:-1000}
       ZCRYPT_VESTING_ACCEL: ${ZCRYPT_VESTING_ACCEL:-1}
-      # NOTE: the Bitcoin SPV network + checkpoint are NOT set here. They live in the
-      # genesis this node downloads from the seed, so the abci configures the identical
-      # Bitcoin anchor at InitChain automatically. A validator sets NOTHING for the bridge.
+      # NOTE: the Bitcoin SPV network + checkpoint and the zBTC reserve key are NOT set here.
+      # They live in the genesis this node downloads from the seed, so the abci configures the
+      # identical Bitcoin anchor at InitChain automatically. A validator sets NOTHING for the
+      # bridge.
     volumes:
       - validator-abci-data:/data
     networks: [vnet]
 
-  # This validator's CometBFT node — own identity, downloads genesis, dials the seed.
+  # This validator's CometBFT node: own identity, downloads genesis, dials the seed.
+  # Runs as the image's unprivileged `cometbft` user (the volume is owned by it).
   validator-cometbft:
     image: cometbft/cometbft:v0.38.17
     container_name: zcrypt-validator-cometbft
-    user: "0"
     restart: unless-stopped
     depends_on:
       - validator-abci
     environment:
       CHAIN_ID: ${CHAIN_ID:-zcrypt-1}
       ABCI_ADDR: tcp://validator-abci:26658
-      # How to find the chain. By default everything comes from the seed node's RPC: the
-      # genesis (SEED_RPC/genesis) and a peer (SEED_RPC/status). Override SEED_RPC/SEED_P2P_*
-      # in .env to join a different chain (e.g. a local foundation). GENESIS_URL is an
-      # optional static-file override for when the genesis is hosted separately.
-      SEED_RPC: ${SEED_RPC:-https://foundation.zcrypt.network:26657}
+      # How to find the chain. By default everything comes from the foundation's public RPC
+      # edge (Caddy, HTTPS): the genesis (SEED_RPC/genesis) and a peer (SEED_RPC/status).
+      # Override SEED_RPC/SEED_P2P_* in .env to join a different chain (e.g. a local
+      # foundation). GENESIS_URL is an optional static-file override.
+      SEED_RPC: ${SEED_RPC:-https://rpc.zcrypt.network}
       SEED_P2P_HOST: ${SEED_P2P_HOST:-foundation.zcrypt.network}
       SEED_P2P_PORT: ${SEED_P2P_PORT:-26656}
       GENESIS_URL: ${GENESIS_URL:-}
+      # The SHA-256 the foundation published for genesis.json. When set, the node refuses to
+      # start on any genesis whose hash differs (protects against a poisoned download).
+      GENESIS_SHA256: ${GENESIS_SHA256:-}
       # Optional: skip auto-discovery by giving the full seed string <node_id>@host:26656.
       ZCRYPT_SEEDS: ${ZCRYPT_SEEDS:-}
+      RPC_CORS_ORIGINS: ${RPC_CORS_ORIGINS:-[]}
     entrypoint: ["/bin/sh", "/entrypoint.sh"]
     volumes:
       - ./docker/validator-entrypoint.sh:/entrypoint.sh:ro
       - validator-cometbft-data:/cometbft
     ports:
-      - "${VALIDATOR_RPC_PORT:-56657}:26657"   # this validator's RPC
+      # This validator's RPC: localhost-only unless you deliberately open it
+      # (VALIDATOR_RPC_BIND=0.0.0.0:56657 puts an unauthenticated RPC on the internet).
+      - "${VALIDATOR_RPC_BIND:-127.0.0.1:56657}:26657"
       - "${VALIDATOR_P2P_PORT:-56656}:26656"   # P2P (reachable so peers can dial back)
     networks: [vnet]
 

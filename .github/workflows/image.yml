@@ -1,0 +1,92 @@
+# Publish the validator/foundation ABCI image, by DIGEST, signed with cosign (keyless,
+# GitHub OIDC). Validators pin the digest in docker-compose.validator.yml and verify the
+# signature before trusting it (chain/README-validator.md "Verify the image").
+#
+# Runs on release tags (v*) and on demand. The build is reproducible in the sense that the
+# Dockerfile uses a date-pinned nightly and --locked; the digest printed in the job summary
+# is the value to commit into the validator compose file.
+name: Publish ABCI image
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      abci_features:
+        description: "Cargo features for zcrypt-abci-node (EMPTY for production; never devnet for mainnet)"
+        required: false
+        default: ""
+
+env:
+  # Change the owner here (and in docker-compose.validator.yml) if the image lives under
+  # the zcryptnetwork org rather than the repository owner.
+  IMAGE: ghcr.io/${{ github.repository_owner }}/zcrypt-abci
+
+permissions:
+  contents: read
+  packages: write
+  id-token: write   # cosign keyless signing (Sigstore Fulcio via GitHub OIDC)
+
+jobs:
+  build-sign:
+    name: Build, push, sign
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Free runner disk space
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5.10.0
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=ref,event=tag
+            type=sha,format=long
+      - id: build
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        with:
+          context: .
+          file: chain/docker/Dockerfile
+          push: true
+          provenance: true
+          sbom: true
+          build-args: |
+            ABCI_FEATURES=${{ github.event.inputs.abci_features }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+      - uses: sigstore/cosign-installer@7e8b541eb2e61bf99390e1afd4be13a184e9ebc5 # v3.10.1
+      - name: Sign the image digest (keyless)
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: cosign sign --yes "${IMAGE}@${DIGEST}"
+      - name: Verify our own signature
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          cosign verify "${IMAGE}@${DIGEST}" \
+            --certificate-identity-regexp "^https://github.com/${{ github.repository }}/" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com
+      - name: Publish the digest
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          {
+            echo "## ABCI image"
+            echo
+            echo "Pin this in \`chain/docker-compose.validator.yml\`:"
+            echo
+            echo '```'
+            echo "${IMAGE}@${DIGEST}"
+            echo '```'
+            echo
+            echo "Verify: \`cosign verify ${IMAGE}@${DIGEST} --certificate-identity-regexp '^https://github.com/${{ github.repository }}/' --certificate-oidc-issuer https://token.actions.githubusercontent.com\`"
+          } >> "$GITHUB_STEP_SUMMARY"

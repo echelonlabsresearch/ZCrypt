@@ -22,10 +22,11 @@ fn main() {
     // Operator + zBTC registration.
     let reserve = Key::from_bytes(&[0xB1; 32]);
     let reserve_ser: [u8; 33] = reserve.pk.inner.serialize();
-    // zBTC is pinned in GENESIS (`zbtc_reserve_pk`, from ZCRYPT_RESERVE_PK when the chain is
-    // created); this legacy gasless registration is rejected and ignored on such a chain.
-    let _ = zc.broadcast(&swap::register_spv_tx("zBTC", 8, &reserve_ser, 21_000_000 * 100_000_000, &[]));
-    let asset: u64 = zc.query("/asset/by_ticker/zBTC").unwrap().trim().parse().unwrap();
+    // zBTC is bound to this reserve pubkey in GENESIS (ZCRYPT_RESERVE_PK = 0xB1 dev key).
+    let asset: u64 = swap::ensure_zbtc_registered(&zc).unwrap_or_else(|e| {
+        eprintln!("{e}\n    this driver's reserve pubkey: {}", hex::encode(reserve_ser));
+        std::process::exit(2)
+    });
     for k in 0..24u64 {
         let pk = zcrypt_shield::spend_pubkey(&[k + 1, k + 2, k + 3, k + 4, k + 5, k + 6, k + 7, k + 8]);
         let c = commit_asset(1_000 + k, &[k + 7, k + 9, k + 11, k + 13], &pk, asset);

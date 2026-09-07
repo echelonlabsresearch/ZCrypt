@@ -1,10 +1,10 @@
-# Heavy live end-to-end — a FRESH 3-validator network (+ bitcoind) with every real
-# RPC driver: consensus agreement, a real ~5 MB shield proof, the full product
-# surface (send/receive/spend, stealth, bearer, assets, abuse cases, bond→rewards
-# →claim→spend→unbond), mnemonic recovery, and BTC<->zBTC both directions.
+# Heavy live end-to-end: a FRESH 3-validator network (+ bitcoind) with every real RPC
+# driver: consensus agreement, a real ~1 MB shield proof, the full product surface
+# (send/receive/spend, stealth, bearer, assets, abuse cases, bond -> rewards -> claim ->
+# spend -> unbond), mnemonic recovery, and BTC<->zBTC both directions.
 #
-# It builds Docker images and generates real STARK proofs, so it is NOT run per
-# push — only on `main`, nightly, or on demand ("Run workflow" button).
+# It builds Docker images and generates real STARK proofs, so it is NOT run per push:
+# only on `main`, nightly, or on demand ("Run workflow" button).
 name: Live 3-node E2E
 
 on:
@@ -14,20 +14,35 @@ on:
     - cron: '0 6 * * *'   # nightly at 06:00 UTC
   workflow_dispatch: {}    # manual trigger
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_RELEASE_DEBUG: "0"
+  CARGO_BUILD_JOBS: "2"
 
 jobs:
   live-e2e:
     name: 3-node network + all live drivers
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 120
     steps:
-      - uses: actions/checkout@v4
-      - name: Cache cargo build (drivers build the prover locally)
-        uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Free runner disk space (images + prover build need it)
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+      - name: Native build deps (drivers build the prover locally)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang libclang-dev cmake pkg-config
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: impl
+          shared-key: live-e2e
       - name: Show toolchain
         working-directory: impl
         run: rustup show

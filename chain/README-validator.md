@@ -17,39 +17,78 @@ The node generates its own identity, **downloads the genesis** and **discovers t
 peer** automatically, and syncs. You never touch the genesis file. It is now a full node;
 it does not produce blocks until you bond it (step 3).
 
+Two things worth doing before you trust it with a bond:
+
+* **Pin the genesis fingerprint.** The foundation publishes the SHA-256 of `genesis.json`
+  (it is printed by the foundation node at first start and written to
+  `config/genesis.sha256`). Put it in a `.env` next to the compose file as
+  `GENESIS_SHA256=<64 hex>`: the entrypoint then refuses to start on any genesis whose
+  hash differs, so a poisoned download cannot put you on a fork.
+* **Verify the image.** The compose file references the ABCI image by **digest**, and
+  every published digest is signed with cosign (keyless, GitHub OIDC). Check the
+  signature once, from any machine with `cosign` installed:
+
+  ```sh
+  IMG=$(grep -o 'ghcr.io/[^ ]*@sha256:[0-9a-f]*' docker-compose.validator.yml | head -1)
+  cosign verify "$IMG" \
+    --certificate-identity-regexp '^https://github.com/echelonlabsresearch/' \
+    --certificate-oidc-issuer https://token.actions.githubusercontent.com
+  ```
+
+  A digest is immutable: a tag can be moved, a digest cannot. If verification fails, do
+  not run the image. To build from source instead, set `ZCRYPT_ABCI_IMAGE` to a local tag
+  (see `validator.env.example`); the Dockerfile uses the same date-pinned toolchain and
+  `--locked` build as the published image.
+
+The validator's own RPC is published on `127.0.0.1:56657` only (set `VALIDATOR_RPC_BIND`
+to open it deliberately); P2P `56656` must be reachable by peers.
+
 It is plug-and-play because the compose defaults point at the public foundation
 (`foundation.zcrypt.network`): it fetches the genesis and finds a peer from the seed node's
 RPC, and the genesis carries the foundation address in its `app_state`, so a downloaded
 genesis fully describes the chain.
 
-> Foundation operator, one-time: keep the seed node's RPC (26657) and P2P (26656) reachable,
-> and publish the ABCI image (`ZCRYPT_ABCI_IMAGE`). Those defaults are what make a download
-> "just work". Optionally host a static `genesis.json` and set `GENESIS_URL`.
+> Foundation operator, one-time: keep the HTTPS RPC edge (`rpc.zcrypt.network`, Caddy)
+> and P2P (26656) reachable, publish the ABCI image digest from the "Publish ABCI image"
+> workflow (and commit it into this compose file), and publish `genesis.sha256`. Those
+> defaults are what make a download "just work". Optionally host a static `genesis.json`
+> and set `GENESIS_URL`.
 
 ## 2. Get your validator identity (consensus key)
 
-Bonding needs the node's **consensus signing key** — the first 32 bytes of its
-`priv_validator_key.json`, as hex. One command:
+Bonding must be signed by the node's **consensus signing key** (the ed25519 key in
+`priv_validator_key.json`). That key never leaves the validator host: the wallet prepares
+the bond, the host signs it with `bond_validator sign`, and the wallet submits the
+signature. The signing tool reads the seed (the first 32 bytes of the key, as hex) from
+`VALIDATOR_SEED_HEX`. Extract it ON THE VALIDATOR HOST only:
 
 ```sh
-docker exec zcrypt-validator-cometbft cat /cometbft/config/priv_validator_key.json \
-  | python3 -c "import sys,json,base64; print(base64.b64decode(json.load(sys.stdin)['priv_key']['value'])[:32].hex())"
+export VALIDATOR_SEED_HEX=$(docker exec zcrypt-validator-cometbft cat /cometbft/config/priv_validator_key.json \
+  | python3 -c "import sys,json,base64; print(base64.b64decode(json.load(sys.stdin)['priv_key']['value'])[:32].hex())")
 ```
 
-Copy that hex string. It signs the bond, proving you control this validator. (The node also
-prints its consensus *pubkey* to its logs on first boot, but bonding needs the *seed* above.)
+Never paste that value into a desktop application or a chat: anyone holding it can make
+your validator equivocate and get it slashed.
 
-## 3. Bond it from your wallet
+## 3. Bond it (prepare in the wallet, sign on the host)
 
-In the **ZCrypt wallet**, go to **Rewards → 🛡️ Become a validator** and fill in:
+1. In the **ZCrypt wallet**, open **Rewards, Become a validator**, enter the stake
+   (minimum 10,000 ZCRYPT, taken from your balance) and your commission, and click
+   **Prepare bond**. The wallet allocates a fresh reward address and shows the exact
+   values to sign: chain id, reward address, stake (base units), commission (bps), nonce.
+2. On the validator host, sign those values (nothing secret is printed, only the
+   128-hex signature):
 
-- **Validator consensus key** — the hex from step 2
-- **Stake** — the ZCRYPT to pledge (minimum 10,000), taken from your wallet balance
-- **Commission %** — your cut of your delegators' rewards (you compete on this)
+```sh
+VALIDATOR_SEED_HEX=... cargo run --release -p zcrypt-bridge --bin bond_validator -- sign \
+  --chain-id zcrypt-1 --reward <reward address hex> --stake <base units> \
+  --commission-bps <bps> --node http://127.0.0.1:26657   # or --nonce <n> as shown by the wallet
+```
 
-Click **Bond**. The wallet pledges the stake (a real burn from your coins, returned after a
-10-day unbond), signs the `BOND` (tag `0x57`) with the consensus key, and sets your wallet as
-the reward address. On the next block the node joins the active set and starts producing.
+3. Paste the signature into the wallet and click **Submit bond**. The wallet verifies it
+   locally, pledges the stake (a real burn from your coins, returned after a 10-day
+   unbond), and broadcasts the `BOND` (tag `0x57`). On the next block the node joins the
+   active set and starts producing.
 Block rewards and bridge-fee yield then accrue in the **Rewards** tab; your pending unbondings
 show under **Unbonding**.
 

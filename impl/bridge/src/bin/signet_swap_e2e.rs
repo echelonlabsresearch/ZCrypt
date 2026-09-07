@@ -115,10 +115,13 @@ fn main() {
     let zc = Zcrypt::new(&zc_url);
     let reserve_pk: [u8; 33] = bridge_key.pk.inner.serialize();
     use zcrypt_core::asset_registry::{ZBTC_DECIMALS, ZBTC_MAX_SUPPLY, ZBTC_TICKER};
-    // zBTC is pinned in GENESIS (`zbtc_reserve_pk`, from ZCRYPT_RESERVE_PK when the chain is
-    // created); this legacy gasless registration is rejected and ignored on such a chain.
-    let _ = zc.broadcast(&swap::register_spv_tx(ZBTC_TICKER, ZBTC_DECIMALS, &reserve_pk, ZBTC_MAX_SUPPLY, &[]));
-    let asset: u64 = zc.query("/asset/by_ticker/zBTC").unwrap().trim().parse().unwrap();
+    // zBTC is bound in GENESIS: the signet stack's ZCRYPT_RESERVE_PK must be THIS run's
+    // reserve pubkey (`reserve_pubkey --signet-e2e-mnemonic-file signet_e2e.mnemonic`).
+    let _ = (ZBTC_TICKER, ZBTC_DECIMALS, ZBTC_MAX_SUPPLY);
+    let asset: u64 = swap::ensure_zbtc_registered(&zc).unwrap_or_else(|e| {
+        eprintln!("{e}\n    this run's reserve pubkey: {}", hex::encode(reserve_pk));
+        std::process::exit(2)
+    });
     println!("    zBTC asset_id = {asset}");
     for k in 0..16u64 {
         let c = zcrypt_shield::commit_asset(

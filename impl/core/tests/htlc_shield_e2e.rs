@@ -888,3 +888,64 @@ fn swap_escrow_refunds_the_locker_on_timeout() {
     // A claim after expiry is impossible.
     assert!(node.htlc_claim(&a_escrow, x).is_err());
 }
+
+/// Bridge C3 regression: an SPV mint escrow can be claimed only while the reserve still has
+/// its full sweep margin before the deposit's Bitcoin refund lock. Once the committed Bitcoin
+/// tip plus the margin reaches the lock, the claim is refused (the depositor could otherwise
+/// refund the BTC on Bitcoin and still take the zBTC), and the escrow stays open for expiry.
+#[test]
+fn spv_mint_claim_is_refused_once_the_refund_lock_is_within_sweep_margin() {
+    use zcrypt_core::bitcoin::consensus::serialize;
+    use zcrypt_core::spv::{self, testutil, MintProof, REGTEST_GENESIS};
+
+    // Two identical deposits on two fresh nodes: one advanced to the last safe Bitcoin
+    // height (claim allowed), one advanced a single block further (claim refused).
+    for (extra_headers, expect_ok) in [(2u32, true), (3u32, false)] {
+        let (alice, _mn) = keys::new_account();
+        let mut node = Node::new();
+        let reserve = testutil::test_pk(7);
+        let refund = testutil::test_pk(9);
+        let asset = node
+            .register_asset("zBTC", 8, Some(spv::spv_authority(&reserve)), 21_000_000 * 100_000_000)
+            .unwrap();
+        node.set_height(10);
+
+        let x = &pre("claim-gate-preimage-0123456789ab");
+        let lock = htlc_hashlock(x);
+        let value = 250_000u64;
+        // After the funding block the Bitcoin tip is 1 and the regtest sweep margin is 20, so
+        // the smallest lock the gate accepts at open is 21. Lock 24 leaves three blocks of slack.
+        let btc_locktime = 24u32;
+        let tx = testutil::funding_tx(&lock, &reserve, &refund, btc_locktime, value, 1);
+        let block = testutil::mine_header(&REGTEST_GENESIS, &[tx.clone()], 1_296_689_000);
+        node.submit_btc_headers(&block).unwrap();
+        let proof = MintProof {
+            reserve_pk: reserve,
+            refund_pk: refund,
+            btc_locktime,
+            vout: 0,
+            raw_tx: serialize(&tx),
+            merkle_block: testutil::merkle_proof(&block, &[tx.clone()], &tx),
+        };
+        let id = open_spv(&mut node, 9, asset, value, lock, 100, alice.pubkey(), &proof).unwrap();
+
+        let mut prev = block;
+        let mut tip = 1;
+        for i in 0..extra_headers {
+            prev = testutil::mine_header(&prev, &[], 1_296_689_600 + 600 * i);
+            tip = node.submit_btc_headers(&prev).unwrap().1;
+        }
+        assert_eq!(tip, 1 + u64::from(extra_headers));
+
+        let res = node.htlc_claim(&id, x);
+        if expect_ok {
+            // tip 3 + margin 20 = 23 < 24: still inside the sweep window.
+            assert!(res.is_ok(), "claim inside the sweep window must succeed: {res:?}");
+        } else {
+            // tip 4 + margin 20 = 24 = lock: the reserve could no longer sweep in time.
+            let err = res.unwrap_err();
+            assert!(err.contains("refund lock"), "unexpected error: {err}");
+            assert_eq!(node.htlc_escrow(&id).map(|e| e.state), Some(EscrowState::Open), "escrow stays open for expiry");
+        }
+    }
+}

@@ -14,6 +14,7 @@
 
 use crate::hdwallet::HdWallet;
 use serde_json::Value;
+use std::str::FromStr;
 use std::time::Duration;
 
 /// A reachable Esplora endpoint, e.g. `https://mempool.space/signet/api` or
@@ -97,14 +98,32 @@ impl Esplora {
     }
 
     /// Fee rate (sat/vB) for confirmation within ~`target` blocks. Falls back to the
-    /// 6-block estimate, then a 1 sat/vB floor.
+    /// 6-block estimate, then a 1 sat/vB floor. The result is clamped to
+    /// [`crate::MAX_FEE_RATE_SAT_VB`]: Esplora is a third party, and a lying or
+    /// compromised endpoint must not be able to make the wallet burn an HTLC in fees
+    /// (bridge M4).
     pub fn fee_rate_sat_vb(&self, target: u32) -> Result<f64, String> {
         let v = self.get_json("/fee-estimates")?;
         let pick = v[target.to_string()]
             .as_f64()
             .or_else(|| v["6"].as_f64())
             .unwrap_or(1.0);
-        Ok(pick.max(1.0))
+        Ok(crate::cap_fee_rate(pick))
+    }
+
+    /// Confirmation status of a transaction: `(confirmed, block_height, block_hash)` where
+    /// the hash is in INTERNAL byte order (what `MintProof::deposit_block_hash` returns),
+    /// or `None` while unconfirmed.
+    pub fn tx_status(&self, txid: &str) -> Result<Option<(u64, [u8; 32])>, String> {
+        use bitcoin::hashes::Hash as _;
+        let v = self.get_json(&format!("/tx/{txid}/status"))?;
+        if !v["confirmed"].as_bool().unwrap_or(false) {
+            return Ok(None);
+        }
+        let h = v["block_height"].as_u64().ok_or("status: confirmed but no height")?;
+        let hash_hex = v["block_hash"].as_str().ok_or("status: confirmed but no block hash")?;
+        let bh = bitcoin::BlockHash::from_str(hash_hex).map_err(|e| e.to_string())?;
+        Ok(Some((h, bh.to_byte_array())))
     }
 
     /// Broadcast a raw (hex) transaction; returns the txid.

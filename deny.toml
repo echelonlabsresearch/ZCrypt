@@ -1,0 +1,93 @@
+# cargo-deny policy for the impl workspace and the wallet crate (CI runs
+# `cargo deny check` in both with `--config` pointing here).
+#
+# Advisories: no known VULNERABILITIES are tolerated. Unmaintained / yanked notices are
+# reported but individually acknowledged below with the reason they cannot be fixed on our
+# side today; revisit each when its upstream moves.
+
+[graph]
+all-features = false
+
+[advisories]
+version = 2
+db-path = "~/.cargo/advisory-db"
+db-urls = ["https://github.com/rustsec/advisory-db"]
+# Only flag unmaintained crates that the workspace depends on DIRECTLY; the transitive
+# ones are listed in `ignore` with a reason.
+unmaintained = "workspace"
+unsound = "all"
+yanked = "warn"
+ignore = [
+    # Plonky3 (p3-*) pulls `paste` for its macro plumbing; upstream has not migrated yet.
+    { id = "RUSTSEC-2024-0436", reason = "paste: macro-only dependency of p3-* crates, no runtime code; tracked upstream" },
+    # heapless -> atomic-polyfill via postcard; compile-time polyfill selection only.
+    { id = "RUSTSEC-2023-0089", reason = "atomic-polyfill: reached through postcard/heapless, not used on our targets" },
+    # Tauri v2 on Linux still binds GTK3 (unmaintained gtk-rs 0.18 bindings) and glib 0.18.
+    { id = "RUSTSEC-2024-0411", reason = "gtk-rs GTK3 bindings via tauri/tao on Linux only; upstream migration to GTK4 pending" },
+    { id = "RUSTSEC-2024-0412", reason = "gtk-rs GTK3 bindings via tauri/tao on Linux only" },
+    { id = "RUSTSEC-2024-0413", reason = "gtk-rs GTK3 bindings via tauri/tao on Linux only" },
+    { id = "RUSTSEC-2024-0414", reason = "gtk-rs GTK3 bindings via tauri/tao on Linux only" },
+    { id = "RUSTSEC-2024-0415", reason = "gtk-rs GTK3 bindings via tauri/tao on Linux only" },
+    { id = "RUSTSEC-2024-0416", reason = "gtk-rs GTK3 bindings via tauri/tao on Linux only" },
+    { id = "RUSTSEC-2024-0417", reason = "gtk-rs GTK3 bindings via tauri/tao on Linux only" },
+    { id = "RUSTSEC-2024-0418", reason = "gtk-rs GTK3 bindings via tauri/tao on Linux only" },
+    { id = "RUSTSEC-2024-0419", reason = "gtk-rs GTK3 bindings via tauri/tao on Linux only" },
+    { id = "RUSTSEC-2024-0420", reason = "gtk-rs GTK3 bindings via tauri/tao on Linux only" },
+    { id = "RUSTSEC-2024-0429", reason = "glib 0.18 iterator unsoundness: reached only through the Tauri Linux shell, the wallet never uses the affected iterator APIs; fixed upstream in glib 0.20 which Tauri has not adopted" },
+    { id = "RUSTSEC-2024-0370", reason = "proc-macro-error: build-time proc-macro helper pulled by tauri plugins; no runtime code" },
+    { id = "RUSTSEC-2025-0075", reason = "unic-* crates: build-time dependency of tauri's asset pipeline; no runtime code" },
+    { id = "RUSTSEC-2025-0080", reason = "unic-* crates: build-time dependency of tauri's asset pipeline; no runtime code" },
+    { id = "RUSTSEC-2025-0081", reason = "unic-* crates: build-time dependency of tauri's asset pipeline; no runtime code" },
+    { id = "RUSTSEC-2025-0098", reason = "unic-* crates: build-time dependency of tauri's asset pipeline; no runtime code" },
+    { id = "RUSTSEC-2025-0100", reason = "unic-* crates: build-time dependency of tauri's asset pipeline; no runtime code" },
+]
+
+[licenses]
+version = 2
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "0BSD",
+    "BSL-1.0",
+    "CC0-1.0",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "OpenSSL",
+    "CDLA-Permissive-2.0",
+    # hex_lit (via rust-bitcoin): MIT with the no-false-attribution clause.
+    "MITNFA",
+]
+confidence-threshold = 0.8
+exceptions = []
+
+[[licenses.clarify]]
+name = "ring"
+expression = "MIT AND ISC AND OpenSSL"
+license-files = [{ path = "LICENSE", hash = 0xbd0eed23 }]
+
+# Workspace binaries without a `license` field in their own manifest (the workspace package
+# license is MIT; add `license.workspace = true` to these manifests to drop the clarifications).
+
+
+[bans]
+multiple-versions = "warn"
+wildcards = "allow"
+highlight = "all"
+deny = [
+    # No OpenSSL anywhere: TLS is rustls-only, so a native-tls link would be a regression.
+    { crate = "openssl", reason = "TLS must stay rustls-only (no native OpenSSL dependency)" },
+    { crate = "openssl-sys", reason = "TLS must stay rustls-only" },
+    { crate = "native-tls", reason = "TLS must stay rustls-only" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

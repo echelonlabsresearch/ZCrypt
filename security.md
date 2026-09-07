@@ -13,13 +13,19 @@ Every cryptographic primitive on the value layer is hash-based or lattice-based:
 | Note encryption | ML-KEM-768 (FIPS 203 lattice KEM) | Module-LWE |
 | Mint / rotation authority | ML-DSA-65, M-of-N threshold | Module-LWE/SIS |
 | Bridge hashlocks | SHA-256 (shared with Bitcoin script) | hash security |
+| STARK parameters | 112 FRI queries, rate 1/4, 20-bit grinding: 244 conjectured bits, fixed in every build | FRI conjecture |
 
-There is **no signature scheme on the money**. Spend authority is knowledge of a
-hash preimage (`pk = Poseidon2(spend_secret)`) proven inside the circuit. There
-are no elliptic curves, no pairings, and no discrete logarithms protecting any
-unit of value, so there is nothing for Shor's algorithm to break. (CometBFT's
-ed25519 consensus signatures secure liveness, not coins: a quantum adversary
-who broke them could disrupt block production, not steal or forge value.)
+There is **no signature scheme on the shielded money**. Spend authority is knowledge
+of a hash preimage (`pk = Poseidon2(spend_secret)`) proven inside the circuit. No
+elliptic curve, pairing, or discrete logarithm protects a shielded coin, so there is
+nothing for Shor's algorithm to break on the value layer itself. Two things at the
+edges are classical and must be said plainly: CometBFT's ed25519 consensus signatures
+(and the ed25519 keys that sign BOND / UNBOND / DELEGATE) secure liveness and staking
+control, not coins; and the **zBTC peg is backed by Bitcoin custody under a secp256k1
+reserve key with ECDSA HTLCs on the Bitcoin side**, because Bitcoin script offers
+nothing else. A quantum adversary who broke ed25519 could disrupt block production or
+forge staking messages; one who broke secp256k1 could take the Bitcoin reserve. Neither
+can forge or steal a shielded coin.
 
 **No trusted setup.** STARKs need no ceremony. There was never a moment where
 toxic waste existed, so there is no moment to have compromised.
@@ -29,19 +35,27 @@ toxic waste existed, so there is no moment to have compromised.
 * **Commitments bind the owner.** `C = Poseidon2(value, blind, pk, asset_id)`
   binds amount, owner, and asset in one hash. The sender of a coin knows `pk`
   but not the preimage, so only the recipient can ever spend it.
-* **Canonical nullifiers.** `nf = Poseidon2(spend_secret, value, blind)` is a
-  deterministic function of the coin: re-spends collide in the nullifier set (a
-  sparse Merkle tree folded into the app hash) and are rejected by consensus.
+* **Canonical nullifiers.** `nf = Poseidon2(spend_secret, value, blind, asset_id)`
+  is a deterministic function of the coin: re-spends collide in the nullifier set (a
+  sparse Merkle tree folded into the app hash) and are rejected by consensus. The
+  commitment, nullifier and spend-key preimages carry distinct role tags, so the three
+  hash domains can never coincide.
 * **In-circuit membership.** A spend proves a Merkle path to a recent tree root
-  inside the STARK, against a node-enforced window of recent anchor roots. You
-  cannot spend a coin that was never created.
+  inside the STARK, against a node-enforced window of the last 1000 block-boundary
+  roots (plus the roots produced inside the current block). You cannot spend a coin
+  that was never created, and a burst of appends cannot expire everyone else's proofs.
 * **Per-asset conservation.** The circuit constrains all coins in a transfer to
   one asset id and enforces sum(inputs) = sum(outputs) + fee, so hidden types
-  can never be transmuted (1 zBTC never spends as 1 ZCRYPT).
+  can never be transmuted (1 zBTC never spends as 1 ZCRYPT). Asset ids are canonical
+  field elements everywhere (registry, wire, circuit), so no two registered assets can
+  share a lane inside the proof.
 * **Value bounds.** Every value is range-constrained (two-limb, up to 2^52
-  atomic per coin): no overflow-minting inside the proof.
-* **Replay scope.** Proof transcripts bind the chain id, so a transaction
-  cannot be replayed onto another network.
+  atomic per coin) and the conservation carry is bounded, so the field equality is an
+  integer equality: no overflow-minting inside the proof.
+* **Replay scope.** Proof transcripts bind a 5-limb (about 154-bit) hash of the chain
+  id, so a transaction cannot be replayed onto another network. Every shield tx carries
+  exactly two fixed-size encrypted notes whose digest is also bound into the proof, so
+  a relayer cannot strip or swap them.
 
 Each of these rules has a public bytecode twin that is differentially tested
 against the circuit: see [vm.md](vm.md).
@@ -73,11 +87,21 @@ against the circuit: see [vm.md](vm.md).
 
 ## Issuance authority for assets
 
-Minting a shielded asset (including zBTC) requires an M-of-N threshold of
-ML-DSA signatures over the exact escrow parameters, from a key set whose
-commitment is registered on chain. No mint secret ever touches the chain, key
-sets rotate on-chain (epoch-bound, replay-proof), and every asset carries a
-hard, consensus-enforced supply cap declared at registration.
+Minting a discretionary shielded asset requires an M-of-N threshold of ML-DSA
+signatures over the exact escrow parameters (chain id included), from a key set whose
+commitment is registered on chain. No mint secret ever touches the chain, key sets
+rotate on-chain (epoch-bound, replay-proof), and every asset carries a hard,
+consensus-enforced supply cap declared at registration. Registering an asset costs
+gas, one authority may back at most one asset, and the wallet's built-in flows produce
+**1-of-1** key sets derived from the operator seed: the threshold machinery supports
+M-of-N, but nothing shipped today uses more than one signer, and that should be read
+as "one operator key", not "a committee".
+
+**zBTC is different.** It has no signers at all: its mint authority is the in-consensus
+Bitcoin SPV gate (every validator verifies the Bitcoin headers, the merkle inclusion
+proof, and that the deposit output is an HTLC claimable only by the reserve key), and
+the reserve key is fixed in the genesis `app_state` (`zbtc_reserve_pk`), not claimed by
+whoever registers first.
 
 ## Hardening already done
 
@@ -89,14 +113,42 @@ value-moving path, supply-cap invariant tests grinding thousands of epochs,
 and differential VM/circuit testing. The full product surface runs as an
 end-to-end test against a live 3-validator network in CI.
 
+## Audit history and how to report
+
+* **2026-09-07, internal multi-reviewer audit** ([AUDIT-2026-09-07.md](AUDIT-2026-09-07.md)):
+  five domain reviews (circuit, privacy, consensus, bridge/SPV, wallet/ops). It found
+  six critical-rated issues, all now fixed in the tree: 64-bit asset ids collapsing
+  onto the 31-bit circuit lane (counterfeit assets), three unbacked zBTC-mint paths in
+  the SPV gate (timestamp-typed CLTV locktimes, unbounded HTLC preimages, escrow
+  timeouts unrelated to the Bitcoin refund lock), the foundation sentinel's voting
+  power being overwritten by the ordinary validator-set diff, and unauthenticated
+  partial reward claims. The high and medium findings (gas on state-creating
+  transactions, per-block anchor window, incremental nullifier tree, CheckTx parity,
+  proof verification outside the state lock, genesis-bound zBTC reserve key, wider
+  chain-id binding, fixed-size notes, digest-pinned and signed validator images,
+  pinned toolchain, rate-limited RPC edge, secrets out of the environment) are fixed
+  alongside; the report lists each with file references.
+* **Reporting.** Send vulnerability reports to the address in `chain/.env.example`
+  (`ACME_EMAIL`, the operations mailbox) with "security" in the subject, or open a
+  private security advisory on the repository. Please do not file public issues for
+  exploitable bugs. There is no bounty programme yet.
+* **What fixed-in means here.** Every fix above shipped as a consensus or proof-format
+  change on a chain that has not launched; there is no live network to migrate.
+
 ## What we will not pretend
 
 * **No external audit yet.** The internal record is documented and the test
   suite is serious, but until independent cryptographers have torn this apart,
   calibrate the value you shield accordingly.
-* **The BTC bridge is a regtest demo.** It proves the protocol (both directions,
-  atomically, live) but is not hardened for mainnet Bitcoin: production builds
-  ship with it disabled. The hardening checklist is in the repo.
+* **The BTC bridge is mainnet-enabled and single-operator.** The wallet ships with
+  `btc_network = bitcoin`, self-custody on, and a public Esplora endpoint by default;
+  the mint side is trustless (consensus SPV), the redeem side and all bridged BTC
+  depend on one operator's hot secp256k1 reserve key, one bitcoind wallet and one
+  watcher daemon. A zBTC holder trusts: that key's custody, the operator staying online
+  and honest for redeems, Bitcoin not reorganising past the value-scaled maturity depth,
+  prompt header relaying, the provenance of the genesis checkpoint, and that Esplora
+  (which cannot forge mints) does not deny service. Keep bridged value proportional to
+  that trust until threshold custody lands.
 * **Anonymity grows with the pool.** Cryptographic soundness holds from block
   one; practical anonymity is a function of adoption.
 * **Devnet builds are unsafe by design.** The `devnet` feature enables an

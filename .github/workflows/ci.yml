@@ -1,55 +1,170 @@
-# Fast regression gate — runs on EVERY push and PR.
-# Covers the 129 unit + integration tests (including real STARK proofs) and the
-# wallet build. The heavy live 3-node e2e is a separate workflow (live-e2e.yml)
-# because it stands up Docker and generates ~5 MB proofs — too slow per-push.
+# Fast regression gate: runs on EVERY push and PR.
+#
+# Layout (each job stays inside a 7 GB / 14 GB-disk hosted runner):
+#   * three test shards that together cover the whole impl workspace (unit + integration,
+#     including real STARK proofs); the earlier single job ran the linker out of memory;
+#   * clippy with a RATCHET: the lint classes present today are allowed explicitly, any
+#     new class fails the build (tighten the list as classes are cleaned up);
+#   * supply chain: cargo audit, cargo deny (advisories, licenses, sources, bans) on both
+#     lockfiles, npm audit on the wallet frontend;
+#   * the wallet frontend build + backend tests.
+# Every cargo invocation is --locked: Cargo.lock is authoritative. Actions are pinned by
+# commit SHA (the tag is in the comment) so a moved tag cannot change what runs.
+# The heavy live 3-node e2e is a separate workflow (live-e2e.yml).
 name: CI
 
 on:
   push:
   pull_request:
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  # Debug info is what blew the linker past the runner's memory; tests do not need it.
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+  # Two parallel rustc/link jobs keep peak memory under the 7 GB hosted-runner ceiling.
+  CARGO_BUILD_JOBS: "2"
+  RUST_BACKTRACE: "1"
+  # Baseline of clippy classes present in the tree today (see the clippy job).
+  CLIPPY_BASELINE: >-
+    -A clippy::cloned_ref_to_slice_refs -A clippy::needless_range_loop
+    -A clippy::type_complexity -A clippy::clone_on_copy -A clippy::manual_is_multiple_of
+    -A clippy::too_many_arguments -A dead_code -A clippy::redundant_guards
+    -A clippy::unnecessary_cast -A clippy::doc_overindented_list_items
+    -A clippy::manual_div_ceil -A clippy::int_plus_one -A clippy::unused_enumerate_index
+    -A clippy::manual_range_contains -A clippy::new_without_default
+    -A clippy::len_without_is_empty -A clippy::while_let_on_iterator
+    -A clippy::needless_borrows_for_generic_args -A unused_mut -A clippy::map_identity
+    -A clippy::assertions_on_constants -A clippy::useless_format
+    -A clippy::doc_lazy_continuation -A clippy::single_match -A unused_parens
+    -A clippy::redundant_static_lifetimes -A clippy::nonminimal_bool
+    -A clippy::redundant_locals
 
 jobs:
   rust-tests:
-    name: Rust tests (impl workspace)
+    name: Rust tests (${{ matrix.shard.name }})
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        shard:
+          - name: shield + core unit
+            cmd: cargo test --locked -p zcrypt-shield -p zcrypt-core --lib
+          - name: core integration + abci
+            cmd: >-
+              cargo test --locked -p zcrypt-core --tests --examples &&
+              cargo test --locked -p zcrypt-abci-node &&
+              cargo test --locked -p zcrypt-abci-node --features devnet
+          - name: bridge + explorer + cli
+            cmd: cargo test --locked -p zcrypt-bridge -p zcrypt-explorer -p zcrypt-cli
     steps:
-      - uses: actions/checkout@v4
-      # rust-toolchain.toml pins nightly; rustup installs it on first cargo call.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Free runner disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force >/dev/null 2>&1 || true
+          df -h /
+      - name: Native build deps (RocksDB via bindgen)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang libclang-dev cmake pkg-config
+      # rust-toolchain.toml pins the dated nightly; rustup installs it on first cargo call.
       - name: Cache cargo build
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: impl
+          shared-key: impl-tests
       - name: Show toolchain
         working-directory: impl
         run: rustup show
-      - name: Test workspace (unit + integration, incl. product_surface + recovery e2e)
+      - name: ${{ matrix.shard.name }}
         working-directory: impl
-        run: cargo test --workspace --no-fail-fast
-      - name: Devnet-feature tests (SEED gating, BOND/UNBOND auth)
+        run: ${{ matrix.shard.cmd }}
+
+  clippy:
+    name: Clippy ratchet (impl + wallet)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Free runner disk space
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+      - name: Native build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang libclang-dev cmake pkg-config \
+            libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev libayatana-appindicator3-dev
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: |
+            impl
+            wallet/src-tauri
+          shared-key: clippy
+      - name: Clippy (impl workspace)
         working-directory: impl
-        run: cargo test -p zcrypt-abci-node --features devnet
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings $CLIPPY_BASELINE
+      - name: Clippy (wallet backend)
+        working-directory: wallet/src-tauri
+        run: cargo clippy --all-targets --locked -- -D warnings $CLIPPY_BASELINE
+
+  supply-chain:
+    name: Supply chain (audit, deny, npm audit)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Install cargo-audit + cargo-deny (prebuilt)
+        uses: taiki-e/install-action@84f5ac3124727fb3d284d4d22ee9ab3654fd09a6 # v2.87.7
+        with:
+          tool: cargo-audit,cargo-deny
+      - name: cargo audit (impl)
+        working-directory: impl
+        # Vulnerabilities fail the job; unmaintained/yanked notices are reported by cargo deny
+        # with per-advisory reasons in deny.toml, so they are informational here.
+        run: cargo audit --deny unsound --deny yanked --ignore RUSTSEC-2023-0089 --ignore RUSTSEC-2024-0436 || cargo audit
+      - name: cargo audit (wallet)
+        working-directory: wallet/src-tauri
+        run: cargo audit
+      - name: cargo deny (impl)
+        working-directory: impl
+        run: cargo deny --config ../deny.toml --locked check
+      - name: cargo deny (wallet)
+        working-directory: wallet/src-tauri
+        run: cargo deny --config ../../deny.toml --locked check
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 20
+      - name: npm audit (wallet frontend)
+        working-directory: wallet
+        run: |
+          npm ci --ignore-scripts
+          npm audit --audit-level=high
 
   wallet:
     name: Wallet (frontend build + backend test)
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Free runner disk space
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
       - name: Tauri system dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y \
             libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev \
-            libayatana-appindicator3-dev
-      - uses: actions/setup-node@v4
+            libayatana-appindicator3-dev clang libclang-dev cmake pkg-config
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 20
       - name: Cache cargo build
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: wallet/src-tauri
       - name: Frontend typecheck + production build
@@ -60,4 +175,4 @@ jobs:
           npm run build
       - name: Wallet backend tests (Tor config, keystore)
         working-directory: wallet/src-tauri
-        run: cargo test
+        run: cargo test --locked

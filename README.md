@@ -16,9 +16,9 @@ If you read that and want to see the machinery, you are the intended audience.
 |---|---|
 | **Whole-pool anonymity** | Every spend proves an in-circuit Merkle path to the global tree. One-input spends are padded with value-zero phantoms so even transaction arity is invisible. |
 | **Post-quantum, no ceremonies** | Plonky3 STARK over hash functions, Poseidon2 commitments, ML-KEM-768 note encryption, ML-DSA threshold issuance. No trusted setup ever happened; there is nothing to leak. |
-| **Shielded assets** | Register a ticker (first-mint-wins, hard supply cap), mint under an M-of-N lattice-signature authority, transfer with the asset id hidden. The circuit enforces per-asset conservation, so 1 zBTC can never be spent as 1 ZCRYPT. |
-| **Shielded Bitcoin** | BTC in, zBTC out, atomically, via hashlocked escrows both chains can verify. Redeem burns the zBTC against the same preimage that releases the BTC. |
-| **Private swaps** | Two escrow legs, one hashlock: asset-for-asset atomic exchange entirely inside the pool. |
+| **Shielded assets** | Register a ticker (gas-paid, first-mint-wins, hard supply cap), mint under a lattice-signature authority (M-of-N capable; the shipped flows use one key), transfer with the asset id hidden. The circuit enforces per-asset conservation, so 1 zBTC can never be spent as 1 ZCRYPT. |
+| **Shielded Bitcoin** | BTC in, zBTC out, atomically, via hashlocked escrows both chains can verify; the mint is gated by an in-consensus Bitcoin SPV proof against a reserve key fixed in genesis. Redeem burns the zBTC against the same preimage that releases the BTC. |
+| **In-pool swaps** | Two escrow legs, one hashlock: asset-for-asset atomic exchange settled inside the pool. The escrow parties, amount and asset are public today; the funding coins are not. |
 | **Bearer + stealth + view keys** | Bearer coins transfer off chain by handing over the secret. Stealth addresses are fresh unlinkable accounts. View keys give an auditor your Normal-address history and nothing else: selective disclosure, not a backdoor. |
 | **Rules you can read** | Every consensus rule is a bytecode program a few opcodes long, differentially tested against the circuit and executed on chain as the admission gate. The explorer steps through it per transaction, re-executes every check it can, and re-verifies the STARK live. Hidden money, transparent law. |
 | **Sound economics** | 21M hard cap, 80% mined on a halving schedule, the 20% foundation allocation **vesting-locked by consensus itself** (50k liquid at genesis, 25% cliff at month 12, monthly through month 48: the chain rejects an early claim). Every fee is burned. |
@@ -27,7 +27,8 @@ If you read that and want to see the machinery, you are the intended audience.
 
 ```sh
 git clone <this repo> zcrypt && cd zcrypt/chain
-docker compose up --build -d          # ABCI state machine + CometBFT + regtest bitcoind
+cp .env.example .env                                  # devnet: ABCI_FEATURES=devnet, ZCRYPT_BTC_NET=regtest
+docker compose --profile dev up --build -d            # ABCI state machine + CometBFT + Caddy (+ regtest bitcoind)
 curl -s http://localhost:36657/status | grep latest_block_height
 ```
 
@@ -41,7 +42,7 @@ EXPLORER_NODE=http://localhost:36657 cargo run --release -p zcrypt-explorer
 # and the STARK proof re-verified in front of you.
 ```
 
-The desktop wallet (`wallet/`, Tauri + React, Tor-by-default) funds, sends, stakes, claims rewards, mints assets, and drives the BTC bridge: `npm install && npm run tauri:dev`. A three-validator consensus stack, a full product-surface e2e, and a live BTC swap demo are one command each (`chain/e2e/docker-compose.3node.yml`, `chain/e2e/run-all.sh`). **To run a validator** (start it, get its identity, bond it from your wallet) see [`chain/README-validator.md`](chain/README-validator.md). The complete operational guide (foundation, wallet, e2e verification) is [running.md](running.md); the production go-live runbook is [`chain/LAUNCH.md`](chain/LAUNCH.md).
+The desktop wallet (`wallet/`, Tauri + React, Tor-by-default and fail-closed) funds, sends, stakes, claims rewards, mints assets, and drives the BTC bridge (mainnet self-custody by default): `npm install && npm run tauri:dev`. A three-validator consensus stack, a full product-surface e2e, and a live BTC swap demo are one command each (`chain/e2e/docker-compose.3node.yml`, `chain/e2e/run-all.sh`). **To run a validator** (start it, get its identity, bond it from your wallet) see [`chain/README-validator.md`](chain/README-validator.md). The complete operational guide (foundation, wallet, e2e verification) is [running.md](running.md); the production go-live runbook is [`chain/LAUNCH.md`](chain/LAUNCH.md).
 
 ## Dig deeper
 
@@ -53,10 +54,12 @@ The desktop wallet (`wallet/`, Tauri + React, Tor-by-default) funds, sends, stak
 
 ## Status
 
-Working software, not a promise: 119+ core tests, differential VM/circuit tests, a
-3-validator BFT stack, and every flow in this README demonstrated live against real
-consensus (the vesting schedule itself was watched executing block-by-block in an
-accelerated run before launch). Proofs are ~1 MB and verify in tens of milliseconds.
-The BTC bridge currently targets regtest and ships disabled in production builds; no
-external audit has been performed yet. Read [security.md](security.md) before trusting
-it with value you care about.
+Working software, not a promise: 270+ tests across the workspace (circuit, VM,
+consensus, persistence, bridge), differential VM/circuit tests, a 3-validator BFT stack,
+and every flow in this README demonstrated live against real consensus (the vesting
+schedule itself was watched executing block-by-block in an accelerated run). Proofs are
+about 1 MB at 244 conjectured bits of soundness and verify in tens of milliseconds.
+The BTC bridge is mainnet-enabled but single-operator (one hot reserve key). An internal
+multi-reviewer audit ran on 2026-09-07 ([AUDIT-2026-09-07.md](AUDIT-2026-09-07.md)) and
+its findings are fixed in the tree; no external audit has been performed yet. Read
+[security.md](security.md) before trusting it with value you care about.

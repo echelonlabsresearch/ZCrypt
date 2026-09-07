@@ -229,7 +229,6 @@ export default function Send({
             <ShareBar
               text={file}
               filename={deliver === "stealth" ? "zcrypt-stealth-note.txt" : "zcrypt-bearer-coin.txt"}
-              subject={deliver === "stealth" ? "A private ZCrypt payment" : "A ZCrypt bearer coin for you"}
             />
           </div>
         )}

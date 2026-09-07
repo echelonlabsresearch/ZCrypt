@@ -1,19 +1,73 @@
-# Foundation edge proxy — Host-based routing on ONE VPS.
+# Foundation edge proxy: Host-based routing on ONE VPS.
 # DNS: explorer.* and rpc.* both A-record to this machine's public IP.
-# TLS: automatic via Let's Encrypt when DOMAIN names resolve here (ports 80+443 open).
-# Local / no DNS: set EXPLORER_DOMAIN=explorer.localhost RPC_DOMAIN=rpc.localhost
-#   and Caddy will use internal TLS (or HTTP if you use http:// prefixes).
+# TLS: automatic via Let's Encrypt when the domains resolve here (ports 80+443 open).
+# Local / no DNS: set EXPLORER_DOMAIN=explorer.localhost RPC_DOMAIN=rpc.localhost and Caddy
+# uses internal TLS (or HTTP if you use http:// prefixes).
+#
+# The RPC vhost is deliberately narrow:
+#   * only the read endpoints wallets, explorers and joining validators need, plus the
+#     broadcast endpoints (GET and the JSON-RPC POST at /);
+#   * request bodies capped (a shield tx bundle is ~3 MB base64; 8 MB leaves headroom),
+#     so nobody can push 30 MB proofs at the node through the public edge;
+#   * per-IP rate limits, tighter on broadcast (every broadcast can cost the node a STARK
+#     verification). The limits are per Caddy instance (in-memory).
+# Everything else (websocket subscriptions, mempool dumps, net_info, unsafe_*) returns 404
+# at the edge. Operators query those on the localhost-only raw RPC port.
 
-# Global options only when ACME_EMAIL is set (see docker-compose environment).
-# Without a real domain + email, Caddy still serves; public LE certs need DNS → this host.
+{
+	# The rate_limit directive comes from mholt/caddy-ratelimit (see Dockerfile.caddy).
+	order rate_limit before basicauth
+}
 
 {$EXPLORER_DOMAIN:explorer.localhost} {
 	encode gzip
+	header -Server
 	reverse_proxy explorer:8080
 }
 
 {$RPC_DOMAIN:rpc.localhost} {
-	# CometBFT JSON-RPC + /genesis for wallets and joining validators.
-	# WebSocket upgrades allowed for /websocket if clients need it.
-	reverse_proxy cometbft:26657
+	header -Server
+	request_body {
+		max_size 8MB
+	}
+
+	rate_limit {
+		zone rpc_broadcast {
+			match {
+				path /broadcast_tx_commit /broadcast_tx_sync /broadcast_tx_async
+				method POST
+			}
+			key {client_ip}
+			events 30
+			window 1m
+		}
+		zone rpc_read {
+			key {client_ip}
+			events 600
+			window 1m
+		}
+	}
+
+	# Read + broadcast endpoints used by the wallet (chain.rs), the bridge client
+	# (zcrypt.rs), the explorer and validator-entrypoint.sh.
+	@allowed {
+		method GET
+		path /status /health /genesis /genesis_chunked /abci_query /block /block_results \
+		     /blockchain /commit /validators /tx /tx_search /header /header_by_hash \
+		     /consensus_params /broadcast_tx_commit /broadcast_tx_sync /broadcast_tx_async
+	}
+	# JSON-RPC over POST at the root (the wallet posts broadcast_tx_commit this way).
+	@jsonrpc {
+		method POST
+		path /
+	}
+	handle @allowed {
+		reverse_proxy cometbft:26657
+	}
+	handle @jsonrpc {
+		reverse_proxy cometbft:26657
+	}
+	handle {
+		respond "not found" 404
+	}
 }

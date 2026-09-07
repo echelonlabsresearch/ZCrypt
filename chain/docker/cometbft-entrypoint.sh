@@ -1,66 +1,121 @@
 #!/bin/sh
+# Foundation CometBFT entrypoint: initialises the home dir ONCE and bakes the ZCrypt genesis
+# app_state from environment variables. Every value that reaches genesis.json is validated
+# against a strict whitelist pattern first (a stray quote, pipe or brace in an env var must
+# never become JSON), and the resulting file's SHA-256 is printed and written next to it so
+# the operator can publish it for joining validators (validator-entrypoint.sh verifies it
+# when GENESIS_SHA256 is set).
 set -eu
 
 HOME_DIR="${COMETBFT_HOME:-/data}"
 ABCI_ADDR="${ABCI_ADDR:-tcp://abci:26658}"
+GENESIS="$HOME_DIR/config/genesis.json"
+CFG="$HOME_DIR/config/config.toml"
 
-if [ ! -f "$HOME_DIR/config/genesis.json" ]; then
+# check NAME VALUE ERE: abort unless VALUE matches the whole extended regex.
+check() {
+  if ! printf '%s' "$2" | grep -Eq "^($3)$"; then
+    echo "[genesis] invalid $1='$2' (expected /$3/)" >&2
+    exit 1
+  fi
+}
+
+if [ ! -f "$GENESIS" ]; then
   echo "Initializing CometBFT home at $HOME_DIR"
   cometbft init --home "$HOME_DIR" >/dev/null
 
-  # CometBFT 0.37 `init` has no --chain-id flag; set it in genesis directly.
-  sed -i "s|\"chain_id\": \"[^\"]*\"|\"chain_id\": \"${CHAIN_ID:-zcrypt-1}\"|" "$HOME_DIR/config/genesis.json"
+  CHAIN_ID="${CHAIN_ID:-zcrypt-1}"
+  check CHAIN_ID "$CHAIN_ID" '[A-Za-z0-9._-]{1,50}'
+  check ABCI_ADDR "$ABCI_ADDR" '(tcp|unix)://[A-Za-z0-9._/-]+(:[0-9]{1,5})?'
+  EMPTY_BLOCKS="${EMPTY_BLOCKS:-true}"
+  check EMPTY_BLOCKS "$EMPTY_BLOCKS" 'true|false'
+  TIMEOUT_COMMIT="${TIMEOUT_COMMIT:-1s}"
+  check TIMEOUT_COMMIT "$TIMEOUT_COMMIT" '[0-9]{1,6}(ms|s)'
+  # CORS: JSON array of origins. Default none: the wallet is a native app (no CORS) and
+  # the explorer talks to the node server-side, so browsers need no direct RPC access.
+  RPC_CORS_ORIGINS="${RPC_CORS_ORIGINS:-[]}"
+  check RPC_CORS_ORIGINS "$RPC_CORS_ORIGINS" '\[\]|\[("[A-Za-z0-9.:/*_-]+"(, ?)?)+\]'
 
-  # Point consensus at the Python ABCI server.
-  sed -i "s|^proxy_app =.*|proxy_app = \"${ABCI_ADDR}\"|" "$HOME_DIR/config/config.toml"
-  # Produce blocks continuously (like a real PoS chain): staking block rewards
-  # are distributed every EPOCH=100 blocks, so consensus must keep ticking even
-  # when idle. A short commit timeout keeps the devnet's epoch (~reward payout)
-  # reachable. The 1s default matches the protocol's target block time
-  # (emission halving + foundation vesting are calibrated to 1s blocks).
-  # Override with EMPTY_BLOCKS / TIMEOUT_COMMIT.
-  sed -i "s|^create_empty_blocks =.*|create_empty_blocks = ${EMPTY_BLOCKS:-true}|" "$HOME_DIR/config/config.toml"
-  sed -i "s|^timeout_commit =.*|timeout_commit = \"${TIMEOUT_COMMIT:-1s}\"|" "$HOME_DIR/config/config.toml"
-
-  # Expose the RPC on all interfaces so the host port mapping can reach it.
-  sed -i 's|^laddr = "tcp://127.0.0.1:26657"|laddr = "tcp://0.0.0.0:26657"|' "$HOME_DIR/config/config.toml"
-  # Allow cross-origin RPC calls (dev convenience).
-  sed -i 's|^cors_allowed_origins = \[\]|cors_allowed_origins = ["*"]|' "$HOME_DIR/config/config.toml"
-  # Shield proofs are ~920 KB (128-bit soundness), which base64-encodes past the
-  # default 1 MB RPC body + mempool tx limits. Raise them so shield txs broadcast.
-  sed -i 's|^max_body_bytes =.*|max_body_bytes = 30000000|' "$HOME_DIR/config/config.toml"
-  sed -i 's|^max_tx_bytes =.*|max_tx_bytes = 12000000|' "$HOME_DIR/config/config.toml"
-
-  # Inject ZCrypt genesis app_state: the empty registry SMT PLUS the foundation reward
-  # address, so a published genesis.json FULLY describes the chain. A joining validator
-  # then reads the foundation addr straight from genesis (no out-of-band env var needed to
-  # compute the same genesis app_hash). Empty when unset — the node treats "" as absent and
-  # falls back to ZCRYPT_FOUNDATION_ADDR / the dev seed, so this stays backward compatible.
+  # --- ZCrypt genesis app_state --------------------------------------------------------
+  # foundation_addr: 64-hex reward address of the foundation cold key (empty = devnet dev
+  # seed fallback; production builds refuse to start without it).
   FADDR="${ZCRYPT_FOUNDATION_ADDR:-}"
+  check ZCRYPT_FOUNDATION_ADDR "$FADDR" '|[0-9a-f]{64}'
   # foundation_sentinel: make THIS node (the sole genesis validator) the liveness guarantor
-  # — the app keeps its voting power above 2/3 forever, so the chain never halts even if
-  # every other validator leaves. Default on for the foundation; set FOUNDATION_SENTINEL=false
-  # for a plain BFT chain with no privileged node.
+  # while the chain bootstraps. Set FOUNDATION_SENTINEL=false for a plain BFT chain.
   FSENTINEL="${FOUNDATION_SENTINEL:-true}"
-  # foundation_sentinel_decay: whole ZCRYPT of EXTERNAL (non-sentinel) stake at which the
-  # sentinel AUTO-RETIRES to normal staked power — so the >2/3 liveness crutch is a bootstrap
-  # phase, not a permanent authority. 0 = permanent (legacy). Tune to your tokenomics; it can
-  # also be retired early by a sentinel-signed disable tx (0x68). Default: retire once ~1M
-  # ZCRYPT of independent stake secures the chain.
+  check FOUNDATION_SENTINEL "$FSENTINEL" 'true|false'
+  # foundation_sentinel_decay: whole ZCRYPT of EXTERNAL stake at which the sentinel retires
+  # to normal staked power (0 = permanent). It can also be retired early by a
+  # sentinel-signed disable tx (0x68).
   FSENTINEL_DECAY="${FOUNDATION_SENTINEL_DECAY:-1000000}"
-  # Bitcoin SPV mint gate baked into genesis too, so a joining validator inherits the
-  # IDENTICAL network + checkpoint straight from the downloaded genesis (no env var, no
-  # out-of-band coordination). CONSENSUS-CRITICAL: the checkpoint must be a recent, buried,
-  # independently-verified header at a height that is a multiple of 2016 (see
-  # chain/mainnet-checkpoint.sh). Empty when unset (devnet: the node then defaults regtest).
+  check FOUNDATION_SENTINEL_DECAY "$FSENTINEL_DECAY" '[0-9]{1,18}'
+  # Bitcoin SPV mint gate, baked into genesis so every validator inherits the identical
+  # network + checkpoint. Mainnet REQUIRES a checkpoint at a 2016-multiple height (see
+  # chain/mainnet-checkpoint.sh); the node fails closed without one.
   BTC_NET="${ZCRYPT_BTC_NET:-}"
+  check ZCRYPT_BTC_NET "$BTC_NET" '|mainnet|signet|testnet|regtest'
   BTC_CP="${ZCRYPT_BTC_CHECKPOINT:-}"
-  # zbtc_reserve_pk: the 33-byte compressed secp256k1 reserve key (hex) zBTC is bound to,
-  # registered by the node at InitChain. Binding it in genesis (instead of a first-come
-  # REGISTER tx) means nobody can race the foundation to own the peg's reserve authority.
-  # Empty when unset (then zBTC is simply not registered at genesis).
+  check ZCRYPT_BTC_CHECKPOINT "$BTC_CP" '|[0-9a-f]{160}:[0-9]{1,9}'
+  # zbtc_reserve_pk: 33-byte compressed secp256k1 reserve PUBLIC key (hex). The node
+  # registers zBTC against it at InitChain, so the peg's reserve authority is fixed by
+  # genesis and can never be claimed by a first-come REGISTER tx. Empty = zBTC not
+  # registered at genesis (devnet only).
   ZBTC_PK="${ZCRYPT_RESERVE_PK:-}"
-  sed -i "s|\"app_hash\": \"\"|\"app_hash\": \"\", \"app_state\": { \"registry\": { \"minted_total\": 0, \"leaves\": [] }, \"foundation_addr\": \"$FADDR\", \"foundation_sentinel\": $FSENTINEL, \"foundation_sentinel_decay\": $FSENTINEL_DECAY, \"btc_net\": \"$BTC_NET\", \"btc_checkpoint\": \"$BTC_CP\", \"zbtc_reserve_pk\": \"$ZBTC_PK\" }|" "$HOME_DIR/config/genesis.json"
+  check ZCRYPT_RESERVE_PK "$ZBTC_PK" '|0[23][0-9a-f]{64}'
+
+  APP_STATE=$(printf '{"registry":{"minted_total":0,"leaves":[]},"foundation_addr":"%s","foundation_sentinel":%s,"foundation_sentinel_decay":%s,"btc_net":"%s","btc_checkpoint":"%s","zbtc_reserve_pk":"%s"}' \
+    "$FADDR" "$FSENTINEL" "$FSENTINEL_DECAY" "$BTC_NET" "$BTC_CP" "$ZBTC_PK")
+
+  # Evidence must stay admissible for the whole 10-day unbonding window (1 s blocks), or a
+  # validator could equivocate, unbond, and outlive the evidence: 12 days of blocks and
+  # 12 days in nanoseconds (CometBFT keeps evidence while EITHER bound holds).
+  EVIDENCE_BLOCKS=1036800
+  EVIDENCE_NS=1036800000000000
+
+  if command -v jq >/dev/null 2>&1; then
+    TMP="$GENESIS.tmp"
+    jq --arg cid "$CHAIN_ID" --argjson app "$APP_STATE" \
+       --arg eb "$EVIDENCE_BLOCKS" --arg ed "$EVIDENCE_NS" \
+       '.chain_id = $cid
+        | .app_hash = ""
+        | .app_state = $app
+        | .consensus_params.evidence.max_age_num_blocks = $eb
+        | .consensus_params.evidence.max_age_duration = $ed' \
+       "$GENESIS" > "$TMP" && mv "$TMP" "$GENESIS"
+  else
+    # No jq in this image: the values above are whitelist-validated, so the literal
+    # substitution below cannot inject structure.
+    sed -i "s|\"chain_id\": \"[^\"]*\"|\"chain_id\": \"${CHAIN_ID}\"|" "$GENESIS"
+    sed -i "s|\"app_hash\": \"\"|\"app_hash\": \"\", \"app_state\": ${APP_STATE}|" "$GENESIS"
+    sed -i "s|\"max_age_num_blocks\": \"[0-9]*\"|\"max_age_num_blocks\": \"${EVIDENCE_BLOCKS}\"|" "$GENESIS"
+    sed -i "s|\"max_age_duration\": \"[0-9]*\"|\"max_age_duration\": \"${EVIDENCE_NS}\"|" "$GENESIS"
+  fi
+  grep -q "\"zbtc_reserve_pk\"" "$GENESIS" || { echo "[genesis] app_state injection failed" >&2; exit 1; }
+
+  # --- config.toml --------------------------------------------------------------------
+  sed -i "s|^proxy_app =.*|proxy_app = \"${ABCI_ADDR}\"|" "$CFG"
+  # Produce blocks continuously: staking rewards pay out every EPOCH blocks, and emission /
+  # vesting are calibrated to 1 s blocks, so consensus must keep ticking when idle.
+  sed -i "s|^create_empty_blocks =.*|create_empty_blocks = ${EMPTY_BLOCKS}|" "$CFG"
+  sed -i "s|^timeout_commit =.*|timeout_commit = \"${TIMEOUT_COMMIT}\"|" "$CFG"
+  # Listen on the container interface: the host mapping is localhost-only by default and
+  # the public path is the Caddy edge (allow-listed endpoints, rate limits, body caps).
+  sed -i 's|^laddr = "tcp://127.0.0.1:26657"|laddr = "tcp://0.0.0.0:26657"|' "$CFG"
+  sed -i "s|^cors_allowed_origins =.*|cors_allowed_origins = ${RPC_CORS_ORIGINS}|" "$CFG"
+  # A shield tx bundle (gas tx + main tx, two ~1 MB proofs, fixed-size notes) is ~3 MB as
+  # base64 JSON. 8 MB body / 5 MB tx leaves headroom without accepting arbitrary blobs.
+  sed -i 's|^max_body_bytes =.*|max_body_bytes = 8000000|' "$CFG"
+  sed -i 's|^max_tx_bytes =.*|max_tx_bytes = 5000000|' "$CFG"
+
+  # Publish the genesis fingerprint for joining validators (GENESIS_SHA256).
+  if command -v sha256sum >/dev/null 2>&1; then
+    SUM=$(sha256sum "$GENESIS" | cut -d' ' -f1)
+  else
+    SUM=$(openssl dgst -sha256 "$GENESIS" | sed 's/.*= //')
+  fi
+  printf '%s\n' "$SUM" > "$HOME_DIR/config/genesis.sha256"
+  echo "[genesis] chain_id=$CHAIN_ID sha256=$SUM (publish this with genesis.json)"
 fi
 
 exec cometbft start --home "$HOME_DIR"

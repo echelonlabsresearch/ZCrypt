@@ -20,13 +20,28 @@ export default function Rewards({
   // Pending unbonding (validator unbond or undelegate): persists until the 10-day timer ends.
   type Unbonding = { stake: string; release_time: string };
   const [unbonding, setUnbonding] = useState<Unbonding[]>([]);
-  // Become a validator: bond a node's consensus key with a stake from this wallet.
-  const [seed, setSeed] = useState("");
+  // Become a validator: the consensus PRIVATE key never enters the wallet. Step 1 prepares
+  // the bond parameters (a fresh reward key), the validator host signs them, step 2 submits
+  // the signature together with a stake pledge from this wallet.
+  type BondRequest = {
+    reward_index: number;
+    reward_address_hex: string;
+    chain_id: string;
+    stake_base: string;
+    commission_bps: number;
+    message_layout: string;
+  };
   const [stake, setStake] = useState("10000");
   const [commissionPct, setCommissionPct] = useState("10");
+  const [bondReq, setBondReq] = useState<BondRequest | null>(null);
+  const [vpk, setVpk] = useState("");
+  const [nonce, setNonce] = useState("0");
+  const [sig, setSig] = useState("");
   const [bonding, setBonding] = useState(false);
   const [bondMsg, setBondMsg] = useState("");
   const [bondErr, setBondErr] = useState("");
+  // Reward balances are fetched only on an explicit click (see the note in the UI).
+  const [checked, setChecked] = useState(false);
   // Delegate: stake to an existing validator without running a node.
   type ValInfo = { pubkey: string; stake: string; commission_pct: number };
   const [vals, setVals] = useState<ValInfo[]>([]);
@@ -36,13 +51,8 @@ export default function Rewards({
   const [delMsg, setDelMsg] = useState("");
   const [delErr, setDelErr] = useState("");
 
-  const load = useCallback(async () => {
-    setLoading(true);
-    try {
-      setClaimable(await call<number>("get_claimable"));
-    } catch {
-      setClaimable(0);
-    }
+  // Validators list sends nothing about this wallet to the node: safe to auto-load.
+  const loadValidators = useCallback(async () => {
     try {
       const vs = await call<ValInfo[]>("list_validators");
       setVals(vs);
@@ -50,6 +60,19 @@ export default function Rewards({
     } catch {
       setVals([]);
     }
+  }, []);
+
+  // Balance lookups send this wallet's REWARD keys to the node (fresh keys created per bond
+  // and delegation, never the payment address). They run only when the user asks.
+  const load = useCallback(async () => {
+    setLoading(true);
+    setChecked(true);
+    try {
+      setClaimable(await call<number>("get_claimable"));
+    } catch {
+      setClaimable(0);
+    }
+    await loadValidators();
     try {
       setFees(await call<FeeYield[]>("claimable_fees"));
     } catch {
@@ -62,11 +85,11 @@ export default function Rewards({
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [loadValidators]);
 
   useEffect(() => {
-    if (active) load();
-  }, [active, load]);
+    if (active) loadValidators();
+  }, [active, loadValidators]);
 
   async function claim() {
     setErr("");
@@ -95,18 +118,41 @@ export default function Rewards({
     }
   }
 
-  async function bond() {
+  async function prepareBond() {
     setBondErr("");
     setBondMsg("");
     setBonding(true);
     try {
-      const msg = await call<string>("bond_validator", {
-        consensusSeedHex: seed.trim(),
+      const r = await call<BondRequest>("bond_request", {
+        stakeZcrypt: stake.trim(),
+        commissionPct: commissionPct.trim(),
+      });
+      setBondReq(r);
+    } catch (e) {
+      setBondErr(String(e));
+    } finally {
+      setBonding(false);
+    }
+  }
+
+  async function submitBond() {
+    if (!bondReq) return;
+    setBondErr("");
+    setBondMsg("");
+    setBonding(true);
+    try {
+      const msg = await call<string>("bond_validator_signed", {
+        rewardIndex: bondReq.reward_index,
+        consensusPubkeyHex: vpk.trim(),
+        nonce: nonce.trim(),
+        signatureHex: sig.trim(),
         stakeZcrypt: stake.trim(),
         commissionPct: commissionPct.trim(),
       });
       setBondMsg(msg);
-      setSeed("");
+      setBondReq(null);
+      setVpk("");
+      setSig("");
       await load();
     } catch (e) {
       setBondErr(String(e));
@@ -155,7 +201,7 @@ export default function Rewards({
         <div className="field">
           <label>Claimable</label>
           <div className="reward-amount">
-            {loading ? "…" : `${fmt(claimable)} ZCRYPT`}
+            {!checked ? "not checked" : loading ? "…" : `${fmt(claimable)} ZCRYPT`}
           </div>
         </div>
         {err && <div className="msg err">{err}</div>}
@@ -176,14 +222,14 @@ export default function Rewards({
           disabled={loading || busy}
           onClick={load}
         >
-          ↻ Refresh
+          {checked ? "↻ Check again" : "🔎 Check rewards"}
         </button>
         <div className="warn" style={{ marginTop: "1rem" }}>
-          Block rewards accrue to this wallet's address when a validator bonded to it
-          signs blocks — every epoch, the reward is split by <b>stake × participation</b>.
-          Claiming mints coinbase coins <b>bound to your key</b> into the note tree; only
-          you can spend them. The amount is fixed by the emission schedule, so a validator
-          can never mint itself extra. Requires a node connection (Settings).
+          Checking asks the node for the balances of this wallet's <b>reward keys</b>: a fresh key is created
+          for every bond and delegation, so your payment address is never sent. The node still learns that this
+          session owns those keys, which is why the check only runs when you click. Claiming mints coinbase
+          coins <b>bound to your key</b>; only you can spend them. The amount is fixed by the emission schedule,
+          so a validator can never mint itself extra.
         </div>
       </div>
 
@@ -220,25 +266,10 @@ export default function Rewards({
       <div className="card" style={{ maxWidth: 560, margin: "1.25rem auto 0" }}>
         <h3 style={{ marginTop: 0 }}>🛡️ Become a validator</h3>
         <div style={{ fontSize: "0.82rem", opacity: 0.75, marginBottom: "0.7rem" }}>
-          Bond a running validator node using a stake from <b>this wallet's balance</b>.
-          Rewards from the validator accrue here. The stake is pledged (burned) and returns
-          after a 10-day unbond.
-        </div>
-        <div className="field">
-          <label>Validator consensus key (hex)</label>
-          <input
-            value={seed}
-            onChange={(e) => setSeed(e.target.value)}
-            placeholder="first 32 bytes of the node's priv_validator_key.json"
-            spellCheck={false}
-          />
-          <div style={{ fontSize: "0.72rem", opacity: 0.6, marginTop: 4 }}>
-            Get it with:{" "}
-            <code>
-              docker exec zcrypt-validator-cometbft cat /cometbft/config/priv_validator_key.json
-            </code>{" "}
-            (base64-decode <code>priv_key.value</code>, first 32 bytes, hex).
-          </div>
+          Bond a running validator node using a stake from <b>this wallet's balance</b>. The validator's
+          consensus <b>private key stays on the validator host</b>: the wallet prepares the bond, the host
+          signs it, and the wallet submits the signature with the stake pledge. Rewards accrue to a fresh
+          reward key of this wallet. The stake is pledged (burned) and returns after a 10-day unbond.
         </div>
         <div className="field">
           <label>Stake (ZCRYPT, min 10,000)</label>
@@ -246,6 +277,7 @@ export default function Rewards({
             value={stake}
             onChange={(e) => setStake(e.target.value)}
             inputMode="numeric"
+            disabled={!!bondReq}
           />
         </div>
         <div className="field">
@@ -254,21 +286,57 @@ export default function Rewards({
             value={commissionPct}
             onChange={(e) => setCommissionPct(e.target.value)}
             inputMode="decimal"
+            disabled={!!bondReq}
           />
           <div style={{ fontSize: "0.72rem", opacity: 0.6, marginTop: 4 }}>
             Lower commission attracts more delegators; you keep this % of what your
             delegators earn. 0-100%.
           </div>
         </div>
+        {!bondReq ? (
+          <button className="btn-primary btn-block" disabled={bonding} onClick={prepareBond}>
+            {bonding ? "Preparing…" : "1. Prepare bond (creates the reward key)"}
+          </button>
+        ) : (
+          <>
+            <div className="mono-box" style={{ fontSize: "0.74rem", whiteSpace: "pre-wrap" }}>
+{`reward_address = ${bondReq.reward_address_hex}
+chain_id       = ${bondReq.chain_id}
+stake_base     = ${bondReq.stake_base}
+commission_bps = ${bondReq.commission_bps}`}
+            </div>
+            <div style={{ fontSize: "0.74rem", opacity: 0.7, margin: "0.4rem 0 0.6rem" }}>
+              2. On the validator host, sign with the consensus key (ed25519) the bytes{" "}
+              <code>{bondReq.message_layout}</code>, where <code>nonce</code> is the node's{" "}
+              <code>/staking/auth_nonce/&lt;consensus_pubkey_hex&gt;</code>. Then paste the pubkey, the nonce
+              you used and the signature below. Nothing secret is entered here.
+            </div>
+            <div className="field">
+              <label>Validator consensus PUBLIC key (hex, 64 chars)</label>
+              <input value={vpk} onChange={(e) => setVpk(e.target.value)} spellCheck={false} />
+            </div>
+            <div className="field">
+              <label>Nonce used in the signature</label>
+              <input value={nonce} onChange={(e) => setNonce(e.target.value)} inputMode="numeric" />
+            </div>
+            <div className="field">
+              <label>Signature (hex, 128 chars)</label>
+              <input value={sig} onChange={(e) => setSig(e.target.value)} spellCheck={false} />
+            </div>
+            <button
+              className="btn-primary btn-block"
+              disabled={bonding || vpk.trim().length !== 64 || sig.trim().length !== 128}
+              onClick={submitBond}
+            >
+              {bonding ? "Bonding on-chain…" : `3. Bond ${stake || "?"} ZCRYPT`}
+            </button>
+            <button className="btn-link" style={{ marginTop: "0.5rem" }} onClick={() => setBondReq(null)}>
+              Cancel
+            </button>
+          </>
+        )}
         {bondErr && <div className="msg err">{bondErr}</div>}
         {bondMsg && <div className="msg ok">{bondMsg}</div>}
-        <button
-          className="btn-primary btn-block"
-          disabled={bonding || !seed.trim()}
-          onClick={bond}
-        >
-          {bonding ? "Bonding on-chain…" : `Bond ${stake || "?"} ZCRYPT`}
-        </button>
       </div>
 
       <div className="card" style={{ maxWidth: 560, margin: "1.25rem auto 0" }}>

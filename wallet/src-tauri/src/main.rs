@@ -8,6 +8,9 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod chain;
+mod privfs;
+
+use zeroize::Zeroizing;
 
 use std::sync::Mutex;
 
@@ -126,9 +129,44 @@ fn default_decimals() -> u8 {
     6
 }
 
+/// One HD index this wallet consumed for a non-transfer action. Every claim, bond,
+/// delegation, mint, bridge deposit and redeem uses a FRESH stealth sub-account pk
+/// (never the reusable Normal pk inside the payment address), so an observer who
+/// knows the address cannot grep the chain for the owner's staking or bridge history.
+/// The log is what lets the wallet find those keys again (claimable balances, the
+/// delegator key for an undelegate, the BTC refund key of a deposit) and is rebuilt
+/// from the chain on restore.
+#[derive(Clone, Serialize, Deserialize)]
+struct ActionKey {
+    index: u32,
+    /// "bond" | "delegate" | "mint" | "shield" | "redeem"
+    kind: String,
+    /// Validator consensus pubkey hex for bond/delegate; empty otherwise.
+    #[serde(default)]
+    target: String,
+}
+
+/// An HTLC escrow one of our keys is party to, recorded from the chain so the coin a
+/// claim or an expiry re-materializes can be reconstructed locally (no node query).
+#[derive(Clone, Serialize, Deserialize)]
+struct EscrowRec {
+    id_hex: String,
+    #[serde(with = "u64_str")]
+    value: u64,
+    #[serde(with = "u64_str")]
+    asset_id: u64,
+    /// HD index of the key that receives the coin (claimer or refund pk).
+    index: u32,
+    /// "claim" (we hold party_pk) or "refund" (we hold refund_pk).
+    role: String,
+    /// SPV-backed mint (the settled coin is net of the bridge fee).
+    #[serde(default)]
+    spv: bool,
+}
+
 struct Wallet {
     account: Account,
-    mnemonic: String,
+    mnemonic: Zeroizing<String>,
     coins: Vec<CoinRec>,
     history: Vec<HistItem>,
     next_stealth: u32,
@@ -152,12 +190,71 @@ struct Wallet {
     /// so the user sees one clean "Sent 3" instead of the intermediate split steps.
     /// Transient (not persisted) — it only spans a single reshape+scan cycle.
     hist_suppress: std::collections::HashSet<zcrypt_shield::Commitment>,
+    /// HD indices consumed by claims / bonds / delegations / mints / bridge ops.
+    action_keys: Vec<ActionKey>,
+    /// Next reward-claim index per reward pk (hex), maintained by the block scan.
+    claim_counters: std::collections::BTreeMap<String, u64>,
+    /// Next fee-claim index per "pk_hex:asset_id", maintained by the block scan.
+    fee_claim_counters: std::collections::BTreeMap<String, u64>,
+    /// Escrows one of our keys is party to (for local settlement-coin reconstruction).
+    escrows: Vec<EscrowRec>,
 }
 
 impl Wallet {
-    /// The account for a stealth sub-address (from its stored random seed).
-    fn stealth_account(&self, seed: &[u8; 32]) -> Account {
-        Account::from_seed(*seed)
+    fn fresh(account: Account, mnemonic: Zeroizing<String>) -> Wallet {
+        Wallet {
+            account,
+            mnemonic,
+            coins: vec![],
+            history: vec![],
+            next_stealth: 0,
+            next_change: 0,
+            stealth_seeds: vec![],
+            clock: 0,
+            scan_height: 0,
+            chain_tag: String::new(),
+            hist_suppress: std::collections::HashSet::new(),
+            action_keys: vec![],
+            claim_counters: Default::default(),
+            fee_claim_counters: Default::default(),
+            escrows: vec![],
+        }
+    }
+
+    /// Consume the next HD stealth index (shared counter with change outputs, so the
+    /// scan window `stealth(0..next_change+20)` always covers every key we ever used).
+    fn alloc_index(&mut self) -> u32 {
+        let i = self.next_change;
+        self.next_change = self.next_change.saturating_add(1);
+        i
+    }
+
+    /// Record that HD index `index` was used for `kind` (idempotent).
+    fn note_action(&mut self, index: u32, kind: &str, target: &str) {
+        if !self.action_keys.iter().any(|a| a.index == index && a.kind == kind && a.target == target) {
+            self.action_keys.push(ActionKey { index, kind: kind.into(), target: target.into() });
+        }
+        if index >= self.next_change {
+            self.next_change = index + 1;
+        }
+    }
+
+    /// The stealth sub-account at HD `index`.
+    fn key_at(&self, index: u32) -> Account {
+        self.account.stealth(index)
+    }
+
+    /// HD indices bound as REWARD keys (every bond and delegation), deduplicated.
+    fn reward_indices(&self) -> Vec<u32> {
+        let mut v: Vec<u32> = self
+            .action_keys
+            .iter()
+            .filter(|a| a.kind == "bond" || a.kind == "delegate")
+            .map(|a| a.index)
+            .collect();
+        v.sort_unstable();
+        v.dedup();
+        v
     }
 }
 
@@ -217,16 +314,16 @@ struct Keystore {
     ct: String, // ChaCha20-Poly1305 of the mnemonic
 }
 
-fn derive_key(password: &str, salt: &[u8]) -> [u8; 32] {
+fn derive_key(password: &str, salt: &[u8]) -> Zeroizing<[u8; 32]> {
     // H8: Argon2id — memory-hard, so an attacker who copies `keystore.json` cannot
     // cheaply brute-force the password on GPUs/ASICs the way a plain SHA3 chain
     // allowed. 64 MiB / 3 passes is a sensible interactive-desktop cost.
     use argon2::{Algorithm, Argon2, Params, Version};
     let params = Params::new(64 * 1024, 3, 1, Some(32)).expect("valid Argon2 params");
     let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
-    let mut key = [0u8; 32];
+    let mut key = Zeroizing::new([0u8; 32]);
     argon2
-        .hash_password_into(password.as_bytes(), salt, &mut key)
+        .hash_password_into(password.as_bytes(), salt, key.as_mut())
         .expect("argon2 derivation");
     key
 }
@@ -236,7 +333,7 @@ fn seal(password: &str, mnemonic: &str) -> Keystore {
     use chacha20poly1305::{ChaCha20Poly1305, Nonce};
     let salt = keys::random_seed();
     let key = derive_key(password, &salt);
-    let cipher = ChaCha20Poly1305::new_from_slice(&key).unwrap();
+    let cipher = ChaCha20Poly1305::new_from_slice(key.as_ref()).unwrap();
     let nonce_bytes = keys::random_seed();
     let nonce = Nonce::from_slice(&nonce_bytes[..12]);
     let ct = cipher.encrypt(nonce, mnemonic.as_bytes()).unwrap();
@@ -247,16 +344,23 @@ fn seal(password: &str, mnemonic: &str) -> Keystore {
     }
 }
 
-fn unseal(password: &str, ks: &Keystore) -> Option<String> {
+fn unseal(password: &str, ks: &Keystore) -> Option<Zeroizing<String>> {
     use chacha20poly1305::aead::{Aead, KeyInit};
     use chacha20poly1305::{ChaCha20Poly1305, Nonce};
     let salt = hex::decode(&ks.salt).ok()?;
     let key = derive_key(password, &salt);
-    let cipher = ChaCha20Poly1305::new_from_slice(&key).ok()?;
+    let cipher = ChaCha20Poly1305::new_from_slice(key.as_ref()).ok()?;
     let nonce = hex::decode(&ks.nonce).ok()?;
     let ct = hex::decode(&ks.ct).ok()?;
-    let pt = cipher.decrypt(Nonce::from_slice(&nonce), ct.as_ref()).ok()?;
-    String::from_utf8(pt).ok()
+    let pt = Zeroizing::new(cipher.decrypt(Nonce::from_slice(&nonce), ct.as_ref()).ok()?);
+    let phrase = String::from_utf8(pt.to_vec()).ok()?;
+    Some(Zeroizing::new(phrase))
+}
+
+/// Persist a sealed keystore as a private (0600) file.
+fn write_keystore(dir: &str, ks: &Keystore) -> Result<(), String> {
+    let json = serde_json::to_string(ks).map_err(|e| e.to_string())?;
+    privfs::write_private(&keystore_path(dir), json.as_bytes()).map_err(|e| e.to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -293,13 +397,22 @@ struct PersistState {
     /// Chain generation this store belongs to (see [`Wallet::chain_tag`]).
     #[serde(default)]
     chain_tag: String,
+    #[serde(default)]
+    action_keys: Vec<ActionKey>,
+    #[serde(default)]
+    claim_counters: std::collections::BTreeMap<String, u64>,
+    #[serde(default)]
+    fee_claim_counters: std::collections::BTreeMap<String, u64>,
+    #[serde(default)]
+    escrows: Vec<EscrowRec>,
 }
 
 // Encryption key for the coin store, bound to the account seed (available while
 // unlocked). Losing/rotating the mnemonic invalidates it; that's fine — the coins
 // are re-scannable on-chain.
-fn state_key(account: &Account) -> [u8; 32] {
-    zcrypt_core::hash::h(b"ZC-COINKEY", &[&account.seed()])
+fn state_key(account: &Account) -> Zeroizing<[u8; 32]> {
+    let seed = Zeroizing::new(account.seed());
+    Zeroizing::new(zcrypt_core::hash::h(b"ZC-COINKEY", &[seed.as_ref()]))
 }
 
 fn save_state(w: &Wallet, dir: &str) -> Result<(), String> {
@@ -325,16 +438,20 @@ fn save_state(w: &Wallet, dir: &str) -> Result<(), String> {
         stealth_seeds: w.stealth_seeds.clone(),
         clock: w.clock,
         chain_tag: w.chain_tag.clone(),
+        action_keys: w.action_keys.clone(),
+        claim_counters: w.claim_counters.clone(),
+        fee_claim_counters: w.fee_claim_counters.clone(),
+        escrows: w.escrows.clone(),
     };
-    let json = serde_json::to_vec(&ps).map_err(|e| e.to_string())?;
-    let cipher = ChaCha20Poly1305::new_from_slice(&state_key(&w.account)).unwrap();
+    // The plaintext holds every spend secret: keep it in a zeroizing buffer.
+    let json = Zeroizing::new(serde_json::to_vec(&ps).map_err(|e| e.to_string())?);
+    let cipher = ChaCha20Poly1305::new_from_slice(state_key(&w.account).as_ref()).unwrap();
     let nonce = keys::random_seed();
     let ct = cipher
         .encrypt(Nonce::from_slice(&nonce[..12]), json.as_ref())
         .map_err(|e| e.to_string())?;
     let blob = serde_json::json!({ "nonce": hex::encode(&nonce[..12]), "ct": hex::encode(ct) });
-    std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
-    std::fs::write(coins_path(dir), blob.to_string()).map_err(|e| e.to_string())?;
+    privfs::write_private(&coins_path(dir), blob.to_string().as_bytes()).map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -357,9 +474,9 @@ fn load_state(w: &mut Wallet, dir: &str) {
         Some(c) => c,
         None => return,
     };
-    let cipher = ChaCha20Poly1305::new_from_slice(&state_key(&w.account)).unwrap();
+    let cipher = ChaCha20Poly1305::new_from_slice(state_key(&w.account).as_ref()).unwrap();
     let pt = match cipher.decrypt(Nonce::from_slice(&nonce), ct.as_ref()) {
-        Ok(p) => p,
+        Ok(p) => Zeroizing::new(p),
         Err(_) => return,
     };
     let ps: PersistState = match serde_json::from_slice(&pt) {
@@ -383,6 +500,16 @@ fn load_state(w: &mut Wallet, dir: &str) {
     w.stealth_seeds = ps.stealth_seeds;
     w.clock = ps.clock;
     w.chain_tag = ps.chain_tag;
+    w.action_keys = ps.action_keys;
+    w.claim_counters = ps.claim_counters;
+    w.fee_claim_counters = ps.fee_claim_counters;
+    w.escrows = ps.escrows;
+    // Every logged action index must stay inside the scan window.
+    if let Some(m) = w.action_keys.iter().map(|a| a.index).max() {
+        if m >= w.next_change {
+            w.next_change = m + 1;
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -406,60 +533,32 @@ fn create_wallet(password: String, state: State<AppState>) -> R<CreateResult> {
         return Err("password must be at least 8 characters".into());
     }
     let (account, phrase) = keys::new_account();
+    let phrase = Zeroizing::new(phrase);
     let dir = state.data_dir.lock().unwrap().clone();
-    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    privfs::ensure_private_dir(std::path::Path::new(&dir)).map_err(|e| e.to_string())?;
     let ks = seal(&password, &phrase);
-    std::fs::write(
-        keystore_path(&dir),
-        serde_json::to_string(&ks).map_err(|e| e.to_string())?,
-    )
-    .map_err(|e| e.to_string())?;
+    write_keystore(&dir, &ks)?;
     let address = account.normal_address().to_bech32();
-    *state.wallet.lock().unwrap() = Some(Wallet {
-        account,
-        mnemonic: phrase.clone(),
-        coins: vec![],
-        history: vec![],
-        next_stealth: 0,
-        next_change: 0,
-        stealth_seeds: vec![],
-        clock: 0,
-        scan_height: 0,
-        chain_tag: String::new(),
-        hist_suppress: std::collections::HashSet::new(),
-    });
-    ok(CreateResult { address, seed_phrase: phrase })
+    let out = CreateResult { address, seed_phrase: phrase.to_string() };
+    *state.wallet.lock().unwrap() = Some(Wallet::fresh(account, phrase));
+    ok(out)
 }
 
 #[tauri::command]
 fn restore_wallet(password: String, mnemonic: String, state: State<AppState>) -> R<CreateResult> {
+    let mnemonic = Zeroizing::new(mnemonic);
     if password.len() < 8 {
         return Err("password must be at least 8 characters".into());
     }
-    let account = Account::from_mnemonic(mnemonic.trim(), "")
+    let mnemonic = Zeroizing::new(mnemonic.trim().to_string());
+    let account = Account::from_mnemonic(&mnemonic, "")
         .ok_or("invalid recovery phrase (check the words and order)")?;
     let dir = state.data_dir.lock().unwrap().clone();
-    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    let ks = seal(&password, mnemonic.trim());
-    std::fs::write(
-        keystore_path(&dir),
-        serde_json::to_string(&ks).map_err(|e| e.to_string())?,
-    )
-    .map_err(|e| e.to_string())?;
+    privfs::ensure_private_dir(std::path::Path::new(&dir)).map_err(|e| e.to_string())?;
+    let ks = seal(&password, &mnemonic);
+    write_keystore(&dir, &ks)?;
     let address = account.normal_address().to_bech32();
-    *state.wallet.lock().unwrap() = Some(Wallet {
-        account,
-        mnemonic: mnemonic.trim().to_string(),
-        coins: vec![],
-        history: vec![],
-        next_stealth: 0,
-        next_change: 0,
-        stealth_seeds: vec![],
-        clock: 0,
-        scan_height: 0,
-        chain_tag: String::new(),
-        hist_suppress: std::collections::HashSet::new(),
-    });
+    *state.wallet.lock().unwrap() = Some(Wallet::fresh(account, mnemonic));
     // if this machine already has coins for this mnemonic, restore them
     if let Some(w) = state.wallet.lock().unwrap().as_mut() {
         load_state(w, &dir);
@@ -474,19 +573,7 @@ fn unlock_wallet(password: String, state: State<AppState>) -> R<bool> {
     let ks: Keystore = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
     let mnemonic = unseal(&password, &ks).ok_or("wrong password")?;
     let account = Account::from_mnemonic(&mnemonic, "").ok_or("corrupt keystore")?;
-    *state.wallet.lock().unwrap() = Some(Wallet {
-        account,
-        mnemonic,
-        coins: vec![],
-        history: vec![],
-        next_stealth: 0,
-        next_change: 0,
-        stealth_seeds: vec![],
-        clock: 0,
-        scan_height: 0,
-        chain_tag: String::new(),
-        hist_suppress: std::collections::HashSet::new(),
-    });
+    *state.wallet.lock().unwrap() = Some(Wallet::fresh(account, mnemonic));
     // restore persisted coins/history/scan-height for this account
     if let Some(w) = state.wallet.lock().unwrap().as_mut() {
         load_state(w, &dir);
@@ -723,7 +810,8 @@ fn asset_label(url: &str, asset_id: u64) -> (String, u8) {
 /// blob. Trial-decrypts with the normal account and every stealth sub-account.
 #[tauri::command]
 fn receive_coin(note: String, state: State<AppState>) -> R<Received> {
-    let url = node_url(&state);
+    let url = node_url(&state)?;
+    let leaves = chain::fetch_leaves(&url)?;
     with_wallet(&state, |w| {
         let s = note.trim();
         let s = s.strip_prefix("zct1").unwrap_or(s);
@@ -737,6 +825,15 @@ fn receive_coin(note: String, state: State<AppState>) -> R<Received> {
             .ok_or("this note is not addressed to any of your keys")?;
         if w.coins.iter().any(|c| c.coin.commitment() == coin.commitment()) {
             return Err("you already have this coin".into());
+        }
+        // Never credit a phantom: the commitment must already be a leaf of the
+        // on-chain tree (the sender's transaction must have been committed).
+        if chain::find_index(&leaves, &coin.commitment()).is_none() {
+            return Err(
+                "this note's coin is not on the chain yet (the payment may still be pending). \
+                 Ask the sender to confirm it went through, then import it again."
+                    .into(),
+            );
         }
         let id = hex::encode(coin.commitment()[0].to_le_bytes());
         let value = coin.value;
@@ -757,7 +854,7 @@ fn receive_coin(note: String, state: State<AppState>) -> R<Received> {
 #[tauri::command]
 fn create_bearer(amount: u64, asset_id: String, state: State<AppState>) -> R<String> {
     let asset_id: u64 = asset_id.parse().map_err(|_| "invalid asset id".to_string())?;
-    let url = node_url(&state);
+    let url = node_url(&state)?;
     let leaves = chain::fetch_leaves(&url)?;
     with_wallet(&state, |w| {
         let bearer = BearerCoin::create_asset(amount, asset_id);
@@ -779,17 +876,16 @@ fn create_bearer(amount: u64, asset_id: String, state: State<AppState>) -> R<Str
 /// useless. You net (value − fee). If someone already spent it, the sweep is rejected.
 #[tauri::command]
 fn claim_bearer(token: String, state: State<AppState>) -> R<Received> {
-    let url = node_url(&state);
+    let url = node_url(&state)?;
     let leaves = chain::fetch_leaves(&url)?;
     with_wallet(&state, |w| {
         let bearer = BearerCoin::from_bech32(token.trim()).ok_or("invalid bearer coin")?;
         let bcoin = bearer.coin;
         let idx = chain::find_index(&leaves, &bcoin.commitment())
             .ok_or("bearer coin not found on chain (never funded, or already spent)")?;
-        let nf_key = hex::encode(shield_tx::nf_registry_key(&bcoin.nullifier()));
-        if chain::nullifier_spent(&url, &nf_key) {
-            return Err("bearer coin already spent".to_string());
-        }
+        // No "is it spent?" query: asking the node about a specific nullifier would tell
+        // the operator which coin this session is about to sweep. The sweep itself is the
+        // check: a double-spend is rejected atomically (nothing of ours is spent).
         // The sweep is a transfer, so it pays ZCRYPT gas via a bundled gas note (built
         // first — it reserves a spare ZCRYPT coin). You get the FULL bearer value; the
         // 0.01 ZCRYPT gas comes from a separate ZCRYPT coin you hold.
@@ -819,7 +915,13 @@ fn claim_bearer(token: String, state: State<AppState>) -> R<Received> {
         let main_tx = shield_tx::build(&cid, &[spend], &[out0, out1], 0, vec![note0, note1])
             .ok_or("failed to build the claim proof")?;
         let raw = bundle_transfer(&gas_blind, &gas_tx, &main_tx);
-        chain::broadcast(&url, &raw)?;
+        chain::broadcast(&url, &raw).map_err(|e| {
+            if e.contains("spent") || e.contains("nullifier") {
+                "bearer coin already spent (its nullifier is in the registry)".to_string()
+            } else {
+                e
+            }
+        })?;
         w.coins[gas_i].spent = true;
         if let Some(rec) = gchg_rec {
             w.coins.push(rec);
@@ -881,6 +983,13 @@ struct Settings {
     /// DNS leaks.
     #[serde(default = "default_tor_proxy")]
     tor_proxy: String,
+    /// Random 0.25 to 2.5 s delay before every broadcast so the time a proof finished
+    /// is not the time the network first sees the transaction. Default on.
+    #[serde(default = "default_true")]
+    broadcast_jitter: bool,
+}
+fn default_true() -> bool {
+    true
 }
 fn default_btc_url() -> String {
     "http://localhost:18443".into()
@@ -922,6 +1031,7 @@ impl Default for Settings {
             esplora_url: default_esplora_url(),
             tor_enabled: default_tor_enabled(),
             tor_proxy: default_tor_proxy(),
+            broadcast_jitter: true,
         }
     }
 }
@@ -942,7 +1052,11 @@ fn normalize_proxy_or_failclosed(proxy: &str) -> String {
     let p = proxy.trim();
     if p.is_empty() {
         FAILCLOSED_PROXY.to_string()
-    } else if p.starts_with("socks5://") || p.starts_with("socks5h://") || p.starts_with("socks://") {
+    } else if let Some(rest) = p.strip_prefix("socks5h://") {
+        // ureq resolves hostnames THROUGH a SOCKS5 proxy already (no DNS leak), and does
+        // not know the `socks5h` scheme, so map it instead of failing on a common spelling.
+        format!("socks5://{rest}")
+    } else if p.starts_with("socks5://") || p.starts_with("socks://") {
         p.to_string()
     } else {
         format!("socks5://{p}")
@@ -961,16 +1075,9 @@ fn tor_proxy_url(s: &Settings) -> Option<String> {
         return None;
     }
     // Local nodes: always direct (privacy vs a local process is a non-goal, and Tor cannot
-    // reach loopback).
-    let host = s
-        .node_url
-        .trim()
-        .trim_start_matches("http://")
-        .trim_start_matches("https://")
-        .split([':', '/', '?'])
-        .next()
-        .unwrap_or("");
-    if host == "localhost" || host == "127.0.0.1" || host == "::1" || host == "[::1]" {
+    // reach loopback). Decided by a real URL parse (`chain::is_loopback_url`), so a
+    // userinfo trick like `http://localhost:1@evil.test/` is NOT treated as local.
+    if chain::is_loopback_url(&s.node_url) {
         return None;
     }
     // Tor ON + REMOTE node: from here we must NEVER return `None` (that would go direct and
@@ -1070,10 +1177,12 @@ mod tor_tests {
     #[test]
     fn tor_disabled_is_always_direct() {
         // Tor off → direct is correct regardless of proxy/target (no IP-privacy promise).
-        let mut s = Settings::default();
-        s.tor_enabled = false;
-        s.node_url = "http://node.example:26657".into();
-        s.tor_proxy = "".into();
+        let mut s = Settings {
+            tor_enabled: false,
+            node_url: "http://node.example:26657".into(),
+            tor_proxy: "".into(),
+            ..Default::default()
+        };
         assert_eq!(tor_proxy_url(&s), None, "disabled → direct");
         assert_eq!(tor_raw_proxy(&s), None, "disabled → direct (bridge)");
         // Even a perfectly good proxy string is ignored while disabled.
@@ -1087,8 +1196,7 @@ mod tor_tests {
         // THE M8 FIX: Tor ON + a REMOTE node + a blank/whitespace proxy must NOT go direct
         // (which would leak the wallet IP). It routes to the unusable sentinel so the request
         // fails closed. Previously this returned None → direct → IP leak.
-        let mut s = Settings::default();
-        s.node_url = "http://node.example:26657".into();
+        let mut s = Settings { node_url: "http://node.example:26657".into(), ..Default::default() };
         for blank in ["", "   ", "\t "] {
             s.tor_proxy = blank.into();
             assert_eq!(
@@ -1122,12 +1230,18 @@ fn load_settings(dir: &str) -> Settings {
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default();
-    // Keep the node-RPC transport in sync with the persisted Tor preference, so any
-    // request path (send, scan, claim, …) honors it without threading it through. The
-    // bridge (ZCrypt node + Esplora) gets the raw proxy and skips loopback per-target.
-    chain::set_tor(tor_proxy_url(&s));
-    zcrypt_bridge::set_tor(tor_raw_proxy(&s));
+    apply_transport(&s);
     s
+}
+
+/// Push the persisted transport preferences into the RPC layers: Tor routing for node
+/// RPC (its own isolation class per request kind, see `chain::agent_for`), a SEPARATE
+/// Tor circuit class for the bridge (Esplora + bridge node calls, which skip loopback
+/// per target), and the broadcast jitter switch.
+fn apply_transport(s: &Settings) {
+    chain::set_tor(tor_proxy_url(s));
+    zcrypt_bridge::set_tor(tor_raw_proxy(s).map(|p| chain::socks_isolated(&p, "bridge")));
+    chain::set_broadcast_jitter(s.broadcast_jitter);
 }
 
 #[tauri::command]
@@ -1138,17 +1252,22 @@ fn get_settings(state: State<AppState>) -> R<Settings> {
 
 #[tauri::command]
 fn save_settings(settings: Settings, state: State<AppState>) -> R<bool> {
+    // Node-URL policy: remote nodes only over https or as a .onion (see chain::check_node_url).
+    chain::check_node_url(&settings.node_url)?;
     let dir = state.data_dir.lock().unwrap().clone();
-    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    std::fs::write(
-        settings_path(&dir),
-        serde_json::to_string(&settings).map_err(|e| e.to_string())?,
-    )
-    .map_err(|e| e.to_string())?;
-    // Apply the Tor preference immediately (don't wait for the next settings read).
-    chain::set_tor(tor_proxy_url(&settings));
-    zcrypt_bridge::set_tor(tor_raw_proxy(&settings));
+    let json = serde_json::to_string(&settings).map_err(|e| e.to_string())?;
+    // 0600: settings carry the bitcoind RPC password (regtest/bitcoind mode only).
+    privfs::write_private(&settings_path(&dir), json.as_bytes()).map_err(|e| e.to_string())?;
+    // Apply the transport preferences immediately (don't wait for the next settings read).
+    apply_transport(&settings);
     ok(true)
+}
+
+/// The chain id this wallet's signatures are pinned to (first successful node contact),
+/// so the user can see which network they are bound to. `None` until first contact.
+#[tauri::command]
+fn chain_pin() -> R<Option<String>> {
+    ok(chain::pinned_id())
 }
 
 /// Live Tor status for the current settings + node.
@@ -1169,10 +1288,12 @@ struct TorStatus {
 }
 
 fn proxy_hostport(url: &str) -> String {
-    url.trim_start_matches("socks5h://")
+    let rest = url
+        .trim_start_matches("socks5h://")
         .trim_start_matches("socks5://")
-        .trim_start_matches("socks://")
-        .to_string()
+        .trim_start_matches("socks://");
+    // Drop any `user:pass@` isolation credentials.
+    rest.rsplit('@').next().unwrap_or(rest).to_string()
 }
 
 /// TCP-connect to the SOCKS proxy to confirm a Tor daemon is actually listening.
@@ -1230,6 +1351,8 @@ struct NodeStatus {
     height: i64,
     app: String,
     version: String,
+    /// Why the node is unusable (URL policy violation), or empty.
+    error: String,
 }
 
 /// Live connection check against the configured node's CometBFT RPC (`/abci_info`).
@@ -1238,7 +1361,10 @@ fn node_status(state: State<AppState>) -> R<NodeStatus> {
     let dir = state.data_dir.lock().unwrap().clone();
     let url = load_settings(&dir).node_url; // also syncs the Tor transport
     let url = url.trim_end_matches('/');
-    // Route through Tor too (when enabled) — a connection check must not leak the IP.
+    if let Err(e) = chain::check_node_url(url) {
+        return ok(NodeStatus { connected: false, height: 0, app: String::new(), version: String::new(), error: e });
+    }
+    // Route through Tor too (when enabled): a connection check must not leak the IP.
     let agent = chain::agent_with_timeout(4);
     match agent.get(&format!("{url}/abci_info")).call() {
         Ok(resp) => {
@@ -1249,6 +1375,7 @@ fn node_status(state: State<AppState>) -> R<NodeStatus> {
                 height: r["last_block_height"].as_str().and_then(|s| s.parse().ok()).unwrap_or(0),
                 app: r["data"].as_str().unwrap_or("").to_string(),
                 version: r["version"].as_str().unwrap_or("").to_string(),
+                error: String::new(),
             })
         }
         Err(_) => ok(NodeStatus {
@@ -1256,6 +1383,7 @@ fn node_status(state: State<AppState>) -> R<NodeStatus> {
             height: 0,
             app: String::new(),
             version: String::new(),
+            error: String::new(),
         }),
     }
 }
@@ -1263,9 +1391,11 @@ fn node_status(state: State<AppState>) -> R<NodeStatus> {
 // ---------------------------------------------------------------------------
 // On-chain transacting (against the configured node)
 // ---------------------------------------------------------------------------
-fn node_url(state: &State<AppState>) -> String {
+fn node_url(state: &State<AppState>) -> Result<String, String> {
     let dir = state.data_dir.lock().unwrap().clone();
-    load_settings(&dir).node_url
+    let url = load_settings(&dir).node_url;
+    chain::check_node_url(&url)?;
+    Ok(url)
 }
 
 /// Fund the wallet on-chain: seed two coins summing to `amount` into the
@@ -1273,7 +1403,7 @@ fn node_url(state: &State<AppState>) -> String {
 /// two coins are no longer required — kept for balance flexibility.)
 #[tauri::command]
 fn fund_onchain(amount: u64, state: State<AppState>) -> R<u32> {
-    let url = node_url(&state);
+    let url = node_url(&state)?;
     with_wallet(&state, |w| {
         let a0 = amount / 2;
         if a0 > MAX_COIN {
@@ -1694,7 +1824,7 @@ fn ensure_spendable(asset_id: u64, amount: u64, state: &State<AppState>) -> Resu
         w.account.normal_address().to_bech32()
     };
     for _ in 0..12 {
-        let url = node_url(state);
+        let url = node_url(state)?;
         let leaves = chain::fetch_leaves(&url)?;
         // Non-ZCRYPT sends need a separate ZCRYPT coin for gas — check it exists.
         if !is_zcrypt {
@@ -1763,7 +1893,7 @@ fn do_shield_send_raw(
     stealth: bool,
     reshape: bool,
 ) -> Result<SendResult, String> {
-    let url = node_url(state);
+    let url = node_url(state)?;
     let leaves = chain::fetch_leaves(&url)?;
     with_wallet(state, |w| {
         let addr = Address::from_bech32(recipient.trim()).ok_or("invalid recipient (expected zc1…)")?;
@@ -1870,8 +2000,21 @@ fn save_export(filename: String, content: String) -> R<String> {
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_' { c } else { '_' })
         .collect();
-    let path = dir.join(if safe.is_empty() { "zcrypt-export.txt".into() } else { safe });
-    std::fs::write(&path, content).map_err(|e| e.to_string())?;
+    let mut name = if safe.is_empty() { "zcrypt-export".to_string() } else { safe };
+    // Only plain-text exports: anything else gets a .txt suffix (never .html/.sh/.app).
+    let ext_ok = std::path::Path::new(&name)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| matches!(e.to_ascii_lowercase().as_str(), "txt" | "json"))
+        .unwrap_or(false);
+    if !ext_ok {
+        name.push_str(".txt");
+    }
+    let path = dir.join(name);
+    if path.exists() {
+        return Err(format!("{} already exists; pick another file name", path.display()));
+    }
+    privfs::write_new(&path, content.as_bytes()).map_err(|e| e.to_string())?;
     ok(path.to_string_lossy().to_string())
 }
 
@@ -1920,76 +2063,348 @@ fn open_external(target: String) -> R<bool> {
     let cmd = std::process::Command::new("open").arg(t).spawn();
     #[cfg(target_os = "linux")]
     let cmd = std::process::Command::new("xdg-open").arg(t).spawn();
+    // Never route through `cmd.exe`: `start` re-parses metacharacters (`&`, `|`, `^`)
+    // in the target, so an https URL could execute a command. `rundll32
+    // url.dll,FileProtocolHandler` takes the target as a single argv element, and a
+    // local export path opens via `explorer` the same way.
     #[cfg(target_os = "windows")]
-    let cmd = std::process::Command::new("cmd").args(["/C", "start", "", t]).spawn();
+    let cmd = if t.starts_with("https://") || t.starts_with("mailto:") {
+        std::process::Command::new("rundll32").args(["url.dll,FileProtocolHandler", t]).spawn()
+    } else {
+        std::process::Command::new("explorer").arg(t).spawn()
+    };
     cmd.map_err(|e| e.to_string())?;
     ok(true)
 }
 
-/// Collect encrypted note blobs from any consensus tag that embeds a shield tx
-/// (transfers, stake pledges, burn/swap locks). Used by rescan so change survives
-/// without relying solely on local `coins.enc`.
-fn shield_enc_notes_in_tx(tx: &[u8]) -> Vec<Vec<u8>> {
+/// Local copy of the node's gas-prefix parser: `gas_blind(32) ‖ gas_len(4) ‖ gas_tx ‖ rest`.
+fn parse_gas_prefix(b: &[u8]) -> Option<(shield_tx::ShieldTx, &[u8])> {
+    if b.len() < 36 {
+        return None;
+    }
+    let gas_len = u32::from_le_bytes(b[32..36].try_into().ok()?) as usize;
+    let gas_end = 36usize.checked_add(gas_len)?;
+    if b.len() < gas_end {
+        return None;
+    }
+    let gas_tx = shield_tx::from_bytes(&b[36..gas_end])?;
+    Some((gas_tx, &b[gas_end..]))
+}
+
+/// Every shield tx embedded in a raw consensus tx (transfers, gas prefixes, stake
+/// pledges, burn/swap locks). The wallet reads notes (to find its coins) and nullifiers
+/// (to learn which of its coins were spent) from these, entirely offline.
+pub fn shield_txs_in_tx(tx: &[u8]) -> Vec<shield_tx::ShieldTx> {
     let tag = match tx.first() {
         Some(t) => *t,
         None => return Vec::new(),
     };
     let body = &tx[1..];
-    let mut notes = Vec::new();
-    let mut push_stx = |raw: &[u8]| {
-        if let Some(stx) = shield_tx::from_bytes(raw) {
-            notes.extend(stx.enc_notes);
+    let mut out = Vec::new();
+    let at = |off: usize, out: &mut Vec<shield_tx::ShieldTx>| {
+        if body.len() > off {
+            if let Some(stx) = shield_tx::from_bytes(&body[off..]) {
+                out.push(stx);
+            }
         }
     };
     match tag {
         0x55 => {
             // gas_blind(32) ‖ gas_len(4) ‖ gas_tx ‖ main_tx
             if let Some((gas, main)) = bswap::parse_transfer_payload(body) {
-                notes.extend(gas.enc_notes);
-                notes.extend(main.enc_notes);
+                out.push(gas);
+                out.push(main);
             }
         }
-        // bond: pk(32) stake(8) reward(32) commission(2) sig(64) stake_blind(32) ‖ shield
-        0x57 => {
-            if body.len() > 170 {
-                push_stx(&body[170..]);
+        // REGISTER / HTLC_OPEN: gas prefix (its change note may be ours), then the payload.
+        0x59 | 0x5A => {
+            if let Some((gas, _)) = parse_gas_prefix(body) {
+                out.push(gas);
             }
         }
+        // bond: pk(32) stake(8) reward(32) commission(2) nonce(8) sig(64) stake_blind(32) ‖ shield
+        0x57 => at(178, &mut out),
         // burn-lock: value(8) blind(32) asset(8) hashlock(32) timeout(8) refund_pk(64) ‖ shield
-        0x5D => {
-            if body.len() > 152 {
-                push_stx(&body[152..]);
-            }
-        }
+        0x5D => at(152, &mut out),
         // delegate: del_pk(32) target(20) stake(8) reward(32) sig(64) stake_blind(32) ‖ shield
-        0x5F => {
-            if body.len() > 188 {
-                push_stx(&body[188..]);
-            }
-        }
+        0x5F => at(188, &mut out),
         // swap-lock: value(8) blind(32) asset(8) hashlock(32) timeout(8) counterparty(64) refund(64) ‖ shield
-        0x62 => {
-            if body.len() > 216 {
-                push_stx(&body[216..]);
-            }
-        }
-        // burn-lock with btc_claim_pk: 33 + burn-lock body (same shield offset as 0x5D + 33)
-        0x67 => {
-            if body.len() > 185 {
-                push_stx(&body[185..]);
-            }
-        }
+        0x62 => at(216, &mut out),
+        // burn-lock with btc_claim_pk(33) ‖ burn-lock body
+        0x67 => at(185, &mut out),
         _ => {}
     }
-    notes
+    out
 }
 
-/// Scan new blocks for incoming coins (trial-decrypt on-chain notes) and mark any
-/// of our coins whose nullifier now appears in the registry as spent.
+/// A shield pk as its 64-byte wire form (8 × u64 LE).
+fn pk64(pk: &zcrypt_shield::PubKey) -> [u8; 64] {
+    let mut b = [0u8; 64];
+    for (i, limb) in pk.iter().enumerate() {
+        b[i * 8..i * 8 + 8].copy_from_slice(&limb.to_le_bytes());
+    }
+    b
+}
+
+/// One scan pass over already-fetched blocks. Everything here is offline: notes are
+/// trial-decrypted, reward / fee / escrow coins are reconstructed from the public
+/// claim and escrow transactions, and spends are detected by matching every published
+/// nullifier against our own coins' registry keys. Returns the discoveries to merge.
+struct ScanKeys {
+    /// (HD index or None for the main / random-seed accounts, account)
+    accounts: Vec<(Option<u32>, Account)>,
+    /// wire pk -> position in `accounts`
+    by_pk: std::collections::HashMap<[u8; 64], usize>,
+    /// reward address -> HD index (bond / delegate reward keys in the scan window)
+    by_reward: std::collections::HashMap<[u8; 32], u32>,
+    /// delegator ed25519 pubkey -> HD index
+    by_delegator: std::collections::HashMap<[u8; 32], u32>,
+}
+
+struct ScanOut {
+    coins: Vec<(Coin, &'static str)>,
+    spent: std::collections::HashSet<zcrypt_shield::Commitment>,
+    actions: Vec<ActionKey>,
+    escrows: Vec<EscrowRec>,
+    settled_escrows: Vec<String>,
+    claim_counters: std::collections::BTreeMap<String, u64>,
+    fee_claim_counters: std::collections::BTreeMap<String, u64>,
+    max_index_seen: Option<u32>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn scan_pass(
+    blocks: &[(i64, Vec<Vec<u8>>)],
+    keys: &ScanKeys,
+    leaves: &[zcrypt_shield::Commitment],
+    known: &std::collections::HashSet<zcrypt_shield::Commitment>,
+    own_nf_seed: &std::collections::HashMap<[u8; 32], zcrypt_shield::Commitment>,
+    escrows_seed: &[EscrowRec],
+    claim_counters: &std::collections::BTreeMap<String, u64>,
+    fee_claim_counters: &std::collections::BTreeMap<String, u64>,
+) -> ScanOut {
+    use std::collections::{HashMap, HashSet};
+    let leaf_set: HashSet<zcrypt_shield::Commitment> = leaves.iter().copied().collect();
+    let mut out = ScanOut {
+        coins: Vec::new(),
+        spent: HashSet::new(),
+        actions: Vec::new(),
+        escrows: Vec::new(),
+        settled_escrows: Vec::new(),
+        claim_counters: claim_counters.clone(),
+        fee_claim_counters: fee_claim_counters.clone(),
+        max_index_seen: None,
+    };
+    let mut known: HashSet<zcrypt_shield::Commitment> = known.clone();
+    let mut own_nf: HashMap<[u8; 32], zcrypt_shield::Commitment> = own_nf_seed.clone();
+    let mut escrows: Vec<EscrowRec> = escrows_seed.to_vec();
+    let seen_idx = |o: &mut ScanOut, i: Option<u32>| {
+        if let Some(i) = i {
+            o.max_index_seen = Some(o.max_index_seen.map_or(i, |m| m.max(i)));
+        }
+    };
+    let add_coin = |o: &mut ScanOut, known: &mut HashSet<_>, own_nf: &mut HashMap<_, _>, coin: Coin, kind: &'static str, require_leaf: bool| {
+        let com = coin.commitment();
+        if !known.insert(com) {
+            return;
+        }
+        if require_leaf && !leaf_set.contains(&com) {
+            return;
+        }
+        own_nf.insert(shield_tx::nf_registry_key(&coin.nullifier()), com);
+        o.coins.push((coin, kind));
+    };
+    let pk_at = |i: usize| keys.accounts[i].0;
+    for (_h, txs) in blocks {
+        for tx in txs {
+            let tag = match tx.first() {
+                Some(t) => *t,
+                None => continue,
+            };
+            let body = &tx[1..];
+            let stxs = shield_txs_in_tx(tx);
+            // (1) Notes: coins addressed to any of our keys.
+            for stx in &stxs {
+                for note in &stx.enc_notes {
+                    if let Some(ct) = kem::ciphertext_from_bytes(note) {
+                        for (i, acc) in keys.accounts.iter().map(|(_, a)| a).enumerate() {
+                            if let Some(coin) = acc.receive(&ct) {
+                                seen_idx(&mut out, pk_at(i));
+                                add_coin(&mut out, &mut known, &mut own_nf, coin, "receive", true);
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            // (2) Public actions that involve one of our keys.
+            match tag {
+                // bond header: pk(32) stake(8) reward(32) ...
+                0x57 if body.len() >= 72 => {
+                    let reward: [u8; 32] = body[40..72].try_into().unwrap();
+                    if let Some(&idx) = keys.by_reward.get(&reward) {
+                        seen_idx(&mut out, Some(idx));
+                        out.actions.push(ActionKey { index: idx, kind: "bond".into(), target: hex::encode(&body[0..32]) });
+                    }
+                }
+                // delegate header: del_pk(32) target(20) stake(8) reward(32) ...
+                0x5F if body.len() >= 92 => {
+                    let del_pk: [u8; 32] = body[0..32].try_into().unwrap();
+                    let reward: [u8; 32] = body[60..92].try_into().unwrap();
+                    let idx = keys.by_reward.get(&reward).or_else(|| keys.by_delegator.get(&del_pk)).copied();
+                    if let Some(idx) = idx {
+                        seen_idx(&mut out, Some(idx));
+                        out.actions.push(ActionKey { index: idx, kind: "delegate".into(), target: hex::encode(&body[32..52]) });
+                    }
+                }
+                // claim: pk(64) amount(8): the node mints claim_chunks() coins to pk.
+                0x58 if body.len() == 72 => {
+                    let pk: [u8; 64] = body[0..64].try_into().unwrap();
+                    if let Some(&i) = keys.by_pk.get(&pk) {
+                        let amount = u64::from_le_bytes(body[64..72].try_into().unwrap());
+                        let key = hex::encode(pk);
+                        let start = *out.claim_counters.get(&key).unwrap_or(&0);
+                        let chunks = keys::claim_chunks(amount, start == 0);
+                        for (k, chunk) in chunks.iter().enumerate() {
+                            let coin = keys.accounts[i].1.reward_coin(*chunk, start + k as u64);
+                            add_coin(&mut out, &mut known, &mut own_nf, coin, "reward", true);
+                        }
+                        out.claim_counters.insert(key, start + chunks.len() as u64);
+                        seen_idx(&mut out, pk_at(i));
+                    }
+                }
+                // claim_fee: pk(64) asset(8) amount(8)
+                0x66 if body.len() == 80 => {
+                    let pk: [u8; 64] = body[0..64].try_into().unwrap();
+                    if let Some(&i) = keys.by_pk.get(&pk) {
+                        let asset = u64::from_le_bytes(body[64..72].try_into().unwrap());
+                        let amount = u64::from_le_bytes(body[72..80].try_into().unwrap());
+                        let key = format!("{}:{asset}", hex::encode(pk));
+                        let start = *out.fee_claim_counters.get(&key).unwrap_or(&0);
+                        let chunks = keys::claim_chunks(amount, false);
+                        for (k, chunk) in chunks.iter().enumerate() {
+                            let coin = keys.accounts[i].1.fee_reward_coin(*chunk, asset, start + k as u64);
+                            add_coin(&mut out, &mut known, &mut own_nf, coin, "fee", true);
+                        }
+                        out.fee_claim_counters.insert(key, start + chunks.len() as u64);
+                        seen_idx(&mut out, pk_at(i));
+                    }
+                }
+                // HTLC open (authority mint, gas-prefixed) / SPV open: we may be the claimer.
+                0x5A | 0x64 => {
+                    let payload: Option<&[u8]> = if tag == 0x5A {
+                        parse_gas_prefix(body).map(|(_, rest)| rest)
+                    } else {
+                        Some(body)
+                    };
+                    if let Some(pl) = payload {
+                        if pl.len() >= 120 {
+                            let claim_pk: [u8; 64] = pl[56..120].try_into().unwrap();
+                            if let Some(&i) = keys.by_pk.get(&claim_pk) {
+                                if let Some(idx) = pk_at(i) {
+                                    let asset = u64::from_le_bytes(pl[0..8].try_into().unwrap());
+                                    let value = u64::from_le_bytes(pl[8..16].try_into().unwrap());
+                                    let mut lock = [0u8; 32];
+                                    lock.copy_from_slice(&pl[16..48]);
+                                    let timeout = u64::from_le_bytes(pl[48..56].try_into().unwrap());
+                                    let pk = keys.accounts[i].1.pubkey();
+                                    let id = zcrypt_core::htlc_shield::escrow_id(asset, value, &lock, timeout, &pk);
+                                    let rec = EscrowRec { id_hex: hex::encode(id), value, asset_id: asset, index: idx, role: "claim".into(), spv: tag == 0x64 };
+                                    seen_idx(&mut out, Some(idx));
+                                    escrows.push(rec.clone());
+                                    out.escrows.push(rec);
+                                }
+                            }
+                        }
+                    }
+                }
+                // burn-lock (redeem): value(8) blind(32) asset(8) hashlock(32) timeout(8) refund_pk(64)
+                0x5D | 0x67 => {
+                    let off = if tag == 0x67 { 33 } else { 0 };
+                    if body.len() >= off + 152 {
+                        let pl = &body[off..];
+                        let refund_pk: [u8; 64] = pl[88..152].try_into().unwrap();
+                        if let Some(&i) = keys.by_pk.get(&refund_pk) {
+                            if let Some(idx) = pk_at(i) {
+                                let value = u64::from_le_bytes(pl[0..8].try_into().unwrap());
+                                let asset = u64::from_le_bytes(pl[40..48].try_into().unwrap());
+                                let mut lock = [0u8; 32];
+                                lock.copy_from_slice(&pl[48..80]);
+                                let timeout = u64::from_le_bytes(pl[80..88].try_into().unwrap());
+                                let pk = keys.accounts[i].1.pubkey();
+                                let id = zcrypt_core::htlc_shield::escrow_id(asset, value, &lock, timeout, &pk);
+                                let rec = EscrowRec { id_hex: hex::encode(id), value, asset_id: asset, index: idx, role: "refund".into(), spv: false };
+                                seen_idx(&mut out, Some(idx));
+                                escrows.push(rec.clone());
+                                out.escrows.push(rec);
+                            }
+                        }
+                    }
+                }
+                // swap-lock: ... counterparty_pk(64) refund_pk(64); escrow keyed by counterparty.
+                0x62 if body.len() >= 216 => {
+                    let party: [u8; 64] = body[88..152].try_into().unwrap();
+                    let refund: [u8; 64] = body[152..216].try_into().unwrap();
+                    let value = u64::from_le_bytes(body[0..8].try_into().unwrap());
+                    let asset = u64::from_le_bytes(body[40..48].try_into().unwrap());
+                    let mut lock = [0u8; 32];
+                    lock.copy_from_slice(&body[48..80]);
+                    let timeout = u64::from_le_bytes(body[80..88].try_into().unwrap());
+                    let party_pk_limbs = |b: &[u8; 64]| -> zcrypt_shield::PubKey {
+                        core::array::from_fn(|k| u64::from_le_bytes(b[k * 8..k * 8 + 8].try_into().unwrap()))
+                    };
+                    let id = zcrypt_core::htlc_shield::escrow_id(asset, value, &lock, timeout, &party_pk_limbs(&party));
+                    for (pkb, role) in [(party, "claim"), (refund, "refund")] {
+                        if let Some(&i) = keys.by_pk.get(&pkb) {
+                            if let Some(idx) = pk_at(i) {
+                                let rec = EscrowRec { id_hex: hex::encode(id), value, asset_id: asset, index: idx, role: role.into(), spv: false };
+                                seen_idx(&mut out, Some(idx));
+                                escrows.push(rec.clone());
+                                out.escrows.push(rec);
+                            }
+                        }
+                    }
+                }
+                // claim (0x5B) / expire (0x5C): a settled escrow re-materializes a coin.
+                0x5B | 0x5C if body.len() >= 32 => {
+                    let id_hex = hex::encode(&body[0..32]);
+                    let role = if tag == 0x5B { "claim" } else { "refund" };
+                    if let Some(rec) = escrows.iter().find(|e| e.id_hex == id_hex && e.role == role).cloned() {
+                        let net = if rec.spv { rec.value - zcrypt_core::emission::bridge_fee(rec.value) } else { rec.value };
+                        let mut id = [0u8; 32];
+                        id.copy_from_slice(&body[0..32]);
+                        let acct = keys.accounts.iter().find(|(i, _)| *i == Some(rec.index)).map(|(_, a)| a);
+                        if let Some(acct) = acct {
+                            let coin = acct.htlc_coin(net, rec.asset_id, &id);
+                            // SPV mints are held immature (not a leaf yet): record them anyway.
+                            add_coin(&mut out, &mut known, &mut own_nf, coin, if rec.spv { "shield" } else { "escrow" }, !rec.spv);
+                        }
+                        escrows.retain(|e| !(e.id_hex == id_hex && e.role == role));
+                        out.settled_escrows.push(id_hex);
+                    }
+                }
+                _ => {}
+            }
+            // (3) Spends: any published nullifier that belongs to one of our coins.
+            for stx in &stxs {
+                for inp in &stx.inputs {
+                    if let Some(com) = own_nf.get(&shield_tx::nf_registry_key(&inp.nullifier)) {
+                        out.spent.insert(*com);
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Scan new blocks for incoming coins (trial-decrypt on-chain notes), reconstruct the
+/// coins our public actions minted (claims, escrows), and mark our coins spent when their
+/// nullifiers appear on-chain. Fully local: the node only ever serves blocks and leaves.
 #[tauri::command]
 fn scan_onchain(state: State<AppState>) -> R<usize> {
-    use std::collections::HashSet;
-    let url = node_url(&state);
+    use std::collections::{HashMap, HashSet};
+    let url = node_url(&state)?;
     let dir = state.data_dir.lock().unwrap().clone();
     let tip = chain::node_height(&url)?;
     // Identify the chain GENERATION the node is serving. If it differs from what this
@@ -1998,153 +2413,138 @@ fn scan_onchain(state: State<AppState>) -> R<usize> {
     // so the leaf reconcile below drops them and re-finds any coins on the new chain.
     let node_tag = chain::chain_tag(&url).unwrap_or_default();
 
-    // Snapshot only what we need (seed + scan cursor + known coins) under a BRIEF
-    // lock. All network I/O + note decryption below runs WITHOUT the wallet lock,
-    // so `get_balance`/`get_address`/etc. never block behind a long scan — this is
-    // what was freezing the UI (the old scan held the lock across one HTTP call per
-    // block, over a 160k-block chain).
-    let (seed, mut from, mut known): (_, i64, HashSet<zcrypt_shield::Commitment>) = {
+    // Snapshot what the pass needs under a BRIEF lock; all network I/O and decryption
+    // run without it so the UI never blocks behind a long scan.
+    let (seed, mut from) = {
         let mut g = state.wallet.lock().unwrap();
         let w = g.as_mut().ok_or("locked")?;
-        // Chain changed (or first tagged sync): reset the cursor to genesis and adopt
-        // the new tag. A tip below our cursor also means the chain was reset underneath us.
         let changed = !node_tag.is_empty() && node_tag != w.chain_tag;
         if changed || (w.scan_height as i64) > tip {
             if changed {
-                eprintln!("[scan] chain generation changed → resyncing this store from genesis");
+                eprintln!("[scan] chain generation changed; resyncing this store from genesis");
                 w.chain_tag = node_tag.clone();
+                // Claim counters and escrow records belong to the old chain.
+                w.claim_counters.clear();
+                w.fee_claim_counters.clear();
+                w.escrows.clear();
             }
             w.scan_height = 0;
         }
-        (
-            w.account.seed(),
-            w.scan_height as i64,
-            w.coins.iter().map(|c| c.coin.commitment()).collect(),
-        )
+        (Zeroizing::new(w.account.seed()), w.scan_height as i64)
     };
-    // No new blocks to scan for notes — but still reconcile, so a chain reset with a
-    // low tip (or simply drift) always drops stale coins rather than returning early.
     let scan_notes = from < tip;
     if !scan_notes {
         from = tip;
     }
-
-    // Fetch only tx-bearing blocks (skips the empty-block flood), decrypt notes.
-    // Try the main account plus HD stealth change accounts (gap of 20 past next_change).
-    let (change_hi, stealth_seeds): (u32, Vec<[u8; 32]>) = {
-        let g = state.wallet.lock().unwrap();
-        let w = g.as_ref().ok_or("locked")?;
-        (w.next_change.saturating_add(20), w.stealth_seeds.clone())
-    };
-    let account = Account::from_seed(seed);
-    let mut scan_accounts: Vec<Account> = vec![account];
-    for i in 0..change_hi {
-        scan_accounts.push(Account::from_seed(seed).stealth(i));
-    }
-    for s in &stealth_seeds {
-        scan_accounts.push(Account::from_seed(*s));
-    }
     let leaves = chain::fetch_leaves(&url)?;
+    // Fetch every tx-bearing block ONCE (the gap-extension loop below re-reads memory).
     let heights = if scan_notes { chain::nonempty_heights(&url, from + 1, tip)? } else { Vec::new() };
-    let mut received: Vec<Coin> = Vec::new();
-    for h in heights {
-        for tx in chain::block_txs(&url, h) {
-            // Trial-decrypt encrypted notes from every shield-bearing tag so change
-            // after bond/delegate/burn/swap locks is recoverable without coins.enc.
-            for note in shield_enc_notes_in_tx(&tx) {
-                if let Some(ct) = kem::ciphertext_from_bytes(&note) {
-                    for acc in &scan_accounts {
-                        if let Some(coin) = acc.receive(&ct) {
-                            let com = coin.commitment();
-                            if known.insert(com) && chain::find_index(&leaves, &com).is_some() {
-                                received.push(coin);
-                            }
-                            break;
-                        }
+    let blocks: Vec<(i64, Vec<Vec<u8>>)> = heights.into_iter().map(|h| (h, chain::block_txs(&url, h))).collect();
+
+    let mut found = 0usize;
+    // HD gap handling: if a pass reveals a key at or beyond the window, widen and rescan
+    // the same blocks (bounded), like an HD wallet's gap-limit walk.
+    for _pass in 0..4 {
+        let (change_hi, stealth_seeds, known, own_nf, escrows, claim_counters, fee_claim_counters) = {
+            let g = state.wallet.lock().unwrap();
+            let w = g.as_ref().ok_or("locked")?;
+            let own_nf: HashMap<[u8; 32], zcrypt_shield::Commitment> = w
+                .coins
+                .iter()
+                .filter(|c| !c.spent)
+                .map(|c| (shield_tx::nf_registry_key(&c.coin.nullifier()), c.coin.commitment()))
+                .collect();
+            (
+                w.next_change.saturating_add(20),
+                w.stealth_seeds.clone(),
+                w.coins.iter().map(|c| c.coin.commitment()).collect::<HashSet<_>>(),
+                own_nf,
+                w.escrows.clone(),
+                w.claim_counters.clone(),
+                w.fee_claim_counters.clone(),
+            )
+        };
+        let master = Account::from_seed(*seed);
+        let mut accounts: Vec<(Option<u32>, Account)> = vec![(None, Account::from_seed(*seed))];
+        for i in 0..change_hi {
+            accounts.push((Some(i), master.stealth(i)));
+        }
+        for sseed in &stealth_seeds {
+            accounts.push((None, Account::from_seed(*sseed)));
+        }
+        let mut by_pk = HashMap::new();
+        let mut by_reward = HashMap::new();
+        let mut by_delegator = HashMap::new();
+        for (pos, (idx, acc)) in accounts.iter().enumerate() {
+            by_pk.insert(pk64(&acc.pubkey()), pos);
+            if let Some(i) = idx {
+                by_reward.insert(acc.reward_address(), *i);
+                by_delegator.insert(delegator_key_at(&master, *i).verifying_key().to_bytes(), *i);
+            }
+        }
+        let keys = ScanKeys { accounts, by_pk, by_reward, by_delegator };
+        let res = scan_pass(&blocks, &keys, &leaves, &known, &own_nf, &escrows, &claim_counters, &fee_claim_counters);
+        let widen = res.max_index_seen.is_some_and(|m| m + 1 > change_hi.saturating_sub(20));
+        // Merge under a BRIEF lock.
+        {
+            let mut g = state.wallet.lock().unwrap();
+            let w = g.as_mut().ok_or("locked")?;
+            for (coin, kind) in res.coins {
+                let com = coin.commitment();
+                if !w.coins.iter().any(|c| c.coin.commitment() == com) {
+                    let (v, asset) = (coin.value, coin.asset_id);
+                    w.coins.push(CoinRec { coin_id: hex::encode(com[0].to_le_bytes()), value: v, coin, spent: false });
+                    found += 1;
+                    // A coin from an internal reshaping self-transfer is credited but NOT
+                    // logged: it is plumbing, not a real incoming payment.
+                    if !w.hist_suppress.remove(&com) {
+                        let label = match kind {
+                            "reward" => "staking reward",
+                            "fee" => "bridge fee",
+                            "shield" => "BTC to zBTC (maturing)",
+                            "escrow" => "escrow settled",
+                            _ => "incoming",
+                        };
+                        w.push_hist(kind, v as i64, label.into(), asset);
                     }
                 }
             }
-        }
-    }
-
-    // Spent-check current unspent coins (network) OUTSIDE the lock — always via
-    // a decoy batch so the node cannot tell which nullifiers are ours.
-    let to_check: Vec<zcrypt_shield::Commitment> = {
-        let g = state.wallet.lock().unwrap();
-        let w = g.as_ref().ok_or("locked")?;
-        w.coins.iter().filter(|c| !c.spent).map(|c| c.coin.commitment()).collect()
-    };
-    let mut newly_spent: HashSet<zcrypt_shield::Commitment> = HashSet::new();
-    {
-        let g = state.wallet.lock().unwrap();
-        let w = g.as_ref().ok_or("locked")?;
-        let keys: Vec<(zcrypt_shield::Commitment, String)> = w
-            .coins
-            .iter()
-            .filter(|c| to_check.contains(&c.coin.commitment()))
-            .map(|c| (c.coin.commitment(), hex::encode(shield_tx::nf_registry_key(&c.coin.nullifier()))))
-            .collect();
-        drop(g); // release before network
-        let key_hexes: Vec<String> = keys.iter().map(|(_, k)| k.clone()).collect();
-        if let Ok(flags) = chain::nullifiers_spent(&url, &key_hexes) {
-            for ((com, _), spent) in keys.into_iter().zip(flags) {
-                if spent {
-                    newly_spent.insert(com);
+            for c in w.coins.iter_mut() {
+                if res.spent.contains(&c.coin.commitment()) {
+                    c.spent = true;
                 }
             }
-        } else {
-            for (com, key) in keys {
-                if chain::nullifier_spent(&url, &key) {
-                    newly_spent.insert(com);
+            for a in res.actions {
+                w.note_action(a.index, &a.kind, &a.target);
+            }
+            for e in res.escrows {
+                if !w.escrows.iter().any(|x| x.id_hex == e.id_hex && x.role == e.role) {
+                    w.escrows.push(e);
+                }
+            }
+            w.escrows.retain(|e| !res.settled_escrows.contains(&e.id_hex));
+            w.claim_counters = res.claim_counters;
+            w.fee_claim_counters = res.fee_claim_counters;
+            if let Some(m) = res.max_index_seen {
+                if m >= w.next_change {
+                    w.next_change = m + 1;
                 }
             }
         }
+        if !widen || blocks.is_empty() {
+            break;
+        }
     }
 
-    // Merge results under a BRIEF lock, then persist.
-    let found = received.len();
+    // Reconcile against reality under a BRIEF lock, then persist.
     {
         let mut g = state.wallet.lock().unwrap();
         let w = g.as_mut().ok_or("locked")?;
-        for coin in received {
-            let com = coin.commitment();
-            if !w.coins.iter().any(|c| c.coin.commitment() == com) {
-                let v = coin.value;
-                let asset = coin.asset_id;
-                w.coins.push(CoinRec {
-                    coin_id: hex::encode(com[0].to_le_bytes()),
-                    value: v,
-                    coin,
-                    spent: false,
-                });
-                // A coin from an internal reshaping self-transfer is credited but NOT
-                // logged — it's plumbing, not a real incoming payment. Genuine receives
-                // (not in the suppress set) log normally.
-                if w.hist_suppress.remove(&com) {
-                    // reshaping output: silently spendable, no history noise
-                } else {
-                    w.push_hist("receive", v as i64, "incoming".into(), asset);
-                }
-            }
-        }
-        for c in w.coins.iter_mut() {
-            if newly_spent.contains(&c.coin.commitment()) {
-                c.spent = true;
-            }
-        }
-        // Reconcile against reality: drop any coin no longer in the on-chain commitment
-        // tree — the "phantom balance" left after a devnet chain reset, which is what
-        // makes a send fail with "no coins of this asset on-chain". This applies to EVERY
-        // asset (ZCRYPT, zBTC, GOLD, …), so a single Refresh self-heals the wallet.
-        // Membership via a set built once → O(coins), not O(coins × leaves).
-        //
-        // EXCEPTION: freshly-shielded zBTC is held IMMATURE by design (the deep-reorg
-        // defense) — it is deliberately NOT a leaf yet, so a naive "not in tree ⇒ stale"
-        // rule would wrongly kill a maturing coin (and it would never recover). Ask the
-        // node which commitments are still pending and spare those; a coin that is neither
-        // a leaf nor pending is genuinely stale (or a reorg voided its mint) and is dropped.
-        // If the node can't answer (too old / transient error), SKIP the drop this cycle
-        // rather than risk losing a maturing coin — stale-coin cleanup can wait a cycle.
+        // Drop any coin no longer in the on-chain commitment tree (the "phantom balance"
+        // left after a devnet chain reset). Freshly-shielded zBTC is held IMMATURE by
+        // design (not a leaf yet): ask the node which commitments are still pending and
+        // spare those. If the node cannot answer, skip the drop this cycle rather than
+        // risk losing a maturing coin.
         let leaf_set: HashSet<zcrypt_shield::Commitment> = leaves.iter().copied().collect();
         let mut dropped = 0usize;
         match chain::fetch_pending_coins(&url) {
@@ -2166,10 +2566,8 @@ fn scan_onchain(state: State<AppState>) -> R<usize> {
             eprintln!("[scan] reconciled: dropped {dropped} stale coin(s) not on the current chain");
         }
         w.scan_height = tip;
-        // Persist — and if we CAN'T (e.g. a root-owned ~/.zcrypt), say so loudly rather
-        // than silently freezing the wallet on an old snapshot.
         save_state(w, &dir).map_err(|e| {
-            format!("wallet reconciled, but could NOT save to disk: {e}. Fix permissions on ~/.zcrypt (e.g. `sudo chown -R $(whoami) ~/.zcrypt`) — otherwise changes won't persist.")
+            format!("wallet reconciled, but could NOT save to disk: {e}. Fix permissions on ~/.zcrypt (e.g. `sudo chown -R $(whoami) ~/.zcrypt`); otherwise changes won't persist.")
         })?;
     }
     ok(found)
@@ -2188,39 +2586,45 @@ fn pk_hex(pk: &zcrypt_shield::PubKey) -> String {
     hex::encode(b)
 }
 
-/// Unclaimed staking reward balance (base units) for this wallet's address.
-/// Returns 0 when the node is unreachable or nothing has accrued.
-/// Build a coin-backed BOND tx (`0x57`): authenticated header (consensus pubkey ‖ stake ‖
-/// reward ‖ ed25519 signature over `"ZCRYPT-BOND-v1"‖chain‖pubkey‖stake‖reward`), then the
-/// `stake_blind` and the `pledge` shield tx whose output[0] burns exactly `stake` ZCRYPT.
-fn bond_tx(
-    sk: &ed25519_dalek::SigningKey,
+/// The BOND authentication message. The validator's consensus key signs this on the
+/// VALIDATOR HOST; the wallet only ever sees the resulting signature (the consensus
+/// private key never enters the wallet or its webview).
+///
+/// `"ZCRYPT-BOND-v1" ‖ chain_id ‖ consensus_pubkey(32) ‖ stake_le(8) ‖ reward(32) ‖
+///  commission_bps_le(2) ‖ nonce_le(8)`
+fn bond_message(chain_id: &[u8], pk: &[u8; 32], stake: u64, reward: &[u8; 32], commission: u16, nonce: u64) -> Vec<u8> {
+    let mut msg = Vec::new();
+    msg.extend_from_slice(b"ZCRYPT-BOND-v1");
+    msg.extend_from_slice(chain_id);
+    msg.extend_from_slice(pk);
+    msg.extend_from_slice(&stake.to_le_bytes());
+    msg.extend_from_slice(reward);
+    msg.extend_from_slice(&commission.to_le_bytes());
+    msg.extend_from_slice(&nonce.to_le_bytes()); // replay-protection nonce
+    msg
+}
+
+/// Serialize a coin-backed BOND tx (`0x57`) from an EXTERNALLY produced signature:
+/// authenticated header (consensus pubkey ‖ stake ‖ reward ‖ commission ‖ nonce ‖ sig),
+/// then the `stake_blind` and the `pledge` shield tx whose output[0] burns exactly `stake`.
+#[allow(clippy::too_many_arguments)]
+fn bond_tx_presigned(
+    pk: &[u8; 32],
+    sig: &[u8; 64],
     stake: u64,
     reward: [u8; 32],
     commission: u16,
     stake_blind: [u64; 4],
     nonce: u64,
     pledge: &shield_tx::ShieldTx,
-    chain_id: &[u8],
 ) -> Vec<u8> {
-    use ed25519_dalek::Signer;
-    let pk = sk.verifying_key().to_bytes();
-    let mut msg = Vec::new();
-    msg.extend_from_slice(b"ZCRYPT-BOND-v1");
-    msg.extend_from_slice(chain_id);
-    msg.extend_from_slice(&pk);
-    msg.extend_from_slice(&stake.to_le_bytes());
-    msg.extend_from_slice(&reward);
-    msg.extend_from_slice(&commission.to_le_bytes());
-    msg.extend_from_slice(&nonce.to_le_bytes()); // replay-protection nonce
-    let sig = sk.sign(&msg);
     let mut t = vec![0x57u8];
-    t.extend_from_slice(&pk);
+    t.extend_from_slice(pk);
     t.extend_from_slice(&stake.to_le_bytes());
     t.extend_from_slice(&reward);
     t.extend_from_slice(&commission.to_le_bytes());
     t.extend_from_slice(&nonce.to_le_bytes());
-    t.extend_from_slice(&sig.to_bytes());
+    t.extend_from_slice(sig);
     for limb in stake_blind {
         t.extend_from_slice(&limb.to_le_bytes());
     }
@@ -2228,26 +2632,8 @@ fn bond_tx(
     t
 }
 
-/// Bond a validator into the active producing set, funding the stake from THIS wallet's own
-/// coins. Pledges `stake_zcrypt` ZCRYPT (>= 10,000) as a real burn (returned after a 10-day
-/// unbond), signed by the validator node's ed25519 consensus key (`consensus_seed_hex` =
-/// first 32 bytes of its `priv_validator_key.json`, hex). Block rewards accrue to this
-/// wallet's reward address. On the next block the node emits a CometBFT ValidatorUpdate and
-/// the validator starts producing.
-#[tauri::command]
-fn bond_validator(
-    consensus_seed_hex: String,
-    stake_zcrypt: String,
-    commission_pct: String,
-    state: State<AppState>,
-) -> R<String> {
-    let seed = hex::decode(consensus_seed_hex.trim())
-        .map_err(|e| format!("consensus seed: invalid hex ({e})"))?;
-    if seed.len() < 32 {
-        return Err("consensus seed must be 32+ bytes (the first 32 of priv_validator_key.json)".into());
-    }
-    let seed32: [u8; 32] = seed[..32].try_into().unwrap();
-    let sk = ed25519_dalek::SigningKey::from_bytes(&seed32);
+/// Parse "whole ZCRYPT" + "commission %" bond parameters into base units and bps.
+fn parse_bond_params(stake_zcrypt: &str, commission_pct: &str) -> Result<(u64, u16), String> {
     let stake_whole: u64 = stake_zcrypt
         .trim()
         .parse()
@@ -2259,16 +2645,84 @@ fn bond_validator(
         return Err(format!("stake must be at least {} ZCRYPT (the validator minimum)", min / atomic));
     }
     // Commission percent (e.g. "5" or "2.5") -> basis points, 0..=100%.
-    // Integer bps: "5" → 500, "2.5" → 250 (at most 2 fractional digits).
     let commission_bps_u64 = parse_decimal_units(commission_pct.trim(), 2)?;
     if commission_bps_u64 > 10_000 {
         return Err("commission must be between 0 and 100 percent".into());
     }
-    let commission_bps = commission_bps_u64 as u16;
+    Ok((stake, commission_bps_u64 as u16))
+}
+
+/// Everything the validator host needs to sign a BOND for this wallet. The reward key
+/// is a FRESH stealth sub-account (never the reusable Normal pk in the payment address),
+/// allocated and persisted here so it is inside the scan window from now on.
+#[derive(Serialize)]
+struct BondRequest {
+    /// HD index of the reward key; pass it back to `bond_validator_signed`.
+    reward_index: u32,
+    /// The reward address (hex, 32 bytes) the signature must commit to.
+    reward_address_hex: String,
+    /// Chain id the signature is bound to (pinned).
+    chain_id: String,
+    /// Stake in base units (string: may exceed 2^53).
+    stake_base: String,
+    commission_bps: u16,
+    /// The exact byte layout the host must sign (documentation for the signer).
+    message_layout: String,
+}
+
+/// Step 1 of bonding from the wallet: allocate a fresh reward key and return the
+/// parameters the validator host signs with its consensus key (see [`bond_message`]).
+#[tauri::command]
+fn bond_request(stake_zcrypt: String, commission_pct: String, state: State<AppState>) -> R<BondRequest> {
+    let (stake, commission_bps) = parse_bond_params(&stake_zcrypt, &commission_pct)?;
+    let url = node_url(&state)?;
+    let cid = chain_id_for(&url)?;
+    with_wallet(&state, |w| {
+        let idx = w.alloc_index();
+        w.note_action(idx, "bond", "");
+        let reward = w.key_at(idx).reward_address();
+        Ok(BondRequest {
+            reward_index: idx,
+            reward_address_hex: hex::encode(reward),
+            chain_id: String::from_utf8_lossy(&cid).to_string(),
+            stake_base: stake.to_string(),
+            commission_bps,
+            message_layout: "\"ZCRYPT-BOND-v1\" || chain_id || consensus_pubkey(32) || stake_le(8) || reward(32) || commission_bps_le(2) || nonce_le(8); \
+                             nonce = /staking/auth_nonce/<consensus_pubkey_hex>; sign with the validator's ed25519 consensus key"
+                .into(),
+        })
+    })
+    .and_then(ok)
+}
+
+/// Step 2 of bonding: submit the host-produced signature. The wallet verifies it locally
+/// against the bond message, funds the stake pledge from its own coins, and broadcasts.
+/// The consensus PRIVATE key never leaves the validator host.
+#[tauri::command]
+fn bond_validator_signed(
+    reward_index: u32,
+    consensus_pubkey_hex: String,
+    nonce: String,
+    signature_hex: String,
+    stake_zcrypt: String,
+    commission_pct: String,
+    state: State<AppState>,
+) -> R<String> {
+    let (stake, commission_bps) = parse_bond_params(&stake_zcrypt, &commission_pct)?;
+    let atomic = zcrypt_core::emission::ATOMIC;
     let commission_pct_display = format!("{}.{:02}", commission_bps / 100, commission_bps % 100);
-    let url = node_url(&state);
+    let pk: [u8; 32] = hex::decode(consensus_pubkey_hex.trim())
+        .map_err(|e| format!("consensus pubkey: invalid hex ({e})"))?
+        .try_into()
+        .map_err(|_| "consensus pubkey must be 32 bytes (64 hex chars)".to_string())?;
+    let sig: [u8; 64] = hex::decode(signature_hex.trim())
+        .map_err(|e| format!("signature: invalid hex ({e})"))?
+        .try_into()
+        .map_err(|_| "signature must be 64 bytes (128 hex chars)".to_string())?;
+    let nonce: u64 = nonce.trim().parse().map_err(|_| "nonce must be a number".to_string())?;
+    let url = node_url(&state)?;
+    let vpk_hex = hex::encode(pk);
     // Reject re-bond in the wallet: consensus destroys the previous self-bond pledge.
-    let vpk_hex = hex::encode(sk.verifying_key().to_bytes());
     if let Ok(list) = chain::query_str(&url, "/staking/validators") {
         for tok in list.split(',') {
             let f: Vec<&str> = tok.split(':').collect();
@@ -2283,28 +2737,35 @@ fn bond_validator(
     let leaves = chain::fetch_leaves(&url)?;
     with_wallet(&state, |w| {
         let cid = chain_id_for(&url)?;
+        if !w.action_keys.iter().any(|a| a.index == reward_index && a.kind == "bond") {
+            return Err("unknown bond request; start again from step 1".into());
+        }
+        let reward = w.key_at(reward_index).reward_address();
+        // Verify the host's signature BEFORE spending anything on the pledge.
+        let msg = bond_message(&cid, &pk, stake, &reward, commission_bps, nonce);
+        let vk = ed25519_dalek::VerifyingKey::from_bytes(&pk).map_err(|e| format!("consensus pubkey: {e}"))?;
+        vk.verify_strict(&msg, &ed25519_dalek::Signature::from_bytes(&sig))
+            .map_err(|_| "signature does not verify for these bond parameters (check pubkey, nonce, stake, commission, chain)".to_string())?;
         let (pledge, stake_blind, inputs, chg_rec) =
             build_stake_pledge(w, &leaves, stake, &cid).map_err(|e| format!("bonding: {e}"))?;
-        // Broadcast the BOND — rewards to THIS wallet's reward address. The BOND carries the
-        // consensus key's current replay-protection nonce (M3), so the signature is single-use.
-        let reward = w.account.reward_address();
-        let bond_nonce: u64 = chain::query_str(&url, &format!("/staking/auth_nonce/{vpk_hex}"))
-            .ok()
-            .and_then(|s| s.trim().parse().ok())
-            .unwrap_or(0);
-        chain::broadcast(&url, &bond_tx(&sk, stake, reward, commission_bps, stake_blind, bond_nonce, &pledge, &cid))?;
+        chain::broadcast(&url, &bond_tx_presigned(&pk, &sig, stake, reward, commission_bps, stake_blind, nonce, &pledge))?;
         for &i in &inputs {
             w.coins[i].spent = true;
         }
         if let Some(c) = chg_rec {
             w.coins.push(c);
         }
-        let vpk = hex::encode(sk.verifying_key().to_bytes());
-        w.push_hist("bond", -(stake as i64), format!("bond {}", &vpk[..12]), zcrypt_shield::ASSET_ZCRYPT);
+        // Remember which validator this reward key belongs to.
+        for a in w.action_keys.iter_mut() {
+            if a.index == reward_index && a.kind == "bond" {
+                a.target = vpk_hex.clone();
+            }
+        }
+        w.push_hist("bond", -(stake as i64), format!("bond {}", &vpk_hex[..12]), zcrypt_shield::ASSET_ZCRYPT);
         Ok(format!(
             "Bonded {} ZCRYPT at {}% commission. Validator {} joins the active set on the next block; \
-             rewards accrue to this wallet.",
-            stake / atomic, commission_pct_display, vpk
+             rewards accrue to a fresh reward key of this wallet.",
+            stake / atomic, commission_pct_display, vpk_hex
         ))
     })
     .and_then(ok)
@@ -2401,11 +2862,22 @@ fn build_stake_pledge(
     Ok((pledge, stake_blind, inputs, chg_rec))
 }
 
-/// The wallet's stable DELEGATOR ed25519 identity, derived from the account seed. Used to
-/// sign DELEGATE/UNDELEGATE so only this wallet can pull its delegation back later. Distinct
-/// from any validator consensus key — a delegator does not run a node.
+/// The wallet's LEGACY delegator ed25519 identity (one per seed). Kept only so an
+/// undelegate can still reach a delegation made before per-delegation keys existed.
 fn delegator_signing_key(account: &Account) -> ed25519_dalek::SigningKey {
-    ed25519_dalek::SigningKey::from_bytes(&zcrypt_core::hash::h(b"ZC-DELEGATOR-KEY", &[&account.seed()]))
+    let seed = Zeroizing::new(account.seed());
+    ed25519_dalek::SigningKey::from_bytes(&zcrypt_core::hash::h(b"ZC-DELEGATOR-KEY", &[seed.as_ref()]))
+}
+
+/// A PER-DELEGATION delegator ed25519 key at HD `index`: every delegation is signed by a
+/// distinct key, so an observer cannot cluster all of one wallet's delegations by a
+/// shared delegator pubkey. Recoverable from the mnemonic by index.
+fn delegator_key_at(account: &Account, index: u32) -> ed25519_dalek::SigningKey {
+    let seed = Zeroizing::new(account.seed());
+    ed25519_dalek::SigningKey::from_bytes(&zcrypt_core::hash::h(
+        b"ZC-DELEGATOR-KEY",
+        &[seed.as_ref(), &index.to_le_bytes()],
+    ))
 }
 
 /// A validator's on-chain id from its consensus pubkey hex: `SHA256(pubkey)[..20]`.
@@ -2489,7 +2961,7 @@ struct ValidatorInfo {
 /// `/staking/validators` = comma-joined "<pubkey_hex>:<stake>:<commission_bps>").
 #[tauri::command]
 fn list_validators(state: State<AppState>) -> R<Vec<ValidatorInfo>> {
-    let url = node_url(&state);
+    let url = node_url(&state)?;
     let raw = chain::query_str(&url, "/staking/validators").unwrap_or_default();
     let mut out = Vec::new();
     for tok in raw.split(',') {
@@ -2528,15 +3000,18 @@ fn delegate_validator(validator_pubkey_hex: String, stake_zcrypt: String, state:
     if stake == 0 {
         return Err("delegation must be a positive amount".into());
     }
-    let url = node_url(&state);
+    let url = node_url(&state)?;
     let leaves = chain::fetch_leaves(&url)?;
     with_wallet(&state, |w| {
-        let del_sk = delegator_signing_key(&w.account);
+        // Fresh HD index: the reward key AND the delegator signing key of this delegation.
+        let idx = w.alloc_index();
+        let del_sk = delegator_key_at(&w.account, idx);
         let cid = chain_id_for(&url)?;
         let (pledge, stake_blind, inputs, chg_rec) =
             build_stake_pledge(w, &leaves, stake, &cid).map_err(|e| format!("delegating: {e}"))?;
-        let reward = w.account.reward_address();
+        let reward = w.key_at(idx).reward_address();
         chain::broadcast(&url, &delegate_tx(&del_sk, &target, stake, reward, stake_blind, &pledge, &cid))?;
+        w.note_action(idx, "delegate", validator_pubkey_hex.trim());
         for &i in &inputs {
             w.coins[i].spent = true;
         }
@@ -2564,9 +3039,19 @@ fn delegate_validator(validator_pubkey_hex: String, stake_zcrypt: String, state:
 #[tauri::command]
 fn undelegate_validator(validator_pubkey_hex: String, state: State<AppState>) -> R<String> {
     let target = validator_target(&validator_pubkey_hex)?;
-    let url = node_url(&state);
+    let url = node_url(&state)?;
     with_wallet(&state, |w| {
-        let del_sk = delegator_signing_key(&w.account);
+        // The delegation was signed by a per-delegation key: find it by validator (pubkey
+        // hex as recorded by the wallet, or the 20-byte id as recovered by a chain scan).
+        let target_hex = hex::encode(&target);
+        let del_sk = match w
+            .action_keys
+            .iter()
+            .find(|a| a.kind == "delegate" && (a.target.eq_ignore_ascii_case(validator_pubkey_hex.trim()) || a.target == target_hex))
+        {
+            Some(a) => delegator_key_at(&w.account, a.index),
+            None => delegator_signing_key(&w.account), // legacy single-key delegation
+        };
         let cid = chain_id_for(&url)?;
         // Fetch the delegator key's current replay-protection nonce so the signature is single-use.
         let pk_hex = hex::encode(del_sk.verifying_key().to_bytes());
@@ -2603,33 +3088,45 @@ struct UnbondingEntry {
 /// persists until the 10-day timer elapses — not just a one-time message after the action.
 #[tauri::command]
 fn my_unbonding(state: State<AppState>) -> R<Vec<UnbondingEntry>> {
-    let url = node_url(&state);
-    let reward_hex = {
+    let url = node_url(&state)?;
+    let reward_hexes: Vec<String> = {
         let g = state.wallet.lock().unwrap();
-        hex::encode(g.as_ref().ok_or("wallet locked")?.account.reward_address())
+        let w = g.as_ref().ok_or("wallet locked")?;
+        w.reward_indices().into_iter().map(|i| hex::encode(w.key_at(i).reward_address())).collect()
     };
-    let raw = chain::query_str(&url, &format!("/staking/my_unbonding/{reward_hex}")).unwrap_or_default();
     let mut out = Vec::new();
-    for tok in raw.split(',') {
-        if let Some((s, r)) = tok.split_once(':') {
-            if let (Ok(stake), Ok(release_time)) = (s.trim().parse::<u64>(), r.trim().parse::<u64>()) {
-                out.push(UnbondingEntry { stake, release_time });
+    for reward_hex in reward_hexes {
+        let raw = chain::query_str(&url, &format!("/staking/my_unbonding/{reward_hex}")).unwrap_or_default();
+        for tok in raw.split(',') {
+            if let Some((s, r)) = tok.split_once(':') {
+                if let (Ok(stake), Ok(release_time)) = (s.trim().parse::<u64>(), r.trim().parse::<u64>()) {
+                    out.push(UnbondingEntry { stake, release_time });
+                }
             }
         }
     }
     ok(out)
 }
 
+/// The reward pks (hex) this wallet has bound at bond / delegate time. Only these are
+/// ever sent to the node for balance lookups, and only when the user asks (Rewards tab
+/// "Check"): each is already public on-chain in its BOND/DELEGATE, but the query still
+/// tells the operator this session owns them, which is why it is opt-in.
+fn reward_pk_hexes(state: &State<AppState>) -> Result<Vec<(u32, String)>, String> {
+    let g = state.wallet.lock().unwrap();
+    let w = g.as_ref().ok_or("wallet locked")?;
+    Ok(w.reward_indices().into_iter().map(|i| (i, pk_hex(&w.key_at(i).pubkey()))).collect())
+}
+
+/// Unclaimed staking rewards (base units) across every reward key of this wallet.
 #[tauri::command]
 fn get_claimable(state: State<AppState>) -> R<u64> {
-    let url = node_url(&state);
-    let pk_h = {
-        let guard = state.wallet.lock().unwrap();
-        let w = guard.as_ref().ok_or("wallet locked")?;
-        pk_hex(&w.account.pubkey())
-    };
-    let bal = chain::staking_u64(&url, &format!("/staking/claimable/{pk_h}")).unwrap_or(0);
-    ok(bal)
+    let url = node_url(&state)?;
+    let mut total = 0u64;
+    for (_, pk_h) in reward_pk_hexes(&state)? {
+        total = total.saturating_add(chain::staking_u64(&url, &format!("/staking/claimable/{pk_h}")).unwrap_or(0));
+    }
+    ok(total)
 }
 
 #[derive(Serialize)]
@@ -2644,54 +3141,55 @@ struct ClaimResult {
 /// consensus-agreed reward balance.
 #[tauri::command]
 fn claim_rewards(state: State<AppState>) -> R<ClaimResult> {
-    let url = node_url(&state);
-    // Read our pubkey, the claimable balance, and the starting coin index.
-    let pk = {
-        let guard = state.wallet.lock().unwrap();
-        let w = guard.as_ref().ok_or("wallet locked")?;
-        w.account.pubkey()
-    };
-    let pk_h = pk_hex(&pk);
-    let claimable = chain::staking_u64(&url, &format!("/staking/claimable/{pk_h}"))?;
-    if claimable == 0 {
-        return Err("no staking rewards to claim for this address".into());
-    }
-    let start = chain::staking_u64(&url, &format!("/staking/claim_index/{pk_h}"))?;
-
-    // CLAIM tx: 0x58 ‖ pk(64) ‖ amount(8 LE).
-    let mut tx = vec![0x58u8];
-    tx.extend_from_slice(&hex::decode(&pk_h).unwrap());
-    tx.extend_from_slice(&claimable.to_le_bytes());
-    chain::broadcast(&url, &tx)?;
-
-    // Reconstruct the minted coins and add any that landed on-chain to our spendable
-    // set. The node splits a claim via `claim_chunks` (reserving a gas coin on the
-    // first claim so the balance is immediately spendable) — we call the SAME function
-    // so our reconstructed coins match the node's exactly.
-    let first_claim = start == 0;
-    let leaves = chain::fetch_leaves(&url)?;
-    with_wallet(&state, |w| {
-        let mut index = start;
-        let mut n = 0u32;
-        for chunk in zcrypt_core::keys::claim_chunks(claimable, first_claim) {
-            let coin = w.account.reward_coin(chunk, index);
-            let com = coin.commitment();
-            let already = w.coins.iter().any(|c| c.coin.commitment() == com);
-            if chain::find_index(&leaves, &com).is_some() && !already {
-                w.coins.push(CoinRec {
-                    coin_id: hex::encode(com[0].to_le_bytes()),
-                    value: chunk,
-                    coin,
-                    spent: false,
-                });
-                w.push_hist("reward", chunk as i64, "staking reward".into(), zcrypt_shield::ASSET_ZCRYPT);
-                n += 1;
-            }
-            index += 1;
+    let url = node_url(&state)?;
+    let mut claimed_total = 0u64;
+    let mut coins_total = 0u32;
+    for (idx, pk_h) in reward_pk_hexes(&state)? {
+        let claimable = chain::staking_u64(&url, &format!("/staking/claimable/{pk_h}")).unwrap_or(0);
+        if claimable == 0 {
+            continue;
         }
-        Ok(ClaimResult { claimed: claimable, coins: n })
-    })
-    .and_then(ok)
+        let start = chain::staking_u64(&url, &format!("/staking/claim_index/{pk_h}"))?;
+        // CLAIM tx: 0x58 ‖ pk(64) ‖ amount(8 LE). Consensus requires the FULL balance.
+        let mut tx = vec![0x58u8];
+        tx.extend_from_slice(&hex::decode(&pk_h).unwrap());
+        tx.extend_from_slice(&claimable.to_le_bytes());
+        chain::broadcast(&url, &tx)?;
+        // Reconstruct the minted coins and add any that landed on-chain to our spendable
+        // set. The node splits a claim via `claim_chunks` (reserving a gas coin on the
+        // first claim so the balance is immediately spendable); the SAME function here
+        // keeps our reconstruction identical to the node's.
+        let first_claim = start == 0;
+        let leaves = chain::fetch_leaves(&url)?;
+        let n = with_wallet(&state, |w| {
+            let acct = w.key_at(idx);
+            let mut index = start;
+            let mut n = 0u32;
+            for chunk in zcrypt_core::keys::claim_chunks(claimable, first_claim) {
+                let coin = acct.reward_coin(chunk, index);
+                let com = coin.commitment();
+                let already = w.coins.iter().any(|c| c.coin.commitment() == com);
+                if chain::find_index(&leaves, &com).is_some() && !already {
+                    w.coins.push(CoinRec {
+                        coin_id: hex::encode(com[0].to_le_bytes()),
+                        value: chunk,
+                        coin,
+                        spent: false,
+                    });
+                    w.push_hist("reward", chunk as i64, "staking reward".into(), zcrypt_shield::ASSET_ZCRYPT);
+                    n += 1;
+                }
+                index += 1;
+            }
+            Ok(n)
+        })?;
+        claimed_total = claimed_total.saturating_add(claimable);
+        coins_total += n;
+    }
+    if claimed_total == 0 {
+        return Err("no staking rewards to claim on any of this wallet's reward keys".into());
+    }
+    ok(ClaimResult { claimed: claimed_total, coins: coins_total })
 }
 
 /// A claimable bridge-fee balance in one bridged asset (real, asset-denominated yield a
@@ -2711,14 +3209,14 @@ struct FeeClaimable {
 /// staking rewards, so a validator AND its delegators accrue here by stake × participation.
 #[tauri::command]
 fn claimable_fees(state: State<AppState>) -> R<Vec<FeeClaimable>> {
-    let url = node_url(&state);
-    let pk_h = {
-        let g = state.wallet.lock().unwrap();
-        pk_hex(&g.as_ref().ok_or("wallet locked")?.account.pubkey())
-    };
-    let mut out = Vec::new();
+    let url = node_url(&state)?;
+    let keys = reward_pk_hexes(&state)?;
+    let mut out: Vec<FeeClaimable> = Vec::new();
     for (ticker, asset_id, _minted) in chain::asset_list(&url) {
-        let amount = chain::staking_u64(&url, &format!("/staking/fees/{pk_h}/{asset_id}")).unwrap_or(0);
+        let mut amount = 0u64;
+        for (_, pk_h) in &keys {
+            amount = amount.saturating_add(chain::staking_u64(&url, &format!("/staking/fees/{pk_h}/{asset_id}")).unwrap_or(0));
+        }
         if amount > 0 {
             let decimals = chain::asset_meta(&url, asset_id).map(|(_, d)| d).unwrap_or(8);
             out.push(FeeClaimable { asset_id, ticker, decimals, amount });
@@ -2732,50 +3230,52 @@ fn claimable_fees(state: State<AppState>) -> R<Vec<FeeClaimable>> {
 /// become spendable. Mirrors the ZCRYPT reward claim but per bridged asset.
 #[tauri::command]
 fn claim_fees(asset_id: String, state: State<AppState>) -> R<u64> {
-    let url = node_url(&state);
+    let url = node_url(&state)?;
     let asset: u64 = asset_id.trim().parse().map_err(|_| "bad asset id".to_string())?;
-    let pk = {
-        let g = state.wallet.lock().unwrap();
-        g.as_ref().ok_or("wallet locked")?.account.pubkey()
-    };
-    let pk_h = pk_hex(&pk);
-    let claimable = chain::staking_u64(&url, &format!("/staking/fees/{pk_h}/{asset}"))?;
-    if claimable == 0 {
+    let (ticker, _dec) = asset_label(&url, asset);
+    let mut total = 0u64;
+    for (idx, pk_h) in reward_pk_hexes(&state)? {
+        let claimable = chain::staking_u64(&url, &format!("/staking/fees/{pk_h}/{asset}")).unwrap_or(0);
+        if claimable == 0 {
+            continue;
+        }
+        // Next fee-coin index for reconstruction (0 for a first-ever fee claim).
+        let start = chain::staking_u64(&url, &format!("/staking/fee_claim_index/{pk_h}/{asset}")).unwrap_or(0);
+        // CLAIM_FEE tx: 0x66 ‖ pk(64) ‖ asset_id(8 LE) ‖ amount(8 LE). Full balance only.
+        let mut tx = vec![0x66u8];
+        tx.extend_from_slice(&hex::decode(&pk_h).unwrap());
+        tx.extend_from_slice(&asset.to_le_bytes());
+        tx.extend_from_slice(&claimable.to_le_bytes());
+        chain::broadcast(&url, &tx)?;
+        // Reconstruct the minted fee coins (node uses claim_chunks(amount, false) + monotonic
+        // fee-claim indices from `start`) so our coins match the node's exactly.
+        let leaves = chain::fetch_leaves(&url)?;
+        with_wallet(&state, |w| {
+            let acct = w.key_at(idx);
+            let mut index = start;
+            for chunk in zcrypt_core::keys::claim_chunks(claimable, false) {
+                let coin = acct.fee_reward_coin(chunk, asset, index);
+                let com = coin.commitment();
+                let already = w.coins.iter().any(|c| c.coin.commitment() == com);
+                if chain::find_index(&leaves, &com).is_some() && !already {
+                    w.coins.push(CoinRec {
+                        coin_id: hex::encode(com[0].to_le_bytes()),
+                        value: chunk,
+                        coin,
+                        spent: false,
+                    });
+                    w.push_hist("fee", chunk as i64, format!("{ticker} bridge fee"), asset);
+                }
+                index += 1;
+            }
+            Ok(())
+        })?;
+        total = total.saturating_add(claimable);
+    }
+    if total == 0 {
         return Err("no bridge-fee yield to claim for this asset".into());
     }
-    // Next fee-coin index for reconstruction. Defaults to 0 if the node predates this query
-    // (correct for a first-ever fee claim; a rebuilt node returns the real index for repeats).
-    let start = chain::staking_u64(&url, &format!("/staking/fee_claim_index/{pk_h}/{asset}")).unwrap_or(0);
-    // CLAIM_FEE tx: 0x66 ‖ pk(64) ‖ asset_id(8 LE) ‖ amount(8 LE).
-    let mut tx = vec![0x66u8];
-    tx.extend_from_slice(&hex::decode(&pk_h).unwrap());
-    tx.extend_from_slice(&asset.to_le_bytes());
-    tx.extend_from_slice(&claimable.to_le_bytes());
-    chain::broadcast(&url, &tx)?;
-    // Reconstruct the minted fee coins (node uses claim_chunks(amount, false) + monotonic
-    // fee-claim indices from `start`) so our coins match the node's exactly.
-    let (ticker, _dec) = asset_label(&url, asset);
-    let leaves = chain::fetch_leaves(&url)?;
-    with_wallet(&state, |w| {
-        let mut index = start;
-        for chunk in zcrypt_core::keys::claim_chunks(claimable, false) {
-            let coin = w.account.fee_reward_coin(chunk, asset, index);
-            let com = coin.commitment();
-            let already = w.coins.iter().any(|c| c.coin.commitment() == com);
-            if chain::find_index(&leaves, &com).is_some() && !already {
-                w.coins.push(CoinRec {
-                    coin_id: hex::encode(com[0].to_le_bytes()),
-                    value: chunk,
-                    coin,
-                    spent: false,
-                });
-                w.push_hist("fee", chunk as i64, format!("{ticker} bridge fee"), asset);
-            }
-            index += 1;
-        }
-        Ok(claimable)
-    })
-    .and_then(ok)
+    ok(total)
 }
 
 // ---------------------------------------------------------------------------
@@ -2840,15 +3340,23 @@ fn swap_backend(
         Ok((Box::new(b), dest))
     }
 }
-fn zc_client(state: &State<AppState>) -> Zcrypt {
-    Zcrypt::new(&node_url(state))
+fn zc_client(state: &State<AppState>) -> Result<Zcrypt, String> {
+    Ok(Zcrypt::new(&node_url(state)?))
 }
 /// Deterministic secp256k1 keys for the bridge + Alice roles (single-user demo).
 fn bridge_btc_keys(account: &Account) -> (BtcKey, BtcKey) {
-    let seed = account.seed();
-    let b = zcrypt_core::hash::h(b"BTCBRDG", &[&seed]);
-    let a = zcrypt_core::hash::h(b"BTCALIC", &[&seed]);
+    let seed = Zeroizing::new(account.seed());
+    let b = zcrypt_core::hash::h(b"BTCBRDG", &[seed.as_ref()]);
+    let a = zcrypt_core::hash::h(b"BTCALIC", &[seed.as_ref()]);
     (BtcKey::from_bytes(&b), BtcKey::from_bytes(&a))
+}
+
+/// A PER-DEPOSIT / per-redeem Bitcoin key (the HTLC refund or payout key) at HD `index`,
+/// so successive bridge operations never share a Bitcoin key that chain analysis could
+/// cluster. Recoverable from the mnemonic by index (the index is logged in `action_keys`).
+fn alice_key_at(account: &Account, index: u32) -> BtcKey {
+    let seed = Zeroizing::new(account.seed());
+    BtcKey::from_bytes(&zcrypt_core::hash::h(b"BTCALIC", &[seed.as_ref(), &index.to_le_bytes()]))
 }
 fn zbtc_asset(zc: &Zcrypt) -> Result<u64, String> {
     zc.query("/asset/by_ticker/zBTC")?.trim().parse::<u64>().map_err(|e| e.to_string())
@@ -2881,7 +3389,7 @@ struct BridgeStatus {
 /// have a ring. Idempotent.
 #[tauri::command]
 fn bridge_init(state: State<AppState>) -> R<u64> {
-    let zc = zc_client(&state);
+    let zc = zc_client(&state)?;
     // zBTC's mint authority is the SPV sentinel over the bridge's Bitcoin RESERVE
     // key: consensus derives `spv_authority(reserve_pk)` itself, and from then on
     // zBTC can only ever be minted against an SPV-proven BTC deposit claimable by
@@ -2920,7 +3428,7 @@ fn bridge_init(state: State<AppState>) -> R<u64> {
 
 #[tauri::command]
 fn bridge_status(state: State<AppState>) -> R<BridgeStatus> {
-    let zc = zc_client(&state);
+    let zc = zc_client(&state)?;
     let asset = zbtc_asset(&zc).unwrap_or(0);
     let btc_network = {
         let dir = state.data_dir.lock().unwrap().clone();
@@ -2937,7 +3445,7 @@ fn bridge_status(state: State<AppState>) -> R<BridgeStatus> {
     // MATURING (minted but held immature by the deep-reorg defense — not yet a tree leaf,
     // so not spendable/redeemable). This is what stops a freshly-shielded-but-immature coin
     // from showing as a phantom spendable balance.
-    let url = node_url(&state);
+    let url = node_url(&state)?;
     let leaves = chain::fetch_leaves(&url).unwrap_or_default();
     let (zbtc_balance, zbtc_maturing) = {
         let g = state.wallet.lock().unwrap();
@@ -2995,7 +3503,7 @@ struct HeldAsset {
 /// — powers the Send asset picker. ZCRYPT (asset 0) is always present.
 #[tauri::command]
 fn held_assets(state: State<AppState>) -> R<Vec<HeldAsset>> {
-    let url = node_url(&state);
+    let url = node_url(&state)?;
     let leaves = chain::fetch_leaves(&url).unwrap_or_default();
     let mut bal: std::collections::BTreeMap<u64, u64> = std::collections::BTreeMap::new();
     bal.insert(zcrypt_shield::ASSET_ZCRYPT, 0);
@@ -3102,7 +3610,7 @@ struct MinterAsset {
 /// more of. Powers the "Assets you mint" list + one-click "mint more".
 #[tauri::command]
 fn my_assets(state: State<AppState>) -> R<Vec<MinterAsset>> {
-    let url = node_url(&state);
+    let url = node_url(&state)?;
     let leaves = chain::fetch_leaves(&url).unwrap_or_default();
     let list = chain::asset_list(&url);
     let (seed, bal): ([u8; 32], std::collections::BTreeMap<u64, u64>) = {
@@ -3142,13 +3650,16 @@ fn mint_asset(
     max_supply: u64,
     state: State<AppState>,
 ) -> R<String> {
-    let url = node_url(&state);
+    let url = node_url(&state)?;
     let t = ticker.trim().to_string();
     if t.is_empty() {
         return Err("enter a ticker".into());
     }
     if t.eq_ignore_ascii_case("ZCRYPT") {
         return Err("ZCRYPT is the native asset — use Fund, not asset mint".into());
+    }
+    if !zcrypt_core::asset_registry::valid_ticker(&t) {
+        return Err("ticker must be 2 to 10 ASCII letters/digits starting with a letter".into());
     }
     if amount == 0 {
         return Err("enter an amount greater than 0".into());
@@ -3205,7 +3716,12 @@ fn mint_asset(
         let preimage = bswap::fresh_preimage(); // 32 random bytes — long + unguessable
         let lock = zcrypt_core::nullifier::htlc_hashlock(&preimage);
         let timeout = height + 100;
-        let pk = w.account.pubkey();
+        // The escrow claimer is a fresh stealth key, so the mint does not publish the
+        // reusable Normal pk.
+        let idx = w.alloc_index();
+        w.note_action(idx, "mint", "");
+        let claimer = w.key_at(idx);
+        let pk = claimer.pubkey();
         let escrow = zcrypt_core::htlc_shield::escrow_id(asset_id, amount, &lock, timeout, &pk);
         // Authorize the mint with a threshold signature over the exact escrow params (bound
         // to this chain id, so it cannot replay on another network); no minting secret goes
@@ -3219,7 +3735,7 @@ fn mint_asset(
             w.coins.push(rec);
         }
         chain::broadcast(&url, &bswap::claim_tx(&escrow, &preimage))?;
-        let coin = w.account.htlc_coin(amount, asset_id, &escrow);
+        let coin = claimer.htlc_coin(amount, asset_id, &escrow);
         w.coins.push(CoinRec {
             coin_id: hex::encode(coin.commitment()[0].to_le_bytes()),
             value: amount,
@@ -3287,11 +3803,16 @@ fn swap_shield_btc(zbtc_amount: u64, btc: String, window: tauri::Window, state: 
     // bitcoind only on regtest. Account 0 = user, 1 = demo LP.
     let (alice_bk, alice_dest) = swap_backend(&state, 0)?;
     let (bridge_bk, bridge_dest) = swap_backend(&state, 1)?;
-    let zc = zc_client(&state);
+    let zc = zc_client(&state)?;
     let asset = zbtc_asset(&zc)?;
     let btc_amt = bitcoin::Amount::from_sat(btc_sats);
     let res = with_wallet(&state, |w| {
-        let (bridge_key, alice_key) = bridge_btc_keys(&w.account);
+        let (bridge_key, _legacy_alice) = bridge_btc_keys(&w.account);
+        // Fresh HD index for this deposit: its shield claimer pk AND its Bitcoin refund key.
+        let idx = w.alloc_index();
+        w.note_action(idx, "shield", "");
+        let claimer = w.key_at(idx);
+        let alice_key = alice_key_at(&w.account, idx);
         let b = bswap::BtcParams {
             alice: alice_bk.as_ref(),
             bridge: bridge_bk.as_ref(),
@@ -3305,9 +3826,9 @@ fn swap_shield_btc(zbtc_amount: u64, btc: String, window: tauri::Window, state: 
             let _ = window.emit("swap-progress", serde_json::json!({ "percent": pct, "phase": phase }));
         };
         // Trustless mint: the swap relays Bitcoin headers to the chain and submits
-        // an SPV proof of the deposit — every validator verifies it; nobody signs.
+        // an SPV proof of the deposit; every validator verifies it, nobody signs.
         let coin = bswap::btc_to_zbtc_progress(
-            &zc, &b, &w.account, asset, &preimage, btc_amt, zbtc_amount, &progress,
+            &zc, &b, &claimer, asset, &preimage, btc_amt, zbtc_amount, &progress,
         )?;
         let com = coin.commitment();
         w.coins.push(CoinRec { coin_id: hex::encode(com[0].to_le_bytes()), value: coin.value, coin, spent: false });
@@ -3333,7 +3854,7 @@ fn swap_shield_btc(zbtc_amount: u64, btc: String, window: tauri::Window, state: 
 /// stale and pending coins would never mature. Returns "<pending_count>:<pending_value>".
 #[tauri::command]
 fn bridge_mature(state: State<AppState>) -> R<String> {
-    let zc = zc_client(&state);
+    let zc = zc_client(&state)?;
     // Relay from the user's Bitcoin backend (untrusted transport — headers self-prove).
     if let Ok((backend, _)) = swap_backend(&state, 0) {
         let _ = bswap::relay_btc_headers(&zc, backend.as_ref());
@@ -3355,17 +3876,22 @@ fn swap_redeem_btc(btc: String, window: tauri::Window, state: State<AppState>) -
         return Err("enter a zBTC amount to redeem".to_string());
     }
     let fee = zcrypt_core::emission::MIN_FEE;
-    let url = node_url(&state);
+    let url = node_url(&state)?;
     // Node-free backends (self-custody via Esplora) for both sides; bitcoind only on regtest.
     let (alice_bk, alice_dest) = swap_backend(&state, 0)?;
     let (bridge_bk, bridge_dest) = swap_backend(&state, 1)?;
-    let zc = zc_client(&state);
+    let zc = zc_client(&state)?;
     let asset = zbtc_asset(&zc)?;
     with_wallet(&state, |w| {
-        let (bridge_key, alice_key) = bridge_btc_keys(&w.account);
+        let (bridge_key, _legacy_alice) = bridge_btc_keys(&w.account);
         let mut redeemed: u64 = 0;
         let mut round: u32 = 0;
         while redeemed < want_total {
+            // Fresh HD index per round: refund pk, change key and the Bitcoin payout key.
+            let idx = w.alloc_index();
+            w.note_action(idx, "redeem", "");
+            let refund_acct = w.key_at(idx);
+            let alice_key = alice_key_at(&w.account, idx);
             // Re-fetch leaves each round: the previous round's change coin (if any) is a
             // committed leaf by now (broadcast_tx_commit), so it is selectable here.
             let leaves = chain::fetch_leaves(&url)?;
@@ -3430,7 +3956,7 @@ fn swap_redeem_btc(btc: String, window: tauri::Window, state: State<AppState>) -
                 );
             };
             let (change_value, change_blind) = bswap::zbtc_to_btc_progress(
-                &zc, &b, &w.account, asset, &coins, &preimage, round_value, btc_amt, &progress,
+                &zc, &b, &refund_acct, asset, &coins, &preimage, round_value, btc_amt, &progress,
             )?;
             for &i in &chosen {
                 w.coins[i].spent = true;
@@ -3438,7 +3964,7 @@ fn swap_redeem_btc(btc: String, window: tauri::Window, state: State<AppState>) -
             // Record the change coin so an un-redeemed remainder stays spendable.
             // `own_asset_coin` rebuilds the exact commitment the burn tx wrote to our key.
             if change_value > 0 {
-                let change = w.account.own_asset_coin(change_value, change_blind, asset);
+                let change = refund_acct.own_asset_coin(change_value, change_blind, asset);
                 let com = change.commitment();
                 w.coins.push(CoinRec {
                     coin_id: hex::encode(com[0].to_le_bytes()),
@@ -3471,9 +3997,9 @@ struct RecoverResult {
 /// isn't destroyed — it refunds itself after its timeout.
 #[tauri::command]
 fn bridge_recover(state: State<AppState>) -> R<RecoverResult> {
-    let url = node_url(&state);
+    let url = node_url(&state)?;
     let leaves = chain::fetch_leaves(&url)?;
-    let zc = zc_client(&state);
+    let zc = zc_client(&state)?;
     let asset = zbtc_asset(&zc).unwrap_or(0);
     with_wallet(&state, |w| {
         let mut live = 0u64;
@@ -3513,7 +4039,7 @@ fn get_seed_phrase(password: String, state: State<AppState>) -> R<String> {
     let raw = std::fs::read_to_string(keystore_path(&dir)).map_err(|_| "no wallet")?;
     let ks: Keystore = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
     let phrase = unseal(&password, &ks).ok_or("wrong password")?;
-    ok(phrase)
+    ok(phrase.to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -3545,7 +4071,7 @@ fn main() {
                 .home_dir()
                 .map(|p| p.join(".zcrypt"))
                 .unwrap_or_else(|_| std::path::PathBuf::from(".zcrypt"));
-            let _ = std::fs::create_dir_all(&dir);
+            let _ = privfs::ensure_private_dir(&dir);
             let dir_str = dir.to_string_lossy().to_string();
             *app.state::<AppState>().data_dir.lock().unwrap() = dir_str.clone();
             // FIX 2: point chain-id pinning at the same data dir (chain_id.txt lives next
@@ -3584,7 +4110,8 @@ fn main() {
             claim_rewards,
             claimable_fees,
             claim_fees,
-            bond_validator,
+            bond_request,
+            bond_validator_signed,
             list_validators,
             delegate_validator,
             undelegate_validator,
@@ -3603,6 +4130,7 @@ fn main() {
             address_kind,
             save_export,
             open_external,
+            chain_pin,
         ])
         .run(tauri::generate_context!())
         .expect("error while running ZCrypt wallet");

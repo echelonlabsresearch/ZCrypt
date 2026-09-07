@@ -67,13 +67,26 @@ fn spend_secret_from_seed(seed: &[u8; 32]) -> SpendSecret {
 }
 
 /// A spendable coin note — the pre-image the ZK spend circuit consumes.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct Coin {
     pub value: u64,
     pub blind: Blind,
     pub spend_secret: SpendSecret,
     /// Which shielded asset the coin holds (0 = native ZCRYPT, e.g. zBTC otherwise).
     pub asset_id: u64,
+}
+
+/// Redacted: a coin's blind and spend secret are spend authority and must never reach a
+/// log line or an error string. Only the public value and asset are printed.
+impl core::fmt::Debug for Coin {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Coin")
+            .field("value", &self.value)
+            .field("asset_id", &self.asset_id)
+            .field("blind", &"<redacted>")
+            .field("spend_secret", &"<redacted>")
+            .finish()
+    }
 }
 
 impl Coin {
@@ -236,6 +249,36 @@ pub struct Account {
     spend_secret: SpendSecret,
     dk: Dk,
     ek: Ek,
+}
+
+/// Overwrite a byte buffer with zeros in a way the optimizer must not elide.
+pub fn wipe(bytes: &mut [u8]) {
+    for b in bytes.iter_mut() {
+        // SAFETY: `b` is a valid, aligned, exclusively borrowed `u8`.
+        unsafe { core::ptr::write_volatile(b, 0) };
+    }
+    core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+}
+
+/// The seed and spend secret are wiped when an account goes out of scope, so a locked
+/// wallet (or a dropped stealth sub-account) leaves no key material behind in freed
+/// memory. The ML-KEM decapsulation key is re-derivable from the seed and is dropped
+/// by its own type.
+impl Drop for Account {
+    fn drop(&mut self) {
+        wipe(&mut self.seed);
+        for limb in self.spend_secret.iter_mut() {
+            // SAFETY: valid, aligned, exclusively borrowed `u64`.
+            unsafe { core::ptr::write_volatile(limb, 0) };
+        }
+        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+impl core::fmt::Debug for Account {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Account").field("pk", &self.pubkey()).field("seed", &"<redacted>").finish()
+    }
 }
 
 impl Account {
@@ -589,9 +632,16 @@ pub fn encrypt_note_asset(to: &Address, value: u64, blind: Blind, asset_id: u64)
 /// A bearer coin: the spend secret is embedded, so possession is ownership. There
 /// is no recipient and no note encryption — whoever holds the bytes can sweep it.
 /// Not covered by any view key.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct BearerCoin {
     pub coin: Coin,
+}
+
+/// Redacted like [`Coin`]: a bearer coin IS the money, so it never prints its secrets.
+impl core::fmt::Debug for BearerCoin {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("BearerCoin").field("coin", &self.coin).finish()
+    }
 }
 
 impl BearerCoin {

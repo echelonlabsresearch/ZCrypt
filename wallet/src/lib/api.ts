@@ -69,23 +69,33 @@ export async function copy(text: string): Promise<void> {
   await navigator.clipboard.writeText(text);
 }
 
+/**
+ * Copy a SECRET (recovery phrase, bearer coin, stealth note). The clipboard is cleared
+ * after `clearMs` if it still holds the text; if the clipboard cannot be read back it is
+ * cleared unconditionally (security over convenience).
+ */
+export async function copySensitive(text: string, clearMs = 60_000): Promise<void> {
+  await navigator.clipboard.writeText(text);
+  setTimeout(async () => {
+    try {
+      const cur = await navigator.clipboard.readText();
+      if (cur === text) await navigator.clipboard.writeText("");
+    } catch {
+      try {
+        await navigator.clipboard.writeText("");
+      } catch {
+        /* clipboard unavailable */
+      }
+    }
+  }, clearMs);
+}
+
 /** Save `content` to a real file (Downloads) via the backend; returns its path. */
 export async function saveFile(filename: string, content: string): Promise<string> {
   return call<string>("save_export", { filename, content });
 }
 
-/** Open a URL / file path with the OS default handler (share links, reveal file). */
+/** Open a URL / file path with the OS default handler (reveal an exported file). */
 export async function openExternal(target: string): Promise<void> {
   await call<boolean>("open_external", { target });
-}
-
-/** Share links for a text payload (a bearer coin or stealth note). */
-export function shareLinks(text: string, subject = "A ZCrypt payment for you") {
-  const t = encodeURIComponent(text);
-  const s = encodeURIComponent(subject);
-  return {
-    whatsapp: `https://wa.me/?text=${t}`,
-    telegram: `https://t.me/share/url?url=${t}&text=${s}`,
-    email: `mailto:?subject=${s}&body=${t}`,
-  };
 }

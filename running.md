@@ -28,13 +28,15 @@ cd chain
 docker compose up --build -d
 ```
 
-Three containers come up on one host:
+Four containers come up on one host (plus regtest bitcoind with `--profile dev`):
 
 | Service | Purpose | Host endpoint |
 |---|---|---|
-| `abci` | Rust ZCrypt state machine | internal only |
-| `cometbft` | consensus (CometBFT 0.38) | RPC `http://localhost:36657` |
-| `bitcoind` | regtest BTC (for the zBTC bridge) | RPC `localhost:18443` (user/pass `zcrypt`/`zcrypt`) |
+| `abci` | Rust ZCrypt state machine (unprivileged user, RocksDB on a volume) | internal only |
+| `cometbft` | consensus (CometBFT 0.38) | raw RPC `http://127.0.0.1:36657` (localhost only) |
+| `explorer` | block explorer | via Caddy at `https://$EXPLORER_DOMAIN` |
+| `caddy` | HTTPS edge: allow-listed RPC endpoints, per-IP rate limits, 8 MB body cap | `https://$RPC_DOMAIN` |
+| `bitcoind` (dev profile) | regtest BTC for the zBTC bridge demo | RPC `127.0.0.1:18443` (credentials from `.env`) |
 
 Check it's live and query state:
 
@@ -56,10 +58,12 @@ Tear down and wipe state with:
 docker compose down -v
 ```
 
-> **Devnet vs. production.** The compose files build with `ABCI_FEATURES=devnet`
-> (enabling the `0x56` faucet the wallet uses to fund coins locally). For a real
-> deployment, build with `ABCI_FEATURES=""` in `chain/docker/Dockerfile` so unbacked
-> coin injection is disabled.
+> **Devnet vs. production.** The compose files build PRODUCTION by default
+> (`ABCI_FEATURES=""`: no `0x56` faucet, real vesting, foundation address required).
+> For a local playground set `ABCI_FEATURES=devnet` and `ZCRYPT_BTC_NET=regtest` in
+> `chain/.env`; the `0x56` faucet the wallet's Fund button uses only exists in that
+> build. The STARK parameters (112 FRI queries, 20-bit grinding, 244 conjectured bits)
+> are identical in every build; there is no lower-security variant to opt into.
 
 ---
 
@@ -83,7 +87,7 @@ The bundled **3-validator** stack reaches consensus over the same state machine:
 
 ```bash
 cd chain
-docker compose -f docker-compose.3node.yml up --build -d
+docker compose -f e2e/docker-compose.3node.yml up --build -d
 ```
 
 | Validator | RPC |
@@ -108,7 +112,9 @@ block 0. At this point it is a **syncing full node** — it doesn't yet produce 
 ### 3. Bond → pledge stake → become a block producer
 
 Submit a **BOND (`0x57`)** transaction signed by the node's ed25519 **consensus key**
-(the first 32 bytes of its `priv_validator_key.json`). Bonding **genuinely pledges your
+(the first 32 bytes of its `priv_validator_key.json`). The wallet never sees that key: it
+prepares the bond and the validator host signs it with `bond_validator sign` (see
+chain/README-validator.md, section 3). Bonding **genuinely pledges your
 coins**: the tx carries a shield spend that burns ≥ 10,000 ZCRYPT into an unspendable
 burn coin, so the stake is real, locked value — not a self-declared number. It also
 names a reward address. On the next block the ABCI app emits the `ValidatorUpdate` and
@@ -195,12 +201,13 @@ npm run tauri:build        # binaries land in wallet/src-tauri/target/release/bu
 
 In the app: **Settings → Consensus Node**, point it at your chain
 (`http://localhost:36657` for the single-node stack, `http://localhost:46657` for the
-3-node stack), then:
+3-node stack; Tor is ON by default and fails closed, so either run a local Tor daemon or
+toggle it off for a localhost node), then:
 
-- **Fund** (Mint tab) seeds coins into the pool via `0x56`.
+- **Fund** (Mint tab) seeds coins into the pool via `0x56` (devnet builds only).
 - **Send** builds a real hidden-amount `0x55` shield tx and broadcasts it.
 - **Refresh** scans new blocks, trial-decrypts on-chain notes to find your coins, and
-  marks spent coins via the nullifier registry.
+  marks spent coins.
 - **Restore** rebuilds your account (and its coins) from the 24-word phrase.
 
 Frontend-only preview (no backend, no chain): `npm run dev`.
@@ -226,7 +233,11 @@ VM≡circuit differential tests) is:
 cd impl && cargo test --workspace
 ```
 
-CI runs both on push (`.github/workflows/ci.yml` and `live-e2e.yml`).
+CI runs the fast suite on every push (`.github/workflows/ci.yml`: three test shards,
+a clippy ratchet, cargo audit + cargo deny + npm audit) and the live e2e on `main` and
+nightly (`live-e2e.yml`). Release images are built, digest-pinned and cosign-signed by
+`image.yml`. Every cargo call runs `--locked` on the date-pinned nightly in
+`impl/rust-toolchain.toml`.
 
 ---
 
@@ -240,10 +251,13 @@ impl/                     Rust workspace
   bridge/                 BTC↔zBTC atomic-swap bridge + live 3-node test drivers
   cli/                    reference CLI demo
 chain/                    Docker consensus stacks
-  docker-compose.yml            single-node devnet (RPC 36657)
-  docker-compose.3node.yml      3-validator network (RPC 46657/46667/46677)
-  docker/                       Dockerfile + CometBFT init/entrypoint scripts
+  docker-compose.yml            foundation node (raw RPC 127.0.0.1:36657, Caddy edge)
+  docker-compose.validator.yml  plug-and-play validator (digest-pinned image)
+  e2e/docker-compose.3node.yml  3-validator devnet (RPC 46657/46667/46677)
+  docker/                       Dockerfile(s) + CometBFT entrypoints + Caddyfile
   e2e/run-all.sh                full live end-to-end
+deny.toml                 cargo-deny policy (advisories, licenses, sources)
+AUDIT-2026-09-07.md       internal security + privacy audit and fix list
 wallet/                   Tauri + React desktop wallet
 protocol.md                 Protocol tour
 security.md               Security & threat model
@@ -268,17 +282,19 @@ transactions in which even the input count is unobservable.
 - **Not externally audited.** The custom circuit constraints need independent review
   before securing real value. This is the dominant limiter.
 - **Metadata at the edges.** The public nullifier set reveals *that* spends happen
-  (inherent to double-spend prevention), and a node sees the submitter's IP unless the
-  wallet's Tor routing is enabled.
+  (inherent to double-spend prevention); staking, claims, mints, bridge escrows and
+  swaps are transparent and name the key they act for; and a node sees the submitter's
+  IP unless the wallet's Tor routing (on by default) is enabled.
 - **Anonymity grows with adoption.** The pool is as large as the coins that exist, so
   early on the crowd is small.
 - **Validator economics are real.** Bonding **pledges real shielded coins** (spent into
   a burn coin), stake stays locked for a **10-day unbonding period** then returns as a
   claimable balance, provable equivocation is **slashed** (5% burned, the validator
   tombstoned), and **delegation** lets anyone back a validator with coin-backed stake to
-  earn a reward share and share its slashing risk. The remaining gap is the **missing
-  external audit** — which is what keeps this a testnet rather than something for securing
-  large stake, not any missing mechanism.
+  earn a reward share and share its slashing risk. An internal multi-reviewer audit
+  ([AUDIT-2026-09-07.md](AUDIT-2026-09-07.md)) found and fixed six critical-rated issues;
+  the remaining gap is the **missing external audit**, which is what keeps this a testnet
+  rather than something for securing large stake.
 
 See [protocol.md](protocol.md), [security.md](security.md), [privacy.md](privacy.md),
 and [vm.md](vm.md) for details, and the [whitepaper](whitepaper/whitepaper.pdf) for the formal treatment.

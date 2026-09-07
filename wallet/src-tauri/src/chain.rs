@@ -2,7 +2,6 @@
 
 use base64::Engine;
 use serde_json::Value;
-use zcrypt_core::smt;
 use zcrypt_shield::Commitment;
 
 const B64: base64::engine::general_purpose::GeneralPurpose = base64::engine::general_purpose::STANDARD;
@@ -13,6 +12,36 @@ const TIMEOUT_S: u64 = 45;
 /// wallet's IP and per-coin query pattern from the node operator and the network.
 /// Set from settings at startup and whenever settings are saved (see `set_tor`).
 static TOR_PROXY: std::sync::RwLock<Option<String>> = std::sync::RwLock::new(None);
+
+/// Random per-process nonce mixed into every SOCKS username so each wallet launch
+/// gets fresh Tor circuits (Tor isolates streams by SOCKS credentials).
+static SESSION_NONCE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+fn session_nonce() -> &'static str {
+    SESSION_NONCE.get_or_init(|| {
+        use rand::RngCore;
+        let mut b = [0u8; 8];
+        rand::thread_rng().fill_bytes(&mut b);
+        hex::encode(b)
+    })
+}
+
+/// Stream isolation: give `proxy_url` a SOCKS5 username/password unique to this
+/// request `class` (node queries, broadcasts, bridge/Esplora) and this process. Tor's
+/// default `IsolateSOCKSAuth` then routes each class over its own circuit, so the exit
+/// (or a .onion service) cannot correlate a wallet's leaf sync, its spent checks, and
+/// its broadcasts by a shared source. Credentials are already-present-aware: a URL that
+/// carries `user:pass@` is returned unchanged.
+pub fn socks_isolated(proxy_url: &str, class: &str) -> String {
+    let (scheme, rest) = match proxy_url.split_once("://") {
+        Some((s, r)) => (s, r),
+        None => ("socks5", proxy_url),
+    };
+    if rest.contains('@') {
+        return proxy_url.to_string();
+    }
+    format!("{scheme}://zc-{class}-{n}:{n}@{rest}", n = session_nonce())
+}
 
 /// Enable/disable Tor routing for all subsequent node RPC. `Some(socks_url)` turns
 /// it on; `None` reverts to a direct connection.
@@ -25,18 +54,26 @@ pub fn tor_active() -> bool {
     TOR_PROXY.read().unwrap().is_some()
 }
 
-/// Build a node-RPC agent with `secs` timeout, routing through the Tor SOCKS proxy
-/// when enabled. Every path that contacts the node MUST use this (never a bare
-/// `ureq::builder()`), or it would bypass Tor and leak the wallet's IP.
-pub fn agent_with_timeout(secs: u64) -> ureq::Agent {
+/// Random delay before a broadcast (default on). Decorrelates the moment a proof
+/// finished from the moment the network first sees the transaction.
+static JITTER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+pub fn set_broadcast_jitter(on: bool) {
+    JITTER.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Build a node-RPC agent for one isolation `class` with `secs` timeout, routing
+/// through the Tor SOCKS proxy when enabled. Every path that contacts the node MUST
+/// use this (never a bare `ureq::builder()`), or it would bypass Tor and leak the
+/// wallet's IP.
+pub fn agent_for(class: &str, secs: u64) -> ureq::Agent {
     let mut b = ureq::builder().timeout(std::time::Duration::from_secs(secs));
     if let Some(proxy) = TOR_PROXY.read().unwrap().clone() {
-        // A misconfigured proxy string must FAIL CLOSED — build an agent that can't
-        // connect — rather than silently falling back to a direct (de-anonymizing)
-        // connection. We do that by only applying a successfully-parsed proxy; if
-        // parsing fails we point at an unusable loopback port so requests error out
-        // instead of leaking the real IP.
-        match ureq::Proxy::new(&proxy) {
+        // A misconfigured proxy string must FAIL CLOSED: build an agent that can't
+        // connect rather than silently falling back to a direct (de-anonymizing)
+        // connection. Only a successfully-parsed proxy is applied; if parsing fails we
+        // point at an unusable loopback port so requests error out instead of leaking.
+        match ureq::Proxy::new(&socks_isolated(&proxy, class)) {
             Ok(p) => b = b.proxy(p),
             Err(_) => {
                 b = b.proxy(ureq::Proxy::new("socks5://127.0.0.1:1").expect("static proxy"));
@@ -46,8 +83,59 @@ pub fn agent_with_timeout(secs: u64) -> ureq::Agent {
     b.build()
 }
 
+/// Node-query agent (the default isolation class).
+pub fn agent_with_timeout(secs: u64) -> ureq::Agent {
+    agent_for("node", secs)
+}
+
 fn agent() -> ureq::Agent {
     agent_with_timeout(TIMEOUT_S)
+}
+
+/// Is `url`'s host a loopback address (`localhost`, 127.0.0.0/8, `::1`)? Decided by
+/// a real URL parse, so `http://localhost:1@evil.test/` (userinfo trick) or
+/// `http://localhost.evil.test/` are NOT treated as local.
+pub fn is_loopback_url(url: &str) -> bool {
+    let parsed = match url::Url::parse(url.trim()) {
+        Ok(u) => u,
+        Err(_) => return false,
+    };
+    match parsed.host() {
+        Some(url::Host::Domain(d)) => d.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        None => false,
+    }
+}
+
+/// Node-URL policy: a REMOTE node must be reached over TLS (`https://`) or as a Tor
+/// onion service (`http://<x>.onion`, end-to-end encrypted inside Tor). Plain `http://`
+/// to a clearnet host would let a Tor exit or any on-path party read and alter every
+/// query and transaction, so it is refused. Loopback nodes may use plain http.
+pub fn check_node_url(url: &str) -> Result<(), String> {
+    let u = url::Url::parse(url.trim()).map_err(|e| format!("node URL: {e}"))?;
+    match u.scheme() {
+        "http" | "https" => {}
+        other => return Err(format!("node URL must be http(s), not `{other}://`")),
+    }
+    if u.host().is_none() {
+        return Err("node URL has no host".into());
+    }
+    if u.username() != "" || u.password().is_some() {
+        return Err("node URL must not embed credentials".into());
+    }
+    if is_loopback_url(url) || u.scheme() == "https" {
+        return Ok(());
+    }
+    let onion = matches!(u.host(), Some(url::Host::Domain(d)) if d.to_ascii_lowercase().ends_with(".onion"));
+    if onion {
+        return Ok(());
+    }
+    Err(format!(
+        "refusing plain http:// to the remote node {}: use https://, a .onion address, or a node on localhost. \
+         Unencrypted RPC lets anyone on the path read and tamper with your queries and transactions.",
+        u.host_str().unwrap_or("")
+    ))
 }
 fn base(url: &str) -> &str {
     url.trim_end_matches('/')
@@ -140,7 +228,7 @@ pub fn pinned_chain_id(url: &str) -> Result<Vec<u8>, String> {
                 None => {
                     // First successful contact: pin it for all future signing.
                     if let Some(p) = &path {
-                        std::fs::write(p, &live)
+                        crate::privfs::write_private(p, live.as_bytes())
                             .map_err(|e| format!("could not pin chain-id to {}: {e}", p.display()))?;
                     }
                     Ok(live_bytes)
@@ -155,6 +243,15 @@ pub fn pinned_chain_id(url: &str) -> Result<Vec<u8>, String> {
             )),
         },
     }
+}
+
+/// The chain id this wallet is pinned to (from `chain_id.txt`), if any. Shown in
+/// Settings so the user can see which domain their signatures are bound to.
+pub fn pinned_id() -> Option<String> {
+    pin_path()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
 }
 
 /// A tag that uniquely identifies the chain GENERATION the node is serving:
@@ -193,9 +290,22 @@ pub fn query_str(url: &str, path: &str) -> Result<String, String> {
     abci_query_hex(url, path)
 }
 
+/// Percent-encode a user-supplied path segment (anything outside `[A-Za-z0-9._~-]`).
+fn pct(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'~' | b'-') {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
 /// Resolve a ticker to its asset id if it is already registered (None if free).
 pub fn asset_by_ticker(url: &str, ticker: &str) -> Option<u64> {
-    abci_query_hex(url, &format!("/asset/by_ticker/{ticker}"))
+    abci_query_hex(url, &format!("/asset/by_ticker/{}", pct(ticker)))
         .ok()?
         .trim()
         .parse::<u64>()
@@ -347,98 +457,27 @@ pub fn find_index(leaves: &[Commitment], com: &Commitment) -> Option<u32> {
     leaves.iter().position(|c| c == com).map(|i| i as u32)
 }
 
-/// Ask the node whether a nullifier (by its registry key hex) is recorded as spent, and
-/// VERIFY the answer cryptographically before believing it.
-///
-/// The node returns a serialized SMT membership proof plus the nullifier-registry ROOT the
-/// proof was generated against. We recompute the root from the proof and require:
-///   1. the proof is for EXACTLY the key we asked about (no answering key A with a valid
-///      proof about key B), and
-///   2. the proof verifies against the reported root.
-/// Only then do we read the spent/unspent answer from the VERIFIED proof (`included` == the
-/// nullifier is in the registry == spent) — never from a bare boolean the node asserts.
-///
-/// Returns `None` ("no trusted answer") on any transport error, malformed response, key
-/// mismatch, or failed verification — we refuse to trust an unproven claim rather than fall
-/// back to the node's word.
-///
-/// HONESTY BOUND: this proves the node produced a valid SMT proof consistent with the root
-/// it reported. It does NOT yet prove that root is the CONSENSUS-committed one — that
-/// requires anchoring the registry root to the block `app_hash` via validator-signed headers
-/// (a light client), which is the remaining step for full trustlessness. This is a real
-/// improvement over trusting a bit, not a full "the node cannot lie" guarantee.
-fn prove_included(url: &str, key_hex: &str) -> Option<bool> {
-    let u = format!("{}/abci_query?path=%22/prove/{}%22", base(url), key_hex);
-    let b: Value = agent().get(&u).call().ok()?.into_json::<Value>().ok()?;
-    let v = b["result"]["response"]["value"].as_str()?;
-    let by = B64.decode(v).ok()?;
-    let j: Value = serde_json::from_slice(&by).ok()?;
-
-    // Decode the serialized SMT proof and the root it was proven against.
-    let proof = smt::proof_from_bytes(&hex::decode(j["proof"].as_str()?).ok()?)?;
-    let root: [u8; 32] = hex::decode(j["root"].as_str()?).ok()?.try_into().ok()?;
-
-    // (1) The proof must be about the exact key we queried.
-    let want_key = hex::decode(key_hex).ok()?;
-    if proof.key.as_slice() != want_key.as_slice() {
-        return None;
-    }
-    // (2) The proof must verify against the reported root; else refuse to trust it.
-    if !smt::verify(&proof, &root) {
-        return None;
-    }
-    // Spent iff the nullifier is INCLUDED in the registry — from the verified proof.
-    Some(proof.included)
-}
-
-/// Is a nullifier (by its registry key hex) already recorded as spent?
-///
-/// Always queries inside a **decoy batch** (real key + random siblings, shuffled)
-/// so a node operator cannot tell which nullifier the wallet cares about from the
-/// query set alone.
-pub fn nullifier_spent(url: &str, key_hex: &str) -> bool {
-    nullifiers_spent(url, &[key_hex.to_string()])
-        .ok()
-        .and_then(|v| v.into_iter().next())
-        .unwrap_or(false)
-}
-
-/// Batch nullifier membership with decoys (min 32 queries). Returns one bool per
-/// *real* key, in the same order as `real_keys`.
-pub fn nullifiers_spent(url: &str, real_keys: &[String]) -> Result<Vec<bool>, String> {
-    use rand::seq::SliceRandom;
-    use rand::RngCore;
-    const BATCH: usize = 32;
-    let mut rng = rand::thread_rng();
-    let mut batch: Vec<(String, Option<usize>)> = real_keys
-        .iter()
-        .enumerate()
-        .map(|(i, k)| (k.clone(), Some(i)))
-        .collect();
-    while batch.len() < BATCH.max(real_keys.len()) {
-        let mut seed = [0u8; 32];
-        rng.fill_bytes(&mut seed);
-        batch.push((hex::encode(seed), None));
-    }
-    batch.shuffle(&mut rng);
-    let mut out = vec![false; real_keys.len()];
-    for (key, idx) in &batch {
-        let included = prove_included(url, key).unwrap_or(false);
-        if let Some(i) = idx {
-            out[*i] = included;
-        }
-    }
-    Ok(out)
-}
+// Spent status is derived LOCALLY: `scan_onchain` reads the nullifiers of every
+// shield transaction in the blocks it downloads anyway and matches them against the
+// wallet's own coins. The wallet never asks the node about individual nullifiers
+// (a per-key `/prove/<key>` query, even inside a decoy batch, let the operator
+// intersect refreshes and attribute later spends to this session).
 
 /// Broadcast a raw tx (with its 1-byte tag) via JSON-RPC POST (large txs can't go
 /// in a GET query string). Returns Ok only if both check_tx and tx_result pass.
 pub fn broadcast(url: &str, tx: &[u8]) -> Result<(), String> {
+    if JITTER.load(std::sync::atomic::Ordering::Relaxed) {
+        // 0.25 to 2.5 s of random delay so the submit time does not equal the prove time.
+        use rand::Rng;
+        let ms: u64 = rand::thread_rng().gen_range(250..2500);
+        std::thread::sleep(std::time::Duration::from_millis(ms));
+    }
     let body = serde_json::json!({
         "jsonrpc": "2.0", "id": 1, "method": "broadcast_tx_commit",
         "params": { "tx": B64.encode(tx) }
     });
-    let resp: Value = agent()
+    // Broadcasts ride their own Tor circuit, separate from the query traffic.
+    let resp: Value = agent_for("broadcast", TIMEOUT_S)
         .post(base(url))
         .send_json(body)
         .map_err(|e| e.to_string())?
@@ -512,4 +551,39 @@ pub fn merkle_path(leaves: &[Commitment], leaf_idx: usize) -> Option<(Vec<Commit
         tree.append(c);
     }
     tree.path(leaf_idx)
+}
+
+#[cfg(test)]
+mod policy_tests {
+    use super::*;
+
+    #[test]
+    fn remote_nodes_need_tls_or_onion_and_loopback_may_be_plain() {
+        assert!(check_node_url("http://localhost:36657").is_ok());
+        assert!(check_node_url("http://127.0.0.1:36657").is_ok());
+        assert!(check_node_url("http://[::1]:36657").is_ok());
+        assert!(check_node_url("https://rpc.example.org").is_ok());
+        assert!(check_node_url("http://abcdefghijklmnop.onion:26657").is_ok());
+        assert!(check_node_url("http://rpc.example.org:26657").is_err(), "plain http to a remote host");
+        assert!(check_node_url("ftp://rpc.example.org").is_err());
+        assert!(check_node_url("not a url").is_err());
+        // userinfo trick: the host is evil.test, not localhost
+        assert!(check_node_url("http://localhost:1@evil.test/").is_err());
+        assert!(!is_loopback_url("http://localhost:1@evil.test/"));
+        assert!(!is_loopback_url("http://localhost.evil.test/"));
+        assert!(is_loopback_url("http://127.0.0.1:36657"));
+        assert!(is_loopback_url("http://localhost:36657"));
+    }
+
+    #[test]
+    fn isolation_credentials_are_per_class_and_never_doubled() {
+        let a = socks_isolated("socks5://127.0.0.1:9050", "node");
+        let b = socks_isolated("socks5://127.0.0.1:9050", "broadcast");
+        assert!(a.starts_with("socks5://zc-node-"));
+        assert!(b.starts_with("socks5://zc-broadcast-"));
+        assert_ne!(a, b, "different classes must yield different SOCKS credentials");
+        assert!(a.ends_with("@127.0.0.1:9050"));
+        assert_eq!(socks_isolated(&a, "bridge"), a, "existing credentials are kept");
+        assert!(ureq::Proxy::new(&a).is_ok(), "ureq must accept the credentialed proxy URL");
+    }
 }

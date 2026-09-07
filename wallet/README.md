@@ -64,3 +64,49 @@ Decoy selection is uniform-random with replacement on a small devnet pool
 (privacy improves as the tree grows; age-weighting is a follow-up). The keystore
 KDF is a demo SHA3-stretch — production should use Argon2id. The reference
 wallet's cross-chain swap screens are not ported.
+
+## Privacy model of the wallet (what leaves this machine)
+
+- Node RPC goes through Tor by default and fails closed. Queries, broadcasts and bridge
+  traffic each use a separate Tor circuit (distinct SOCKS credentials per class).
+- A remote node must be `https://` or a `.onion`; plain `http://` is accepted only for a
+  node on this machine.
+- The wallet downloads blocks and leaves and trial-decrypts locally. It never asks the
+  node whether a specific nullifier is spent: spent status is derived from the nullifiers
+  in the blocks it already fetched.
+- Every claim, bond, delegation, mint, bridge deposit and redeem uses a fresh stealth
+  sub-key (an HD index that is logged and recovered from the chain on restore). The reusable
+  payment address is never published by those actions. Bridge deposits and redeems also use a
+  fresh Bitcoin refund / payout key per operation.
+- Reward balances are looked up only when you press "Check rewards" (that sends the reward
+  keys, not the payment address, to the node).
+- Bonding never handles the validator's consensus private key: the host signs, the wallet
+  submits the signature.
+- A random 0.25 to 2.5 s delay precedes every broadcast (Settings toggle).
+
+## Files on disk
+
+`~/.zcrypt` is created 0700; `keystore.json` (Argon2id + ChaCha20-Poly1305 sealed phrase),
+`coins.enc`, `settings.json` and `chain_id.txt` are written 0600. `settings.json` holds the
+bitcoind RPC password only in regtest / bitcoind mode; self-custody mode (default) needs none.
+
+## Signing and notarization (macOS)
+
+`bundle.macOS.signingIdentity` in `src-tauri/tauri.conf.json` is `null` so a build works
+without an Apple certificate (the app is ad-hoc signed and Gatekeeper warns on other Macs).
+For distribution set the environment at build time instead of editing the config:
+
+```bash
+APPLE_SIGNING_IDENTITY="Developer ID Application: <team>" \
+APPLE_ID=<apple id> APPLE_PASSWORD=<app-specific password> APPLE_TEAM_ID=<team id> \
+npm run tauri:build
+```
+
+Tauri signs with the identity and notarizes when the `APPLE_*` variables are present.
+There is no auto-update channel yet; publish release hashes alongside the DMG.
+
+## Tracked dependency advisories
+
+See the comment block in `src-tauri/Cargo.toml`: `glib`/`gtk3` 0.18 (Linux, unmaintained
+bindings pulled by Tauri), `proc-macro-error` and `paste` (build-time only). Re-run
+`cargo audit` in `src-tauri` on every dependency bump.

@@ -1,11 +1,13 @@
 import { useEffect, useState } from "react";
-import { call, copy } from "../lib/api";
+import { call, copySensitive } from "../lib/api";
 
 interface NodeStatus {
   connected: boolean;
   height: number;
   app: string;
   version: string;
+  /** Why the node is unusable (URL policy), or empty. */
+  error: string;
 }
 
 // Full settings object — kept intact so saving one field never resets the others.
@@ -20,6 +22,7 @@ interface WalletSettings {
   esplora_url: string;
   tor_enabled: boolean;
   tor_proxy: string;
+  broadcast_jitter: boolean;
 }
 
 export default function Settings() {
@@ -53,6 +56,8 @@ export default function Settings() {
     detail: string;
   };
   const [tor, setTor] = useState<TorStatus | null>(null);
+  const [jitter, setJitter] = useState(true);
+  const [pinned, setPinned] = useState<string | null>(null);
 
   useEffect(() => {
     call<WalletSettings>("get_settings")
@@ -61,6 +66,7 @@ export default function Settings() {
         setNodeUrl(s.node_url);
         setTorEnabled(!!s.tor_enabled);
         setTorProxy(s.tor_proxy || "127.0.0.1:9050");
+        setJitter(s.broadcast_jitter !== false);
       })
       .catch(() => {});
     checkNode();
@@ -81,9 +87,16 @@ export default function Settings() {
       esplora_url: full?.esplora_url ?? "https://blockstream.info/api",
       tor_enabled: torEnabled,
       tor_proxy: torProxy.trim() || "127.0.0.1:9050",
+      broadcast_jitter: jitter,
       ...next,
     };
-    await call("save_settings", { settings: merged });
+    setErr("");
+    try {
+      await call("save_settings", { settings: merged });
+    } catch (e) {
+      setErr(String(e));
+      return;
+    }
     setFull(merged);
     setSaved(true);
     setTimeout(() => setSaved(false), 1500);
@@ -100,7 +113,7 @@ export default function Settings() {
       const s = await call<NodeStatus>("node_status");
       setStatus(s);
     } catch {
-      setStatus({ connected: false, height: 0, app: "", version: "" });
+      setStatus({ connected: false, height: 0, app: "", version: "", error: "" });
     } finally {
       setChecking(false);
     }
@@ -108,6 +121,11 @@ export default function Settings() {
       setTor(await call<TorStatus>("tor_status"));
     } catch {
       setTor(null);
+    }
+    try {
+      setPinned(await call<string | null>("chain_pin"));
+    } catch {
+      setPinned(null);
     }
   }
 
@@ -132,6 +150,11 @@ export default function Settings() {
         <div className="field" style={{ marginTop: "0.8rem" }}>
           <label>CometBFT RPC URL</label>
           <input value={nodeUrl} onChange={(e) => setNodeUrl(e.target.value)} placeholder="http://localhost:36657" />
+          <div style={{ fontSize: "0.76rem", opacity: 0.6, marginTop: "0.3rem" }}>
+            A remote node must be <code>https://</code> or a Tor <code>.onion</code> address. Plain <code>http://</code> is
+            accepted only for a node on this machine, because unencrypted RPC lets anyone on the path read and alter your
+            queries and transactions.
+          </div>
         </div>
         <div style={{ display: "flex", gap: "0.6rem", alignItems: "center", flexWrap: "wrap" }}>
           <button className="btn-primary" onClick={saveNode}>{saved ? "✓ Saved" : "Save"}</button>
@@ -142,6 +165,8 @@ export default function Settings() {
                 <span style={{ color: "var(--color-green)" }}>
                   ● Connected · {status.app} v{status.version} · height {status.height}
                 </span>
+              ) : status.error ? (
+                <span style={{ color: "var(--color-red)" }}>● Refused: {status.error}</span>
               ) : (
                 <span style={{ color: "var(--color-red)" }}>● Not reachable — is your node running?</span>
               )
@@ -149,6 +174,17 @@ export default function Settings() {
               <span style={{ opacity: 0.5 }}>…</span>
             )}
           </div>
+        </div>
+        {err && <div className="msg err">{err}</div>}
+        <div style={{ fontSize: "0.8rem", marginTop: "0.6rem" }}>
+          {pinned ? (
+            <>
+              🔏 Signatures pinned to chain <code style={{ color: "var(--color-cyan)" }}>{pinned}</code>. The wallet
+              refuses to sign for a node reporting any other chain id.
+            </>
+          ) : (
+            <>🔏 No chain pinned yet: the first node you connect to defines the chain your signatures bind to.</>
+          )}
         </div>
         <div className="warn" style={{ marginTop: "0.9rem" }}>
           Local devnet default is <code style={{ color: "var(--color-cyan)" }}>http://localhost:36657</code> (the
@@ -162,9 +198,9 @@ export default function Settings() {
         <h2>🧅 Tor Privacy</h2>
         <div style={{ fontSize: "0.82rem", opacity: 0.75, marginBottom: "0.7rem" }}>
           When enabled, the wallet reaches the node <b>only through a local Tor proxy</b>, so the node operator and
-          anyone on the network path can't tie your IP to the coins and nullifiers you look up. <b>Off by default.</b>{" "}
-          Requires a Tor daemon running locally (hostnames, including <code>.onion</code>, resolve inside Tor — no DNS
-          leaks).
+          anyone on the network path can't tie your IP to the coins you look up. <b>On by default</b> and fail-closed.
+          Queries, broadcasts and bridge traffic each use their own Tor circuit. Requires a Tor daemon running locally
+          (hostnames, including <code>.onion</code>, resolve inside Tor, so there are no DNS leaks).
         </div>
         <label style={{ display: "flex", alignItems: "center", gap: "0.6rem", cursor: "pointer" }}>
           <input
@@ -207,7 +243,19 @@ export default function Settings() {
             Tor daemon default is <code>127.0.0.1:9050</code>; Tor Browser uses <code>127.0.0.1:9150</code>.
           </div>
         </div>
-        <button className="btn-primary" onClick={() => saveSettings({ tor_proxy: torProxy.trim() })}>
+        <label style={{ display: "flex", alignItems: "center", gap: "0.6rem", cursor: "pointer", marginTop: "0.8rem" }}>
+          <input
+            type="checkbox"
+            checked={jitter}
+            onChange={(e) => {
+              setJitter(e.target.checked);
+              saveSettings({ broadcast_jitter: e.target.checked });
+            }}
+            style={{ width: "auto" }}
+          />
+          <span>Random delay before broadcasting (0.25 to 2.5 s), so submit time does not reveal proving time</span>
+        </label>
+        <button className="btn-primary" style={{ marginTop: "0.8rem" }} onClick={() => saveSettings({ tor_proxy: torProxy.trim() })}>
           {saved ? "✓ Saved" : "Save Tor settings"}
         </button>
         {torEnabled && tor && (
@@ -232,7 +280,7 @@ export default function Settings() {
         ) : (
           <>
             <div className="mono-box" style={{ color: "var(--color-green)" }}>{phrase}</div>
-            <button className="copy-btn" style={{ marginTop: "0.6rem" }} onClick={() => copy(phrase)}>📋 Copy</button>
+            <button className="copy-btn" style={{ marginTop: "0.6rem" }} onClick={() => copySensitive(phrase)}>📋 Copy (clipboard clears in 60 s)</button>
             <button className="btn-link" style={{ marginLeft: "0.8rem" }} onClick={() => setPhrase("")}>Hide</button>
           </>
         )}
@@ -243,7 +291,7 @@ export default function Settings() {
         <h2>ℹ️ About</h2>
         <div className="card-row" style={{ borderTop: "none", paddingTop: 0 }}>
           <span>Value proof</span>
-          <span style={{ color: "var(--color-cyan)" }}>Plonky3 STARK · 128-bit · no trusted setup</span>
+          <span style={{ color: "var(--color-cyan)" }}>Plonky3 STARK · 244-bit conjectured · no trusted setup</span>
         </div>
         <div className="card-row">
           <span>Signatures & notes</span>

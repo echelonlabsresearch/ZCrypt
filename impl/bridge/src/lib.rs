@@ -6,6 +6,7 @@
 //!
 //! ```text
 //! OP_IF                                  # claim branch
+//!   OP_SIZE 32 OP_EQUALVERIFY            # preimage is exactly 32 bytes (bridge C2)
 //!   OP_SHA256 <hashlock> OP_EQUALVERIFY
 //!   <claim_pubkey> OP_CHECKSIG
 //! OP_ELSE                                # refund branch
@@ -80,6 +81,78 @@ pub fn network_from_str(s: &str) -> Network {
         "signet" => Network::Signet,
         _ => Network::Regtest,
     }
+}
+
+// ---------------------------------------------------------------------------
+// Reserve / refund key derivation (ONE rule, shared by the wallet and the daemon)
+// ---------------------------------------------------------------------------
+
+/// The bridge operator's Bitcoin RESERVE key, derived from the operator wallet's 32-byte
+/// ZCrypt seed exactly as the desktop wallet's `bridge_init` does: `H("BTCBRDG", seed)`.
+/// The daemon must use this same rule (or be handed the derived 32-byte key itself), so
+/// the key the chain's `zbtc_reserve_pk` is bound to and the key the daemon sweeps with can
+/// never diverge (bridge L4). Prefer exporting the DERIVED key to the daemon host: the wallet
+/// seed also spends the operator's shielded coins and must never leave the wallet.
+pub fn reserve_key_from_wallet_seed(seed: &[u8; 32]) -> Key {
+    Key::from_bytes(&zcrypt_core::hash::h(b"BTCBRDG", &[seed]))
+}
+
+/// A user's Bitcoin HTLC refund key for deposit number `index`, derived from the wallet's
+/// 32-byte seed. Index 0 is the legacy single refund key (`H("BTCALIC", seed)`, what the
+/// wallet used for every deposit); index `n > 0` is `H("BTCALIC", seed ‖ n)`. Using a FRESH
+/// index per deposit stops a chain-analysis observer from clustering all of one user's
+/// deposits by their shared refund key in the HTLC scripts (privacy H3).
+pub fn refund_key_for(seed: &[u8; 32], index: u32) -> Key {
+    if index == 0 {
+        Key::from_bytes(&zcrypt_core::hash::h(b"BTCALIC", &[seed]))
+    } else {
+        Key::from_bytes(&zcrypt_core::hash::h(b"BTCALIC", &[seed, &index.to_le_bytes()]))
+    }
+}
+
+/// Parse a 32-byte secp256k1 secret from a file's contents: either 64 hex characters
+/// (whitespace tolerated) or exactly 32 raw bytes.
+pub fn parse_secret_bytes(raw: &[u8]) -> Result<[u8; 32], String> {
+    if raw.len() == 32 {
+        return raw.try_into().map_err(|_| "secret: not 32 bytes".to_string());
+    }
+    let text = std::str::from_utf8(raw).map_err(|_| "secret: neither 32 raw bytes nor hex text")?;
+    let h: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+    let b = hex::decode(&h).map_err(|e| format!("secret: invalid hex: {e}"))?;
+    b.try_into().map_err(|_| "secret: hex must decode to exactly 32 bytes".to_string())
+}
+
+// ---------------------------------------------------------------------------
+// Fee sanity caps (bridge M4): a lying fee oracle (Esplora, or a compromised bitcoind)
+// must not be able to make a wallet pay most of an HTLC as fees.
+// ---------------------------------------------------------------------------
+
+/// Hard ceiling on any fee rate the bridge will act on (sat/vB). Real mempools rarely
+/// exceed a few hundred sat/vB even under extreme congestion.
+pub const MAX_FEE_RATE_SAT_VB: f64 = 500.0;
+/// A single HTLC spend or funding tx never pays more than this fraction of the value it
+/// moves as fees (1/4), except the absolute relay floor on tiny amounts.
+pub const MAX_FEE_FRACTION_DEN: u64 = 4;
+
+/// Clamp a fee rate into `[1, MAX_FEE_RATE_SAT_VB]`.
+pub fn cap_fee_rate(rate: f64) -> f64 {
+    if !rate.is_finite() {
+        return 1.0;
+    }
+    rate.clamp(1.0, MAX_FEE_RATE_SAT_VB)
+}
+
+/// Cap an absolute fee against the value being moved: at most `value / MAX_FEE_FRACTION_DEN`,
+/// but never below `floor` (the relay minimum for the spend). Errors when even the floor
+/// would eat the value (the amount is dust for this fee market).
+pub fn cap_fee_for_value(fee_sat: u64, value_sat: u64, floor_sat: u64) -> Result<u64, String> {
+    let max = (value_sat / MAX_FEE_FRACTION_DEN).max(floor_sat);
+    if max >= value_sat {
+        return Err(format!(
+            "fee floor {floor_sat} sats would consume the {value_sat}-sat value: amount too small to move"
+        ));
+    }
+    Ok(fee_sat.min(max))
 }
 
 /// The HTLC redeem (witness) script. Delegates to the CONSENSUS definition
@@ -322,19 +395,29 @@ impl Btc {
     /// Fund an HTLC: pay `amount` BTC to the script's P2WSH address, mine 1 block,
     /// and return the resulting UTXO.
     pub fn fund_htlc(&self, script: &ScriptBuf, amount: Amount) -> Result<HtlcUtxo, String> {
-        let addr = htlc_address(script, self.network);
-        let txid = self
-            .rpc
-            .send_to_address(&addr, amount, None, None, None, None, None, None)
-            .map_err(|e| e.to_string())?;
+        let utxo = self.fund_htlc_unconfirmed(script, amount)?;
         // Regtest confirms instantly; real networks BLOCK here until the funding tx has
         // `conf_target` confirmations, so the returned UTXO is settled (not a mempool tx
         // a counterparty could still double-spend/RBF) before anyone acts on it.
         if self.is_regtest() {
             self.mine(1)?;
         } else {
-            self.wait_confirmed(&txid)?;
+            self.wait_confirmed(&utxo.outpoint.txid)?;
         }
+        Ok(utxo)
+    }
+
+    /// Broadcast an HTLC funding tx and return its UTXO WITHOUT waiting for confirmation.
+    /// Split out from [`Self::fund_htlc`] so a daemon can persist the txid the moment it is
+    /// on the network: a confirmation wait that times out (or a crash during it) must never
+    /// lose track of a broadcast that already happened, or the next attempt would fund the
+    /// same escrow twice (bridge H2).
+    pub fn fund_htlc_unconfirmed(&self, script: &ScriptBuf, amount: Amount) -> Result<HtlcUtxo, String> {
+        let addr = htlc_address(script, self.network);
+        let txid = self
+            .rpc
+            .send_to_address(&addr, amount, None, None, None, None, None, None)
+            .map_err(|e| e.to_string())?;
         // find the vout paying our address
         let tx = self.rpc.get_raw_transaction(&txid, None).map_err(|e| e.to_string())?;
         let spk = addr.script_pubkey();
@@ -349,6 +432,38 @@ impl Btc {
             value: txout.value,
             script: script.clone(),
         })
+    }
+
+    /// Every unspent output currently locked to `script`'s P2WSH address (confirmed UTXO
+    /// set via `scantxoutset`). Lets a daemon discover an HTLC it already funded before it
+    /// funds again, and lets a user resume a deposit whose funding landed but whose flow
+    /// aborted before the SPV open (bridge H2 / L3).
+    pub fn htlc_utxos(&self, script: &ScriptBuf) -> Result<Vec<HtlcUtxo>, String> {
+        use serde_json::json;
+        let addr = htlc_address(script, self.network);
+        let desc = format!("addr({addr})");
+        let res: serde_json::Value = self
+            .rpc
+            .call("scantxoutset", &[json!("start"), json!([{ "desc": desc }])])
+            .map_err(|e| e.to_string())?;
+        let mut out = Vec::new();
+        for u in res["unspents"].as_array().into_iter().flatten() {
+            let sats = (u["amount"].as_f64().unwrap_or(0.0) * 1e8).round() as u64;
+            let txid_str = u["txid"].as_str().ok_or("scan: missing txid")?;
+            let vout = u["vout"].as_u64().ok_or("scan: missing vout")? as u32;
+            let txid = Txid::from_str(txid_str).map_err(|e| e.to_string())?;
+            out.push(HtlcUtxo { outpoint: OutPoint { txid, vout }, value: Amount::from_sat(sats), script: script.clone() });
+        }
+        Ok(out)
+    }
+
+    /// The hash of the block `txid` is confirmed in on this node's best chain (internal
+    /// byte order, matching `MintProof::deposit_block_hash`), or `None` while unconfirmed.
+    pub fn tx_block_hash(&self, txid: &Txid) -> Result<Option<[u8; 32]>, String> {
+        match self.rpc.get_raw_transaction_info(txid, None) {
+            Ok(info) => Ok(info.blockhash.map(|h| h.to_byte_array())),
+            Err(_) => Ok(None),
+        }
     }
 
     /// Broadcast a raw transaction, returning its txid.
@@ -480,6 +595,27 @@ pub trait BtcBackend {
     /// price HTLC claim/refund spends dynamically — a hardcoded fee can fall below the
     /// mempool min-relay rate on a busy mainnet and strand a claim past its CLTV timelock.
     fn fee_rate_sat_vb(&self, target: u32) -> Result<f64, String>;
+    /// Broadcast an HTLC funding tx and return its UTXO WITHOUT waiting for confirmations
+    /// (see [`Btc::fund_htlc_unconfirmed`]). Default: the confirmed variant.
+    fn fund_htlc_unconfirmed(&self, script: &ScriptBuf, amount: Amount) -> Result<HtlcUtxo, String> {
+        self.fund_htlc(script, amount)
+    }
+    /// Unspent outputs locked to `script`'s P2WSH address, if this backend can look them up.
+    /// Used to avoid double-funding an HTLC and to resume an aborted deposit.
+    fn htlc_utxos(&self, _script: &ScriptBuf) -> Result<Vec<HtlcUtxo>, String> {
+        Err("htlc_utxos not supported by this backend".to_string())
+    }
+    /// Spend an HTLC's REFUND branch after `locktime` with `key`, paying `dest`. Lets the
+    /// operator watcher recover BTC it locked for a redeem the user never claimed (bridge M5).
+    fn refund(&self, _utxo: &HtlcUtxo, _key: &Key, _locktime: u32, _dest: &Address, _fee: Amount) -> Result<Txid, String> {
+        Err("refund not supported by this backend".to_string())
+    }
+    /// The block (internal byte order) `txid` is confirmed in on this backend's best chain,
+    /// `None` while unconfirmed. Used to detect a deposit re-mined by a reorg so its immature
+    /// mint can be re-anchored before the void grace expires (bridge M2).
+    fn tx_block_hash(&self, _txid: &Txid) -> Result<Option<[u8; 32]>, String> {
+        Err("tx_block_hash not supported by this backend".to_string())
+    }
     /// If the HTLC `utxo` has been spent via its CLAIM branch (revealing the preimage), return
     /// that preimage; `None` if still unspent or spent via the refund branch. Lets the redeem
     /// watcher detect the user's BTC claim and finalize the burn autonomously, without being
@@ -527,6 +663,18 @@ impl BtcBackend for Btc {
     fn confirm(&self, txid: &Txid) -> Result<(), String> {
         Btc::confirm(self, txid)
     }
+    fn fund_htlc_unconfirmed(&self, script: &ScriptBuf, amount: Amount) -> Result<HtlcUtxo, String> {
+        Btc::fund_htlc_unconfirmed(self, script, amount)
+    }
+    fn htlc_utxos(&self, script: &ScriptBuf) -> Result<Vec<HtlcUtxo>, String> {
+        Btc::htlc_utxos(self, script)
+    }
+    fn refund(&self, utxo: &HtlcUtxo, key: &Key, locktime: u32, dest: &Address, fee: Amount) -> Result<Txid, String> {
+        Btc::refund(self, utxo, key, locktime, dest, fee)
+    }
+    fn tx_block_hash(&self, txid: &Txid) -> Result<Option<[u8; 32]>, String> {
+        Btc::tx_block_hash(self, txid)
+    }
     fn fee_rate_sat_vb(&self, target: u32) -> Result<f64, String> {
         // Regtest has no fee market; use a nominal 1 sat/vB.
         if self.is_regtest() {
@@ -538,7 +686,8 @@ impl BtcBackend for Btc {
             .call("estimatesmartfee", &[serde_json::json!(target)])
             .map_err(|e| e.to_string())?;
         let sat_vb = res["feerate"].as_f64().unwrap_or(0.0) * 100_000_000.0 / 1000.0;
-        Ok(if sat_vb >= 1.0 { sat_vb } else { 2.0 })
+        // Never act on an absurd estimate (bridge M4).
+        Ok(cap_fee_rate(if sat_vb >= 1.0 { sat_vb } else { 2.0 }))
     }
     fn find_htlc_spend_preimage(&self, utxo: &HtlcUtxo, since_height: u64) -> Result<Option<Vec<u8>>, String> {
         let tip = self.height()?;

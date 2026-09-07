@@ -1,12 +1,20 @@
-# Foundation stack — one VPS, one `docker compose up`:
-#   abci + cometbft + explorer + caddy (HTTPS for explorer.* and rpc.*)
+# Foundation stack: one VPS, one `docker compose up`:
+#   abci + cometbft + explorer + caddy (HTTPS edge for explorer.* and rpc.*)
 #   P2P 26656 published on the HOST for validators / firewall
 # Optional:
-#   --profile bridge  → bridge_watcher (needs ZCRYPT_RESERVE_SEED)
-#   --profile dev     → regtest bitcoind
+#   --profile bridge  -> bridge_watcher (needs the reserve key SECRET file, see below)
+#   --profile dev     -> regtest bitcoind, bound to localhost (local demos only)
 #
-# DNS before public TLS: EXPLORER_DOMAIN and RPC_DOMAIN both A → this machine's IP.
+# DNS before public TLS: EXPLORER_DOMAIN and RPC_DOMAIN both A -> this machine's IP.
 # Copy env:  cp .env.example .env
+#
+# Security posture of this file:
+#   * the ABCI image runs as an unprivileged user (uid 10001) and owns /data;
+#   * the raw CometBFT RPC is published on 127.0.0.1 only; the internet reaches the node
+#     solely through Caddy (allow-listed endpoints, per-IP rate limits, 8 MB body cap);
+#   * the bridge reserve key is a Docker SECRET mounted read-only at /run/secrets, never an
+#     environment variable (env is visible in `docker inspect` and /proc);
+#   * bitcoind (dev profile) never listens on a public interface.
 
 services:
   abci:
@@ -21,7 +29,11 @@ services:
     restart: unless-stopped
     environment:
       ABCI_PORT: "26658"
+      # RocksDB consensus state + periodic postcard backup, both on the /data volume.
+      ZCRYPT_STATE_DB: /data/zcrypt-state.db
       ZCRYPT_STATE_FILE: /data/zcrypt-state.bin
+      # Blocks between full postcard backups of the state (default 1000).
+      ZCRYPT_BACKUP_EVERY: ${ZCRYPT_BACKUP_EVERY:-1000}
     volumes:
       - abci-data:/data
     networks:
@@ -43,12 +55,16 @@ services:
       # 33-byte compressed reserve PUBLIC key (hex) baked into genesis as `zbtc_reserve_pk`;
       # the node registers zBTC against it at InitChain (see cometbft-entrypoint.sh).
       ZCRYPT_RESERVE_PK: ${ZCRYPT_RESERVE_PK:-}
+      FOUNDATION_SENTINEL: ${FOUNDATION_SENTINEL:-true}
+      FOUNDATION_SENTINEL_DECAY: ${FOUNDATION_SENTINEL_DECAY:-1000000}
+      # JSON array of allowed browser origins for the raw RPC (default: none).
+      RPC_CORS_ORIGINS: ${RPC_CORS_ORIGINS:-[]}
     volumes:
       - ./docker/cometbft-entrypoint.sh:/entrypoint.sh:ro
       - cometbft-data:/cometbft
     entrypoint: ["/bin/sh", "/entrypoint.sh"]
     # P2P on the HOST (open this in the VPS firewall for other validators).
-    # Raw RPC bound to localhost by default — public RPC goes through Caddy (rpc.*).
+    # Raw RPC bound to localhost by default: public RPC goes through Caddy (rpc.*).
     ports:
       - "${FOUNDATION_P2P_PORT:-26656}:26656"
       - "${FOUNDATION_RPC_PORT:-127.0.0.1:36657}:26657"
@@ -67,14 +83,17 @@ services:
       - cometbft
     command: ["zcrypt-explorer"]
     environment:
-      # Inside the compose network — not the host-published RPC port
+      # Inside the compose network, not the host-published RPC port
       EXPLORER_NODE: http://cometbft:26657
       EXPLORER_PORT: "8080"
     networks:
       - zcrypt-net
 
   caddy:
-    image: caddy:2-alpine
+    # Stock Caddy plus the rate-limit plugin (chain/docker/Dockerfile.caddy).
+    build:
+      context: ./docker
+      dockerfile: Dockerfile.caddy
     container_name: zcrypt-caddy
     restart: unless-stopped
     depends_on:
@@ -95,8 +114,13 @@ services:
     networks:
       - zcrypt-net
 
-  # Public bridge operator — NOT started by default (needs hot reserve key).
-  #   ZCRYPT_RESERVE_SEED=... docker compose --profile bridge up -d
+  # Public bridge operator: NOT started by default (needs the hot reserve key).
+  #   1. put the DERIVED reserve key (64 hex, H("BTCBRDG", wallet seed); write it with
+  #      `reserve_pubkey --wallet-seed-file <custody seed> --write-derived-key secrets/reserve.key`)
+  #      in ./secrets/reserve.key (chmod 600, never commit it)
+  #   2. docker compose --profile bridge up -d
+  # The daemon reads the key from ZCRYPT_RESERVE_KEY_FILE (a read-only secret mount); the
+  # ZCRYPT_RESERVE_SEED environment variable is no longer used by this compose file.
   bridge-watcher:
     profiles: ["bridge"]
     build:
@@ -109,25 +133,35 @@ services:
     depends_on:
       - cometbft
     command: ["bridge_watcher"]
+    secrets:
+      - reserve_key
     environment:
       ZC_URL: http://cometbft:26657
-      ZCRYPT_RESERVE_SEED: ${ZCRYPT_RESERVE_SEED:-}
+      ZCRYPT_RESERVE_KEY_FILE: /run/secrets/reserve_key
       WATCHER_STATE: /data/bridge-watcher-state.json
       WATCHER_POLL_SECS: ${WATCHER_POLL_SECS:-10}
-      WATCHER_FINALIZE_MARGIN: ${WATCHER_FINALIZE_MARGIN:-130000}
-      BTC_URL: ${BTC_URL:-http://bitcoind:18443}
-      BTC_USER: ${BTC_USER:-zcrypt}
-      BTC_PASS: ${BTC_PASS:-zcrypt}
-      BTC_NETWORK: ${BTC_NETWORK:-regtest}
+      # ZCrypt blocks a redeem escrow must have left before the operator locks BTC.
+      # Must exceed the BTC HTLC lock the watcher funds (3.5 days on mainnet) plus a claim
+      # window; the daemon refuses to start with a value below its own floor.
+      WATCHER_FINALIZE_MARGIN: ${WATCHER_FINALIZE_MARGIN:-475200}
+      # Your OWN bitcoind for the operator wallet (the dev-profile regtest node is NOT
+      # part of this profile; a production bridge never runs regtest).
+      # All three are REQUIRED when the profile runs (the daemon exits if any is empty).
+      BTC_URL: ${BTC_URL:-}
+      BTC_USER: ${BTC_USER:-}
+      BTC_PASS: ${BTC_PASS:-}
+      BTC_NETWORK: ${BTC_NETWORK:-bitcoin}
       BTC_WALLET: ${BTC_WALLET:-operator}
     volumes:
       - watcher-data:/data
     networks:
       - zcrypt-net
 
-  # Regtest bitcoind — LOCAL demos only. Never on a public production host.
+  # Regtest bitcoind: LOCAL demos only (profile dev). Bound to 127.0.0.1 on the host and
+  # reachable inside the compose network; credentials come from .env, never defaults on a
+  # public interface.
   bitcoind:
-    profiles: ["dev", "bridge"]
+    profiles: ["dev"]
     image: ruimarinho/bitcoin-core:24
     container_name: zcrypt-bitcoind
     restart: unless-stopped
@@ -137,16 +171,26 @@ services:
       - -txindex=1
       - -fallbackfee=0.0002
       - -rpcbind=0.0.0.0
-      - -rpcallowip=0.0.0.0/0
-      - -rpcuser=zcrypt
-      - -rpcpassword=zcrypt
+      - -rpcallowip=172.16.0.0/12
+      - -rpcallowip=10.0.0.0/8
+      - -rpcallowip=192.168.0.0/16
+      - -rpcuser=${BTC_USER:-zcrypt}
+      - -rpcpassword=${BTC_PASS:-zcrypt}
       - -rpcport=18443
     ports:
-      - "18443:18443"
+      - "127.0.0.1:18443:18443"
     volumes:
       - bitcoind-data:/home/bitcoin/.bitcoin
     networks:
       - zcrypt-net
+
+secrets:
+  reserve_key:
+    # 64 hex characters: the DERIVED 32-byte secp256k1 reserve key H("BTCBRDG", wallet seed),
+    # optionally newline-terminated. (A file holding the wallet seed itself goes in
+    # ZCRYPT_RESERVE_WALLET_SEED_FILE instead; the daemon then derives the key.)
+    # Create with: umask 077; mkdir -p secrets; reserve_pubkey --wallet-seed-file <custody seed> --write-derived-key secrets/reserve.key
+    file: ${ZCRYPT_RESERVE_KEY_PATH:-./secrets/reserve.key}
 
 volumes:
   cometbft-data:
