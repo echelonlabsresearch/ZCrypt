@@ -16,8 +16,7 @@
 
 use bitcoin::absolute::LockTime;
 use bitcoin::hashes::Hash;
-use bitcoin::opcodes::all::*;
-use bitcoin::script::{Builder, PushBytesBuf, ScriptBuf};
+use bitcoin::script::ScriptBuf;
 use bitcoin::secp256k1::{Message, Secp256k1, SecretKey};
 use bitcoin::sighash::{EcdsaSighashType, SighashCache};
 use bitcoin::{
@@ -83,30 +82,18 @@ pub fn network_from_str(s: &str) -> Network {
     }
 }
 
-/// The HTLC redeem (witness) script.
+/// The HTLC redeem (witness) script. Delegates to the CONSENSUS definition
+/// (`zcrypt_core::spv::btc_htlc_script`) so the script the wallet funds and the script the
+/// chain verifies a deposit against can never diverge. Includes the `OP_SIZE 32` guard that
+/// pins the preimage length on Bitcoin.
 pub fn htlc_script(
     hashlock: &[u8; 32],
     claim_pk: &PublicKey,
     refund_pk: &PublicKey,
     locktime: u32,
 ) -> ScriptBuf {
-    let mut lock = PushBytesBuf::new();
-    lock.extend_from_slice(hashlock).unwrap();
-    Builder::new()
-        .push_opcode(OP_IF)
-        .push_opcode(OP_SHA256)
-        .push_slice(lock)
-        .push_opcode(OP_EQUALVERIFY)
-        .push_key(claim_pk)
-        .push_opcode(OP_CHECKSIG)
-        .push_opcode(OP_ELSE)
-        .push_int(locktime as i64)
-        .push_opcode(OP_CLTV)
-        .push_opcode(OP_DROP)
-        .push_key(refund_pk)
-        .push_opcode(OP_CHECKSIG)
-        .push_opcode(OP_ENDIF)
-        .into_script()
+    zcrypt_core::spv::btc_htlc_script(hashlock, &claim_pk.inner.serialize(), &refund_pk.inner.serialize(), locktime)
+        .expect("valid compressed keys")
 }
 
 /// The P2WSH address the HTLC script commits to, on `network`.

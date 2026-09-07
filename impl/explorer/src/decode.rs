@@ -505,12 +505,12 @@ fn shield_program(tx: Option<&ShieldTx>) -> Vec<Value> {
 /// reproduced here (`ok: true/false`); where it depended on chain state at the time (escrow
 /// open, height, ticker-free, claimable) it is marked state-dependent (`ok: null`) because the
 /// state has since moved. This is the same program consensus ran, walked step by step.
-fn gate_program(tag: u8, prog: &[u8], body: &[u8], height: u64) -> Vec<Value> {
+fn gate_program(tag: u8, prog: &[u8], body: &[u8], chain_id: &[u8], height: u64) -> Vec<Value> {
     prog.iter()
         .map(|&op| {
             let (name, note) = op_gate(op);
             let mut o = json!({ "op": format!("0x{op:02X}"), "name": name, "note": note });
-            if let Some(r) = gate_op_result(tag, op, body, height) {
+            if let Some(r) = gate_op_result(tag, op, body, chain_id, height) {
                 o["result"] = r;
             }
             o
@@ -518,7 +518,7 @@ fn gate_program(tag: u8, prog: &[u8], body: &[u8], height: u64) -> Vec<Value> {
         .collect()
 }
 
-fn gate_op_result(tag: u8, op: u8, body: &[u8], height: u64) -> Option<Value> {
+fn gate_op_result(tag: u8, op: u8, body: &[u8], chain_id: &[u8], height: u64) -> Option<Value> {
     let ran = |ok: bool, note: String| json!({ "ok": ok, "note": note });
     let state = json!({ "ok": Value::Null, "note": "checked at consensus over chain state at the time (not reproducible now — the state has moved)" });
     match op {
@@ -585,7 +585,7 @@ fn gate_op_result(tag: u8, op: u8, body: &[u8], height: u64) -> Option<Value> {
             let timeout = rd_u64(body, 48)?;
             let pk = rd_pk(body, 56)?;
             let (keyset, sigs) = zcrypt_core::mint_auth::decode_auth(body.get(120..)?)?;
-            let msg = zcrypt_core::mint_auth::mint_message(asset, value, &lock, timeout, &pk);
+            let msg = zcrypt_core::mint_auth::mint_message(chain_id, asset, value, &lock, timeout, &pk);
             let ok = zcrypt_core::mint_auth::verify_threshold(&keyset, &msg, &sigs);
             Some(ran(ok, format!("explorer re-verified {}-of-{} ML-DSA signatures over the mint message → {}", keyset.threshold, keyset.n(), if ok { "valid" } else { "INVALID" })))
         }
@@ -620,7 +620,7 @@ fn rules(tag: u8, main: Option<&ShieldTx>, body: &[u8], chain_id: &[u8], height:
     // Annotate each opcode with per-transaction execution: shield emits values (COMPUTE steps),
     // a consensus-gate program is walked step by step with the explorer re-executing each check
     // it can reproduce.
-    let program = if shield { shield_program(main) } else { gate_program(tag, prog, body, height) };
+    let program = if shield { shield_program(main) } else { gate_program(tag, prog, body, chain_id, height) };
     let mut v = json!({
         "vm": if shield { "shield circuit" } else { "consensus gate" },
         "program_hex": hex::encode(prog),

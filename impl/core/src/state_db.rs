@@ -19,10 +19,12 @@ use crate::node::{ImmatureMint, Node, NodeSnapshot, Sentinel};
 /// On-disk schema for this module. Bump when key layout changes; older DBs
 /// refuse to open (re-migrate from postcard backup or relaunch) rather than
 /// silently misparse.
-pub const STATE_DB_SCHEMA: u32 = 1;
+pub const STATE_DB_SCHEMA: u32 = 2;
 
 // ---- key layout (default column family) ------------------------------------
 // meta/schema        -> u32 LE
+// meta/snapshot_ver  -> u32 LE  (the Node snapshot layout the blobs were written with)
+// meta/chain_id      -> bytes   (genesis chain id, the proof/signature domain)
 // meta/height        -> u64 LE
 // meta/commit_count  -> u64 LE  (number of commitment leaves flushed)
 // meta/nf_count      -> u64 LE  (number of nullifier keys flushed)
@@ -37,6 +39,8 @@ pub const STATE_DB_SCHEMA: u32 = 1;
 // blob/sentinel      -> postcard of Option<Sentinel>
 
 const K_SCHEMA: &[u8] = b"meta/schema";
+const K_SNAPSHOT_VERSION: &[u8] = b"meta/snapshot_ver";
+const K_CHAIN_ID: &[u8] = b"meta/chain_id";
 const K_HEIGHT: &[u8] = b"meta/height";
 const K_COMMIT_COUNT: &[u8] = b"meta/commit_count";
 const K_NF_COUNT: &[u8] = b"meta/nf_count";
@@ -49,6 +53,7 @@ const K_SPV: &[u8] = b"blob/spv";
 const K_IMMATURE: &[u8] = b"blob/immature";
 const K_RECENT_ROOTS: &[u8] = b"blob/recent_roots";
 const K_SENTINEL: &[u8] = b"blob/sentinel";
+const K_BLOCK_ROOTS: &[u8] = b"blob/block_roots";
 
 /// Stats from one successful `commit` (phase-2 observability).
 #[derive(Clone, Debug, Default)]
@@ -149,6 +154,13 @@ impl StateDb {
         &self.path
     }
 
+    /// The genesis chain id persisted with the state, if any. Restarts must resume under
+    /// the same proof/signature domain; a lost sidecar file used to silently fall back to
+    /// the compiled default and reject every valid tx (L3).
+    pub fn chain_id(&self) -> Result<Option<Vec<u8>>, String> {
+        Ok(self.db.get(K_CHAIN_ID).map_err(|e| e.to_string())?.filter(|b| !b.is_empty()).map(|b| b.to_vec()))
+    }
+
     fn init_or_check_schema(&mut self) -> Result<(), String> {
         match self.db.get(K_SCHEMA).map_err(|e| e.to_string())? {
             None => {
@@ -198,6 +210,20 @@ impl StateDb {
             Some(h) => h,
             None => return Ok(None),
         };
+        // The blobs are positional postcard: a layout written by another Node version must
+        // refuse to load rather than misparse (L2). `#[serde(default)]` cannot help here.
+        match self.db.get(K_SNAPSHOT_VERSION).map_err(|e| e.to_string())? {
+            Some(b) if b.len() >= 4 => {
+                let v = u32::from_le_bytes(b[..4].try_into().unwrap());
+                if v != crate::node::SNAPSHOT_VERSION_PUB {
+                    return Err(format!(
+                        "state db snapshot version {v} != expected {} (no migration; relaunch fresh)",
+                        crate::node::SNAPSHOT_VERSION_PUB
+                    ));
+                }
+            }
+            _ => return Err("state db has no snapshot version stamp (pre-v10 layout); relaunch fresh".into()),
+        }
         if let Some(schema_bytes) = self.db.get(K_SCHEMA).map_err(|e| e.to_string())? {
             let v = u32::from_le_bytes(
                 schema_bytes
@@ -258,6 +284,10 @@ impl StateDb {
                 postcard::from_bytes(&b).map_err(|e| format!("decode sentinel: {e}"))?
             }
         };
+        let block_roots: Vec<Commitment> = match self.db.get(K_BLOCK_ROOTS).map_err(|e| e.to_string())? {
+            None => Vec::new(),
+            Some(b) => postcard::from_bytes(&b).map_err(|e| format!("decode block_roots: {e}"))?,
+        };
 
         let snap = NodeSnapshot {
             version: crate::node::SNAPSHOT_VERSION_PUB,
@@ -271,6 +301,7 @@ impl StateDb {
             spv,
             immature,
             sentinel,
+            block_roots,
         };
         let (node, h) = Node::restore(snap);
         Ok(Some((node, h)))
@@ -279,10 +310,36 @@ impl StateDb {
     /// Persist `node` at `height` with a synced WriteBatch.
     ///
     /// * New commitment leaves are appended (cursor-based).
-    /// * Nullifiers are put by key (idempotent; only truly new keys add work).
+    /// * Only the nullifiers inserted since the last commit are written (the node's insert
+    ///   journal); re-putting the whole set every block was O(total spent coins) per block.
     /// * Subsystem blobs (staking, assets, HTLC, SPV, …) are rewritten each commit
     ///   (small relative to the leaf sets as the chain grows).
-    pub fn commit(&mut self, node: &Node, height: u64) -> Result<CommitStats, String> {
+    ///
+    /// `chain_id` is stamped alongside the state so a restart resumes under the same
+    /// proof/signature domain even if the sidecar file is lost.
+    pub fn commit(&mut self, node: &mut Node, height: u64, chain_id: &[u8]) -> Result<CommitStats, String> {
+        let new_nfs = node.take_new_nullifiers();
+        let res = self.commit_inner(node, height, chain_id, Some(new_nfs.clone()));
+        if res.is_err() {
+            // The journal entries were not made durable: replay them into the next attempt.
+            node.requeue_nullifiers(new_nfs);
+        }
+        res
+    }
+
+    /// [`Self::commit`] writing EVERY nullifier (initial migration into an empty store).
+    fn commit_full(&mut self, node: &mut Node, height: u64, chain_id: &[u8]) -> Result<CommitStats, String> {
+        let _ = node.take_new_nullifiers();
+        self.commit_inner(node, height, chain_id, None)
+    }
+
+    fn commit_inner(
+        &mut self,
+        node: &Node,
+        height: u64,
+        chain_id: &[u8],
+        new_nfs: Option<Vec<(crate::hash::Hash, crate::hash::Hash)>>,
+    ) -> Result<CommitStats, String> {
         let t0 = Instant::now();
         let snap = node.snapshot(height);
         let total_c = snap.commitment_leaves.len();
@@ -299,8 +356,10 @@ impl StateDb {
         let mut puts = 0usize;
 
         batch.put(K_SCHEMA, STATE_DB_SCHEMA.to_le_bytes());
+        batch.put(K_SNAPSHOT_VERSION, crate::node::SNAPSHOT_VERSION_PUB.to_le_bytes());
+        batch.put(K_CHAIN_ID, chain_id);
         batch.put(K_HEIGHT, height.to_le_bytes());
-        puts += 2;
+        puts += 4;
 
         let new_commitments = total_c - self.commit_count;
         for i in self.commit_count..total_c {
@@ -312,9 +371,12 @@ impl StateDb {
         batch.put(K_COMMIT_COUNT, (total_c as u64).to_le_bytes());
         puts += 1;
 
-        // Idempotent puts; count "new" as growth in cardinality for stats.
         let prev_nf = self.nf_count;
-        for (nf, bind) in &snap.smt_leaves {
+        let to_write: &[(crate::hash::Hash, crate::hash::Hash)] = match &new_nfs {
+            Some(j) => j,
+            None => &snap.smt_leaves,
+        };
+        for (nf, bind) in to_write {
             let mut key = Vec::with_capacity(P_NF.len() + 32);
             key.extend_from_slice(P_NF);
             key.extend_from_slice(nf);
@@ -330,7 +392,8 @@ impl StateDb {
         put_blob(&mut batch, K_SPV, &snap.spv)?;
         put_blob(&mut batch, K_IMMATURE, &snap.immature)?;
         put_blob(&mut batch, K_RECENT_ROOTS, &snap.recent_roots)?;
-        puts += 6;
+        put_blob(&mut batch, K_BLOCK_ROOTS, &snap.block_roots)?;
+        puts += 7;
         let sent_bytes = postcard::to_allocvec(&snap.sentinel)
             .map_err(|e| format!("encode sentinel: {e}"))?;
         batch.put(K_SENTINEL, sent_bytes);
@@ -362,11 +425,12 @@ impl StateDb {
     pub fn migrate_from_bin(&mut self, path: &Path) -> Result<(), String> {
         let bytes = std::fs::read(path)
             .map_err(|e| format!("read legacy {}: {e}", path.display()))?;
-        let (node, height) = Node::from_snapshot_bytes(&bytes)?;
+        let (mut node, height) = Node::from_snapshot_bytes(&bytes)?;
         // Reset cursors so commit writes every leaf.
         self.commit_count = 0;
         self.nf_count = 0;
-        let _ = self.commit(&node, height)?;
+        let chain_id = self.chain_id()?.unwrap_or_default();
+        let _ = self.commit_full(&mut node, height, &chain_id)?;
         Ok(())
     }
 
@@ -467,9 +531,9 @@ mod tests {
     fn commit_load_preserves_app_hash_and_height() {
         let dir = tmp_db();
         let mut db = StateDb::open(&dir).expect("open");
-        let node = sample_node(7, 5);
+        let mut node = sample_node(7, 5);
         let hash = node.state_root();
-        let stats = db.commit(&node, 7).expect("commit");
+        let stats = db.commit(&mut node, 7, b"zcrypt-test").expect("commit");
         assert_eq!(stats.new_commitments, 5);
         assert_eq!(stats.total_commitments, 5);
         assert!(stats.elapsed_ms < 60_000);
@@ -488,13 +552,13 @@ mod tests {
         let dir = tmp_db();
         let mut db = StateDb::open(&dir).expect("open");
         let mut node = sample_node(1, 3);
-        let s1 = db.commit(&node, 1).expect("c1");
+        let s1 = db.commit(&mut node, 1, b"zcrypt-test").expect("c1");
         assert_eq!(s1.new_commitments, 3);
 
         node.set_height(2);
         node.seed_coin([9u64; 8]);
         node.seed_coin([10u64; 8]);
-        let s2 = db.commit(&node, 2).expect("c2");
+        let s2 = db.commit(&mut node, 2, b"zcrypt-test").expect("c2");
         assert_eq!(s2.new_commitments, 2, "only the two new leaves");
         assert_eq!(s2.total_commitments, 5);
 
@@ -515,7 +579,7 @@ mod tests {
     fn migrate_from_legacy_bin() {
         let dir = tmp_db();
         let bin = dir.with_extension("legacy.bin");
-        let node = sample_node(42, 8);
+        let mut node = sample_node(42, 8);
         let hash = node.state_root();
         std::fs::write(&bin, node.to_snapshot_bytes(42)).unwrap();
 
@@ -537,8 +601,8 @@ mod tests {
     fn postcard_backup_roundtrip() {
         let dir = tmp_db();
         let mut db = StateDb::open(&dir).unwrap();
-        let node = sample_node(3, 2);
-        db.commit(&node, 3).unwrap();
+        let mut node = sample_node(3, 2);
+        db.commit(&mut node, 3, b"zcrypt-test").unwrap();
         let backup = dir.join("backup.bin");
         StateDb::write_backup_file(&backup, &node, 3).unwrap();
         let (restored, h) = Node::from_snapshot_bytes(&std::fs::read(&backup).unwrap()).unwrap();
@@ -576,7 +640,7 @@ mod tests {
 
         let mut node = sample_node(1, 2);
         let hash_h1 = node.state_root();
-        db.commit(&node, 1).expect("commit h1");
+        db.commit(&mut node, 1, b"zcrypt-test").expect("commit h1");
 
         // Simulate finalize_block for height 2 in RAM only — never Commit.
         node.set_height(2);
@@ -611,7 +675,7 @@ mod tests {
             for h in 1..=5u64 {
                 node.set_height(h);
                 node.seed_coin([h + 50; 8]);
-                db.commit(&node, h).unwrap();
+                db.commit(&mut node, h, b"zcrypt-test").unwrap();
                 hashes.push((h, node.state_root(), node.commitment_count()));
             }
             // Abrupt drop = process exit after last synced commit.
@@ -637,16 +701,16 @@ mod tests {
         let dir = tmp_db();
         let mut db = StateDb::open(&dir).unwrap();
 
-        let good = sample_node(3, 4);
+        let mut good = sample_node(3, 4);
         let good_hash = good.state_root();
-        db.commit(&good, 3).unwrap();
+        db.commit(&mut good, 3, b"zcrypt-test").unwrap();
         assert_eq!(db.commit_count, 4);
 
         // Shrinkage is refused: would indicate a forked/broken Node. Disk stays at h=3.
         let mut bad = Node::new();
         bad.set_height(4);
         // zero coins → total_c (0) < commit_count (4)
-        let err = db.commit(&bad, 4).expect_err("must refuse shrink");
+        let err = db.commit(&mut bad, 4, b"zcrypt-test").expect_err("must refuse shrink");
         assert!(
             err.contains("shrank"),
             "unexpected error: {err}"
@@ -668,16 +732,16 @@ mod tests {
         let dir = tmp_db();
         let mut db = StateDb::open(&dir).unwrap();
         let mut node = sample_node(1, 2);
-        db.commit(&node, 1).unwrap();
+        db.commit(&mut node, 1, b"zcrypt-test").unwrap();
 
         let mut bad = Node::new();
         bad.set_height(2);
-        assert!(db.commit(&bad, 2).is_err());
+        assert!(db.commit(&mut bad, 2, b"zcrypt-test").is_err());
 
         // Real block 2: extend the same chain that was durable at h=1.
         node.set_height(2);
         node.seed_coin([7u64; 8]);
-        let stats = db.commit(&node, 2).expect("commit after failed attempt");
+        let stats = db.commit(&mut node, 2, b"zcrypt-test").expect("commit after failed attempt");
         assert_eq!(stats.new_commitments, 1);
         assert_eq!(stats.total_commitments, 3);
         let hash = node.state_root();
@@ -698,16 +762,16 @@ mod tests {
         let backup = dir.join("backup.bin");
         let mut db = StateDb::open(&dir).unwrap();
 
-        let n1 = sample_node(1, 1);
+        let mut n1 = sample_node(1, 1);
         let h1 = n1.state_root();
-        db.commit(&n1, 1).unwrap();
+        db.commit(&mut n1, 1, b"zcrypt-test").unwrap();
         StateDb::write_backup_file(&backup, &n1, 1).unwrap();
 
         let mut n2 = n1;
         n2.set_height(2);
         n2.seed_coin([9u64; 8]);
         let h2 = n2.state_root();
-        db.commit(&n2, 2).unwrap();
+        db.commit(&mut n2, 2, b"zcrypt-test").unwrap();
         // Crash before backup update: leave backup at height 1.
         assert!(backup.is_file());
         let (bak_node, bak_h) =
@@ -732,9 +796,9 @@ mod tests {
 
         let dir = tmp_db();
         let mut db = StateDb::open(&dir).unwrap();
-        let good = sample_node(2, 3);
+        let mut good = sample_node(2, 3);
         let good_hash = good.state_root();
-        db.commit(&good, 2).unwrap();
+        db.commit(&mut good, 2, b"zcrypt-test").unwrap();
         drop(db);
 
         // Freeze the directory: new SST/WAL files cannot be created.
@@ -747,7 +811,7 @@ mod tests {
             let mut next = good;
             next.set_height(3);
             next.seed_coin([99u64; 8]);
-            db.commit(&next, 3).map(|_| ()).map_err(|e| e)
+            db.commit(&mut next, 3, b"zcrypt-test").map(|_| ()).map_err(|e| e)
         })();
 
         // Restore perms before asserts/cleanup so we can always delete the dir.
@@ -774,8 +838,8 @@ mod tests {
         let dir = tmp_db();
         {
             let mut db = StateDb::open(&dir).unwrap();
-            let node = sample_node(1, 10);
-            db.commit(&node, 1).unwrap();
+            let mut node = sample_node(1, 10);
+            db.commit(&mut node, 1, b"zcrypt-test").unwrap();
             assert_eq!(db.commit_count, 10);
         }
         let mut db = StateDb::open(&dir).unwrap();
@@ -784,7 +848,7 @@ mod tests {
         // Rebuild equivalent tree then add one leaf (same foundation + 10 seeds).
         node.set_height(2);
         node.seed_coin([200u64; 8]);
-        let stats = db.commit(&node, 2).unwrap();
+        let stats = db.commit(&mut node, 2, b"zcrypt-test").unwrap();
         assert_eq!(stats.new_commitments, 1, "only the new leaf is written");
         assert_eq!(stats.total_commitments, 11);
         let _ = std::fs::remove_dir_all(&dir);

@@ -9,7 +9,8 @@
 //! * inclusion proof     — `nf` is present, carrying its committed `txbind`
 //! * non-inclusion proof — `nf` is absent (leaf holds the default empty value)
 
-use std::collections::BTreeMap;
+use std::cell::RefCell;
+use std::collections::{BTreeMap, HashMap};
 
 use crate::hash::{h, Hash};
 
@@ -53,9 +54,29 @@ pub struct Proof {
     pub included: bool,
 }
 
+/// Nullifier set with O(log n) root recomputation.
+///
+/// The hash definition is the plain 256-level sparse Merkle tree (unchanged, so every
+/// root and proof is bit-identical to the reference full-scan implementation kept in the
+/// tests). What changed is the cost model: the tree used to be recomputed from scratch on
+/// every `root()` call, i.e. about `n * (256 - log n)` hashes per block and per `/app/hash`
+/// query, which grew without bound with the number of spent coins (consensus H3).
+///
+/// Structure: only *branching* nodes (subtrees holding at least two leaves) are cached,
+/// keyed by `(depth, prefix)`. There are at most `n - 1` of them, so memory is O(n).
+/// Single-leaf chains and the chains above branching nodes are folded against the
+/// precomputed empty-subtree hashes on the fly (at most 256 hashes each). Inserting a key
+/// invalidates exactly the branching nodes on its path, so `root()` after an insert costs
+/// O(256) hashes plus O(log n) map operations.
 pub struct Smt {
     pub(crate) leaves: BTreeMap<Hash, Hash>, // nullifier -> txbind
     defaults: [Hash; HEIGHT + 1],
+    /// Cached hashes of branching subtrees: `(depth, prefix masked to depth) -> hash`.
+    /// Pure memoization: never affects any hash value, so it is never serialized.
+    cache: RefCell<HashMap<(u16, Hash), Hash>>,
+    /// Inserts since the last [`Self::take_journal`], in insertion order, so the durable
+    /// store can write only the new leaves instead of re-putting every nullifier each block.
+    journal: Vec<(Hash, Hash)>,
 }
 
 impl Default for Smt {
@@ -64,12 +85,46 @@ impl Default for Smt {
     }
 }
 
+/// Number of leading bits `a` and `b` share (0..=256).
+fn lcp_bits(a: &Hash, b: &Hash) -> usize {
+    let mut n = 0;
+    for i in 0..32 {
+        let x = a[i] ^ b[i];
+        if x == 0 {
+            n += 8;
+        } else {
+            n += x.leading_zeros() as usize;
+            break;
+        }
+    }
+    n
+}
+
+/// `key` with every bit at or below `depth` cleared (the canonical prefix of length `depth`).
+fn mask(key: &Hash, depth: usize) -> Hash {
+    let (lo, _) = prefix_bounds(key, depth);
+    lo
+}
+
 impl Smt {
     pub fn new() -> Self {
         Smt {
             leaves: BTreeMap::new(),
             defaults: defaults(),
+            cache: RefCell::new(HashMap::new()),
+            journal: Vec::new(),
         }
+    }
+
+    /// Inserts since the previous call (insertion order), clearing the journal.
+    pub fn take_journal(&mut self) -> Vec<(Hash, Hash)> {
+        std::mem::take(&mut self.journal)
+    }
+
+    /// Prepend entries a caller took but could not make durable.
+    pub fn requeue_journal(&mut self, mut entries: Vec<(Hash, Hash)>) {
+        entries.extend(std::mem::take(&mut self.journal));
+        self.journal = entries;
     }
 
     /// The (nullifier → txbind) leaf set — the SMT's entire source of truth. The
@@ -111,37 +166,86 @@ impl Smt {
         if self.leaves.contains_key(&key) {
             return false;
         }
+        self.invalidate_path(&key);
         self.leaves.insert(key, txbind);
+        self.journal.push((key, txbind));
         true
+    }
+
+    /// Drop every cached branching node on `key`'s path (the only hashes an insert of
+    /// `key` can change). Walks from the root: at each branching node that contains the
+    /// key's prefix, forget it and descend into the child holding `key`; stop at the first
+    /// subtree with fewer than two leaves or one `key` is not inside.
+    fn invalidate_path(&mut self, key: &Hash) {
+        let mut depth = 0usize;
+        loop {
+            let prefix = mask(key, depth);
+            let (lo, hi) = prefix_bounds(&prefix, depth);
+            let mut range = self.leaves.range(lo..=hi);
+            let Some((first, _)) = range.next() else { return };
+            let Some((last, _)) = range.next_back() else { return }; // single leaf: a chain
+            let b = lcp_bits(first, last);
+            // The branching node sits at depth `b`. It changes only if `key` lies inside it.
+            if lcp_bits(key, first) < b {
+                return;
+            }
+            self.cache.borrow_mut().remove(&(b as u16, mask(first, b)));
+            depth = b + 1;
+            if depth > HEIGHT {
+                return;
+            }
+        }
+    }
+
+    /// Fold a node hash at `from` depth up to `to` depth along `key`'s path, pairing with
+    /// empty subtrees at every level (the levels in between hold no other leaf).
+    fn fold_up(&self, mut node: Hash, key: &Hash, from: usize, to: usize) -> Hash {
+        for d in (to..from).rev() {
+            let sib = &self.defaults[HEIGHT - (d + 1)];
+            node = if bit(key, d) == 0 { node_hash(&node, sib) } else { node_hash(sib, &node) };
+        }
+        node
     }
 
     /// Hash of the subtree rooted at (level bits fixed = `depth`, given prefix).
     /// `depth` counts fixed bits from the top; subtree height = HEIGHT - depth.
+    ///
+    /// Keys are 256-bit and read MSB-first, which is exactly the lexicographic order of
+    /// their byte arrays, so every prefix covers a CONTIGUOUS range of the sorted leaf map:
+    /// one range probe finds the first and last leaf under the prefix, and their longest
+    /// common prefix is the depth of the subtree's single branching node.
     fn subtree(&self, depth: usize, prefix: &Hash) -> Hash {
-        let height = HEIGHT - depth;
-        // Is any nullifier under this prefix? Keys are 256-bit and read MSB-first, which is
-        // exactly the lexicographic order of their byte arrays, so every prefix covers a
-        // CONTIGUOUS range of the sorted leaf map and a range probe answers this in O(log n).
-        //
-        // This used to be a full scan of every leaf, with an O(depth) bit comparison per leaf,
-        // run at each of the ~256n nodes a root computation visits. That made computing a root
-        // quadratic in the number of spent coins, and the root was (before the receipt change)
-        // recomputed once per transaction.
         let (lo, hi) = prefix_bounds(prefix, depth);
-        let Some((_, first)) = self.leaves.range(lo..=hi).next() else {
-            return self.defaults[height];
+        let mut range = self.leaves.range(lo..=hi);
+        let Some((first, first_v)) = range.next() else {
+            return self.defaults[HEIGHT - depth];
         };
-        if depth == HEIGHT {
-            // Every bit is fixed, so the range spans exactly one key: a single leaf.
-            return leaf_hash(first);
+        let Some((last, _)) = range.next_back() else {
+            // Exactly one leaf under this prefix: a single-leaf chain.
+            return self.fold_up(leaf_hash(first_v), first, HEIGHT, depth);
+        };
+        let b = lcp_bits(first, last);
+        debug_assert!(b >= depth);
+        let hb = self.branch_hash(b, first);
+        self.fold_up(hb, first, b, depth)
+    }
+
+    /// Hash of the branching node at `depth` on `key`'s path (both children non-empty),
+    /// memoized in the cache.
+    fn branch_hash(&self, depth: usize, key: &Hash) -> Hash {
+        let pfx = mask(key, depth);
+        if let Some(h) = self.cache.borrow().get(&(depth as u16, pfx)) {
+            return *h;
         }
-        let mut left_prefix = *prefix;
-        let mut right_prefix = *prefix;
+        let mut left_prefix = pfx;
+        let mut right_prefix = pfx;
         set_bit(&mut left_prefix, depth, 0);
         set_bit(&mut right_prefix, depth, 1);
         let l = self.subtree(depth + 1, &left_prefix);
         let r = self.subtree(depth + 1, &right_prefix);
-        node_hash(&l, &r)
+        let node = node_hash(&l, &r);
+        self.cache.borrow_mut().insert((depth as u16, pfx), node);
+        node
     }
 
     pub fn root(&self) -> Hash {
@@ -348,6 +452,60 @@ mod tests {
             }
             assert!(verify(&t.prove(&hkey(n + 999)), &t.root()), "non-inclusion at n={n}");
         }
+    }
+
+    #[test]
+    fn incremental_root_matches_reference_across_interleaved_inserts() {
+        // The cache must be invalidated exactly along each inserted key's path: interleave
+        // root() calls (which populate the cache) with inserts and compare every root, and
+        // every proof, against the from-scratch reference on the same leaf set.
+        let mut t = Smt::new();
+        for i in 0..200u64 {
+            t.insert(hkey(i), h(b"bind", &[&i.to_le_bytes()]));
+            if i % 7 == 0 || i < 5 {
+                assert_eq!(t.root(), t.root_reference(), "root after {} inserts", i + 1);
+                let probe = hkey(i / 2);
+                let p = t.prove(&probe);
+                assert!(verify(&p, &t.root()), "proof after {} inserts", i + 1);
+                assert!(verify(&t.prove(&hkey(10_000 + i)), &t.root()), "non-inclusion after {}", i + 1);
+            }
+        }
+        // Same leaves inserted fresh (no cache history) give the identical root.
+        let fresh = Smt::restore(t.leaf_entries());
+        assert_eq!(fresh.root(), t.root());
+        // The journal records every insert once.
+        let mut j = Smt::new();
+        j.insert(hkey(1), [1; 32]);
+        j.insert(hkey(2), [2; 32]);
+        assert!(!j.insert(hkey(2), [3; 32]));
+        assert_eq!(j.take_journal(), vec![(hkey(1), [1; 32]), (hkey(2), [2; 32])]);
+        assert!(j.take_journal().is_empty());
+    }
+
+    #[test]
+    fn deep_prefix_splits_invalidate_correctly() {
+        // Keys that split at the deepest levels create branching nodes far down the tree;
+        // inserting between cached siblings must refresh only what changed and still agree
+        // with the reference.
+        let mut t = Smt::new();
+        let base = [0x5Au8; 32];
+        t.insert(base, [0xEE; 32]);
+        let _ = t.root();
+        for d in (0..HEIGHT).rev().step_by(9) {
+            let mut k = base;
+            k[d / 8] ^= 1 << (7 - (d % 8));
+            t.insert(k, [d as u8; 32]);
+            assert_eq!(t.root(), t.root_reference(), "split at depth {d}");
+        }
+        let (mut a, mut b) = ([0xC3u8; 32], [0xC3u8; 32]);
+        a[31] = 0xFE;
+        b[31] = 0xFF;
+        t.insert(a, [1; 32]);
+        let _ = t.root();
+        t.insert(b, [2; 32]);
+        assert_eq!(t.root(), t.root_reference());
+        assert!(verify(&t.prove(&a), &t.root()));
+        assert!(verify(&t.prove(&b), &t.root()));
     }
 
     #[test]

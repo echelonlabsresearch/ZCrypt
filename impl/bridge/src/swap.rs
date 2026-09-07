@@ -204,8 +204,49 @@ fn pk_bytes(pk: &PubKey) -> Vec<u8> {
     b
 }
 
-pub fn register_tx(ticker: &str, decimals: u8, authority: &[u8; 32], max_supply: u64) -> Vec<u8> {
-    let mut t = vec![0x59u8, decimals, ticker.len() as u8];
+/// Build the GAS PREFIX state-creating txs (REGISTER 0x59, HTLC_OPEN 0x5A) must carry:
+/// `gas_blind(32) ‖ gas_len(u32 LE) ‖ gas_tx`, where `gas_tx` is a ZCRYPT shield spend of
+/// `gas_coin` (owned by `gas_owner`) whose output[0] burns exactly MIN_FEE ZCRYPT and whose
+/// change returns to `gas_owner`. Exactly the gas note a 0x55 transfer bundles. Consensus
+/// rejects these tags without it (they used to be free: consensus H1).
+pub fn build_gas_prefix(zc: &Zcrypt, gas_owner: &Account, gas_coin: &Coin) -> Result<Vec<u8>, String> {
+    let min_fee = zcrypt_core::emission::MIN_FEE;
+    if gas_coin.value < min_fee {
+        return Err("gas coin is below the minimum fee".to_string());
+    }
+    let gas_blind = zcrypt_core::keys::random_blind();
+    let burn: OutCoin = (min_fee, gas_blind, zcrypt_core::htlc_shield::BURN_PK, zcrypt_shield::ASSET_ZCRYPT);
+    let chg_val = gas_coin.value - min_fee;
+    let chg_blind = zcrypt_core::keys::random_blind();
+    let chg = zcrypt_core::keys::out_coin(&gas_owner.normal_address(), chg_val, chg_blind);
+    let chg_note = zcrypt_core::kem::ciphertext_to_bytes(&zcrypt_core::keys::encrypt_note(
+        &gas_owner.normal_address(),
+        chg_val,
+        chg_blind,
+    ));
+    let gas_tx = build_shield_spend(
+        zc,
+        &[gas_coin.clone()],
+        &[burn, chg],
+        0,
+        vec![zcrypt_core::keys::cover_note_bytes(), chg_note],
+    )?;
+    let gas_bytes = shield_tx::to_bytes(&gas_tx);
+    let mut out = Vec::with_capacity(36 + gas_bytes.len());
+    for limb in gas_blind {
+        out.extend_from_slice(&limb.to_le_bytes());
+    }
+    out.extend_from_slice(&(gas_bytes.len() as u32).to_le_bytes());
+    out.extend_from_slice(&gas_bytes);
+    Ok(out)
+}
+
+/// Build a REGISTER tx (0x59). `gas` is the encoded gas prefix from [`build_gas_prefix`].
+pub fn register_tx(ticker: &str, decimals: u8, authority: &[u8; 32], max_supply: u64, gas: &[u8]) -> Vec<u8> {
+    let mut t = vec![0x59u8];
+    t.extend_from_slice(gas);
+    t.push(decimals);
+    t.push(ticker.len() as u8);
     t.extend_from_slice(ticker.as_bytes());
     t.extend_from_slice(&max_supply.to_le_bytes());
     t.extend_from_slice(authority);
@@ -217,8 +258,15 @@ pub fn register_tx(ticker: &str, decimals: u8, authority: &[u8; 32], max_supply:
 /// `spv_authority(reserve_pk)` from it — minting is then possible only via a
 /// verified Bitcoin deposit claimable by that reserve key. zBTC is *required* to
 /// be registered this way (the node rejects any discretionary-authority zBTC).
-pub fn register_spv_tx(ticker: &str, decimals: u8, reserve_pk: &[u8; 33], max_supply: u64) -> Vec<u8> {
-    let mut t = vec![0x59u8, decimals, ticker.len() as u8];
+///
+/// NOTE: on a launched chain zBTC is pinned in GENESIS (`zbtc_reserve_pk`), never by this
+/// tx; the ticker then fails as "already registered". `gas` is the encoded gas prefix from
+/// [`build_gas_prefix`] (an empty prefix is rejected by consensus).
+pub fn register_spv_tx(ticker: &str, decimals: u8, reserve_pk: &[u8; 33], max_supply: u64, gas: &[u8]) -> Vec<u8> {
+    let mut t = vec![0x59u8];
+    t.extend_from_slice(gas);
+    t.push(decimals);
+    t.push(ticker.len() as u8);
     t.extend_from_slice(ticker.as_bytes());
     t.extend_from_slice(&max_supply.to_le_bytes());
     t.extend_from_slice(reserve_pk);
@@ -260,12 +308,23 @@ pub fn open_spv_tx(
     t.extend_from_slice(lock);
     t.extend_from_slice(&timeout.to_le_bytes());
     t.extend_from_slice(&pk_bytes(claim_pk));
-    // H1 recipient binding: sign the funding outpoint + claim_pk with the refund key.
+    // Recipient binding, extended to EVERY open parameter: the refund key signs the chain,
+    // outpoint, claim_pk, asset, value, hashlock and timeout, so a mempool front-runner can
+    // neither redirect the mint nor open it as a 1-sat / already-expired escrow.
     let txid = proof.funding_txid().expect("open_spv_tx: proof carries a valid funding tx");
     let mut op = [0u8; 36];
     op[..32].copy_from_slice(&txid);
     op[32..].copy_from_slice(&proof.vout.to_le_bytes());
-    let auth = zcrypt_core::spv::sign_open_auth(&refund.sk, &op, claim_pk);
+    let a = zcrypt_core::spv::OpenAuth {
+        chain_id: CHAIN,
+        outpoint: &op,
+        claim_pk,
+        asset_id: asset,
+        value,
+        hashlock: lock,
+        timeout_height: timeout,
+    };
+    let auth = zcrypt_core::spv::sign_open_auth(&refund.sk, &a);
     t.extend_from_slice(&auth);
     t.extend_from_slice(&proof.to_bytes());
     t
@@ -334,8 +393,10 @@ pub fn relay_btc_headers(zc: &Zcrypt, btc: &dyn crate::BtcBackend) -> Result<u64
 /// Build a mint-escrow open tx (0x5A). `auth` is the encoded M-of-N mint authorization
 /// (key set + threshold ML-DSA signatures over these exact params) from
 /// [`zcrypt_core::mint_auth::encode_auth`] — no secret is ever placed on-chain.
-pub fn open_tx(asset: u64, value: u64, lock: &[u8; 32], timeout: u64, claim_pk: &PubKey, auth: &[u8]) -> Vec<u8> {
+/// `gas` is the encoded gas prefix from [`build_gas_prefix`].
+pub fn open_tx(asset: u64, value: u64, lock: &[u8; 32], timeout: u64, claim_pk: &PubKey, auth: &[u8], gas: &[u8]) -> Vec<u8> {
     let mut t = vec![0x5Au8];
+    t.extend_from_slice(gas);
     t.extend_from_slice(&asset.to_le_bytes());
     t.extend_from_slice(&value.to_le_bytes());
     t.extend_from_slice(lock);
@@ -373,10 +434,12 @@ pub fn expire_tx(escrow_id: &[u8; 32]) -> Vec<u8> {
     t
 }
 
-/// Minimum HTLC preimage length. The hashlock is `SHA256(preimage)`, so a short or
-/// low-entropy preimage can be brute-forced from the public hashlock and the
-/// counterparty's leg stolen (H5). 16 bytes = 128-bit preimage resistance.
-pub const MIN_PREIMAGE_LEN: usize = 16;
+/// The ONLY HTLC preimage length consensus (and the Bitcoin script's `OP_SIZE 32`) accepts.
+/// A short preimage is brute-forceable from the public hashlock; a long one can never be
+/// pushed as a Bitcoin witness element, so the reserve could never sweep the deposit.
+pub const PREIMAGE_LEN: usize = zcrypt_core::htlc_shield::HTLC_PREIMAGE_LEN;
+/// Legacy alias (the minimum is now also the maximum).
+pub const MIN_PREIMAGE_LEN: usize = PREIMAGE_LEN;
 
 /// Generate a fresh, unguessable 32-byte HTLC preimage from OS entropy. Swaps MUST
 /// use this (or another CSPRNG source) rather than a fixed/guessable string.
@@ -599,7 +662,13 @@ pub fn build_transfer(
         chg_val,
         chg_blind,
     ));
-    let gas_tx = build_shield_spend(zc, &[gas_coin.clone()], &[burn, chg], 0, vec![vec![], chg_note])?;
+    let gas_tx = build_shield_spend(
+        zc,
+        &[gas_coin.clone()],
+        &[burn, chg],
+        0,
+        vec![zcrypt_core::keys::cover_note_bytes(), chg_note],
+    )?;
     // Bundle: 0x55 ‖ gas_blind(32) ‖ gas_len(4) ‖ gas_tx ‖ main_tx.
     let gas_bytes = shield_tx::to_bytes(&gas_tx);
     let main_bytes = shield_tx::to_bytes(&main_tx);
@@ -674,8 +743,8 @@ pub fn btc_to_zbtc_progress(
     zbtc_value: u64,
     progress: &dyn Fn(u8, &str),
 ) -> Result<Coin, String> {
-    if preimage.len() < MIN_PREIMAGE_LEN {
-        return Err(format!("HTLC preimage too short (< {MIN_PREIMAGE_LEN} bytes): brute-forceable"));
+    if preimage.len() != PREIMAGE_LEN {
+        return Err(format!("HTLC preimage must be exactly {PREIMAGE_LEN} bytes (got {})", preimage.len()));
     }
     if zbtc_value > btc_amount.to_sat() {
         return Err(format!(
@@ -785,8 +854,8 @@ pub fn btc_to_zbtc_public_progress(
     zbtc_value: u64,
     progress: &dyn Fn(u8, &str),
 ) -> Result<Coin, String> {
-    if preimage.len() < MIN_PREIMAGE_LEN {
-        return Err(format!("HTLC preimage too short (< {MIN_PREIMAGE_LEN} bytes): brute-forceable"));
+    if preimage.len() != PREIMAGE_LEN {
+        return Err(format!("HTLC preimage must be exactly {PREIMAGE_LEN} bytes (got {})", preimage.len()));
     }
     if zbtc_value > btc_amount.to_sat() {
         return Err(format!(
@@ -1190,7 +1259,7 @@ pub fn redeem_user_burn(
         coins,
         &[burn_out, change_out],
         zcrypt_core::emission::MIN_FEE,
-        vec![vec![1; 8], change_note],
+        vec![zcrypt_core::keys::cover_note_bytes(), change_note],
         &envelope,
     )?;
     let data = zc.broadcast(&burn_lock_btc_tx(btc_claim_pk, zbtc_value, &burn_blind, asset, hashlock, zc_timeout, &user.pubkey(), &stx))?;
@@ -1446,8 +1515,8 @@ pub fn zbtc_to_btc_progress(
     btc_amount: Amount,
     progress: &dyn Fn(u8, &str),
 ) -> Result<(u64, [u64; 4]), String> {
-    if preimage.len() < MIN_PREIMAGE_LEN {
-        return Err(format!("HTLC preimage too short (< {MIN_PREIMAGE_LEN} bytes): brute-forceable"));
+    if preimage.len() != PREIMAGE_LEN {
+        return Err(format!("HTLC preimage must be exactly {PREIMAGE_LEN} bytes (got {})", preimage.len()));
     }
     // Peg integrity: BTC locked must equal zBTC burned (1:1 base units).
     if btc_amount.to_sat() != zbtc_value {
@@ -1505,7 +1574,7 @@ pub fn zbtc_to_btc_progress(
         coins,
         &[burn_out, change_out],
         zcrypt_core::emission::MIN_FEE,
-        vec![vec![1; 8], change_note],
+        vec![zcrypt_core::keys::cover_note_bytes(), change_note],
         &envelope,
     )?;
     let data = zc.broadcast(&burn_lock_tx(zbtc_value, &burn_blind, asset, &lock, zc_timeout, &alice.pubkey(), &stx))?;
@@ -1608,7 +1677,7 @@ fn send_swap_lock(
         coins,
         &[burn_out, change_out],
         zcrypt_core::emission::MIN_FEE,
-        vec![vec![1; 8], change_note],
+        vec![zcrypt_core::keys::cover_note_bytes(), change_note],
         &envelope,
     )?;
     let data = zc.broadcast(&swap_lock_tx(
@@ -1642,8 +1711,8 @@ pub fn swap_in_pool_progress(
     preimage: &[u8],
     progress: &dyn Fn(u8, &str),
 ) -> Result<SwapResult, String> {
-    if preimage.len() < MIN_PREIMAGE_LEN {
-        return Err(format!("HTLC preimage too short (< {MIN_PREIMAGE_LEN} bytes): brute-forceable"));
+    if preimage.len() != PREIMAGE_LEN {
+        return Err(format!("HTLC preimage must be exactly {PREIMAGE_LEN} bytes (got {})", preimage.len()));
     }
     let lock = htlc_hashlock(preimage);
     // Stagger timeouts: maker's locked leg (give) expires first; taker's locked leg

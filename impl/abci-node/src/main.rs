@@ -7,15 +7,17 @@
 //!   * commit          -> RocksDB StateDb (incremental leaves + fsync WriteBatch)
 //!   * query           -> /registry/root, /registry/minted, /prove/<nf_hex>
 
+use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use tendermint_abci::{Application, ServerBuilder};
 use tendermint_proto::v0_38::abci::{
-    ExecTxResult, MisbehaviorType, RequestCheckTx, RequestFinalizeBlock, RequestInfo,
+    CheckTxType, ExecTxResult, MisbehaviorType, RequestCheckTx, RequestFinalizeBlock, RequestInfo,
     RequestInitChain, RequestQuery, ResponseCheckTx, ResponseCommit, ResponseFinalizeBlock,
     ResponseInfo, ResponseInitChain, ResponseQuery, ValidatorUpdate,
 };
+use zcrypt_core::shield_tx::ShieldTx;
 use tendermint_proto::v0_38::crypto::{public_key::Sum as PubKeySum, PublicKey};
 use tendermint_proto::v0_38::types::BlockIdFlag;
 
@@ -59,16 +61,22 @@ const BOND_TAG: u8 = 0x57;
 const CLAIM_TAG: u8 = 0x58;
 
 /// Register a shielded-asset ticker (first-mint-wins). Payload:
+///   GAS PREFIX: gas_blind(4×u64 = 32) ‖ gas_tx_len(u32 LE) ‖ gas_tx_bytes (a ZCRYPT shield
+///   spend whose output[0] burns exactly MIN_FEE ZCRYPT, exactly as a 0x55 transfer bundles),
+///   then:
 ///   [0]      decimals
 ///   [1]      ticker length L
 ///   [2..2+L] ticker (UTF-8, e.g. "zBTC")
-///   [2+L..]  optional 32-byte controlled-mint authority (absent = protocol/bridge mint)
+///   [2+L..2+L+8] max_supply (u64 LE)
+///   [2+L+8..] optional 32-byte controlled-mint authority or 33-byte SPV reserve pubkey
+/// State-creating txs used to be free, so a flood of registrations / opens grew every
+/// node's per-block hashing and persistence for nothing (consensus H1).
 const REGISTER_TAG: u8 = 0x59;
 
-/// Open a shield-native HTLC escrow. Payload:
+/// Open a shield-native HTLC escrow. Payload: the same GAS PREFIX as REGISTER, then
 ///   [0..8]    asset_id (u64 LE)   [8..16]   value (u64 LE)
 ///   [16..48]  hashlock (SHA-256)  [48..56]  timeout height (u64 LE)
-///   [56..120] claim shield pubkey (8×u64 LE)   [120..] mint capability
+///   [56..120] claim shield pubkey (8×u64 LE)   [120..] M-of-N mint authorization
 const HTLC_OPEN_TAG: u8 = 0x5A;
 /// Claim an HTLC escrow: escrow_id(32) ‖ preimage(rest). Mints the escrow coin.
 const HTLC_CLAIM_TAG: u8 = 0x5B;
@@ -111,6 +119,14 @@ const SWAP_LOCK_TAG: u8 = 0x62;
 /// Relay raw Bitcoin headers into the consensus SPV chain (anyone may send; each
 /// header carries its own proof-of-work). Payload: N×80-byte headers, concatenated.
 const BTC_HEADERS_TAG: u8 = 0x63;
+/// Raw header bytes a single block may relay (two full batches). Header relays carry no
+/// gas, so without a cap a relayer could fill every block with 161 KB header txs.
+const MAX_HEADER_BYTES_PER_BLOCK: usize = 2 * zcrypt_core::spv::MAX_HEADER_BATCH * 80;
+/// Leaves per `/commit/leaves` page. Clients page with `/commit/leaves/<from>` until a page
+/// comes back shorter than this; one query never clones the whole tree (consensus H3).
+const LEAF_PAGE: usize = 20_000;
+/// Verified-proof cache size for mempool rechecks (tx digests whose STARKs already verified).
+const VERIFIED_CACHE: usize = 4096;
 
 /// Open a **zBTC** mint escrow gated by a Bitcoin **SPV deposit proof** — the
 /// trustless bridge mint (no treasury, no signers). Payload:
@@ -194,6 +210,23 @@ fn foundation_addr_from_genesis(app_state_bytes: &[u8]) -> Option<[u8; 32]> {
         return None;
     }
     hex::decode(h).ok()?.try_into().ok()
+}
+
+/// A 33-byte compressed secp256k1 key from the genesis `app_state` JSON (hex), e.g.
+/// `zbtc_reserve_pk`. `None` when absent, empty, or malformed (deterministic across nodes).
+fn genesis_pubkey33(app_state_bytes: &[u8], name: &str) -> Option<[u8; 33]> {
+    let v: serde_json::Value = serde_json::from_slice(app_state_bytes).ok()?;
+    let h = v.get(name)?.as_str()?.trim();
+    if h.is_empty() {
+        return None;
+    }
+    let raw: [u8; 33] = hex::decode(h).ok()?.try_into().ok()?;
+    bitcoin_pk_ok(&raw).then_some(raw)
+}
+
+/// Whether `pk` is a well-formed compressed secp256k1 point.
+fn bitcoin_pk_ok(pk: &[u8; 33]) -> bool {
+    zcrypt_core::spv::reserve_pk_ok(pk)
 }
 
 /// A boolean flag in the genesis `app_state` JSON (e.g. `foundation_sentinel: true`).
@@ -313,6 +346,25 @@ fn build_spv_chain(net_str: &str, cp_str: &str) -> Option<zcrypt_core::spv::Head
         let height: u64 = height.parse().expect("checkpoint height: invalid number");
         HeaderChain::with_checkpoint(btc_net, raw, height).expect("invalid checkpoint")
     })
+}
+
+/// Parse the GAS PREFIX that state-creating txs carry: `gas_blind(32) ‖ gas_len(u32 LE) ‖
+/// gas_tx`. Returns `(gas_blind, gas_tx, rest)`.
+fn parse_gas_prefix(b: &[u8]) -> Option<([u64; 4], ShieldTx, &[u8])> {
+    if b.len() < 36 {
+        return None;
+    }
+    let mut gas_blind = [0u64; 4];
+    for (i, limb) in gas_blind.iter_mut().enumerate() {
+        *limb = u64::from_le_bytes(b[i * 8..i * 8 + 8].try_into().ok()?);
+    }
+    let gas_len = u32::from_le_bytes(b[32..36].try_into().ok()?) as usize;
+    let gas_end = 36usize.checked_add(gas_len)?;
+    if b.len() < gas_end {
+        return None;
+    }
+    let gas_tx = zcrypt_core::shield_tx::from_bytes(&b[36..gas_end])?;
+    Some((gas_blind, gas_tx, &b[gas_end..]))
 }
 
 /// Parse an HTLC-open payload into (asset_id, value, hashlock, timeout, claim_pk, capability).
@@ -770,9 +822,23 @@ fn voting_power(stake: u64) -> i64 {
 /// validator sets stay in lockstep — a divergent update would fork the app_hash and
 /// halt, never silently split the set.
 fn validator_updates(before: &[(Vec<u8>, u64)], after: &[(Vec<u8>, u64)]) -> Vec<ValidatorUpdate> {
+    validator_updates_excluding(before, after, None)
+}
+
+/// [`validator_updates`] with the sentinel key EXCLUDED from the diff. The sentinel's
+/// CometBFT power is owned by `Node::sentinel_update` (its supermajority inflation);
+/// emitting it here too let any 1-ZCRYPT delegation to the sentinel overwrite that power
+/// with its stake, and a block that changed both produced two updates for one key, which
+/// CometBFT rejects (a permanent halt). Consensus C1.
+fn validator_updates_excluding(
+    before: &[(Vec<u8>, u64)],
+    after: &[(Vec<u8>, u64)],
+    exclude: Option<&[u8]>,
+) -> Vec<ValidatorUpdate> {
     use std::collections::BTreeMap;
-    let bmap: BTreeMap<&Vec<u8>, u64> = before.iter().map(|(k, v)| (k, *v)).collect();
-    let amap: BTreeMap<&Vec<u8>, u64> = after.iter().map(|(k, v)| (k, *v)).collect();
+    let keep = |k: &&Vec<u8>| exclude.map(|x| x != k.as_slice()).unwrap_or(true);
+    let bmap: BTreeMap<&Vec<u8>, u64> = before.iter().map(|(k, v)| (k, *v)).filter(|(k, _)| keep(k)).collect();
+    let amap: BTreeMap<&Vec<u8>, u64> = after.iter().map(|(k, v)| (k, *v)).filter(|(k, _)| keep(k)).collect();
     let mk = |pubkey: &[u8], power: i64| ValidatorUpdate {
         pub_key: Some(PublicKey { sum: Some(PubKeySum::Ed25519(pubkey.to_vec())) }),
         power,
@@ -845,6 +911,9 @@ struct State {
     height: i64,
     /// CometBFT genesis `chain_id` bytes — bound into shield proofs and staking signatures.
     chain_id: Vec<u8>,
+    /// The app hash of the last finalized (or loaded) state, served to `info` and `/app/hash`
+    /// so public queries never recompute consensus roots under the state lock.
+    app_hash: [u8; 32],
 }
 
 /// ABCI application. `Clone` is required by tendermint-abci; all heavy state is behind `Arc`.
@@ -860,6 +929,18 @@ struct ZcryptApp {
     /// When true (default), a failed DB commit panics so CometBFT restarts and replays
     /// rather than continuing with unsaved state. Set `ZCRYPT_STATE_STRICT=0` to log-only.
     strict: bool,
+    /// Write the postcard backup file every this many blocks (0 = never). The backup
+    /// serializes the ENTIRE state, so writing it every block was O(state) per block.
+    backup_every: u64,
+    /// Digests of mempool txs whose STARK proofs already verified, so CometBFT's per-block
+    /// recheck does not re-run every pending proof (bounded FIFO).
+    verified: Arc<Mutex<(HashSet<[u8; 32]>, VecDeque<[u8; 32]>)>>,
+}
+
+/// SHA-256 of the raw tx bytes (the verified-proof cache key).
+fn tx_digest(tx: &[u8]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(tx).into()
 }
 
 /// Persist genesis chain id next to the state DB directory so restarts keep the same domain.
@@ -875,6 +956,12 @@ fn load_chain_id(db_path: &Path) -> Vec<u8> {
     }
 }
 
+/// Header-relay txs must not exceed the per-block byte budget; tracked per block so the
+/// cap is a deterministic function of the block's contents.
+fn header_budget_ok(used: usize, len: usize) -> bool {
+    used.saturating_add(len) <= MAX_HEADER_BYTES_PER_BLOCK
+}
+
 fn persist_chain_id(db_path: &Path, chain_id: &[u8]) {
     let path = chain_id_path(db_path);
     if let Some(dir) = path.parent() {
@@ -886,6 +973,16 @@ fn persist_chain_id(db_path: &Path, chain_id: &[u8]) {
 impl ZcryptApp {
     /// Open the RocksDB store at `db_path`, migrating `legacy_bin` if the DB is empty.
     fn new(db_path: PathBuf, legacy_bin: Option<PathBuf>, backup_path: PathBuf, strict: bool) -> Self {
+        Self::with_backup_every(db_path, legacy_bin, backup_path, strict, 1000)
+    }
+
+    fn with_backup_every(
+        db_path: PathBuf,
+        legacy_bin: Option<PathBuf>,
+        backup_path: PathBuf,
+        strict: bool,
+        backup_every: u64,
+    ) -> Self {
         let (store, loaded) = StateDb::open_or_migrate(&db_path, legacy_bin.as_deref()).unwrap_or_else(|e| {
             panic!("cannot open state db {}: {e}", db_path.display());
         });
@@ -893,13 +990,38 @@ impl ZcryptApp {
             Some((n, h)) => (n, h as i64),
             None => (Node::new(), 0),
         };
-        let chain_id = load_chain_id(&db_path);
+        // The chain id stamped in the durable state is authoritative; the sidecar file and
+        // the compiled default are fallbacks only (a lost sidecar used to silently switch a
+        // node to the default domain and reject every valid tx).
+        let chain_id = match store.chain_id() {
+            Ok(Some(id)) => id,
+            _ => load_chain_id(&db_path),
+        };
+        let app_hash = node.state_root();
         ZcryptApp {
-            state: Arc::new(Mutex::new(State { node, height, chain_id })),
+            state: Arc::new(Mutex::new(State { node, height, chain_id, app_hash })),
             store: Arc::new(Mutex::new(store)),
             db_path,
             backup_path,
             strict,
+            backup_every,
+            verified: Arc::new(Mutex::new((HashSet::new(), VecDeque::new()))),
+        }
+    }
+
+    fn verified_contains(&self, d: &[u8; 32]) -> bool {
+        self.verified.lock().unwrap_or_else(|p| p.into_inner()).0.contains(d)
+    }
+
+    fn verified_insert(&self, d: [u8; 32]) {
+        let mut g = self.verified.lock().unwrap_or_else(|p| p.into_inner());
+        if g.0.insert(d) {
+            g.1.push_back(d);
+            while g.1.len() > VERIFIED_CACHE {
+                if let Some(old) = g.1.pop_front() {
+                    g.0.remove(&old);
+                }
+            }
         }
     }
 
@@ -936,7 +1058,7 @@ impl Application for ZcryptApp {
             version: env!("CARGO_PKG_VERSION").into(),
             app_version: 1,
             last_block_height: s.height,
-            last_block_app_hash: s.node.state_root().to_vec().into(),
+            last_block_app_hash: s.app_hash.to_vec().into(),
         }
     }
 
@@ -993,20 +1115,100 @@ impl Application for ZcryptApp {
                 Err(e) => eprintln!("[spv] keeping persisted SPV chain ({e})"),
             }
         }
+        // zBTC's reserve key is bound in GENESIS (`zbtc_reserve_pk`), never by a first-come
+        // REGISTER tx: whoever landed that tx first owned every bridged BTC forever, with no
+        // rotation (bridge H3 / consensus M4). Once registered here, a later REGISTER of the
+        // ticker fails as "already registered".
+        if let Some(pk) = genesis_pubkey33(&req.app_state_bytes, "zbtc_reserve_pk") {
+            use zcrypt_core::asset_registry::{ZBTC_DECIMALS, ZBTC_MAX_SUPPLY, ZBTC_TICKER};
+            match s.node.register_asset(
+                ZBTC_TICKER,
+                ZBTC_DECIMALS,
+                Some(zcrypt_core::spv::spv_authority(&pk)),
+                ZBTC_MAX_SUPPLY,
+            ) {
+                Ok(id) => eprintln!("[zbtc] reserve key pinned from genesis: asset {id}, reserve {}", hex::encode(pk)),
+                Err(e) => eprintln!("[zbtc] genesis registration skipped ({e})"),
+            }
+        }
+        s.app_hash = s.node.state_root();
         ResponseInitChain {
-            app_hash: s.node.state_root().to_vec().into(),
+            app_hash: s.app_hash.to_vec().into(),
             ..Default::default()
         }
     }
 
     fn check_tx(&self, req: RequestCheckTx) -> ResponseCheckTx {
-        let s = self.locked();
-        let chain_id = s.chain_id.as_slice();
         let tx = req.tx.as_ref();
+        let name = tag_name(tx.first().copied());
+        let is_recheck = req.r#type == CheckTxType::Recheck as i32;
+        let digest = tx_digest(tx);
+        // Phase 1 (under the state lock, microseconds): parse, authenticate, and run every
+        // proof-FREE precondition. Shield proofs are collected and verified in phase 2 with
+        // the lock RELEASED, so a flood of expensive-but-invalid proofs cannot starve
+        // block execution (consensus M3).
+        let (result, deferred, chain_id) = {
+            let s = self.locked();
+            let (r, d) = self.check_tx_locked(&s, tx);
+            (r, d, s.chain_id.clone())
+        };
+        let result = match result {
+            Err(e) => Err(e),
+            Ok(()) if deferred.is_empty() => Ok(()),
+            Ok(()) if is_recheck && self.verified_contains(&digest) => Ok(()),
+            Ok(()) => {
+                let mut r = Ok(());
+                for (stx, env) in &deferred {
+                    if let Err(e) = zcrypt_core::shield_tx::verify_bound(&chain_id, stx, env) {
+                        r = Err(e);
+                        break;
+                    }
+                }
+                if r.is_ok() {
+                    self.verified_insert(digest);
+                }
+                r
+            }
+        };
+        match result {
+            Ok(()) => {
+                eprintln!("[check_tx]  {name:<14} accepted ({} bytes)", tx.len());
+                ResponseCheckTx { code: OK, ..Default::default() }
+            }
+            Err(e) => {
+                eprintln!("[check_tx]  {name:<14} REJECTED: {e}");
+                ResponseCheckTx { code: ERR, log: e, ..Default::default() }
+            }
+        }
+    }
+
+    fn finalize_block(&self, req: RequestFinalizeBlock) -> ResponseFinalizeBlock {
+        self.finalize_block_impl(req)
+    }
+
+    fn commit(&self) -> ResponseCommit {
+        self.commit_impl()
+    }
+
+    fn query(&self, req: RequestQuery) -> ResponseQuery {
+        self.query_impl(req)
+    }
+}
+
+impl ZcryptApp {
+    /// The proof-free mempool checks (see [`Application::check_tx`]). Returns the outcome
+    /// and the `(shield tx, envelope)` proofs still to verify outside the lock.
+    #[allow(clippy::type_complexity)]
+    fn check_tx_locked(&self, s: &State, tx: &[u8]) -> (Result<(), String>, Vec<(ShieldTx, Vec<u8>)>) {
+        let chain_id = s.chain_id.as_slice();
+        let mut deferred: Vec<(ShieldTx, Vec<u8>)> = Vec::new();
         let result = if tx.first() == Some(&SHIELD_TAG) {
             match parse_transfer(&tx[1..]) {
                 Some((gas_blind, gas_tx, main_tx)) => {
-                    s.node.check_transfer(chain_id, &main_tx, &gas_tx, gas_blind)
+                    s.node.precheck_transfer(&main_tx, &gas_tx, gas_blind).map(|()| {
+                        deferred.push((gas_tx, Vec::new()));
+                        deferred.push((main_tx, Vec::new()));
+                    })
                 }
                 None => Err("malformed transfer (needs a ZCRYPT gas note + main tx)".to_string()),
             }
@@ -1041,7 +1243,7 @@ impl Application for ZcryptApp {
                         if stx.output_commitments.first() != Some(&expected) {
                             Err("bond: output[0] is not the declared stake burn coin".to_string())
                         } else {
-                            s.node.check_shield(chain_id, &stx)
+                            s.node.precheck_shield(&stx).map(|()| deferred.push((stx, Vec::new())))
                         }
                     }
                 }
@@ -1049,6 +1251,12 @@ impl Application for ZcryptApp {
             }
         } else if tx.first() == Some(&UNBOND_TAG) {
             match verify_unbond(&tx[1..], chain_id) {
+                // CheckTx mirrors DeliverTx: the signer must currently BE a bonded validator, or
+                // any fresh key with nonce 0 could fill blocks with unbonds that fail at delivery
+                // for free (consensus M2).
+                Some((addr, _, _)) if !s.node.is_validator(&addr) => {
+                    Err("unbond: signer is not a bonded validator".to_string())
+                }
                 Some((_, signer_pk, nonce)) if nonce == s.node.auth_nonce(&signer_pk) => Ok(()),
                 Some(_) => Err("unbond nonce mismatch (replay?)".to_string()),
                 None => Err("malformed or unauthenticated unbond tx".to_string()),
@@ -1071,7 +1279,7 @@ impl Application for ZcryptApp {
                         if stx.output_commitments.first() != Some(&expected) {
                             Err("delegate: output[0] is not the declared stake burn coin".to_string())
                         } else {
-                            s.node.check_shield(chain_id, &stx)
+                            s.node.precheck_shield(&stx).map(|()| deferred.push((stx, Vec::new())))
                         }
                     }
                 }
@@ -1102,8 +1310,9 @@ impl Application for ZcryptApp {
             match parse_claim(&tx[1..]) {
                 Some((pk, amount)) => {
                     let bal = s.node.claimable(&pk);
-                    if amount == 0 || amount > bal {
-                        Err(format!("claim {amount} exceeds claimable {bal}"))
+                    // Full-balance claims only (consensus C2: partial claims shred balances).
+                    if amount == 0 || amount != bal {
+                        Err(format!("claim {amount} must equal the full claimable balance {bal}"))
                     } else {
                         Ok(())
                     }
@@ -1114,8 +1323,10 @@ impl Application for ZcryptApp {
             match parse_claim_fee(&tx[1..]) {
                 Some((pk, asset, amount)) => {
                     let bal = s.node.claimable_fee(&pk, asset);
-                    if amount == 0 || amount > bal {
-                        Err(format!("fee claim {amount} exceeds claimable {bal}"))
+                    if !zcrypt_core::asset_registry::asset_id_ok(asset) {
+                        Err("asset id is not a canonical field element".to_string())
+                    } else if amount == 0 || amount != bal {
+                        Err(format!("fee claim {amount} must equal the full claimable balance {bal}"))
                     } else {
                         Ok(())
                     }
@@ -1123,46 +1334,58 @@ impl Application for ZcryptApp {
                 None => Err("malformed fee-claim tx".to_string()),
             }
         } else if tx.first() == Some(&REGISTER_TAG) {
-            match parse_register(&tx[1..]) {
-                Some((ticker, _, _, _, _)) if s.node.asset_id_of(&ticker).is_some() => {
-                    Err(format!("ticker '{ticker}' is already registered"))
-                }
-                Some((_, _, _, max_supply, _)) if max_supply == 0 => {
-                    Err("asset must declare a non-zero max supply".to_string())
-                }
-                Some((ticker, _, _, _, is_spv))
-                    if zcrypt_core::asset_registry::valid_ticker(&ticker) =>
-                {
-                    zbtc_requires_spv(&ticker, is_spv)
-                }
-                Some((ticker, _, _, _, _)) => Err(format!("invalid ticker '{ticker}'")),
-                None => Err("malformed register tx".to_string()),
+            match parse_gas_prefix(&tx[1..]) {
+                None => Err("malformed register tx (needs a ZCRYPT gas note prefix)".to_string()),
+                Some((gas_blind, gas_tx, rest)) => match parse_register(rest) {
+                    Some((ticker, _, _, _, _)) if s.node.asset_id_of(&ticker).is_some() => {
+                        Err(format!("ticker '{ticker}' is already registered"))
+                    }
+                    Some((_, _, _, max_supply, _)) if max_supply == 0 => {
+                        Err("asset must declare a non-zero max supply".to_string())
+                    }
+                    Some((ticker, _, _, _, is_spv))
+                        if zcrypt_core::asset_registry::valid_ticker(&ticker) =>
+                    {
+                        zbtc_requires_spv(&ticker, is_spv)
+                            .and_then(|()| s.node.precheck_gas_note(&gas_tx, gas_blind))
+                            .map(|()| deferred.push((gas_tx, Vec::new())))
+                    }
+                    Some((ticker, _, _, _, _)) => Err(format!("invalid ticker '{ticker}'")),
+                    None => Err("malformed register tx".to_string()),
+                },
             }
         } else if tx.first() == Some(&HTLC_OPEN_TAG) {
-            match parse_htlc_open(&tx[1..]) {
-                Some((asset, value, lock, timeout, claim_pk, auth)) => {
-                    let Some((keyset, sigs)) = zcrypt_core::mint_auth::decode_auth(&auth) else {
-                        return ResponseCheckTx { code: ERR, log: "malformed htlc-open auth".into(), ..Default::default() };
-                    };
-                    let msg = zcrypt_core::mint_auth::mint_message(asset, value, &lock, timeout, &claim_pk);
-                    if !zcrypt_core::mint_auth::verify_threshold(&keyset, &msg, &sigs) {
-                        Err("htlc-open: mint authorization invalid".to_string())
-                    } else if s.node.asset_meta(asset).and_then(|m| m.authority) != Some(keyset.commitment()) {
-                        Err("htlc-open: keyset does not match asset authority".to_string())
-                    } else {
-                        Ok(())
+            match parse_gas_prefix(&tx[1..]) {
+                None => Err("malformed htlc-open tx (needs a ZCRYPT gas note prefix)".to_string()),
+                Some((gas_blind, gas_tx, rest)) => match parse_htlc_open(rest) {
+                    Some((asset, value, lock, timeout, claim_pk, auth)) => {
+                        let Some((keyset, sigs)) = zcrypt_core::mint_auth::decode_auth(&auth) else {
+                            return (Err("malformed htlc-open auth".into()), deferred);
+                        };
+                        let msg = zcrypt_core::mint_auth::mint_message(chain_id, asset, value, &lock, timeout, &claim_pk);
+                        if !zcrypt_core::asset_registry::asset_id_ok(asset) {
+                            Err("asset id is not a canonical field element".to_string())
+                        } else if !zcrypt_core::mint_auth::verify_threshold(&keyset, &msg, &sigs) {
+                            Err("htlc-open: mint authorization invalid".to_string())
+                        } else if s.node.asset_meta(asset).and_then(|m| m.authority) != Some(keyset.commitment()) {
+                            Err("htlc-open: keyset does not match asset authority".to_string())
+                        } else {
+                            s.node
+                                .precheck_gas_note(&gas_tx, gas_blind)
+                                .map(|()| deferred.push((gas_tx, Vec::new())))
+                        }
                     }
-                }
-                None => Err("malformed htlc-open tx".to_string()),
+                    None => Err("malformed htlc-open tx".to_string()),
+                },
             }
         } else if tx.first() == Some(&ROTATE_AUTH_TAG) {
             match parse_rotate(&tx[1..]) {
                 Some((asset, new_auth, auth)) => {
                     let Some((keyset, sigs)) = zcrypt_core::mint_auth::decode_auth(&auth) else {
-                        return ResponseCheckTx { code: ERR, log: "malformed rotate auth".into(), ..Default::default() };
+                        return (Err("malformed rotate auth".into()), deferred);
                     };
                     let epoch = s.node.authority_epoch(asset);
-                    let msg = zcrypt_core::mint_auth::rotate_message(asset, epoch, &new_auth);
+                    let msg = zcrypt_core::mint_auth::rotate_message(chain_id, asset, epoch, &new_auth);
                     if !zcrypt_core::mint_auth::verify_threshold(&keyset, &msg, &sigs) {
                         Err("rotate-auth: authorization invalid".to_string())
                     } else if s.node.asset_meta(asset).and_then(|m| m.authority) != Some(keyset.commitment()) {
@@ -1180,10 +1403,27 @@ impl Application for ZcryptApp {
             s.node.spv().precheck_headers(&tx[1..])
         } else if tx.first() == Some(&HTLC_OPEN_SPV_TAG) {
             match parse_htlc_open_spv(&tx[1..]) {
-                Some((asset, value, lock, _timeout, _claim_pk, _open_auth, proof)) => {
+                Some((asset, value, lock, timeout, claim_pk, open_auth, proof)) => {
                     let authority = s.node.asset_meta(asset).and_then(|m| m.authority);
                     match authority {
-                        Some(auth) => s.node.spv().verify_mint_proof(&auth, value, &lock, &proof).map(|_| ()),
+                        Some(auth) => s
+                            .node
+                            .spv()
+                            .verify_mint_proof(&auth, value, &lock, &proof)
+                            .and_then(|(outpoint, _)| {
+                                // The depositor's authorization over EVERY open parameter is
+                                // checked at admission too, so a front-run never reaches a block.
+                                let a = zcrypt_core::spv::OpenAuth {
+                                    chain_id,
+                                    outpoint: &outpoint,
+                                    claim_pk: &claim_pk,
+                                    asset_id: asset,
+                                    value,
+                                    hashlock: &lock,
+                                    timeout_height: timeout,
+                                };
+                                zcrypt_core::spv::verify_open_auth(&proof.refund_pk, &a, &open_auth)
+                            }),
                         None => Err("asset not registered / no mint authority".to_string()),
                     }
                 }
@@ -1191,11 +1431,13 @@ impl Application for ZcryptApp {
             }
         } else if tx.first() == Some(&BTC_REANCHOR_TAG) {
             match zcrypt_core::spv::MintProof::from_bytes(&tx[1..]) {
-                Some(proof) => {
-                    // Structural parse ok; full re-anchor needs immature match at deliver.
-                    let _ = proof;
-                    Ok(())
-                }
+                // CheckTx mirrors DeliverTx: an immature mint for this deposit must exist, or
+                // 12 MB re-anchor payloads for nonexistent deposits fill blocks for free (M2).
+                Some(proof) => match proof.funding_txid() {
+                    Some(txid) if s.node.has_immature_deposit(&txid, proof.vout) => Ok(()),
+                    Some(_) => Err("re-anchor: no immature mint for this deposit outpoint".to_string()),
+                    None => Err("re-anchor: bad funding tx".to_string()),
+                },
                 None => Err("malformed BTC re-anchor tx".to_string()),
             }
         } else if tx.first() == Some(&HTLC_CLAIM_TAG) {
@@ -1205,7 +1447,9 @@ impl Application for ZcryptApp {
                     match s.node.htlc_escrow(&id) {
                         Some(e) if e.state == zcrypt_core::htlc_shield::EscrowState::Open => {
                             if s.node.height() >= e.timeout_height {
-                                Err("escrow has timed out — expire/refund only".to_string())
+                                Err("escrow has timed out: expire/refund only".to_string())
+                            } else if preimage.len() != zcrypt_core::htlc_shield::HTLC_PREIMAGE_LEN {
+                                Err("preimage must be exactly 32 bytes".to_string())
                             } else if zcrypt_core::nullifier::htlc_hashlock(preimage) != e.hashlock {
                                 Err("preimage does not match the hashlock".to_string())
                             } else {
@@ -1251,7 +1495,7 @@ impl Application for ZcryptApp {
                                 zcrypt_core::htlc_shield::ENV_BURN_LOCK,
                                 asset, value, &lock, timeout, &refund, &refund, &[],
                             );
-                            s.node.check_shield_bound(chain_id, &stx, &env)
+                            s.node.precheck_shield(&stx).map(|()| deferred.push((stx, env)))
                         }
                     }
                 }
@@ -1277,7 +1521,7 @@ impl Application for ZcryptApp {
                                     zcrypt_core::htlc_shield::ENV_BURN_LOCK_BTC,
                                     asset, value, &lock, timeout, &refund, &refund, btc_claim_pk,
                                 );
-                                s.node.check_shield_bound(chain_id, &stx, &env)
+                                s.node.precheck_shield(&stx).map(|()| deferred.push((stx, env)))
                             }
                         }
                     }
@@ -1300,7 +1544,7 @@ impl Application for ZcryptApp {
                                 zcrypt_core::htlc_shield::ENV_SWAP_LOCK,
                                 asset, value, &lock, timeout, &cp, &refund, &[],
                             );
-                            s.node.check_shield_bound(chain_id, &stx, &env)
+                            s.node.precheck_shield(&stx).map(|()| deferred.push((stx, env)))
                         }
                     }
                 }
@@ -1309,20 +1553,10 @@ impl Application for ZcryptApp {
         } else {
             Err(CLASSICAL_DISABLED.to_string()) // classical native path removed
         };
-        let name = tag_name(tx.first().copied());
-        match result {
-            Ok(()) => {
-                eprintln!("[check_tx]  {name:<14} accepted ({} bytes)", tx.len());
-                ResponseCheckTx { code: OK, ..Default::default() }
-            }
-            Err(e) => {
-                eprintln!("[check_tx]  {name:<14} REJECTED: {e}");
-                ResponseCheckTx { code: ERR, log: e, ..Default::default() }
-            }
-        }
+        (result, deferred)
     }
 
-    fn finalize_block(&self, req: RequestFinalizeBlock) -> ResponseFinalizeBlock {
+    fn finalize_block_impl(&self, req: RequestFinalizeBlock) -> ResponseFinalizeBlock {
         let mut s = self.locked();
         let chain_id = s.chain_id.clone();
         let chain_id = chain_id.as_slice();
@@ -1340,6 +1574,10 @@ impl Application for ZcryptApp {
         // so the diff below tells CometBFT exactly which block producers to add/remove —
         // including any validator ejected by a slash this block.
         let vset_before = s.node.validator_set();
+        // The sentinel's key (if active) is excluded from the bonded-set diff for the whole
+        // block; `sentinel_update` alone emits its power (also on retirement).
+        let sentinel_key = s.node.sentinel_key();
+        let mut header_bytes_used = 0usize;
         // SLASHING: punish validators CometBFT reported for provable equivocation
         // (double-signing / light-client attack). Deterministic — the evidence is part of
         // the block and the penalty is integer math, so every node slashes identically.
@@ -1546,53 +1784,69 @@ impl Application for ZcryptApp {
                     None => Err("malformed fee-claim tx".to_string()),
                 }
             } else if bytes.first() == Some(&REGISTER_TAG) {
-                match parse_register(&bytes[1..]) {
-                    Some((ticker, decimals, authority, max_supply, is_spv)) => {
-                        match zbtc_requires_spv(&ticker, is_spv)
-                            .and_then(|()| s.node.register_asset(&ticker, decimals, authority, max_supply))
-                        {
-                            Ok(id) => {
-                                let data = serde_json::json!({
-                                    "ticker": ticker,
-                                    "asset_id": id,
-                                })
-                                .to_string();
-                                tx_results.push(ExecTxResult {
-                                    code: OK,
-                                    data: data.into_bytes().into(),
-                                    ..Default::default()
-                                });
-                                continue;
+                match parse_gas_prefix(&bytes[1..]) {
+                    None => Err("malformed register tx (needs a ZCRYPT gas note prefix)".to_string()),
+                    Some((gas_blind, gas_tx, rest)) => match parse_register(rest) {
+                        Some((ticker, decimals, authority, max_supply, is_spv)) => {
+                            // Gas is burned FIRST (a rejected registration still pays), then
+                            // the registration is applied.
+                            match zbtc_requires_spv(&ticker, is_spv)
+                                .and_then(|()| s.node.submit_gas_note(chain_id, &gas_tx, gas_blind))
+                                .and_then(|_| {
+                                    s.node
+                                        .register_asset(&ticker, decimals, authority, max_supply)
+                                        .map_err(|e| format!("{e} (gas consumed)"))
+                                }) {
+                                Ok(id) => {
+                                    let data = serde_json::json!({
+                                        "ticker": ticker,
+                                        "asset_id": id,
+                                    })
+                                    .to_string();
+                                    tx_results.push(ExecTxResult {
+                                        code: OK,
+                                        data: data.into_bytes().into(),
+                                        ..Default::default()
+                                    });
+                                    continue;
+                                }
+                                Err(e) => Err(e),
                             }
-                            Err(e) => Err(e),
                         }
-                    }
-                    None => Err("malformed register tx".to_string()),
+                        None => Err("malformed register tx".to_string()),
+                    },
                 }
             } else if bytes.first() == Some(&HTLC_OPEN_TAG) {
-                match parse_htlc_open(&bytes[1..])
-                    .and_then(|(asset, value, lock, timeout, pk, auth)| {
-                        // The trailing bytes are the M-of-N mint authorization (key set +
-                        // threshold ML-DSA signatures); decode before gating the mint.
-                        zcrypt_core::mint_auth::decode_auth(&auth)
-                            .map(|(ks, sigs)| (asset, value, lock, timeout, pk, ks, sigs))
-                    }) {
-                    Some((asset, value, lock, timeout, pk, keyset, sigs)) => {
-                        match s.node.htlc_open(asset, value, lock, timeout, pk, &keyset, &sigs) {
-                            Ok(id) => {
-                                let data =
-                                    serde_json::json!({ "escrow_id": hex::encode(id) }).to_string();
-                                tx_results.push(ExecTxResult {
-                                    code: OK,
-                                    data: data.into_bytes().into(),
-                                    ..Default::default()
-                                });
-                                continue;
+                match parse_gas_prefix(&bytes[1..]) {
+                    None => Err("malformed htlc-open tx (needs a ZCRYPT gas note prefix)".to_string()),
+                    Some((gas_blind, gas_tx, rest)) => match parse_htlc_open(rest)
+                        .and_then(|(asset, value, lock, timeout, pk, auth)| {
+                            // The trailing bytes are the M-of-N mint authorization (key set +
+                            // threshold ML-DSA signatures); decode before gating the mint.
+                            zcrypt_core::mint_auth::decode_auth(&auth)
+                                .map(|(ks, sigs)| (asset, value, lock, timeout, pk, ks, sigs))
+                        }) {
+                        Some((asset, value, lock, timeout, pk, keyset, sigs)) => {
+                            match s.node.submit_gas_note(chain_id, &gas_tx, gas_blind).and_then(|_| {
+                                s.node
+                                    .htlc_open(chain_id, asset, value, lock, timeout, pk, &keyset, &sigs)
+                                    .map_err(|e| format!("{e} (gas consumed)"))
+                            }) {
+                                Ok(id) => {
+                                    let data =
+                                        serde_json::json!({ "escrow_id": hex::encode(id) }).to_string();
+                                    tx_results.push(ExecTxResult {
+                                        code: OK,
+                                        data: data.into_bytes().into(),
+                                        ..Default::default()
+                                    });
+                                    continue;
+                                }
+                                Err(e) => Err(e),
                             }
-                            Err(e) => Err(e),
                         }
-                    }
-                    None => Err("malformed htlc-open tx".to_string()),
+                        None => Err("malformed htlc-open tx".to_string()),
+                    },
                 }
             } else if bytes.first() == Some(&ROTATE_AUTH_TAG) {
                 match parse_rotate(&bytes[1..]).and_then(|(asset, new_commitment, auth)| {
@@ -1600,7 +1854,7 @@ impl Application for ZcryptApp {
                         .map(|(ks, sigs)| (asset, new_commitment, ks, sigs))
                 }) {
                     Some((asset, new_commitment, keyset, sigs)) => {
-                        match s.node.rotate_authority(asset, new_commitment, &keyset, &sigs) {
+                        match s.node.rotate_authority(chain_id, asset, new_commitment, &keyset, &sigs) {
                             Ok(()) => {
                                 let data = serde_json::json!({
                                     "asset_id": asset.to_string(),
@@ -1694,7 +1948,13 @@ impl Application for ZcryptApp {
                     None => Err("malformed swap-lock tx".to_string()),
                 }
             } else if bytes.first() == Some(&BTC_HEADERS_TAG) {
-                match s.node.submit_btc_headers(&bytes[1..]) {
+                let relay = if header_budget_ok(header_bytes_used, bytes.len() - 1) {
+                    header_bytes_used += bytes.len() - 1;
+                    s.node.submit_btc_headers(&bytes[1..])
+                } else {
+                    Err(format!("header relay exceeds the {MAX_HEADER_BYTES_PER_BLOCK}-byte per-block budget"))
+                };
+                match relay {
                     Ok((accepted, tip)) => {
                         let data = serde_json::json!({ "accepted": accepted, "btc_tip": tip })
                             .to_string();
@@ -1710,7 +1970,7 @@ impl Application for ZcryptApp {
             } else if bytes.first() == Some(&HTLC_OPEN_SPV_TAG) {
                 match parse_htlc_open_spv(&bytes[1..]) {
                     Some((asset, value, lock, timeout, pk, open_auth, proof)) => {
-                        match s.node.htlc_open_spv(asset, value, lock, timeout, pk, &proof, &open_auth) {
+                        match s.node.htlc_open_spv(chain_id, asset, value, lock, timeout, pk, &proof, &open_auth) {
                             Ok(id) => {
                                 let data =
                                     serde_json::json!({ "escrow_id": hex::encode(id) }).to_string();
@@ -1857,13 +2117,16 @@ impl Application for ZcryptApp {
                 s.node.total_issued()
             );
         }
+        // Block-boundary anchor root + escrow pruning (deterministic housekeeping).
+        s.node.end_block();
         s.height = req.height;
         // Dynamic validator set: diff the bonded set across this block and hand
         // CometBFT the resulting add/remove/re-weight updates, so a BOND actually
         // makes a node a block producer and an UNBOND stops it. Deterministic (a pure
-        // function of the app-hash-committed staking ledger), so all nodes agree.
+        // function of the app-hash-committed staking ledger), so all nodes agree. The
+        // sentinel key is excluded: its power is emitted only by `sentinel_update`.
         let vset_after = s.node.validator_set();
-        let mut updates = validator_updates(&vset_before, &vset_after);
+        let mut updates = validator_updates_excluding(&vset_before, &vset_after, sentinel_key.as_deref());
         // Keep the foundation sentinel above 2/3 of the total whenever the bonded set's
         // power changed this block, so the chain can never be halted by validators leaving.
         if let Some((key, power)) = s.node.sentinel_update() {
@@ -1881,25 +2144,27 @@ impl Application for ZcryptApp {
                 eprintln!("[validators] height {height}: set {pk} -> power {}", u.power);
             }
         }
+        s.app_hash = s.node.state_root();
         ResponseFinalizeBlock {
             tx_results,
             validator_updates: updates,
-            app_hash: s.node.state_root().to_vec().into(),
+            app_hash: s.app_hash.to_vec().into(),
             ..Default::default()
         }
     }
 
-    fn commit(&self) -> ResponseCommit {
+    fn commit_impl(&self) -> ResponseCommit {
         // Persist consensus state at the just-finalized height via RocksDB
         // (incremental commitment leaves + nullifier keys, synced WriteBatch).
         // The snapshot reflects exactly the state whose `state_root()` was returned
         // as this block's app_hash, so on restart `info()` matches and CometBFT
         // resumes from here instead of replaying the whole chain from genesis.
-        let s = self.locked();
+        let mut s = self.locked();
         let height = s.height.max(0) as u64;
         let commit_result = {
             let mut store = self.store_locked();
-            store.commit(&s.node, height)
+            let State { node, chain_id, .. } = &mut *s;
+            store.commit(node, height, chain_id)
         };
         match commit_result {
             Ok(stats) => {
@@ -1914,12 +2179,15 @@ impl Application for ZcryptApp {
                     stats.elapsed_ms
                 );
                 // Phase 2: keep a legacy-compatible postcard backup for disaster recovery
-                // / offline inspection. Failure here is non-fatal if the DB write succeeded.
-                if let Err(e) = StateDb::write_backup_file(&self.backup_path, &s.node, height) {
-                    eprintln!(
-                        "[state-db] WARNING: postcard backup {} failed ({e})",
-                        self.backup_path.display()
-                    );
+                // / offline inspection, written PERIODICALLY (it serializes the whole
+                // state). Failure here is non-fatal if the DB write succeeded.
+                if self.backup_every > 0 && height % self.backup_every == 0 {
+                    if let Err(e) = StateDb::write_backup_file(&self.backup_path, &s.node, height) {
+                        eprintln!(
+                            "[state-db] WARNING: postcard backup {} failed ({e})",
+                            self.backup_path.display()
+                        );
+                    }
                 }
             }
             Err(e) => {
@@ -1941,7 +2209,7 @@ impl Application for ZcryptApp {
         ResponseCommit { retain_height: 0 }
     }
 
-    fn query(&self, req: RequestQuery) -> ResponseQuery {
+    fn query_impl(&self, req: RequestQuery) -> ResponseQuery {
         let s = self.locked();
         let value: Vec<u8> = match req.path.as_str() {
             "/chain_id" => s.chain_id.clone(),
@@ -1955,31 +2223,32 @@ impl Application for ZcryptApp {
                 hex::encode(b).into_bytes()
             }
             "/commit/count" => s.node.commitment_count().to_string().into_bytes(),
+            // Leaves are PAGED: `/commit/leaves` is page 0 and `/commit/leaves/<from>` the
+            // page starting at `from`; each page holds at most LEAF_PAGE leaves (64 bytes,
+            // 8×u64 LE each, concatenated, hex). Clients keep paging until a page comes
+            // back shorter than LEAF_PAGE. The wallet's decoy pool + a way to find its own
+            // coin's index.
             "/commit/leaves" => {
-                // hex of all leaves concatenated, 64 bytes (8×u64 LE) each — the
-                // wallet's decoy pool + a way to find its own coin's index.
                 let mut b = Vec::new();
-                for c in s.node.commitment_leaves() {
+                for c in s.node.commitment_leaves_range(0, LEAF_PAGE) {
                     for x in &c {
                         b.extend_from_slice(&x.to_le_bytes());
                     }
                 }
                 hex::encode(b).into_bytes()
             }
-            // Incremental leaf sync: `/commit/leaves/<from_index>` returns only
-            // leaves[from..] so wallets need not re-download the whole tree.
+            "/commit/leaf_page" => LEAF_PAGE.to_string().into_bytes(),
             p if p.starts_with("/commit/leaves/") => {
                 let from: usize = p["/commit/leaves/".len()..].parse().unwrap_or(0);
-                let leaves = s.node.commitment_leaves();
                 let mut b = Vec::new();
-                for c in leaves.into_iter().skip(from) {
+                for c in s.node.commitment_leaves_range(from, LEAF_PAGE) {
                     for x in &c {
                         b.extend_from_slice(&x.to_le_bytes());
                     }
                 }
                 hex::encode(b).into_bytes()
             }
-            "/app/hash" => hex::encode(s.node.state_root()).into_bytes(),
+            "/app/hash" => hex::encode(s.app_hash).into_bytes(),
             // ---- Bitcoin SPV chain (the trustless zBTC mint gate) ----
             "/spv/height" => s.node.btc_tip().0.to_string().into_bytes(),
             "/spv/tip" => {
@@ -2478,7 +2747,11 @@ fn main() {
     if std::env::var("ZCRYPT_VESTING_ACCEL").is_ok() {
         eprintln!("[warn] ZCRYPT_VESTING_ACCEL ignored: production build vests on the real schedule");
     }
-    let app = ZcryptApp::new(db_path, Some(legacy_bin), backup_path, strict);
+    let backup_every: u64 = std::env::var("ZCRYPT_BACKUP_EVERY")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(1000);
+    let app = ZcryptApp::with_backup_every(db_path, Some(legacy_bin), backup_path, strict, backup_every);
     // The Bitcoin SPV mint gate (network + checkpoint) is configured at InitChain from the
     // GENESIS app_state (see `btc_spv_config` / `build_spv_chain`), so a downloaded genesis
     // fully describes the bridge and joining validators need no out-of-band env var. Env vars
@@ -2842,25 +3115,34 @@ mod tests {
         assert_eq!(k, skey);
         assert!(node.sentinel_info().is_none(), "sentinel removed after disable");
 
-        // (2) AUTO-DECAY: retires only once external stake reaches the threshold AND is spread
-        // across >= MIN_VALIDATORS distinct validators AND that has held for the full dwell
-        // window — so a transient single-party stake spike can't retire the guarantor (M3).
-        // (`sentinel_update` returns Some on any power change, so retirement is detected via
-        // `sentinel_info()` going None, not via the return value.)
-        use zcrypt_core::node::{SENTINEL_DECAY_DWELL_BLOCKS as DWELL, SENTINEL_DECAY_MIN_VALIDATORS as MINV};
+        // (2) AUTO-DECAY: retires only once external stake reaches the threshold AND no single
+        // external validator holds more than a third of it AND that has held for the full
+        // dwell window, so neither a transient spike nor a Sybil spread of one whale's stake
+        // across a few keys retires the guarantor (M5). (`sentinel_update` returns Some on any
+        // power change, so retirement is detected via `sentinel_info()` going None.)
+        use zcrypt_core::node::SENTINEL_DECAY_DWELL_BLOCKS as DWELL;
         let mut node = Node::new();
         node.set_sentinel(skey.clone(), 100, 50_000);
-        // One big validator alone (> 50k threshold) must NOT retire it — too few validators.
+        // One big validator alone (> 50k threshold) must NOT retire it: it holds 100%.
         node.bond(vec![1u8; 20], vec![1u8; 32], 60_000 * ATOMIC, [0u8; 32], 1_000).unwrap();
         for _ in 0..DWELL + 1 {
             node.sentinel_update();
         }
         assert!(node.sentinel_info().is_some(), "one whale can't retire the sentinel");
-        // Spread stake across MIN_VALIDATORS distinct validators (still > threshold total)…
-        for i in 2..=(MINV as u8) {
+        // Three more 20k validators: the whale still holds 60k of 120k = 50% > 1/3, so the
+        // old "4 distinct validators" rule would have retired it, but the share rule holds.
+        for i in 2..=4u8 {
             node.bond(vec![i; 20], vec![i; 32], 20_000 * ATOMIC, [0u8; 32], 1_000).unwrap();
         }
-        // …now the condition holds; it retires only AFTER the dwell window, never before.
+        for _ in 0..DWELL + 1 {
+            node.sentinel_update();
+        }
+        assert!(node.sentinel_info().is_some(), "a 50% whale among 4 validators can't retire it");
+        // Dilute the whale below a third (60k of 200k = 30%): now the condition holds; it
+        // retires only AFTER the dwell window, never before.
+        for i in 5..=8u8 {
+            node.bond(vec![i; 20], vec![i; 32], 20_000 * ATOMIC, [0u8; 32], 1_000).unwrap();
+        }
         let mut retired_at = None;
         for n in 0..DWELL + 5 {
             node.sentinel_update();
@@ -2879,6 +3161,72 @@ mod tests {
         node.sentinel_update();
         let (_k, p) = node.sentinel_info().expect("permanent sentinel remains");
         assert!(p > 2 * 60_000 / 3, "permanent sentinel keeps >2/3 (power {p})");
+    }
+
+    #[test]
+    fn sentinel_key_is_never_emitted_by_the_bonded_set_diff() {
+        // Consensus C1. The launch runbook bonds the sentinel's own consensus key, so its
+        // stake appears in the bonded set. The ordinary diff must EXCLUDE that key: (a) a
+        // dust delegation to the sentinel must not overwrite its supermajority with its
+        // stake-based power, (b) a block that changes both the sentinel's stake and another
+        // validator's must never yield two updates for one key (CometBFT rejects that and
+        // the chain halts), and (c) the sentinel unbonding as sole validator must not emit
+        // an empty set.
+        use zcrypt_core::emission::ATOMIC;
+        use zcrypt_core::node::Node;
+        let skey = vec![0xAAu8; 32];
+        let other = vec![0xBBu8; 32];
+        let mut node = Node::new();
+        node.set_sentinel(skey.clone(), 10, 1_000_000);
+        // Block 1: the sentinel bonds its own key, another validator bonds too.
+        let before = node.validator_set();
+        node.bond(skey.clone(), skey.clone(), 10_000 * ATOMIC, [0u8; 32], 1_000).unwrap();
+        node.bond(other.clone(), other.clone(), 10_000 * ATOMIC, [0u8; 32], 1_000).unwrap();
+        let after = node.validator_set();
+        let mut updates = validator_updates_excluding(&before, &after, node.sentinel_key().as_deref());
+        if let Some((k, p)) = node.sentinel_update() {
+            updates.push(ValidatorUpdate { pub_key: Some(PublicKey { sum: Some(PubKeySum::Ed25519(k)) }), power: p });
+        }
+        let keys: Vec<Vec<u8>> = updates
+            .iter()
+            .filter_map(|u| match &u.pub_key { Some(PublicKey { sum: Some(PubKeySum::Ed25519(k)) }) => Some(k.clone()), _ => None })
+            .collect();
+        assert_eq!(keys.iter().filter(|k| **k == skey).count(), 1, "exactly one update for the sentinel key");
+        let spow = updates.iter().zip(&keys).find(|(_, k)| **k == skey).map(|(u, _)| u.power).unwrap();
+        assert_eq!(spow, 2 * 10_000 + 1, "sentinel power comes from sentinel_update, not its stake");
+        assert!(3 * spow > 2 * (spow + 10_000), "sentinel keeps > 2/3");
+
+        // Block 2: a 1-ZCRYPT delegation to the sentinel AND to the other validator. The old
+        // diff emitted (S, 10_001) here, deflating the sentinel to a minority and, with the
+        // sentinel_update emitted in the same block, a duplicate key.
+        let before = node.validator_set();
+        node.staking_delegate_for_test(&skey, vec![1u8; 20], ATOMIC);
+        node.staking_delegate_for_test(&other, vec![2u8; 20], ATOMIC);
+        let after = node.validator_set();
+        let mut updates = validator_updates_excluding(&before, &after, node.sentinel_key().as_deref());
+        if let Some((k, p)) = node.sentinel_update() {
+            updates.push(ValidatorUpdate { pub_key: Some(PublicKey { sum: Some(PubKeySum::Ed25519(k)) }), power: p });
+        }
+        let keys: Vec<Vec<u8>> = updates
+            .iter()
+            .filter_map(|u| match &u.pub_key { Some(PublicKey { sum: Some(PubKeySum::Ed25519(k)) }) => Some(k.clone()), _ => None })
+            .collect();
+        assert_eq!(keys.iter().filter(|k| **k == skey).count(), 1, "still exactly one update for the sentinel");
+        let spow = updates.iter().zip(&keys).find(|(_, k)| **k == skey).map(|(u, _)| u.power).unwrap();
+        assert_eq!(spow, 2 * 10_001 + 1, "re-inflated above 2/3 of the grown external power");
+        assert!(updates.iter().all(|u| u.power > 0), "no removal");
+
+        // Block 3: the other validator leaves; only S remains. Then S itself unbonds: the
+        // diff must NOT emit (S, 0) (an empty validator set is a halt); S keeps its power.
+        let before = node.validator_set();
+        node.staking_unbond_for_test(&other);
+        node.staking_unbond_for_test(&skey);
+        let after = node.validator_set();
+        let updates = validator_updates_excluding(&before, &after, node.sentinel_key().as_deref());
+        assert!(updates.iter().all(|u| match &u.pub_key { Some(PublicKey { sum: Some(PubKeySum::Ed25519(k)) }) => *k != skey, _ => true }), "sentinel never in the diff");
+        let (k, p) = node.sentinel_update().expect("power drops back to the floor");
+        assert_eq!(k, skey);
+        assert_eq!(p, 10, "floor, never zero");
     }
 
     #[test]
@@ -2940,6 +3288,8 @@ mod tests {
         // replays only new blocks (not the whole chain from genesis).
         let (db, backup, base) = tmp_app_paths("persist");
         let mut node = Node::new();
+        #[allow(unused_mut)]
+        let mut node = node;
         node.mint_foundation([0xF0; 32]);
         node.set_height(42);
         for k in 0..8u64 {
@@ -2949,7 +3299,7 @@ mod tests {
 
         {
             let mut store = StateDb::open(&db).expect("open db");
-            store.commit(&node, 42).expect("commit");
+            store.commit(&mut node, 42, DEFAULT_CHAIN_ID).expect("commit");
             StateDb::write_backup_file(&backup, &node, 42).expect("backup");
         }
 

@@ -20,7 +20,7 @@ pub use zcrypt_shield::zvm as shield;
 
 use crate::asset_registry::valid_ticker;
 use crate::hash::Hash;
-use crate::htlc_shield::mint_capability;
+use crate::htlc_shield::{mint_capability, HTLC_PREIMAGE_LEN};
 use crate::nullifier::htlc_hashlock;
 use crate::staking::MIN_STAKE;
 
@@ -41,12 +41,15 @@ pub const OP_CHECK_ASSET_REGISTERED: u8 = 0x1B; // asset id is registered
 pub const OP_CHECK_BURN_OUTPUT: u8 = 0x1C; // output[0] == declared burn coin
 pub const OP_CHECK_THRESHOLD_SIG: u8 = 0x1D; // ≥M valid ML-DSA sigs from the asset's key set
 pub const OP_CHECK_SPV_PROOF: u8 = 0x1E; // a verified Bitcoin SPV deposit proof (trustless mint)
+pub const OP_CHECK_AMOUNT_EQ_CLAIMABLE: u8 = 0x1F; // amount == claimable (full-balance claims only)
 
 // ---- one canonical program per transaction type ----
 /// 0x57 bond a validator.
 pub const BOND: &[u8] = &[OP_CHECK_MIN_STAKE, OP_HALT];
-/// 0x58 claim staking rewards → coinbase coins.
-pub const CLAIM: &[u8] = &[OP_CHECK_AMOUNT_POSITIVE, OP_CHECK_AMOUNT_LE_CLAIMABLE, OP_HALT];
+/// 0x58 claim staking rewards → coinbase coins. Full-balance only: a partial-amount claim
+/// let anyone (the tx is unauthenticated) shred a victim's balance into dust coins each
+/// worth less than the gas needed to consolidate them (consensus C2).
+pub const CLAIM: &[u8] = &[OP_CHECK_AMOUNT_POSITIVE, OP_CHECK_AMOUNT_EQ_CLAIMABLE, OP_HALT];
 /// 0x59 register a shielded-asset ticker (first-mint-wins).
 pub const REGISTER: &[u8] = &[OP_CHECK_TICKER_VALID, OP_CHECK_TICKER_FREE, OP_HALT];
 /// 0x5A open a mint HTLC escrow with an M-of-N authorization (user-minted assets).
@@ -127,12 +130,17 @@ pub fn evaluate(program: &[u8], ctx: &Ctx) -> Outcome {
             OP_CHECK_ESCROW_OPEN if !ctx.escrow_open => return Outcome::reject("escrow missing or not open"),
             OP_CHECK_BEFORE_TIMEOUT if ctx.height >= ctx.timeout => return Outcome::reject("escrow timed out"),
             OP_CHECK_AT_OR_AFTER_TIMEOUT if ctx.height < ctx.timeout => return Outcome::reject("not yet timed out"),
+            OP_CHECK_AMOUNT_EQ_CLAIMABLE if ctx.amount != ctx.claimable => return Outcome::reject("claim must take the full claimable balance"),
+            // A preimage is exactly 32 bytes. Bitcoin consensus caps a witness element at 520
+            // bytes and standard relay at 80, so an oversized preimage that ZCrypt accepted
+            // could never be spent on the Bitcoin leg: the depositor would keep both.
+            OP_CHECK_PREIMAGE if ctx.preimage.len() != HTLC_PREIMAGE_LEN => return Outcome::reject("preimage must be exactly 32 bytes"),
             OP_CHECK_PREIMAGE if htlc_hashlock(&ctx.preimage) != ctx.hashlock => return Outcome::reject("preimage does not match hashlock"),
             OP_CHECK_ASSET_REGISTERED if !ctx.asset_registered => return Outcome::reject("asset not registered"),
             OP_CHECK_BURN_OUTPUT if !ctx.burn_output_ok => return Outcome::reject("output[0] is not the declared burn coin"),
             OP_HALT => break,
             // a guard byte that passed, or a no-op position
-            0x10..=0x1E => {}
+            0x10..=0x1F => {}
             _ => return Outcome::reject("unknown opcode"),
         }
     }
@@ -223,6 +231,9 @@ mod tests {
         let ctx = Ctx { amount: 1, claimable: n2.claimable(&a2.pubkey()), ..Default::default() };
         assert_eq!(evaluate(CLAIM, &ctx).accept, n2.claim_rewards(&a2.pubkey(), 1).is_ok());
         assert!(!evaluate(CLAIM, &ctx).accept);
+        // adversarial: a PARTIAL claim (dust-shredding, consensus C2) is rejected by both.
+        let ctx = Ctx { amount: 1, claimable: 1_000, ..Default::default() };
+        assert!(!evaluate(CLAIM, &ctx).accept, "partial claims are refused");
     }
 
     #[test]
@@ -237,7 +248,7 @@ mod tests {
         let lock = htlc_hashlock(b"x");
         let (value, timeout, pk) = (100u64, 50u64, account.pubkey());
         let authority = node.asset_meta(asset).and_then(|m| m.authority);
-        let msg = mint_auth::mint_message(asset, value, &lock, timeout, &pk);
+        let msg = mint_auth::mint_message(b"zcrypt-test", asset, value, &lock, timeout, &pk);
 
         // valid M-of-N authorization: VM and node agree it is accepted.
         let sigs = mint_auth::authorize(&keyset, &signers, &msg);
@@ -248,7 +259,7 @@ mod tests {
             mint_sigs: sigs.clone(),
             ..Default::default()
         };
-        let node_ok = node.htlc_open(asset, value, lock, timeout, pk, &keyset, &sigs).is_ok();
+        let node_ok = node.htlc_open(b"zcrypt-test", asset, value, lock, timeout, pk, &keyset, &sigs).is_ok();
         assert!(node_ok);
         assert_eq!(evaluate(HTLC_OPEN, &ctx).accept, node_ok);
 
@@ -262,7 +273,7 @@ mod tests {
             mint_sigs: bad_sigs.clone(),
             ..Default::default()
         };
-        let node_bad = node.htlc_open(asset, value, lock, timeout, pk, &bad_keyset, &bad_sigs).is_ok();
+        let node_bad = node.htlc_open(b"zcrypt-test", asset, value, lock, timeout, pk, &bad_keyset, &bad_sigs).is_ok();
         assert_eq!(evaluate(HTLC_OPEN, &ctx_bad).accept, node_bad);
         assert!(!evaluate(HTLC_OPEN, &ctx_bad).accept);
     }
@@ -275,15 +286,16 @@ mod tests {
         let (keyset, signers) = mint_auth::derive_keyset(b"lp-treasury", 3, 2);
         let asset =
             node.register_asset("GOLD", 8, Some(keyset.commitment()), 21_000_000 * 100_000_000).unwrap();
-        let x = b"preimage";
+        let x = b"preimage-of-exactly-32-bytes!!!!";
+        assert_eq!(x.len(), HTLC_PREIMAGE_LEN);
         let lock = htlc_hashlock(x);
         node.set_height(10);
         // Open a mint escrow with a valid M-of-N authorization over the exact params.
         let open = |node: &mut Node, value: u64, lock: [u8; 32], timeout: u64| {
             let pk = account.pubkey();
-            let msg = mint_auth::mint_message(asset, value, &lock, timeout, &pk);
+            let msg = mint_auth::mint_message(b"zcrypt-test", asset, value, &lock, timeout, &pk);
             let sigs = mint_auth::authorize(&keyset, &signers, &msg);
-            node.htlc_open(asset, value, lock, timeout, pk, &keyset, &sigs)
+            node.htlc_open(b"zcrypt-test", asset, value, lock, timeout, pk, &keyset, &sigs)
         };
         let id = open(&mut node, 100, lock, 100).unwrap();
 
@@ -301,18 +313,24 @@ mod tests {
         assert_eq!(evaluate(HTLC_CLAIM, &ctx).accept, node.htlc_claim(&id, x).is_ok());
 
         // CLAIM adversarial: wrong preimage on a fresh open escrow
-        let id2 = open(&mut node, 100, htlc_hashlock(b"y"), 100).unwrap();
+        let y = b"another-32-byte-preimage-value!!";
+        let id2 = open(&mut node, 100, htlc_hashlock(y), 100).unwrap();
         let e2 = node.htlc_escrow(&id2).unwrap();
         let ctx_bad = Ctx {
             escrow_open: e2.state == EscrowState::Open,
             height: node.height(),
             timeout: e2.timeout_height,
             hashlock: e2.hashlock,
-            preimage: b"wrong".to_vec(),
+            preimage: b"wrong-preimage-of-32-bytes-len!!".to_vec(),
             ..Default::default()
         };
-        assert_eq!(evaluate(HTLC_CLAIM, &ctx_bad).accept, node.htlc_claim(&id2, b"wrong").is_ok());
+        assert_eq!(evaluate(HTLC_CLAIM, &ctx_bad).accept, node.htlc_claim(&id2, b"wrong-preimage-of-32-bytes-len!!").is_ok());
         assert!(!evaluate(HTLC_CLAIM, &ctx_bad).accept);
+        // Bridge C2: the RIGHT preimage in an oversized encoding is refused by both.
+        let mut long = y.to_vec();
+        long.extend_from_slice(&[0u8; 600]);
+        let ctx_long = Ctx { preimage: long.clone(), hashlock: htlc_hashlock(&long), escrow_open: true, height: 10, timeout: 100, ..Default::default() };
+        assert!(!evaluate(HTLC_CLAIM, &ctx_long).accept, "oversized preimage rejected by the VM");
 
         // EXPIRE: rejected before timeout, accepted at/after
         let (open2, timeout2) = {

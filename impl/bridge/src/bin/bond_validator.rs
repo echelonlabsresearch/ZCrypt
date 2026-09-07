@@ -124,7 +124,7 @@ fn main() {
     let cblind = keys::random_blind();
     let change_out = keys::out_coin(&funder.normal_address(), 100, cblind);
     let cnote = kem::ciphertext_to_bytes(&keys::encrypt_note(&funder.normal_address(), 100, cblind));
-    let pledge = build_shield_spend(&zc, &[fund], &[burn_out, change_out], emission::MIN_FEE, vec![vec![], cnote])
+    let pledge = build_shield_spend(&zc, &[fund], &[burn_out, change_out], emission::MIN_FEE, vec![zcrypt_core::keys::cover_note_bytes(), cnote])
         .expect("build the stake pledge");
 
     // 5. Broadcast the BOND (no unbond — this validator stays in the set).

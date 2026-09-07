@@ -76,11 +76,20 @@ fn claimed_reward_coins_are_spendable() {
     let per_epoch = emission::epoch_reward(emission::EPOCH);
     assert_eq!(node.claimable(&account.pubkey()), 2 * per_epoch);
 
-    // First claim reserves a gas coin: chunks [gas, reward] at tree indices [0, 1].
+    // Claims must take the FULL balance (a partial claim is rejected: consensus C2). So
+    // simulate two claims by claiming after each epoch's accrual instead of splitting one.
+    assert!(node.claim_rewards(&account.pubkey(), per_epoch).is_err(), "partial claims are refused");
+    // Rewind: claim the two-epoch balance in one go, then accrue a third epoch and claim
+    // again. First claim reserves a gas coin: chunks [gas, rest] at tree indices [0, 1].
     // Second claim (already holds coins) is a single coin at tree index 2.
-    let claim1 = node.claim_rewards(&account.pubkey(), per_epoch).unwrap();
+    let claim1 = node.claim_rewards(&account.pubkey(), 2 * per_epoch).unwrap();
+    for h in (2 * emission::EPOCH + 1)..=(3 * emission::EPOCH) {
+        node.set_height(h);
+        node.record_block_signers(&[b"validator-consensus-2".to_vec()]);
+        node.maybe_distribute_rewards(h);
+    }
     let claim2 = node.claim_rewards(&account.pubkey(), per_epoch).unwrap();
-    let chunks1 = keys::claim_chunks(per_epoch, true);
+    let chunks1 = keys::claim_chunks(2 * per_epoch, true);
     let chunks2 = keys::claim_chunks(per_epoch, false);
     // (value, tree index) of every minted coin, appended in order.
     let mut all: Vec<(u64, u64)> = Vec::new();
@@ -128,7 +137,7 @@ fn claimed_reward_coins_are_spendable() {
     let total = va + vb;
     let out0: OutCoin = (va, keys::random_blind(), account.pubkey(), 0);
     let out1: OutCoin = (total - va - emission::MIN_FEE, keys::random_blind(), account.pubkey(), 0);
-    let notes = vec![vec![0xa1; 8], vec![0xb2; 8]];
+    let notes = vec![keys::cover_note_bytes(), keys::cover_note_bytes()];
     let tx = shield_tx::build(CHAIN, &[a, b], &[out0, out1], emission::MIN_FEE, notes)
         .expect("shield proof over claimed reward coins");
 
@@ -141,7 +150,7 @@ fn claimed_reward_coins_are_spendable() {
     let b2 = mk_spend(&coin1, ib as usize);
     let out2: OutCoin = (va, keys::random_blind(), account.pubkey(), 0);
     let out3: OutCoin = (total - va - emission::MIN_FEE, keys::random_blind(), account.pubkey(), 0);
-    let tx2 = shield_tx::build(CHAIN, &[a2, b2], &[out2, out3], emission::MIN_FEE, vec![vec![1; 8], vec![2; 8]])
+    let tx2 = shield_tx::build(CHAIN, &[a2, b2], &[out2, out3], emission::MIN_FEE, vec![keys::cover_note_bytes(), keys::cover_note_bytes()])
         .unwrap();
     assert!(node.submit_shield(CHAIN, &tx2).is_err(), "no double-spend of claimed coins");
 }

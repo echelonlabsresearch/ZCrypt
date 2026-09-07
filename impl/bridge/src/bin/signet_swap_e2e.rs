@@ -115,7 +115,9 @@ fn main() {
     let zc = Zcrypt::new(&zc_url);
     let reserve_pk: [u8; 33] = bridge_key.pk.inner.serialize();
     use zcrypt_core::asset_registry::{ZBTC_DECIMALS, ZBTC_MAX_SUPPLY, ZBTC_TICKER};
-    let _ = zc.broadcast(&swap::register_spv_tx(ZBTC_TICKER, ZBTC_DECIMALS, &reserve_pk, ZBTC_MAX_SUPPLY));
+    // zBTC is pinned in GENESIS (`zbtc_reserve_pk`, from ZCRYPT_RESERVE_PK when the chain is
+    // created); this legacy gasless registration is rejected and ignored on such a chain.
+    let _ = zc.broadcast(&swap::register_spv_tx(ZBTC_TICKER, ZBTC_DECIMALS, &reserve_pk, ZBTC_MAX_SUPPLY, &[]));
     let asset: u64 = zc.query("/asset/by_ticker/zBTC").unwrap().trim().parse().unwrap();
     println!("    zBTC asset_id = {asset}");
     for k in 0..16u64 {

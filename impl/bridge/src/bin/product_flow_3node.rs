@@ -261,23 +261,30 @@ fn main() {
 
     // ---- 4. Shielded asset GOLD: register, mint (1-of-1 M-of-N HTLC), spend ----
     let (gold_ks, gold_signers) = zcrypt_core::mint_auth::derive_keyset(b"gold-cap-3node", 1, 1);
-    let _ = zc.broadcast(&swap::register_tx("GOLD", 2, &gold_ks.commitment(), 1_000_000));
+    // Registration and mint-open are state-creating txs: each carries a ZCRYPT gas note.
+    let rg1 = gas_for(&zc, &alice);
+    let rg1p = swap::build_gas_prefix(&zc, &alice, &rg1).expect("register gas");
+    let _ = zc.broadcast(&swap::register_tx("GOLD", 2, &gold_ks.commitment(), 1_000_000, &rg1p));
     let gold: u64 = zc.query("/asset/by_ticker/GOLD").unwrap().trim().parse().unwrap();
     // ABUSE: registering GOLD again must be rejected (first-mint-wins).
+    let rg2 = gas_for(&zc, &alice);
+    let rg2p = swap::build_gas_prefix(&zc, &alice, &rg2).expect("register gas");
     assert!(
-        zc.broadcast(&swap::register_tx("GOLD", 2, &gold_ks.commitment(), 1_000_000)).is_err(),
+        zc.broadcast(&swap::register_tx("GOLD", 2, &gold_ks.commitment(), 1_000_000, &rg2p)).is_err(),
         "duplicate ticker rejected"
     );
-    let preimage = b"gold-mint-preimage-3node";
+    let preimage = b"gold-mint-preimage-3node-32byte!"; // exactly 32 bytes (consensus rule)
     let lock = zcrypt_core::nullifier::htlc_hashlock(preimage);
     let timeout = zc.height().unwrap() as u64 + 100;
     let escrow = zcrypt_core::htlc_shield::escrow_id(gold, 500_000, &lock, timeout, &alice.pubkey());
-    let gold_msg = zcrypt_core::mint_auth::mint_message(gold, 500_000, &lock, timeout, &alice.pubkey());
+    let gold_msg = zcrypt_core::mint_auth::mint_message(swap::CHAIN, gold, 500_000, &lock, timeout, &alice.pubkey());
     let gold_auth = zcrypt_core::mint_auth::encode_auth(
         &gold_ks,
         &zcrypt_core::mint_auth::authorize(&gold_ks, &gold_signers, &gold_msg),
     );
-    zc.broadcast(&swap::open_tx(gold, 500_000, &lock, timeout, &alice.pubkey(), &gold_auth)).expect("htlc open");
+    let og = gas_for(&zc, &alice);
+    let ogp = swap::build_gas_prefix(&zc, &alice, &og).expect("open gas");
+    zc.broadcast(&swap::open_tx(gold, 500_000, &lock, timeout, &alice.pubkey(), &gold_auth, &ogp)).expect("htlc open");
     zc.broadcast(&swap::claim_tx(&escrow, preimage)).expect("htlc claim mints GOLD");
     let gold_coin = alice.htlc_coin(500_000, gold, &escrow);
     let (g0, gn0) = pay_asset(&bob.normal_address(), 300_000, keys::random_blind(), gold);
@@ -322,7 +329,7 @@ fn main() {
             let cblind = keys::random_blind();
             let change_out = keys::out_coin(&rewarder.normal_address(), 100, cblind);
             let cnote = kem::ciphertext_to_bytes(&keys::encrypt_note(&rewarder.normal_address(), 100, cblind));
-            let pledge = build_shield_spend(&zc, &[fund], &[burn_out, change_out], FEE, vec![vec![], cnote])
+            let pledge = build_shield_spend(&zc, &[fund], &[burn_out, change_out], FEE, vec![keys::cover_note_bytes(), cnote])
                 .expect("build the stake pledge");
             // BOND carries the signer's monotonic auth nonce (M3). Query it — a prior run
             // (e.g. fee_flow's bond/unbond of this same node) may have already advanced it.
@@ -350,7 +357,7 @@ fn main() {
             let dcblind = keys::random_blind();
             let del_change = keys::out_coin(&delegator.normal_address(), 100, dcblind);
             let dcnote = kem::ciphertext_to_bytes(&keys::encrypt_note(&delegator.normal_address(), 100, dcblind));
-            let del_pledge = build_shield_spend(&zc, &[dfund], &[del_burn, del_change], FEE, vec![vec![], dcnote])
+            let del_pledge = build_shield_spend(&zc, &[dfund], &[del_burn, del_change], FEE, vec![keys::cover_note_bytes(), dcnote])
                 .expect("build the delegation pledge");
             zc.broadcast(&delegate_tx(&del_sk, &val_addr, del_stake, del_reward, del_blind, &del_pledge))
                 .expect("DELEGATE accepted");

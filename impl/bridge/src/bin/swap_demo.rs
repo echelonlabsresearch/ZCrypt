@@ -30,7 +30,9 @@ fn main() {
 
     // register zBTC in SPV form (idempotent-ish: ignore "already registered")
     let reserve_pk: [u8; 33] = bridge_key.pk.inner.serialize();
-    let _ = zc.broadcast(&swap::register_spv_tx(asset_ticker, 8, &reserve_pk, 21_000_000 * 100_000_000));
+    // zBTC is pinned in GENESIS (`zbtc_reserve_pk`, from ZCRYPT_RESERVE_PK when the chain is
+    // created); this legacy gasless registration is rejected and ignored on such a chain.
+    let _ = zc.broadcast(&swap::register_spv_tx(asset_ticker, 8, &reserve_pk, 21_000_000 * 100_000_000, &[]));
     let asset: u64 = zc.query(&format!("/asset/by_ticker/{asset_ticker}")).unwrap().trim().parse().unwrap();
     println!("zBTC asset_id = {asset}");
 

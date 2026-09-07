@@ -39,16 +39,29 @@ pub fn canonical_ticker(t: &str) -> String {
 }
 
 /// Deterministic non-zero asset id for a ticker (identical on every node and, by
-/// construction, every chain — so `zBTC` means the same asset everywhere). Derived
+/// construction, every chain, so `zBTC` means the same asset everywhere). Derived
 /// from the case-insensitive canonical form, so `zBTC` and `ZBTC` share one id.
+///
+/// The id is ALWAYS a canonical BabyBear field element (`< FIELD_ORDER`). The shield
+/// circuit carries the asset in one field lane, so two 64-bit ids that were congruent
+/// modulo the field order produced byte-identical commitments and nullifiers: a
+/// permissionless registrant could grind a ticker aliasing zBTC (or native ZCRYPT, id 0)
+/// and mint counterfeit coins. Reducing here, keying uniqueness on the reduced id, and
+/// rejecting out-of-field ids on every wire closes that.
 pub fn asset_id_for(ticker: &str) -> u64 {
     let d = h(b"ZC-ASSET", &[canonical_ticker(ticker).as_bytes()]);
-    let id = u64::from_le_bytes(d[0..8].try_into().unwrap());
+    let id = zcrypt_shield::field_limb(u64::from_le_bytes(d[0..8].try_into().unwrap()));
     if id == NATIVE_ASSET {
         1
     } else {
         id
     }
+}
+
+/// True iff `id` is a canonical field element and therefore a valid asset id on the wire.
+/// Every consensus entry point that takes a user-supplied asset id must check this.
+pub fn asset_id_ok(id: u64) -> bool {
+    id < zcrypt_shield::FIELD_ORDER
 }
 
 /// A ticker is 2..=10 ASCII alphanumerics beginning with a letter (so `zBTC`,
@@ -134,8 +147,16 @@ impl AssetRegistry {
             return Err(format!("ticker '{ticker}' is already registered"));
         }
         let id = asset_id_for(ticker);
-        if id == NATIVE_ASSET || self.by_id.contains_key(&id) {
-            return Err(format!("asset id collision for '{ticker}' — pick another ticker"));
+        if id == NATIVE_ASSET || !asset_id_ok(id) || self.by_id.contains_key(&id) {
+            return Err(format!("asset id collision for '{ticker}': pick another ticker"));
+        }
+        // One mint authority may back only one asset. Otherwise a registrant could bind
+        // a second ticker to zBTC's reserve key and re-open a proven deposit under the
+        // other asset id (bridge M1).
+        if authority.is_some() && self.by_id.values().any(|m| m.authority == authority) {
+            return Err(format!(
+                "the mint authority for '{ticker}' already backs another registered asset"
+            ));
         }
         // Uniqueness is keyed on the canonical (case-insensitive) form; the display
         // ticker keeps the first registrant's original spelling.
@@ -290,6 +311,39 @@ mod tests {
         assert_eq!(r.count(), 2);
         assert_eq!(r.asset_of("zBTC"), Some(id));
         assert_eq!(r.meta(id).unwrap().decimals, 8);
+    }
+
+    #[test]
+    fn ids_are_canonical_field_elements_and_uniqueness_keys_on_the_reduced_id() {
+        // Circuit C1 regression: every id the registry can ever hand out is < FIELD_ORDER,
+        // so no two registered assets can share the circuit's asset lane.
+        for t in ["zBTC", "GOLD", "USDC", "zETH", "AB", "Z9Z9Z9Z9Z9", "ticker"] {
+            let id = asset_id_for(t);
+            assert!(asset_id_ok(id), "{t} -> {id} must be below the field order");
+            assert_ne!(id, NATIVE_ASSET);
+        }
+        assert!(!asset_id_ok(zcrypt_shield::FIELD_ORDER));
+        assert!(!asset_id_ok(u64::MAX));
+        // A registration whose reduced id is already occupied (by whatever ticker) is
+        // rejected. Occupy GOLD's reduced lane directly, then try to register GOLD.
+        let mut r = AssetRegistry::default();
+        let lane = asset_id_for("GOLD");
+        r.by_ticker.insert(canonical_ticker("OTHER"), lane);
+        r.by_id.insert(lane, AssetMeta {
+            asset_id: lane, ticker: "OTHER".into(), decimals: 8, authority: None,
+            minted: 0, max_supply: 1, authority_epoch: 0,
+        });
+        let err = r.register("GOLD", 8, None, CAP).unwrap_err();
+        assert!(err.contains("collision"), "{err}");
+    }
+
+    #[test]
+    fn one_authority_backs_at_most_one_asset() {
+        let mut r = AssetRegistry::default();
+        let auth = Some([7u8; 32]);
+        r.register("zBTC", 8, auth, CAP).unwrap();
+        assert!(r.register("FAKE", 8, auth, CAP).is_err(), "reserve key reuse must be rejected");
+        assert!(r.register("FAKE", 8, Some([8u8; 32]), CAP).is_ok());
     }
 
     #[test]

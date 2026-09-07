@@ -5859,6 +5859,7 @@ dependencies = [
  "postcard",
  "rand 0.10.2",
  "serde",
+ "sha3",
 ]
 
 [[package]]

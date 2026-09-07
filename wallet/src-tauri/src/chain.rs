@@ -274,13 +274,30 @@ pub fn commitment_count(url: &str) -> Result<usize, String> {
 /// Leaves starting at `from` (inclusive). Prefer this over a full dump when the
 /// wallet already holds a prefix of the tree.
 pub fn fetch_leaves_from(url: &str, from: usize) -> Result<Vec<Commitment>, String> {
-    let path = if from == 0 {
-        "/commit/leaves".to_string()
-    } else {
-        format!("/commit/leaves/{from}")
-    };
-    let hexs = abci_query_hex(url, &path)?;
-    parse_leaves_hex(&hexs)
+    // The node serves leaves in PAGES (at most `/commit/leaf_page` per query, so a single
+    // request never clones the whole tree): keep paging until a page comes back short.
+    let page: usize = abci_query_hex(url, "/commit/leaf_page")
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(20_000);
+    let mut out = Vec::new();
+    let mut cursor = from;
+    loop {
+        let path = if cursor == 0 {
+            "/commit/leaves".to_string()
+        } else {
+            format!("/commit/leaves/{cursor}")
+        };
+        let hexs = abci_query_hex(url, &path)?;
+        let got = parse_leaves_hex(&hexs)?;
+        let n = got.len();
+        out.extend(got);
+        cursor += n;
+        if n < page {
+            break;
+        }
+    }
+    Ok(out)
 }
 
 /// The node's committed leaf at `idx`. The commitment tree is append-only, so a committed

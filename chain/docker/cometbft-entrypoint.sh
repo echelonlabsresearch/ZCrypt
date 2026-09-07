@@ -55,7 +55,12 @@ if [ ! -f "$HOME_DIR/config/genesis.json" ]; then
   # chain/mainnet-checkpoint.sh). Empty when unset (devnet: the node then defaults regtest).
   BTC_NET="${ZCRYPT_BTC_NET:-}"
   BTC_CP="${ZCRYPT_BTC_CHECKPOINT:-}"
-  sed -i "s|\"app_hash\": \"\"|\"app_hash\": \"\", \"app_state\": { \"registry\": { \"minted_total\": 0, \"leaves\": [] }, \"foundation_addr\": \"$FADDR\", \"foundation_sentinel\": $FSENTINEL, \"foundation_sentinel_decay\": $FSENTINEL_DECAY, \"btc_net\": \"$BTC_NET\", \"btc_checkpoint\": \"$BTC_CP\" }|" "$HOME_DIR/config/genesis.json"
+  # zbtc_reserve_pk: the 33-byte compressed secp256k1 reserve key (hex) zBTC is bound to,
+  # registered by the node at InitChain. Binding it in genesis (instead of a first-come
+  # REGISTER tx) means nobody can race the foundation to own the peg's reserve authority.
+  # Empty when unset (then zBTC is simply not registered at genesis).
+  ZBTC_PK="${ZCRYPT_RESERVE_PK:-}"
+  sed -i "s|\"app_hash\": \"\"|\"app_hash\": \"\", \"app_state\": { \"registry\": { \"minted_total\": 0, \"leaves\": [] }, \"foundation_addr\": \"$FADDR\", \"foundation_sentinel\": $FSENTINEL, \"foundation_sentinel_decay\": $FSENTINEL_DECAY, \"btc_net\": \"$BTC_NET\", \"btc_checkpoint\": \"$BTC_CP\", \"zbtc_reserve_pk\": \"$ZBTC_PK\" }|" "$HOME_DIR/config/genesis.json"
 fi
 
 exec cometbft start --home "$HOME_DIR"

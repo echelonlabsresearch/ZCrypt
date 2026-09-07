@@ -104,19 +104,35 @@ impl Zcrypt {
     }
 
     /// All commitment-tree leaves in order (the shield decoy pool).
+    /// All commitment leaves in tree order. The node serves them in PAGES
+    /// (`/commit/leaves/<from>`, each at most `/commit/leaf_page` leaves), so keep paging
+    /// until a page comes back short.
     pub fn leaves(&self) -> Result<Vec<[u64; 8]>, String> {
-        let hexs = self.query("/commit/leaves")?;
-        let raw = hex::decode(hexs.trim()).map_err(|e| e.to_string())?;
+        let page: usize = self
+            .query("/commit/leaf_page")
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(20_000);
         let mut out = Vec::new();
-        for chunk in raw.chunks(64) {
-            if chunk.len() < 64 {
+        loop {
+            let path = if out.is_empty() { "/commit/leaves".to_string() } else { format!("/commit/leaves/{}", out.len()) };
+            let hexs = self.query(&path)?;
+            let raw = hex::decode(hexs.trim()).map_err(|e| e.to_string())?;
+            let mut got = 0usize;
+            for chunk in raw.chunks(64) {
+                if chunk.len() < 64 {
+                    break;
+                }
+                let mut c = [0u64; 8];
+                for (i, ci) in c.iter_mut().enumerate() {
+                    *ci = u64::from_le_bytes(chunk[i * 8..i * 8 + 8].try_into().unwrap());
+                }
+                out.push(c);
+                got += 1;
+            }
+            if got < page {
                 break;
             }
-            let mut c = [0u64; 8];
-            for (i, ci) in c.iter_mut().enumerate() {
-                *ci = u64::from_le_bytes(chunk[i * 8..i * 8 + 8].try_into().unwrap());
-            }
-            out.push(c);
         }
         Ok(out)
     }

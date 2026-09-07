@@ -32,8 +32,10 @@ use p3_matrix::dense::RowMajorMatrix;
 use p3_poseidon2::GenericPoseidon2LinearLayers;
 use p3_poseidon2_air::{generate_trace_rows, Poseidon2Cols, RoundConstants};
 use p3_uni_stark::{
-    prove_with_preprocessed, setup_preprocessed, verify_with_preprocessed, Proof,
+    prove_with_preprocessed, setup_preprocessed, verify_with_preprocessed,
+    PreprocessedProverData, PreprocessedVerifierKey,
 };
+use std::sync::OnceLock;
 
 use super::*;
 
@@ -87,7 +89,7 @@ impl BaseAir<BabyBear> for CoinsAirTall {
         // The trailing 8-limb enc_notes digest is observed into the transcript (Fiat-Shamir), not
         // constrained by the AIR — it binds the tx's encrypted notes to the proof so a relayer
         // can't strip/replace them and lock the recipient out of a valid on-chain coin.
-        N_OUT * 8 + 1 + N_IN * 8 + 8 + 1 + 8
+        N_OUT * 8 + 1 + N_IN * 8 + 8 + CHAIN_DOMAIN_LIMBS + 8
     }
     fn preprocessed_trace(&self) -> Option<RowMajorMatrix<BabyBear>> {
         let mut v = vec![BabyBear::ZERO; HEIGHT * NUM_SEL];
@@ -201,18 +203,19 @@ impl<AB: AirBuilder<F = BabyBear>> Air<AB> for CoinsAirTall {
                 let one_minus_act = AB::Expr::ONE - act.clone();
                 core_zero!(builder, one_minus_act.clone() * Into::<AB::Expr>::into(local[i * BLK]));
                 core_zero!(builder, one_minus_act * Into::<AB::Expr>::into(local[i * BLK + 1]));
-                // L1 defense-in-depth: pin the input commitment's padding lane [15] to
-                // 0, mirroring the output-coin constraint below. Real leaves are always
-                // built with lane[15]=0 (see `coin_input`), so this binds the last free
+                // Role tag: the input commitment's lane [15] is TAG_COMMIT, mirroring the
+                // output-coin constraint below. Real leaves are always built with
+                // lane[15]=TAG_COMMIT (see `coin_input`), so this binds the last free
                 // preimage lane and denies a malleable second opening of a spent coin.
-                core_zero!(builder, Into::<AB::Expr>::into(local[i * BLK + 15]));
+                core_zero!(builder, Into::<AB::Expr>::into(local[i * BLK + 15]) - konst::<AB>(TAG_COMMIT));
                 // OWNERSHIP: pk in the commitment (input[6..14]) == Poseidon2(ss).
                 for t in 0..8 {
                     core_zero!(builder, Into::<AB::Expr>::into(local[i * BLK + 6 + t]) - outs[pk_blk][t].into());
                 }
-                for t in 8..WIDTH {
+                for t in 8..WIDTH - 1 {
                     core_zero!(builder, Into::<AB::Expr>::into(local[pk_blk * BLK + t]));
                 }
+                core_zero!(builder, Into::<AB::Expr>::into(local[pk_blk * BLK + WIDTH - 1]) - konst::<AB>(TAG_PK));
                 // CANONICAL nullifier input: [ss(8), vlo, vhi, blind(4), asset].
                 for t in 0..8 {
                     core_zero!(builder, Into::<AB::Expr>::into(local[nf_blk * BLK + t]) - local[pk_blk * BLK + t].into());
@@ -223,13 +226,13 @@ impl<AB: AirBuilder<F = BabyBear>> Air<AB> for CoinsAirTall {
                     core_zero!(builder, Into::<AB::Expr>::into(local[nf_blk * BLK + 10 + t]) - local[i * BLK + 2 + t].into());
                 }
                 core_zero!(builder, Into::<AB::Expr>::into(local[nf_blk * BLK + 14]) - local[i * BLK + 14].into());
-                core_zero!(builder, Into::<AB::Expr>::into(local[nf_blk * BLK + 15]));
+                core_zero!(builder, Into::<AB::Expr>::into(local[nf_blk * BLK + 15]) - konst::<AB>(TAG_NF));
                 // Published nullifier for EVERY input (real or dummy) — arity-leak fix.
                 for k in 0..8 {
                     core_zero!(builder, Into::<AB::Expr>::into(outs[nf_blk][k]) - pis[nf_off + i * 8 + k].clone());
                 }
             } else {
-                core_zero!(builder, Into::<AB::Expr>::into(local[i * BLK + 15]));
+                core_zero!(builder, Into::<AB::Expr>::into(local[i * BLK + 15]) - konst::<AB>(TAG_COMMIT));
                 for j in 0..8 {
                     core_zero!(builder, Into::<AB::Expr>::into(outs[i][j]) - pis[out_off + (i - N_IN) * 8 + j].clone());
                 }
@@ -511,12 +514,33 @@ fn tall_trace(
     for &x in &root {
         pis.push(BabyBear::from_u64(x));
     }
-    pis.push(BabyBear::from_u64(chain_domain(chain_id)));
+    for &x in &chain_domain(chain_id) {
+        pis.push(BabyBear::from_u64(x));
+    }
     for &x in enc_digest {
         pis.push(BabyBear::from_u64(x));
     }
 
     Some((trace, pis, out_commits, nullifiers, root))
+}
+
+/// The preprocessed-column commitment, computed ONCE per process. It is a pure
+/// function of the AIR's fixed selector columns and the deterministic verifier
+/// config, so every node derives the identical key; caching it removes one Keccak
+/// Merkle commit per prove/verify and lets a test pin its value (see
+/// `preprocessed_key_is_pinned`), so an upstream change to salt derivation can never
+/// split consensus silently.
+fn preprocessed() -> &'static (PreprocessedProverData<ZkConfig>, PreprocessedVerifierKey<ZkConfig>) {
+    static PP: OnceLock<(PreprocessedProverData<ZkConfig>, PreprocessedVerifierKey<ZkConfig>)> = OnceLock::new();
+    PP.get_or_init(|| {
+        setup_preprocessed(&verifier_config(), &CoinsAirTall, DEGREE_BITS)
+            .expect("CoinsAirTall defines preprocessed columns")
+    })
+}
+
+/// Serialized commitment of the tall circuit's preprocessed verifier key.
+pub fn preprocessed_commitment_bytes() -> Vec<u8> {
+    postcard::to_allocvec(&preprocessed().1.commitment).expect("commitment serializes")
 }
 
 /// Prove a shielded-pool spend with the tall circuit. Same return shape as the wide
@@ -529,10 +553,10 @@ pub fn prove_tall(
     enc_digest: &[u64; 8],
 ) -> Option<(Vec<Commitment>, Vec<Commitment>, Commitment, Vec<u8>)> {
     let (trace, pis, out_commits, nullifiers, root) = tall_trace(inputs, outputs, fee, chain_id, enc_digest)?;
-    // Preprocessed columns are fixed & public; commit them with the deterministic
+    // Preprocessed columns are fixed & public; committed once with the deterministic
     // (fixed-seed) config so prover and verifier derive the same key without sharing.
-    let (pp_data, _pp_vk) = setup_preprocessed(&verifier_config(), &CoinsAirTall, DEGREE_BITS)?;
-    let proof = prove_with_preprocessed(&prover_config(), &CoinsAirTall, trace, &pis, Some(&pp_data));
+    let (pp_data, _pp_vk) = preprocessed();
+    let proof = prove_with_preprocessed(&prover_config(), &CoinsAirTall, trace, &pis, Some(pp_data));
     let bytes = postcard::to_allocvec(&proof).ok()?;
     Some((out_commits, nullifiers, root, bytes))
 }
@@ -558,13 +582,11 @@ pub fn verify_tall(
     if !all_canonical {
         return false;
     }
-    let (_pp_data, pp_vk) = match setup_preprocessed(&verifier_config(), &CoinsAirTall, DEGREE_BITS) {
-        Some(x) => x,
+    let (_pp_data, pp_vk) = preprocessed();
+    // Strict decode: trailing bytes after the proof are rejected (see `decode_proof`).
+    let proof = match decode_proof(proof_bytes) {
+        Some(p) => p,
         None => return false,
-    };
-    let proof: Proof<ZkConfig> = match postcard::from_bytes(proof_bytes) {
-        Ok(p) => p,
-        Err(_) => return false,
     };
     let mut pis: Vec<BabyBear> = Vec::new();
     for c in output_commits {
@@ -581,19 +603,19 @@ pub fn verify_tall(
     for &x in root {
         pis.push(BabyBear::from_u64(x));
     }
-    pis.push(BabyBear::from_u64(chain_domain(chain_id)));
+    for &x in &chain_domain(chain_id) {
+        pis.push(BabyBear::from_u64(x));
+    }
     for &x in enc_digest {
         pis.push(BabyBear::from_u64(x));
     }
 
-    let prev = std::panic::take_hook();
-    std::panic::set_hook(Box::new(|_| {}));
-    let ok = std::panic::catch_unwind(|| {
-        verify_with_preprocessed(&verifier_config(), &CoinsAirTall, &proof, &pis, Some(&pp_vk)).is_ok()
+    // `catch_unwind` contains a verifier panic on a malformed proof without touching the
+    // process-wide panic hook (which is shared, non-reentrant state).
+    std::panic::catch_unwind(|| {
+        verify_with_preprocessed(&verifier_config(), &CoinsAirTall, &proof, &pis, Some(pp_vk)).is_ok()
     })
-    .unwrap_or(false);
-    std::panic::set_hook(prev);
-    ok
+    .unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -601,6 +623,9 @@ mod tests {
     use super::*;
 
     const CHAIN: &[u8] = b"zcrypt-devnet";
+    /// Hex of `postcard(preprocessed vk commitment)`; update ONLY with a deliberate,
+    /// coordinated circuit change (it is a proof-format change).
+    const PINNED_PREPROCESSED_COMMITMENT: &str = "01bd939debe7cda8c67cb88da48a9ef3d492b501b8a4919992edccb4db01b79a8cedddbdb0977f";
 
     fn bl(b: u64) -> Blind {
         core::array::from_fn(|i| field_limb(b.wrapping_add(0x9e37u64.wrapping_mul(i as u64 + 1))))
@@ -830,6 +855,38 @@ mod tests {
              statement — the hiding mask is NOT carrying fresh randomness",
             frac * 100.0,
         );
+    }
+
+    #[test]
+    fn proof_with_trailing_bytes_is_rejected() {
+        // Regression (circuit L3): `postcard::from_bytes` ignored trailing data, so a relayer
+        // could append junk to the proof field, keep the proof valid, and change the tx's
+        // identity (txbind). The decoder must now consume the proof exactly.
+        let (ins, _root) = with_tree(vec![inp(100, 11, 7), inp(50, 22, 8)]);
+        let (o, n, r, p) = prove_tall(&ins, &[oc(90, 33, 1), oc(55, 44, 2)], 5, CHAIN, &[0u64; 8]).unwrap();
+        assert!(verify_tall(&o, &n, 5, &r, &p, CHAIN, &[0u64; 8]));
+        let mut padded = p.clone();
+        padded.push(0);
+        assert!(!verify_tall(&o, &n, 5, &r, &padded, CHAIN, &[0u64; 8]), "trailing byte must be rejected");
+        assert!(!verify_tall(&o, &n, 5, &r, &p[..p.len() - 1], CHAIN, &[0u64; 8]), "truncated proof rejected");
+    }
+
+    #[test]
+    fn preprocessed_key_is_pinned() {
+        // The preprocessed selector commitment is consensus-critical: every node must derive
+        // the identical key or valid proofs fail on upgraded nodes only. Pin it, so a Plonky3
+        // or rand bump that changes salt derivation fails HERE instead of splitting the chain.
+        let got = hex::encode(preprocessed_commitment_bytes());
+        assert_eq!(got, PINNED_PREPROCESSED_COMMITMENT, "preprocessed key changed: {got}");
+    }
+
+    #[test]
+    fn hash_role_tags_separate_domains() {
+        // Circuit L11: before the role tags, pk_input(ss) == nf_input(ss, 0, zero-blind, 0).
+        let s = ss(7);
+        assert_ne!(spend_pubkey(&s), nullifier_asset(&s, 0, &[0u64; 4], ASSET_ZCRYPT));
+        assert_ne!(spend_pubkey(&s), commit_asset(0, &[0u64; 4], &[0u64; 8], ASSET_ZCRYPT));
+        assert!(TAG_COMMIT != TAG_NF && TAG_NF != TAG_PK && TAG_COMMIT != TAG_PK);
     }
 
     #[test]

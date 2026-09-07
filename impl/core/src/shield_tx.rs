@@ -231,27 +231,7 @@ pub fn verify(chain_id: &[u8], tx: &ShieldTx) -> Result<Vec<Hash>, String> {
 /// who rewrites any of them produces a digest the proof was not made against and the
 /// verification fails. See [`aux_digest`].
 pub fn verify_bound(chain_id: &[u8], tx: &ShieldTx, envelope: &[u8]) -> Result<Vec<Hash>, String> {
-    if tx.inputs.len() != N_IN || tx.output_commitments.len() != N_OUT {
-        return Err("shield-tx: wrong shape".to_string());
-    }
-    let mut seen = HashSet::new();
-    let mut nf_keys = Vec::with_capacity(tx.inputs.len());
-    for i in &tx.inputs {
-        // EVERY slot publishes a genuine nullifier — real inputs and value-0 DUMMY
-        // padding alike (the arity-leak fix; no all-zero NULL_NF sentinel to reveal the
-        // input count). All are recorded as spent: dummy nullifiers are unique Poseidon2
-        // images of a hidden key (see `zcrypt_shield::dummy_witness`), so they never
-        // collide with a real coin. A valid proof can never publish the all-zero
-        // sentinel (it would need a Poseidon2 preimage of zero), so reject it defensively.
-        if i.nullifier == zcrypt_shield::NULL_NF {
-            return Err("shield-tx: all-zero nullifier is not a valid Poseidon2 image".to_string());
-        }
-        let key = nf_hash(&i.nullifier);
-        if !seen.insert(key) {
-            return Err("shield-tx: duplicate nullifier in tx".to_string());
-        }
-        nf_keys.push(key);
-    }
+    let nf_keys = nullifier_keys(tx)?;
     let nullifiers: Vec<Commitment> = tx.inputs.iter().map(|i| i.nullifier).collect();
     // chain_id is a public input of the STARK — a proof for chain A will not verify under chain
     // B's domain tag. The aux digest is likewise a public input, so a mempool relayer that
@@ -273,6 +253,50 @@ pub fn verify_bound(chain_id: &[u8], tx: &ShieldTx, envelope: &[u8]) -> Result<V
             // signed off on it (a mempool front-run), so the digest no longer matches.
             "shield-tx: value/membership/note/envelope-binding proof invalid".to_string()
         });
+    }
+    Ok(nf_keys)
+}
+
+/// The cheap, proof-free half of [`verify_bound`]: shape, fixed note size, the all-zero
+/// sentinel, and in-tx duplicate nullifiers. Returns the registry nullifier keys so a
+/// caller can run the double-spend and anchor checks under its state lock and defer the
+/// expensive STARK verification to outside it (see the ABCI `check_tx`).
+pub fn nullifier_keys(tx: &ShieldTx) -> Result<Vec<Hash>, String> {
+    if tx.inputs.len() != N_IN || tx.output_commitments.len() != N_OUT {
+        return Err("shield-tx: wrong shape".to_string());
+    }
+    // Consensus-enforced uniform note shape: exactly one fixed-size note per output. This
+    // is what makes every shield tx byte-identical in shape on the wire, so a client that
+    // sends shorter, longer, or missing notes cannot fingerprint itself (or bloat blocks).
+    if tx.enc_notes.len() != N_OUT {
+        return Err(format!("shield-tx: expected {N_OUT} encrypted notes, got {}", tx.enc_notes.len()));
+    }
+    for n in &tx.enc_notes {
+        if n.len() != crate::kem::NOTE_WIRE_LEN {
+            return Err(format!(
+                "shield-tx: every encrypted note must be exactly {} bytes (got {})",
+                crate::kem::NOTE_WIRE_LEN,
+                n.len()
+            ));
+        }
+    }
+    let mut seen = HashSet::new();
+    let mut nf_keys = Vec::with_capacity(tx.inputs.len());
+    for i in &tx.inputs {
+        // EVERY slot publishes a genuine nullifier — real inputs and value-0 DUMMY
+        // padding alike (the arity-leak fix; no all-zero NULL_NF sentinel to reveal the
+        // input count). All are recorded as spent: dummy nullifiers are unique Poseidon2
+        // images of a hidden key (see `zcrypt_shield::dummy_witness`), so they never
+        // collide with a real coin. A valid proof can never publish the all-zero
+        // sentinel (it would need a Poseidon2 preimage of zero), so reject it defensively.
+        if i.nullifier == zcrypt_shield::NULL_NF {
+            return Err("shield-tx: all-zero nullifier is not a valid Poseidon2 image".to_string());
+        }
+        let key = nf_hash(&i.nullifier);
+        if !seen.insert(key) {
+            return Err("shield-tx: duplicate nullifier in tx".to_string());
+        }
+        nf_keys.push(key);
     }
     Ok(nf_keys)
 }
@@ -378,7 +402,11 @@ pub fn from_bytes(b: &[u8]) -> Option<ShieldTx> {
     }
     let mut enc_notes = Vec::with_capacity(n_notes);
     for _ in 0..n_notes {
-        enc_notes.push(r.var()?);
+        let n = r.var()?;
+        if n.len() != crate::kem::NOTE_WIRE_LEN {
+            return None; // fixed note size is a wire invariant (see `nullifier_keys`)
+        }
+        enc_notes.push(n);
     }
     let fee = r.u64()?;
     // Fee is one limb wide in the circuit; a fee >= 2^BITS would let the raw-u64 the
@@ -418,7 +446,7 @@ mod tests {
     fn pkof(s: u64) -> PubKey { spend_pubkey(&ss(s)) }
     fn tc(value: u64, b: u64, s: u64) -> Commitment { commit(value, &bl(b), &pkof(s)) }
     fn oc(value: u64, b: u64, s: u64) -> OutCoin { (value, bl(b), pkof(s), 0) }
-    fn notes() -> Vec<Vec<u8>> { vec![vec![0xaa; 8], vec![0xbb; 8]] }
+    fn notes() -> Vec<Vec<u8>> { vec![crate::keys::cover_note_bytes(), crate::keys::cover_note_bytes()] }
 
     // How many decoy coins to pad the pool with. In the shielded pool there is no
     // ring floor — the anonymity set is the whole tree — but a realistic pool has
@@ -687,6 +715,22 @@ mod tests {
         // and the canonical original still commits, then its shifted twin double-spends nothing.
         let mut node2 = seeded_node(&pool);
         node2.submit_shield(CHAIN, &tx).expect("canonical tx accepted");
+    }
+
+    #[test]
+    fn odd_sized_or_missing_notes_are_rejected() {
+        // Wallet L5: consensus pins the note shape so third-party clients cannot
+        // fingerprint themselves (or bloat blocks) with non-standard notes.
+        let pool = pool_with(tc(100_000, 1, 0), tc(101_000, 2, 1));
+        let a = spend_coin(100_000, 1, 0, 0, &pool);
+        let b = spend_coin(101_000, 2, 1, 1, &pool);
+        let outs = [oc(90_000, 33, 2), oc(101_000, 44, 3)];
+        for bad in [vec![vec![1u8; 8], vec![2u8; 8]], vec![vec![], vec![]], vec![crate::keys::cover_note_bytes(), vec![0u8; 5000]]] {
+            let tx = build(CHAIN, &[a.clone(), b.clone()], &outs, FEE, bad).unwrap();
+            let mut node = seeded_node(&pool);
+            assert!(node.submit_shield(CHAIN, &tx).is_err(), "non-standard notes must be rejected");
+            assert!(from_bytes(&to_bytes(&tx)).is_none(), "and never even deserialize");
+        }
     }
 
     #[test]

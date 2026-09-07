@@ -92,9 +92,14 @@ pub struct SignerSig {
 
 /// The canonical message the treasury signs to authorize a mint: the exact escrow
 /// parameters, so a signature is bound to one specific mint and cannot be repurposed for a
-/// different asset, amount, hashlock, timeout, or recipient.
-pub fn mint_message(asset_id: u64, value: u64, hashlock: &Hash, timeout: u64, claim_pk: &PubKey) -> Vec<u8> {
-    let mut m = Vec::with_capacity(8 + 8 + 32 + 8 + 64);
+/// different asset, amount, hashlock, timeout, or recipient. The chain id is bound too:
+/// asset ids are chain-independent by design, so without it a testnet mint signature
+/// would replay on mainnet whenever the same key set is registered on both.
+pub fn mint_message(chain_id: &[u8], asset_id: u64, value: u64, hashlock: &Hash, timeout: u64, claim_pk: &PubKey) -> Vec<u8> {
+    let mut m = Vec::with_capacity(16 + 4 + chain_id.len() + 8 + 8 + 32 + 8 + 64);
+    m.extend_from_slice(b"ZC-MINT-AUTH-v2-");
+    m.extend_from_slice(&(chain_id.len() as u32).to_le_bytes());
+    m.extend_from_slice(chain_id);
     m.extend_from_slice(&asset_id.to_le_bytes());
     m.extend_from_slice(&value.to_le_bytes());
     m.extend_from_slice(hashlock);
@@ -110,9 +115,11 @@ pub fn mint_message(asset_id: u64, value: u64, hashlock: &Hash, timeout: u64, cl
 /// can never be reused as a rotation) and bound to the asset's monotonic `epoch`, so a
 /// rotation signature is single-use — it cannot be replayed, even to re-apply a previous
 /// authority in an A→B→A sequence.
-pub fn rotate_message(asset_id: u64, epoch: u64, new_commitment: &Hash) -> Vec<u8> {
-    let mut m = Vec::with_capacity(16 + 8 + 8 + 32);
-    m.extend_from_slice(b"ZC-ROTATE-AUTH-1"); // domain tag (16 bytes)
+pub fn rotate_message(chain_id: &[u8], asset_id: u64, epoch: u64, new_commitment: &Hash) -> Vec<u8> {
+    let mut m = Vec::with_capacity(16 + 4 + chain_id.len() + 8 + 8 + 32);
+    m.extend_from_slice(b"ZC-ROTATE-AUTH-2"); // domain tag (16 bytes)
+    m.extend_from_slice(&(chain_id.len() as u32).to_le_bytes());
+    m.extend_from_slice(chain_id);
     m.extend_from_slice(&asset_id.to_le_bytes());
     m.extend_from_slice(&epoch.to_le_bytes());
     m.extend_from_slice(new_commitment);
@@ -298,7 +305,7 @@ mod tests {
     use super::*;
 
     fn msg_a() -> Vec<u8> {
-        mint_message(0xB7C, 50_000, &[7u8; 32], 100, &[3u64; 8])
+        mint_message(b"zcrypt-test", 0xB7C, 50_000, &[7u8; 32], 100, &[3u64; 8])
     }
 
     #[test]
@@ -345,7 +352,7 @@ mod tests {
         // Signatures are bound to the exact mint params — swapping the message must fail.
         let (ks, signers) = derive_keyset(b"treasury-master", 3, 2);
         let sigs = authorize(&ks, &signers, &msg_a());
-        let other = mint_message(0xB7C, 50_001, &[7u8; 32], 100, &[3u64; 8]); // value off by one
+        let other = mint_message(b"zcrypt-test", 0xB7C, 50_001, &[7u8; 32], 100, &[3u64; 8]); // value off by one
         assert!(!verify_threshold(&ks, &other, &sigs));
     }
 

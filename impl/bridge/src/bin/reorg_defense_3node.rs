@@ -81,7 +81,9 @@ fn main() {
     let alice = Account::from_seed([0x42; 32]);
 
     // Register zBTC (SPV form). Idempotent — ignore "already registered".
-    let _ = nodes[0].broadcast(&swap::register_spv_tx("zBTC", 8, &reserve, 21_000_000 * 100_000_000));
+    // zBTC is pinned in GENESIS (`zbtc_reserve_pk`, from ZCRYPT_RESERVE_PK when the chain is
+    // created); this legacy gasless registration is rejected and ignored on such a chain.
+    let _ = nodes[0].broadcast(&swap::register_spv_tx("zBTC", 8, &reserve, 21_000_000 * 100_000_000, &[]));
     let asset: u64 = q(&nodes, "/asset/by_ticker/zBTC").trim().parse().expect("zBTC registered");
     println!("[setup] zBTC asset_id = {asset}");
     println!("[setup] chain BTC SPV tip = {}", q(&nodes, "/spv/tip"));

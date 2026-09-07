@@ -332,19 +332,27 @@ pub fn random_spend_secret() -> SpendSecret {
     core::array::from_fn(|_| rand_field_limb())
 }
 
-/// Domain tag for a chain_id, as one public field element bound into every proof.
-/// Distinct chain_id byte strings map to distinct tags with overwhelming probability
-/// (64-bit FNV-1a folded into the field). Consensus constants, not adversarial secrets.
-pub fn chain_domain(chain_id: &[u8]) -> u64 {
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325; // FNV-1a offset
-    for &b in chain_id {
-        hash ^= b as u64;
-        hash = hash.wrapping_mul(0x100_0000_01b3);
-    }
-    // Mix length so prefix collisions don't alias.
-    hash ^= chain_id.len() as u64;
-    hash = hash.wrapping_mul(0x100_0000_01b3);
-    field_limb(hash)
+/// Number of public-input limbs the chain domain occupies. Each limb is a canonical
+/// BabyBear element (about 30.9 bits), so five limbs bind about 154 bits of a
+/// SHA3-256 digest of the chain id: a fork operator can no longer grind a colliding
+/// chain id in 2^31 work (the old single FNV limb) and replay mainnet spends on it.
+pub const CHAIN_DOMAIN_LIMBS: usize = 5;
+
+/// Domain tag for a chain_id, as [`CHAIN_DOMAIN_LIMBS`] public field elements bound
+/// into every proof: `SHA3-256("ZC-CHAIN" ‖ len(chain_id) ‖ chain_id)`, split into
+/// little-endian u32 words and reduced into the field. Consensus constants, not
+/// adversarial secrets, but the binding must be collision resistant across forks.
+pub fn chain_domain(chain_id: &[u8]) -> [u64; CHAIN_DOMAIN_LIMBS] {
+    use sha3::Digest;
+    let mut hasher = sha3::Sha3_256::new();
+    hasher.update(b"ZC-CHAIN");
+    hasher.update((chain_id.len() as u64).to_le_bytes());
+    hasher.update(chain_id);
+    let d = hasher.finalize();
+    core::array::from_fn(|i| {
+        let w = u32::from_le_bytes([d[4 * i], d[4 * i + 1], d[4 * i + 2], d[4 * i + 3]]);
+        field_limb(w as u64)
+    })
 }
 
 /// Wallet-side spend witness: a coin `(value, blind, spend_secret)` plus the Merkle
@@ -430,7 +438,7 @@ impl BaseAir<BabyBear> for CoinsAir {
         // in-circuit path. chain_domain binds the proof to a consensus chain_id; the trailing
         // 8-limb enc_notes digest binds the tx's encrypted notes (observed into the transcript,
         // not constrained) so they can't be stripped/replaced in the mempool.
-        N_OUT * 8 + 1 + N_IN * 8 + 8 + 1 + 8
+        N_OUT * 8 + 1 + N_IN * 8 + 8 + CHAIN_DOMAIN_LIMBS + 8
     }
 }
 
@@ -493,10 +501,10 @@ impl<AB: AirBuilder<F = BabyBear>> Air<AB> for CoinsAir {
                 let one_minus_act = AB::Expr::ONE - act.clone();
                 builder.assert_zero(one_minus_act.clone() * Into::<AB::Expr>::into(row[i * BLK]));
                 builder.assert_zero(one_minus_act * Into::<AB::Expr>::into(row[i * BLK + 1]));
-                // L1 defense-in-depth: pin the input commitment's padding lane [15] to 0,
-                // mirroring the output-coin constraint below (kept in parity with the tall
-                // production AIR). Real leaves are always built with lane[15]=0.
-                builder.assert_zero(row[i * BLK + 15].into());
+                // Role tag: the input commitment's lane [15] is the commit tag, mirroring
+                // the output-coin constraint below (kept in parity with the tall production
+                // AIR). Real leaves are always built with lane[15]=TAG_COMMIT.
+                builder.assert_eq(row[i * BLK + 15], konst::<AB>(TAG_COMMIT));
                 // OWNERSHIP: pk bound in the commitment (input[6..14]) == Poseidon2(ss).
                 // Kept unconditional (a pad still binds pk = Poseidon2(ss=0), trivially).
                 // Together with the Merkle path below, this proves the prover knows the
@@ -505,9 +513,10 @@ impl<AB: AirBuilder<F = BabyBear>> Air<AB> for CoinsAir {
                 for t in 0..8 {
                     builder.assert_eq(row[i * BLK + 6 + t], outs[pk_blk][t]);
                 }
-                for t in 8..WIDTH {
+                for t in 8..WIDTH - 1 {
                     builder.assert_zero(row[pk_blk * BLK + t].into());
                 }
+                builder.assert_eq(row[pk_blk * BLK + WIDTH - 1], konst::<AB>(TAG_PK));
                 // CANONICAL nullifier: nf block hashes [ss(8), value_lo, value_hi, blind(4), asset].
                 for t in 0..8 {
                     builder.assert_eq(row[nf_blk * BLK + t], row[pk_blk * BLK + t]); // same spend_secret
@@ -518,7 +527,7 @@ impl<AB: AirBuilder<F = BabyBear>> Air<AB> for CoinsAir {
                     builder.assert_eq(row[nf_blk * BLK + 10 + t], row[i * BLK + 2 + t]); // blind
                 }
                 builder.assert_eq(row[nf_blk * BLK + 14], row[i * BLK + 14]); // asset_id
-                builder.assert_zero(row[nf_blk * BLK + 15].into());
+                builder.assert_eq(row[nf_blk * BLK + 15], konst::<AB>(TAG_NF));
                 // MERKLE MEMBERSHIP: prove the spent coin commitment `outs[i]` is a
                 // real leaf under the public anchor root, by recomputing the root
                 // from an in-circuit authentication path. This is what lets a
@@ -567,8 +576,8 @@ impl<AB: AirBuilder<F = BabyBear>> Air<AB> for CoinsAir {
                     wf.assert_eq(Into::<AB::Expr>::into(outs[nf_blk][k]), pis[nf_off + i * 8 + k].clone());
                 }
             } else {
-                // output coin: [14]=asset, [15] canonical zero padding.
-                builder.assert_zero(row[i * BLK + 15].into());
+                // output coin: [14]=asset, [15] the commit role tag.
+                builder.assert_eq(row[i * BLK + 15], konst::<AB>(TAG_COMMIT));
                 let mut wf = builder.when_first_row();
                 for j in 0..8 { wf.assert_eq(outs[i][j], pis[out_off + (i - N_IN) * 8 + j].clone()); }
             }
@@ -609,30 +618,52 @@ impl<AB: AirBuilder<F = BabyBear>> Air<AB> for CoinsAir {
 
 const LIMB_MASK: u64 = (1u64 << SHIFT) - 1;
 
-// Commit: [0]=vlo [1]=vhi [2..6]=blind(4) [6..14]=pk(8) [14]=asset [15]=0
+/// Role tags pinned into lane 15 of every core Poseidon2 preimage, so the three hash
+/// domains (coin commitment, nullifier, spend pubkey) can never coincide for any choice
+/// of the other lanes. Before this, `pk_input(ss) == nf_input(ss, 0, [0; 4], 0)`, so a
+/// zero-value zero-blind coin's nullifier equalled its owner's public key. The AIR
+/// constrains lane 15 of each block to the matching tag (see `CoinsAir` / `CoinsAirTall`).
+pub const TAG_COMMIT: u64 = 1;
+pub const TAG_NF: u64 = 2;
+pub const TAG_PK: u64 = 3;
+
+/// A constant as an AIR expression.
+fn konst<AB: AirBuilder<F = BabyBear>>(x: u64) -> AB::Expr {
+    AB::Expr::from(BabyBear::from_u64(x))
+}
+
+// Commit: [0]=vlo [1]=vhi [2..6]=blind(4) [6..14]=pk(8) [14]=asset [15]=TAG_COMMIT
 fn coin_input(value: u64, blind: &Blind, pk: &PubKey, asset_id: u64) -> [BabyBear; WIDTH] {
+    // The asset lane is a field element: an id at or above the field order would alias
+    // another id inside the circuit. Consensus rejects such ids on every wire; this guard
+    // catches any caller that bypasses it in debug builds.
+    debug_assert!(asset_id < FIELD_ORDER, "asset_id {asset_id} is not a canonical field element");
     let mut s = [BabyBear::ZERO; WIDTH];
     s[0] = BabyBear::from_u64(value & LIMB_MASK);
     s[1] = BabyBear::from_u64(value >> SHIFT);
     for i in 0..BLIND_LIMBS { s[2 + i] = BabyBear::from_u64(blind[i]); }
     for i in 0..8 { s[6 + i] = BabyBear::from_u64(pk[i]); }
     s[14] = BabyBear::from_u64(asset_id);
+    s[15] = BabyBear::from_u64(TAG_COMMIT);
     s
 }
-// Pk: [0..8]=spend_secret, rest 0.
+// Pk: [0..8]=spend_secret, [8..15]=0, [15]=TAG_PK.
 fn pk_input(spend_secret: &SpendSecret) -> [BabyBear; WIDTH] {
     let mut s = [BabyBear::ZERO; WIDTH];
     for i in 0..SPEND_SECRET_LIMBS { s[i] = BabyBear::from_u64(spend_secret[i]); }
+    s[15] = BabyBear::from_u64(TAG_PK);
     s
 }
-// Nullifier: [0..8]=ss [8]=vlo [9]=vhi [10..14]=blind [14]=asset [15]=0
+// Nullifier: [0..8]=ss [8]=vlo [9]=vhi [10..14]=blind [14]=asset [15]=TAG_NF
 fn nf_input(spend_secret: &SpendSecret, value: u64, blind: &Blind, asset_id: u64) -> [BabyBear; WIDTH] {
+    debug_assert!(asset_id < FIELD_ORDER, "asset_id {asset_id} is not a canonical field element");
     let mut s = [BabyBear::ZERO; WIDTH];
     for i in 0..SPEND_SECRET_LIMBS { s[i] = BabyBear::from_u64(spend_secret[i]); }
     s[8] = BabyBear::from_u64(value & LIMB_MASK);
     s[9] = BabyBear::from_u64(value >> SHIFT);
     for i in 0..BLIND_LIMBS { s[10 + i] = BabyBear::from_u64(blind[i]); }
     s[14] = BabyBear::from_u64(asset_id);
+    s[15] = BabyBear::from_u64(TAG_NF);
     s
 }
 fn native_commit(input: &[BabyBear; WIDTH]) -> Commitment {
@@ -925,7 +956,7 @@ pub fn prove_wide(
     pis.push(BabyBear::from_u64(fee));
     for nf in &nullifiers { for &x in nf { pis.push(BabyBear::from_u64(x)); } }
     for &x in &root { pis.push(BabyBear::from_u64(x)); }
-    pis.push(BabyBear::from_u64(chain_domain(chain_id)));
+    for &x in &chain_domain(chain_id) { pis.push(BabyBear::from_u64(x)); }
     for &x in enc_digest { pis.push(BabyBear::from_u64(x)); }
 
     let config = prover_config();
@@ -954,23 +985,32 @@ pub fn verify_wide(
     if fee >= MAX_FEE { return false; }
     let all_canonical = output_commits.iter().chain(nullifiers).chain([root]).all(limbs_canonical);
     if !all_canonical { return false; }
-    let proof: Proof<ZkConfig> = match postcard::from_bytes(proof_bytes) { Ok(p) => p, Err(_) => return false };
+    let proof: Proof<ZkConfig> = match decode_proof(proof_bytes) { Some(p) => p, None => return false };
     let mut pis: Vec<BabyBear> = Vec::new();
     for c in output_commits { for &x in c { pis.push(BabyBear::from_u64(x)); } }
     pis.push(BabyBear::from_u64(fee));
     for nf in nullifiers { for &x in nf { pis.push(BabyBear::from_u64(x)); } }
     for &x in root { pis.push(BabyBear::from_u64(x)); }
-    pis.push(BabyBear::from_u64(chain_domain(chain_id)));
+    for &x in &chain_domain(chain_id) { pis.push(BabyBear::from_u64(x)); }
     for &x in enc_digest { pis.push(BabyBear::from_u64(x)); }
 
-    let prev = std::panic::take_hook();
-    std::panic::set_hook(Box::new(|_| {}));
-    let ok = std::panic::catch_unwind(|| {
+    // `catch_unwind` alone contains a verifier panic on a malformed proof; the process
+    // panic hook is deliberately left untouched (swapping it is process-global state and
+    // races with any concurrent verifier).
+    std::panic::catch_unwind(|| {
         let config = verifier_config();
         p3_verify(&config, &CoinsAir, &proof, &pis).is_ok()
-    }).unwrap_or(false);
-    std::panic::set_hook(prev);
-    ok
+    }).unwrap_or(false)
+}
+
+/// Strict proof decoding: the proof must consume EXACTLY `bytes`. `postcard::from_bytes`
+/// ignores trailing data, which let a relayer append junk to a tx's proof field and
+/// change its `txbind` while the proof still verified (a malleable tx identity).
+pub(crate) fn decode_proof(bytes: &[u8]) -> Option<Proof<ZkConfig>> {
+    match postcard::take_from_bytes::<Proof<ZkConfig>>(bytes) {
+        Ok((proof, rest)) if rest.is_empty() => Some(proof),
+        _ => None,
+    }
 }
 
 /// Prove a shielded-pool spend. **Production entry point** — routes to the

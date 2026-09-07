@@ -21,10 +21,14 @@ fn main() {
     let bob = Account::from_seed([0x22; 32]); // maker / LP
 
     // Register two shielded assets (idempotent; a swap moves existing coins, so the mint
-    // authority is irrelevant — any value is fine here).
-    let auth = [0x09u8; 32];
-    for t in ["AAAA", "BBBB"] {
-        let _ = zc.broadcast(&swap::register_tx(t, 8, &auth, 21_000_000 * 100_000_000));
+    // authority is irrelevant, but each asset needs its OWN authority value and each
+    // registration burns a ZCRYPT gas note).
+    let gas_owner = Account::from_seed([0x33; 32]);
+    for (t, auth) in [("AAAA", [0x09u8; 32]), ("BBBB", [0x0Au8; 32])] {
+        let gas = gas_owner.own_coin(1_000_000, keys::random_blind());
+        zc.broadcast(&swap::seed_tx(&gas.commitment())).expect("seed gas coin");
+        let prefix = swap::build_gas_prefix(&zc, &gas_owner, &gas).expect("gas prefix");
+        let _ = zc.broadcast(&swap::register_tx(t, 8, &auth, 21_000_000 * 100_000_000, &prefix));
     }
     let asset_a: u64 = zc.query("/asset/by_ticker/AAAA").unwrap().trim().parse().unwrap();
     let asset_b: u64 = zc.query("/asset/by_ticker/BBBB").unwrap().trim().parse().unwrap();

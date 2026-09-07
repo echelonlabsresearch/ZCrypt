@@ -120,7 +120,7 @@ fn pledge(zc: &Zcrypt, owner: &Account, stake: u64) -> (shield_tx::ShieldTx, Bli
     let cblind = keys::random_blind();
     let change = keys::out_coin(&owner.normal_address(), 100, cblind);
     let cnote = kem::ciphertext_to_bytes(&keys::encrypt_note(&owner.normal_address(), 100, cblind));
-    let p = build_shield_spend(zc, &[fund], &[burn, change], fee, vec![vec![], cnote]).expect("pledge");
+    let p = build_shield_spend(zc, &[fund], &[burn, change], fee, vec![zcrypt_core::keys::cover_note_bytes(), cnote]).expect("pledge");
     (p, blind)
 }
 
@@ -138,7 +138,9 @@ fn main() {
     let btc = Btc::connect(&btc_url, "zcrypt", "zcrypt", "demo", zcrypt_bridge::NETWORK).unwrap();
     let bridge_key = Key::from_bytes(&[0xB1; 32]);
     let reserve_pk: [u8; 33] = bridge_key.pk.inner.serialize();
-    let _ = zc.broadcast(&swap::register_spv_tx("zBTC", 8, &reserve_pk, 21_000_000 * 100_000_000));
+    // zBTC is pinned in GENESIS (`zbtc_reserve_pk`, from ZCRYPT_RESERVE_PK when the chain is
+    // created); this legacy gasless registration is rejected and ignored on such a chain.
+    let _ = zc.broadcast(&swap::register_spv_tx("zBTC", 8, &reserve_pk, 21_000_000 * 100_000_000, &[]));
     let asset: u64 = zc.query("/asset/by_ticker/zBTC").unwrap().trim().parse().unwrap();
 
     // --- bond node0's validator at 20% commission ---

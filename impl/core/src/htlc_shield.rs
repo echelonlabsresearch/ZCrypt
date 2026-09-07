@@ -32,6 +32,21 @@ pub fn mint_capability(secret: &[u8]) -> Hash {
     h(b"ZC-MINT-CAP", &[secret])
 }
 
+/// The one and only preimage length consensus accepts (and the Bitcoin HTLC scripts
+/// enforce with `OP_SIZE 32 OP_EQUALVERIFY`). See [`crate::zvm::OP_CHECK_PREIMAGE`].
+pub const HTLC_PREIMAGE_LEN: usize = 32;
+
+/// Settled (claimed or expired) escrows are pruned from consensus state this many
+/// blocks after settlement (about 28 hours at 1 s blocks). Escrows used to live forever,
+/// so a gasless flood of opens grew every node's per-block hashing and persistence
+/// without bound.
+pub const ESCROW_RETENTION_BLOCKS: u64 = 100_000;
+
+/// Longest escrow timeout consensus accepts, in blocks from the opening height (30 days
+/// at 1 s blocks). Bounds how long any escrow can occupy state and, for SPV mints, is
+/// tightened further by [`crate::node::MAX_SPV_CLAIM_WINDOW`].
+pub const MAX_ESCROW_HORIZON_BLOCKS: u64 = 30 * 24 * 3600;
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
 pub enum EscrowState {
     Open,
@@ -68,6 +83,12 @@ pub struct SpvDeposit {
     /// Output index within the funding tx (part of the claimed outpoint identity).
     #[serde(default)]
     pub vout: u32,
+    /// The deposit HTLC's refund CLTV (a Bitcoin block height). Claiming the escrow is
+    /// refused once the committed SPV tip is within the reserve's sweep margin of it:
+    /// otherwise the depositor could wait out the Bitcoin lock, refund the BTC, and still
+    /// claim the zBTC (bridge C3).
+    #[serde(default)]
+    pub btc_locktime: u32,
 }
 
 /// A fixed, unspendable "burn" public key: no `spend_secret` hashes to it under
@@ -99,6 +120,10 @@ pub struct HtlcEscrow {
     #[serde(default)]
     pub spv_deposit: Option<SpvDeposit>,
     pub state: EscrowState,
+    /// Height at which the escrow was claimed or expired; pruned from state after
+    /// [`ESCROW_RETENTION_BLOCKS`]. `None` while open.
+    #[serde(default)]
+    pub settled_at: Option<u64>,
 }
 
 /// Envelope discriminants, matching the transaction tags that carry each lock kind. Folding
@@ -224,9 +249,22 @@ impl HtlcBook {
                 refund_pk,
                 spv_deposit,
                 state: EscrowState::Open,
+                settled_at: None,
             },
         );
         Ok(id)
+    }
+
+    /// Drop every settled escrow whose settlement is older than
+    /// [`ESCROW_RETENTION_BLOCKS`]. Returns how many were pruned. Deterministic in the
+    /// committed height, so every node prunes identically (the book root moves in lockstep).
+    pub fn prune_settled(&mut self, height: u64) -> usize {
+        let before = self.escrows.len();
+        self.escrows.retain(|_, e| match e.settled_at {
+            Some(at) => height.saturating_sub(at) < ESCROW_RETENTION_BLOCKS,
+            None => true,
+        });
+        before - self.escrows.len()
     }
 
     /// Open a **mint** escrow (BTC→zBTC): claiming mints zBTC to `claim_pk`. For an
@@ -287,12 +325,16 @@ impl HtlcBook {
             return Err("escrow is not open".to_string());
         }
         if height >= e.timeout_height {
-            return Err("escrow has timed out — expire/refund only".to_string());
+            return Err("escrow has timed out: expire/refund only".to_string());
+        }
+        if preimage.len() != HTLC_PREIMAGE_LEN {
+            return Err(format!("preimage must be exactly {HTLC_PREIMAGE_LEN} bytes"));
         }
         if crate::nullifier::htlc_hashlock(preimage) != e.hashlock {
             return Err("preimage does not match the hashlock".to_string());
         }
         e.state = EscrowState::Claimed;
+        e.settled_at = Some(height);
         Ok(Claim { kind: e.kind, party_pk: e.party_pk, refund_pk: e.refund_pk, value: e.value, asset_id: e.asset_id, spv_deposit: e.spv_deposit })
     }
 
@@ -308,6 +350,7 @@ impl HtlcBook {
             return Err("escrow has not yet timed out".to_string());
         }
         e.state = EscrowState::Expired;
+        e.settled_at = Some(height);
         Ok(Claim { kind: e.kind, party_pk: e.party_pk, refund_pk: e.refund_pk, value: e.value, asset_id: e.asset_id, spv_deposit: e.spv_deposit })
     }
 
@@ -345,6 +388,7 @@ impl HtlcBook {
                     buf.extend_from_slice(&d.block);
                     buf.extend_from_slice(&d.txid);
                     buf.extend_from_slice(&d.vout.to_le_bytes());
+                    buf.extend_from_slice(&d.btc_locktime.to_le_bytes());
                 }
                 None => buf.push(0),
             }
@@ -353,6 +397,7 @@ impl HtlcBook {
                 EscrowState::Claimed => 1,
                 EscrowState::Expired => 2,
             });
+            buf.extend_from_slice(&e.settled_at.unwrap_or(u64::MAX).to_le_bytes());
         }
         h(b"ZC-HTLC", &[&buf])
     }
@@ -370,11 +415,16 @@ mod tests {
     #[test]
     fn open_claim_flow() {
         let mut b = HtlcBook::default();
-        let x = b"swap-preimage-123";
+        let x = b"swap-preimage-123-padded-to-32b!";
+        assert_eq!(x.len(), HTLC_PREIMAGE_LEN);
         let lock = htlc_hashlock(x);
         let id = b.open(0xB7C, 100_000, lock, 200, pk(1), None).unwrap();
         // wrong preimage rejected
-        assert!(b.claim(&id, b"wrong", 10).is_err());
+        assert!(b.claim(&id, b"wrong-preimage-of-32-bytes-len!!", 10).is_err());
+        // right preimage, wrong length (Bitcoin could never spend it) rejected
+        let mut long = x.to_vec();
+        long.push(0);
+        assert!(b.claim(&id, &long, 10).is_err());
         // correct preimage before timeout
         let c = b.claim(&id, x, 10).unwrap();
         assert_eq!(c.kind, EscrowKind::Mint);
@@ -389,7 +439,7 @@ mod tests {
     #[test]
     fn timeout_blocks_claim_and_allows_expire() {
         let mut b = HtlcBook::default();
-        let x = b"abc";
+        let x = b"abc-preimage-padded-to-32-bytes!";
         let id = b.open(0xB7C, 50, htlc_hashlock(x), 100, pk(2), None).unwrap();
         // at/after timeout, claim is rejected even with the right preimage
         assert!(b.claim(&id, x, 100).is_err());
@@ -399,6 +449,11 @@ mod tests {
         assert_eq!(b.get(&id).unwrap().state, EscrowState::Expired);
         // an expired escrow can no longer be claimed
         assert!(b.claim(&id, x, 101).is_err());
+        // settled escrows are pruned after the retention window, never before
+        assert_eq!(b.prune_settled(100 + ESCROW_RETENTION_BLOCKS - 1), 0);
+        assert_eq!(b.count(), 1);
+        assert_eq!(b.prune_settled(100 + ESCROW_RETENTION_BLOCKS), 1);
+        assert_eq!(b.count(), 0);
     }
 
     #[test]

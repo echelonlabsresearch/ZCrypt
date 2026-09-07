@@ -1394,6 +1394,24 @@ fn build_gas_note(
     Ok((gas_tx, gas_blind, gas_i, gchg_rec))
 }
 
+/// The encoded GAS PREFIX (`gas_blind(32) ‖ gas_len(4) ‖ gas_tx`) a state-creating tx
+/// (REGISTER / HTLC_OPEN) must carry, built from this wallet's ZCRYPT coins exactly like a
+/// transfer's gas note. Returns the prefix, the index of the spent gas coin, and the change
+/// coin record (if any) to add once the tx is accepted.
+fn mint_gas_prefix(w: &mut Wallet, url: &str) -> Result<(Vec<u8>, usize, Option<CoinRec>), String> {
+    let chain_id = chain_id_for(url)?;
+    let leaves = chain::fetch_leaves(url)?;
+    let (gas_tx, gas_blind, gas_i, gchg_rec) = build_gas_note(w, &leaves, &[], &chain_id)?;
+    let gas_bytes = shield_tx::to_bytes(&gas_tx);
+    let mut out = Vec::with_capacity(36 + gas_bytes.len());
+    for limb in gas_blind {
+        out.extend_from_slice(&limb.to_le_bytes());
+    }
+    out.extend_from_slice(&(gas_bytes.len() as u32).to_le_bytes());
+    out.extend_from_slice(&gas_bytes);
+    Ok((out, gas_i, gchg_rec))
+}
+
 /// Serialize a bundled `0x55` transfer: `0x55 ‖ gas_blind(32) ‖ gas_len(4) ‖ gas_tx ‖ main_tx`.
 fn bundle_transfer(gas_blind: &[u64; 4], gas_tx: &shield_tx::ShieldTx, main_tx: &shield_tx::ShieldTx) -> Vec<u8> {
     let gas_bytes = shield_tx::to_bytes(gas_tx);
@@ -2877,7 +2895,9 @@ fn bridge_init(state: State<AppState>) -> R<u64> {
     // of truth). Consensus rejects any zBTC registration with other values, and these
     // fit a shield coin's multi-limb range (MAX_COIN_VALUE ≈ 2^52).
     use zcrypt_core::asset_registry::{ZBTC_DECIMALS, ZBTC_MAX_SUPPLY, ZBTC_TICKER};
-    let _ = zc.broadcast(&bswap::register_spv_tx(ZBTC_TICKER, ZBTC_DECIMALS, &reserve_pk, ZBTC_MAX_SUPPLY)); // ignore "already registered"
+    // On a launched chain zBTC is pinned in GENESIS (`zbtc_reserve_pk`); this legacy
+    // gasless registration attempt is rejected there and the result is ignored.
+    let _ = zc.broadcast(&bswap::register_spv_tx(ZBTC_TICKER, ZBTC_DECIMALS, &reserve_pk, ZBTC_MAX_SUPPLY, &[]));
     let asset = zbtc_asset(&zc)?;
     // Seed a shielded pool so the very first spend hides among a non-trivial tree
     // (the anonymity set is the whole pool; no fixed ring size to satisfy).
@@ -3164,8 +3184,14 @@ fn mint_asset(
                 }
             }
             None => {
-                // Free → register it (first-mint-wins) with your authority.
-                chain::broadcast(&url, &bswap::register_tx(&t, decimals, &my_authority, max_supply))?;
+                // Free → register it (first-mint-wins) with your authority. Registration is
+                // a state-creating tx and carries a ZCRYPT gas note (0.01 ZCRYPT burned).
+                let (gas, gas_i, gchg) = mint_gas_prefix(w, &url)?;
+                chain::broadcast(&url, &bswap::register_tx(&t, decimals, &my_authority, max_supply, &gas))?;
+                w.coins[gas_i].spent = true;
+                if let Some(rec) = gchg {
+                    w.coins.push(rec);
+                }
                 chain::asset_by_ticker(&url, &t)
                     .ok_or("ticker registration did not take (it may have just been claimed)")?
             }
@@ -3181,10 +3207,17 @@ fn mint_asset(
         let timeout = height + 100;
         let pk = w.account.pubkey();
         let escrow = zcrypt_core::htlc_shield::escrow_id(asset_id, amount, &lock, timeout, &pk);
-        // Authorize the mint with a threshold signature over the exact escrow params — no
-        // minting secret goes on-chain (the old `cap`-in-the-tx was readable by anyone).
-        let auth = sign_mint(&zcrypt_core::mint_auth::mint_message(asset_id, amount, &lock, timeout, &pk));
-        chain::broadcast(&url, &bswap::open_tx(asset_id, amount, &lock, timeout, &pk, &auth))?;
+        // Authorize the mint with a threshold signature over the exact escrow params (bound
+        // to this chain id, so it cannot replay on another network); no minting secret goes
+        // on-chain. The open is a state-creating tx and carries a ZCRYPT gas note.
+        let cid = chain_id_for(&url)?;
+        let auth = sign_mint(&zcrypt_core::mint_auth::mint_message(&cid, asset_id, amount, &lock, timeout, &pk));
+        let (gas, gas_i, gchg) = mint_gas_prefix(w, &url)?;
+        chain::broadcast(&url, &bswap::open_tx(asset_id, amount, &lock, timeout, &pk, &auth, &gas))?;
+        w.coins[gas_i].spent = true;
+        if let Some(rec) = gchg {
+            w.coins.push(rec);
+        }
         chain::broadcast(&url, &bswap::claim_tx(&escrow, &preimage))?;
         let coin = w.account.htlc_coin(amount, asset_id, &escrow);
         w.coins.push(CoinRec {

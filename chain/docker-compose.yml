@@ -40,6 +40,9 @@ services:
       ZCRYPT_FOUNDATION_ADDR: ${ZCRYPT_FOUNDATION_ADDR:-}
       ZCRYPT_BTC_NET: ${ZCRYPT_BTC_NET:-mainnet}
       ZCRYPT_BTC_CHECKPOINT: ${ZCRYPT_BTC_CHECKPOINT:-}
+      # 33-byte compressed reserve PUBLIC key (hex) baked into genesis as `zbtc_reserve_pk`;
+      # the node registers zBTC against it at InitChain (see cometbft-entrypoint.sh).
+      ZCRYPT_RESERVE_PK: ${ZCRYPT_RESERVE_PK:-}
     volumes:
       - ./docker/cometbft-entrypoint.sh:/entrypoint.sh:ro
       - cometbft-data:/cometbft

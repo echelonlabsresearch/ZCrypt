@@ -724,6 +724,18 @@ mod tests {
     }
 
     #[test]
+    fn every_note_kind_has_the_fixed_wire_length() {
+        // Consensus pins every note to `kem::NOTE_WIRE_LEN`; real notes and cover notes
+        // must both hit it exactly or every wallet transfer would be rejected.
+        let (acct, _) = new_account();
+        let real = kem::ciphertext_to_bytes(&encrypt_note(&acct.normal_address(), 5, [1, 2, 3, 4]));
+        assert_eq!(real.len(), kem::NOTE_WIRE_LEN);
+        let asset = kem::ciphertext_to_bytes(&encrypt_note_asset(&acct.stealth_address(), 5, [1, 2, 3, 4], 77));
+        assert_eq!(asset.len(), kem::NOTE_WIRE_LEN);
+        assert_eq!(cover_note_bytes().len(), kem::NOTE_WIRE_LEN);
+    }
+
+    #[test]
     fn claim_chunks_reserves_a_gas_coin_on_first_claim_only() {
         let big = 50_000 * crate::emission::ATOMIC; // 50k ZCRYPT
         // First claim: [gas coin, rest]; sums to the full amount.

@@ -70,8 +70,23 @@ pub fn ek_to_bytes(ek: &Ek) -> Vec<u8> {
 
 pub fn ek_from_bytes(bytes: &[u8]) -> Option<Ek> {
     let enc = Encoded::<Ek>::try_from(bytes).ok()?;
-    Some(Ek::from_bytes(&enc))
+    let ek = Ek::from_bytes(&enc);
+    // FIPS 203 modulus check by round trip: a non-canonical encapsulation key (a
+    // coefficient at or above q) re-encodes differently. Rejecting it removes address
+    // malleability (two distinct address strings for one key) and any decapsulation
+    // mismatch a malleated key could cause.
+    if ek.as_bytes().as_slice() != bytes {
+        return None;
+    }
+    Some(ek)
 }
+
+/// Serialized size of one on-chain encrypted note: ML-KEM-768 ciphertext + nonce +
+/// AEAD ciphertext of the fixed [`PAD_LEN`] padded plaintext, with the two length
+/// prefixes of [`ciphertext_to_bytes`]. Consensus requires EVERY note in a shield tx
+/// to be exactly this long, so third-party clients cannot fingerprint themselves (or
+/// bloat blocks) with odd-sized notes.
+pub const NOTE_WIRE_LEN: usize = 4 + 1088 + 12 + 4 + (PAD_LEN + 16);
 
 fn derive_key(ss_pq: &[u8], mlkem_ct: &[u8], ek_bytes: &[u8]) -> [u8; 32] {
     let hk = Hkdf::<Sha256>::new(None, ss_pq);

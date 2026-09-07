@@ -2451,6 +2451,7 @@ dependencies = [
 name = "zcrypt-shield"
 version = "2.0.0"
 dependencies = [
+ "hex",
  "p3-air",
  "p3-baby-bear",
  "p3-challenger",
@@ -2469,6 +2470,7 @@ dependencies = [
  "postcard",
  "rand 0.10.2",
  "serde",
+ "sha3",
 ]
 
 [[package]]

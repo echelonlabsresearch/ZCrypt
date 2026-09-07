@@ -30,9 +30,20 @@ fn open_mint(
     timeout: u64,
     pk: [u64; 8],
 ) -> Result<[u8; 32], String> {
-    let msg = mint_auth::mint_message(asset, value, &lock, timeout, &pk);
+    let msg = mint_auth::mint_message(CHAIN, asset, value, &lock, timeout, &pk);
     let sigs = mint_auth::authorize(ks, signers, &msg);
-    node.htlc_open(asset, value, lock, timeout, pk, ks, &sigs)
+    node.htlc_open(CHAIN, asset, value, lock, timeout, pk, ks, &sigs)
+}
+
+/// A 32-byte preimage from a short label (consensus accepts exactly 32 bytes).
+fn pre(label: &str) -> [u8; 32] {
+    let mut p = [0x2Au8; 32];
+    p[..label.len().min(32)].copy_from_slice(&label.as_bytes()[..label.len().min(32)]);
+    p
+}
+/// Two fixed-size cover notes (consensus pins the note shape).
+fn notes() -> Vec<Vec<u8>> {
+    vec![keys::cover_note_bytes(), keys::cover_note_bytes()]
 }
 /// Every value-moving action burns at least this (0.01 ZCRYPT) — the universal-gas floor.
 const FEE: u64 = emission::MIN_FEE;
@@ -195,7 +206,7 @@ fn full_product_surface_happy_path() {
     let sweep = |node: &Node, b: u64, s: u64| -> ShieldTx {
         let out0 = keys::out_coin(&Account::from_seed([s as u8; 32]).normal_address(), bearer.coin.value - FEE, [b, b + 1, (b).wrapping_add(1), (b + 1).wrapping_add(1)]);
         let out1 = keys::out_coin(&Account::from_seed([(s + 1) as u8; 32]).normal_address(), 0, [b + 2, b + 3, (b + 2).wrapping_add(1), (b + 3).wrapping_add(1)]);
-        build_shield(node, &[bearer.coin.clone()], [out0, out1], FEE, vec![vec![1; 8], vec![2; 8]]).unwrap()
+        build_shield(node, &[bearer.coin.clone()], [out0, out1], FEE, notes()).unwrap()
     };
     node.submit_shield(CHAIN, &sweep(&node, 11, 0x71)).expect("bearer coin swept by holder");
     assert!(
@@ -207,7 +218,7 @@ fn full_product_surface_happy_path() {
     // ---- 8. Shielded asset (GOLD): register, mint via M-of-N authority, spend ----
     let (gold_ks, gold_signers) = mint_auth::derive_keyset(b"gold-treasury", 2, 2);
     let gold = node.register_asset("GOLD", 2, Some(gold_ks.commitment()), 1_000_000).unwrap();
-    let preimage = b"gold-issue-preimage-0001";
+    let preimage = &pre("gold-issue-preimage-0001");
     let lock = htlc_hashlock(preimage);
     node.set_height(emission::EPOCH + 1);
     let escrow =
@@ -266,7 +277,7 @@ fn shielded_swap_end_to_end() {
 
     // RFQ terms: Alice gives 100_000 A, receives 120_000 B. One shared hashlock links both legs.
     let (give_a, take_b) = (100_000u64, 120_000u64);
-    let x = b"in-pool-swap-preimage-01";
+    let x = &pre("in-pool-swap-preimage-01");
     let lock = htlc_hashlock(x);
     let timeout = 100u64;
 
@@ -285,7 +296,7 @@ fn shielded_swap_end_to_end() {
             zcrypt_core::htlc_shield::ENV_SWAP_LOCK,
             asset, value, &lock, timeout, &counterparty.pubkey(), &locker.pubkey(), &[],
         );
-        let stx = build_shield_bound(node, &[coin.clone()], [burn_out, chg_out], FEE, vec![vec![1; 8], note], &env).unwrap();
+        let stx = build_shield_bound(node, &[coin.clone()], [burn_out, chg_out], FEE, vec![keys::cover_note_bytes(), note], &env).unwrap();
         node.swap_lock(CHAIN, &stx, value, burn_blind, asset, lock, timeout, counterparty.pubkey(), locker.pubkey()).unwrap()
     };
 
@@ -384,7 +395,7 @@ fn product_surface_abuse_cases() {
     // --- (c) Minting past the declared cap is rejected (even with valid signatures) ---
     let (cap_ks, cap_signers) = mint_auth::derive_keyset(b"cap-treasury", 1, 1);
     let capped = node.register_asset("CAP", 0, Some(cap_ks.commitment()), 1_000).unwrap();
-    let lock = htlc_hashlock(b"cap-mint-preimage-01");
+    let lock = htlc_hashlock(&pre("cap-mint-preimage-01"));
     node.set_height(1);
     assert!(
         open_mint(&mut node, &cap_ks, &cap_signers, capped, 2_000, lock, 100, alice.pubkey()).is_err(),
@@ -404,7 +415,7 @@ fn product_surface_abuse_cases() {
     let out_native = keys::out_coin(&alice.normal_address(), 95, [1, 2, 2, 3]); // native ZCRYPT output
     let out_asset = keys::out_asset_coin(&alice.normal_address(), 0, [3, 4, 4, 5], id);
     // Mixing the input asset with a native output must fail to prove.
-    let mix = build_shield(&node, &[coin.clone()], [out_native, out_asset], 5, vec![vec![], vec![]]);
+    let mix = build_shield(&node, &[coin.clone()], [out_native, out_asset], 5, notes());
     assert!(mix.is_err(), "cross-asset spend must be unprovable");
 
     // --- (f) Double-spend: re-submitting the same nullifier is rejected ---
@@ -413,7 +424,7 @@ fn product_surface_abuse_cases() {
     let mk = |node: &Node, o: u64| {
         let o0 = keys::out_coin(&alice.normal_address(), o, [7, 8, 8, 9]);
         let o1 = keys::out_coin(&alice.normal_address(), 100_000 - o - FEE, [9, 10, 10, 11]);
-        build_shield(node, &[spendable.clone()], [o0, o1], FEE, vec![vec![], vec![]]).unwrap()
+        build_shield(node, &[spendable.clone()], [o0, o1], FEE, notes()).unwrap()
     };
     node.submit_shield(CHAIN, &mk(&node, 80_000)).expect("first spend");
     assert!(node.submit_shield(CHAIN, &mk(&node, 70_000)).is_err(), "double-spend rejected");
@@ -434,7 +445,7 @@ fn product_surface_abuse_cases() {
 fn mk_single(node: &Node, coin: &Coin, owner: &Account) -> ShieldTx {
     let o0 = keys::out_coin(&owner.normal_address(), coin.value - 5, [5, 6, 6, 7]);
     let o1 = keys::out_coin(&owner.normal_address(), 0, [7, 8, 8, 9]);
-    build_shield(node, &[coin.clone()], [o0, o1], 5, vec![vec![], vec![]]).unwrap()
+    build_shield(node, &[coin.clone()], [o0, o1], 5, notes()).unwrap()
 }
 
 /// COIN-BACKED STAKING round-trip: bonding genuinely pledges shielded coins, and the
@@ -458,7 +469,7 @@ fn coin_backed_bond_pledges_coins_and_unbonding_returns_them() {
     let change_blind = keys::random_blind();
     let burn_out: OutCoin = (stake, stake_blind, BURN_PK, 0);
     let change_out = keys::out_coin(&bonder.normal_address(), 100, change_blind);
-    let stx = build_shield(&node, &[fund.clone()], [burn_out, change_out], fee, vec![vec![], vec![]]).unwrap();
+    let stx = build_shield(&node, &[fund.clone()], [burn_out, change_out], fee, notes()).unwrap();
 
     let reward = keys::reward_address(&bonder.pubkey());
     node.bond_with_stake(CHAIN, &stx, stake, stake_blind, b"val".to_vec(), b"val".to_vec(), reward, zcrypt_core::staking::DEFAULT_COMMISSION_BPS)
@@ -478,7 +489,7 @@ fn coin_backed_bond_pledges_coins_and_unbonding_returns_them() {
         [keys::out_coin(&bonder.normal_address(), stake, keys::random_blind()),
          keys::out_coin(&bonder.normal_address(), 50, keys::random_blind())],
         fee,
-        vec![vec![], vec![]],
+        notes(),
     ).unwrap();
     assert!(
         node.bond_with_stake(CHAIN, &normal, stake, stake_blind, b"v2".to_vec(), b"v2".to_vec(), reward, zcrypt_core::staking::DEFAULT_COMMISSION_BPS).is_err(),
@@ -529,7 +540,7 @@ fn coin_backed_delegation_shares_rewards_and_returns_stake() {
     let vblind = keys::random_blind();
     let vburn: OutCoin = (vstake, vblind, BURN_PK, 0);
     let vchange = keys::out_coin(&validator.normal_address(), 100, keys::random_blind());
-    let vtx = build_shield(&node, &[vfund], [vburn, vchange], fee, vec![vec![], vec![]]).unwrap();
+    let vtx = build_shield(&node, &[vfund], [vburn, vchange], fee, notes()).unwrap();
     let vreward = keys::reward_address(&validator.pubkey());
     node.bond_with_stake(CHAIN, &vtx, vstake, vblind, b"val".to_vec(), b"val".to_vec(), vreward, zcrypt_core::staking::DEFAULT_COMMISSION_BPS)
         .expect("bond");
@@ -543,7 +554,7 @@ fn coin_backed_delegation_shares_rewards_and_returns_stake() {
     let dblind = keys::random_blind();
     let dburn: OutCoin = (dstake, dblind, BURN_PK, 0);
     let dchange = keys::out_coin(&delegator.normal_address(), 100, keys::random_blind());
-    let dtx = build_shield(&node, &[dfund], [dburn, dchange], fee, vec![vec![], vec![]]).unwrap();
+    let dtx = build_shield(&node, &[dfund], [dburn, dchange], fee, notes()).unwrap();
     let dreward = keys::reward_address(&delegator.pubkey());
     node.delegate_with_stake(CHAIN, &dtx, dstake, dblind, b"val".to_vec(), b"del".to_vec(), dreward)
         .expect("coin-backed delegation accepted");
@@ -561,7 +572,7 @@ fn coin_backed_delegation_shares_rewards_and_returns_stake() {
     let bblind = keys::random_blind();
     let bburn: OutCoin = (dstake, bblind, BURN_PK, 0);
     let bchange = keys::out_coin(&delegator.normal_address(), 50, keys::random_blind());
-    let btx = build_shield(&node, &[bad], [bburn, bchange], fee, vec![vec![], vec![]]).unwrap();
+    let btx = build_shield(&node, &[bad], [bburn, bchange], fee, notes()).unwrap();
     assert!(
         node.delegate_with_stake(CHAIN, &btx, dstake, bblind, b"nope".to_vec(), b"del2".to_vec(), dreward).is_err(),
         "cannot delegate to an unbonded validator"
@@ -614,7 +625,7 @@ fn transfer_of_a_shielded_asset_pays_zcrypt_gas() {
     // Register + mint GOLD to Alice.
     let (gold_ks, gold_signers) = mint_auth::derive_keyset(b"gold-gas-treasury", 2, 2);
     let gold = node.register_asset("GOLD", 2, Some(gold_ks.commitment()), 1_000_000).unwrap();
-    let preimage = b"gold-gas-preimage-01";
+    let preimage = &pre("gold-gas-preimage-01");
     let lock = zcrypt_core::nullifier::htlc_hashlock(preimage);
     node.set_height(1);
     let escrow =
@@ -640,7 +651,7 @@ fn transfer_of_a_shielded_asset_pays_zcrypt_gas() {
     let gas_blind = keys::random_blind();
     let gas_burn: OutCoin = (FEE, gas_blind, BURN_PK, 0);
     let gas_chg = keys::out_coin(&alice.normal_address(), 1_000, keys::random_blind());
-    let gas_tx = build_shield(&node, &[gas_coin], [gas_burn, gas_chg], 0, vec![vec![], vec![]]).unwrap();
+    let gas_tx = build_shield(&node, &[gas_coin], [gas_burn, gas_chg], 0, notes()).unwrap();
 
     // The bundled transfer is accepted: a GOLD transfer, gas paid in ZCRYPT.
     node.submit_transfer(CHAIN, &main_tx, &gas_tx, gas_blind).expect("GOLD transfer with ZCRYPT gas");
@@ -658,7 +669,7 @@ fn transfer_of_a_shielded_asset_pays_zcrypt_gas() {
         [keys::out_coin(&bob.normal_address(), 9_000, keys::random_blind()),
          keys::out_coin(&carol.normal_address(), 1_000, keys::random_blind())],
         0,
-        vec![vec![], vec![]],
+        notes(),
     ).unwrap();
     let underpay = carol.own_coin(FEE + 1_000, keys::random_blind());
     node.seed_coin(underpay.commitment());
@@ -668,7 +679,7 @@ fn transfer_of_a_shielded_asset_pays_zcrypt_gas() {
         &[underpay],
         [(FEE - 1, ub, BURN_PK, 0), keys::out_coin(&carol.normal_address(), 1_001, keys::random_blind())],
         0,
-        vec![vec![], vec![]],
+        notes(),
     ).unwrap();
     assert!(
         node.submit_transfer(CHAIN, &good_main, &under_gas, ub).is_err(),
@@ -685,7 +696,7 @@ fn transfer_of_a_shielded_asset_pays_zcrypt_gas() {
         [keys::out_coin(&bob.normal_address(), 8_000, keys::random_blind()),
          keys::out_coin(&carol.normal_address(), 1_995, keys::random_blind())],
         5, // nonzero in-tx fee
-        vec![vec![], vec![]],
+        notes(),
     ).unwrap();
     let gas_coin2 = carol.own_coin(FEE + 1_000, keys::random_blind());
     node.seed_coin(gas_coin2.commitment());
@@ -695,7 +706,7 @@ fn transfer_of_a_shielded_asset_pays_zcrypt_gas() {
         &[gas_coin2],
         [(FEE, gb2, BURN_PK, 0), keys::out_coin(&carol.normal_address(), 1_000, keys::random_blind())],
         0,
-        vec![vec![], vec![]],
+        notes(),
     ).unwrap();
     assert!(
         node.submit_transfer(CHAIN, &main_with_fee, &good_gas, gb2).is_err(),

@@ -64,7 +64,7 @@ fn main() {
         &[a, b],
         &[(90, [3, 4, 5, 6], out_pk, 0), (106, [7, 8, 9, 10], out_pk, 0)],
         5,
-        vec![vec![], vec![]],
+        vec![zcrypt_core::keys::cover_note_bytes(), zcrypt_core::keys::cover_note_bytes()],
     )
     .expect("prove");
     let prove_ms = ms(t.elapsed());

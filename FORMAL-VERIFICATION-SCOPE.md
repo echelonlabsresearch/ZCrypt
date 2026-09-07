@@ -169,3 +169,13 @@ Charon, Aeneas, and Hax are public. A DIY attempt would start with Phase 0 (the 
 already pure and safe), which is the cheapest way to learn the toolchain's real limits
 against this codebase before committing to a paid engagement. Expect the Tier-3 AIR to be
 where a DIY effort stalls without the ArkLib-level infrastructure.
+
+## Hash-domain separation (2026-09-07 update)
+
+The audit noted that the Lean binding model (`formal/Zcrypt/Binding.lean`) makes the
+commitment, nullifier and spend-pubkey preimage domains disjoint by construction, while the
+shipped Poseidon2 layouts overlapped (`pk_input(ss)` equalled `nf_input(ss, 0, zero-blind, 0)`).
+The code now realises the model's assumption: lane 15 of every core preimage carries a fixed
+role tag (`TAG_COMMIT = 1`, `TAG_NF = 2`, `TAG_PK = 3`, see `impl/shield/src/lib.rs`), and both
+AIRs constrain it. TODO for the formal model: state the injectivity hypothesis as a
+collision-resistance reduction rather than literal injectivity of the truncated permutation.

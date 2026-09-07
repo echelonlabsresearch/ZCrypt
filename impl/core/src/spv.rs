@@ -34,10 +34,41 @@ use bitcoin::{MerkleBlock, ScriptBuf, Transaction};
 
 use crate::hash::{h, Hash};
 
-/// Max headers accepted in a single `BTC_HEADERS` (0x63) relay tx. Caps both the mempool
-/// pre-check cost and the deliver-time working-copy clone. One retargeting epoch (2016) is
-/// ample for catch-up relays; larger histories arrive across multiple txs.
-const MAX_HEADER_BATCH: usize = 2016;
+/// Max headers accepted in a single `BTC_HEADERS` (0x63) relay tx. Caps the mempool
+/// pre-check and deliver-time validation cost. One retargeting epoch (2016) is ample for
+/// catch-up relays; larger histories arrive across multiple txs.
+pub const MAX_HEADER_BATCH: usize = 2016;
+
+/// `OP_CHECKLOCKTIMEVERIFY` treats a script number at or above this as a UNIX timestamp,
+/// not a block height. Consensus compares a deposit's refund locktime against the SPV
+/// tip HEIGHT, so a timestamp-typed locktime (for example 600 million, the year 1989)
+/// looked like a far-future height while being spendable on Bitcoin in the very next
+/// block: deposit, refund immediately, still claim the zBTC. Every accepted locktime
+/// must be a height (bridge C1).
+pub const CLTV_HEIGHT_LIMIT: u32 = 500_000_000;
+
+/// Smallest deposit consensus will mint against, by network. A deposit below the reserve's
+/// sweep fee can never be economically swept, so the depositor would refund it after the
+/// CLTV and keep the zBTC (bridge L2).
+pub fn min_deposit_sats(net: BtcNet) -> u64 {
+    match net {
+        BtcNet::Regtest => 1_000,
+        BtcNet::Signet => 10_000,
+        BtcNet::Mainnet => 50_000,
+    }
+}
+
+/// Upper bound on how far ahead of the SPV tip a deposit's refund locktime may sit, by
+/// network: twice the honest bridge lock (`zcrypt-bridge`'s `btc_lock_blocks`). Together
+/// with [`HeaderChain::locktime_margin`] this pins the deposit lock to a sane window, so
+/// the ZCrypt-side claim gate (see `SpvDeposit::btc_locktime`) has a bounded horizon.
+pub fn max_locktime_ahead(net: BtcNet) -> u64 {
+    match net {
+        BtcNet::Regtest => 200,
+        BtcNet::Signet => 1008,
+        BtcNet::Mainnet => 2016,
+    }
+}
 
 /// Which Bitcoin network's consensus rules the header chain enforces.
 /// Regtest (demo/dev): no retargeting, min-difficulty blocks, depth 1.
@@ -126,6 +157,11 @@ pub fn safe_sweep_conf(net: BtcNet, value: u64) -> u64 {
     maturity_conf(net, value) + reanchor_grace_for(net)
 }
 
+/// Whether `pk` is a well-formed compressed secp256k1 point (a usable reserve key).
+pub fn reserve_pk_ok(pk: &[u8; 33]) -> bool {
+    bitcoin::secp256k1::PublicKey::from_slice(pk).is_ok()
+}
+
 /// The SPV mint-authority sentinel for `reserve_pk` (a 33-byte compressed
 /// secp256k1 key). An asset registered with this `authority` is mintable ONLY
 /// via a valid [`MintProof`] whose Bitcoin HTLC is claimable by `reserve_pk` —
@@ -135,50 +171,60 @@ pub fn spv_authority(reserve_pk: &[u8]) -> Hash {
     h(b"ZC-SPV-AUTH-1", &[reserve_pk])
 }
 
-/// Domain-separated digest the depositor's **refund key** signs to AUTHORIZE which shield
-/// key (`claim_pk`) receives the zBTC minted against this deposit. Binds the funding outpoint
-/// (txid‖vout) and the claim key. The refund key is committed in the SPV-proven HTLC script,
-/// and only the depositor holds its secret — so a third party who sees the public `MintProof`
-/// cannot re-open the same deposit to a *different* `claim_pk`. Without this, anyone could
-/// front-run an open with their own recipient, permanently consuming (and stranding) the
-/// deposit's one-time mint.
-pub fn open_auth_digest(outpoint: &[u8; 36], claim_pk: &[u64; 8]) -> [u8; 32] {
+/// Everything the depositor's refund key AUTHORIZES when it opens an SPV mint: the chain,
+/// the funding outpoint, and every escrow parameter the open tx carries in plaintext.
+/// Binding only `(outpoint, claim_pk)` left `value`, `timeout_height`, `asset_id` and
+/// `hashlock` rewritable by a mempool front-runner, who could open the victim's deposit as
+/// a 1-sat or already-expired escrow and burn the outpoint (bridge M1 / consensus H4).
+#[derive(Clone, Copy, Debug)]
+pub struct OpenAuth<'a> {
+    pub chain_id: &'a [u8],
+    pub outpoint: &'a [u8; 36],
+    pub claim_pk: &'a [u64; 8],
+    pub asset_id: u64,
+    pub value: u64,
+    pub hashlock: &'a Hash,
+    pub timeout_height: u64,
+}
+
+/// Domain-separated digest the depositor's **refund key** signs to AUTHORIZE an SPV mint
+/// open (see [`OpenAuth`]). The refund key is committed in the SPV-proven HTLC script, and
+/// only the depositor holds its secret, so a third party who sees the public `MintProof`
+/// cannot re-open the same deposit with any other parameters.
+pub fn open_auth_digest(a: &OpenAuth<'_>) -> [u8; 32] {
     use bitcoin::hashes::{sha256, Hash as _};
-    let mut buf = Vec::with_capacity(16 + 36 + 64);
-    buf.extend_from_slice(b"ZC-BRIDGE-OPEN-1");
-    buf.extend_from_slice(outpoint);
-    for limb in claim_pk {
+    let mut buf = Vec::with_capacity(16 + 4 + a.chain_id.len() + 36 + 64 + 8 + 8 + 32 + 8);
+    buf.extend_from_slice(b"ZC-BRIDGE-OPEN-2");
+    buf.extend_from_slice(&(a.chain_id.len() as u32).to_le_bytes());
+    buf.extend_from_slice(a.chain_id);
+    buf.extend_from_slice(a.outpoint);
+    for limb in a.claim_pk {
         buf.extend_from_slice(&limb.to_le_bytes());
     }
+    buf.extend_from_slice(&a.asset_id.to_le_bytes());
+    buf.extend_from_slice(&a.value.to_le_bytes());
+    buf.extend_from_slice(a.hashlock);
+    buf.extend_from_slice(&a.timeout_height.to_le_bytes());
     sha256::Hash::hash(&buf).to_byte_array()
 }
 
 /// Producer side: sign the open-authorization with the deposit's refund secret key.
-pub fn sign_open_auth(
-    refund_sk: &bitcoin::secp256k1::SecretKey,
-    outpoint: &[u8; 36],
-    claim_pk: &[u64; 8],
-) -> [u8; 64] {
+pub fn sign_open_auth(refund_sk: &bitcoin::secp256k1::SecretKey, a: &OpenAuth<'_>) -> [u8; 64] {
     let secp = bitcoin::secp256k1::Secp256k1::signing_only();
-    let msg = bitcoin::secp256k1::Message::from_digest(open_auth_digest(outpoint, claim_pk));
+    let msg = bitcoin::secp256k1::Message::from_digest(open_auth_digest(a));
     secp.sign_ecdsa(&msg, refund_sk).serialize_compact()
 }
 
 /// Consensus side: verify the refund-key authorization for an SPV mint open. `sig` is a
 /// 64-byte compact ECDSA signature by `refund_pk` over [`open_auth_digest`].
-pub fn verify_open_auth(
-    refund_pk: &[u8; 33],
-    outpoint: &[u8; 36],
-    claim_pk: &[u64; 8],
-    sig: &[u8],
-) -> Result<(), String> {
+pub fn verify_open_auth(refund_pk: &[u8; 33], a: &OpenAuth<'_>, sig: &[u8]) -> Result<(), String> {
     use bitcoin::secp256k1::{ecdsa::Signature, PublicKey, Secp256k1};
     let pk = PublicKey::from_slice(refund_pk).map_err(|e| format!("open-auth: bad refund key: {e}"))?;
     let sig = Signature::from_compact(sig).map_err(|e| format!("open-auth: bad signature: {e}"))?;
-    let msg = bitcoin::secp256k1::Message::from_digest(open_auth_digest(outpoint, claim_pk));
+    let msg = bitcoin::secp256k1::Message::from_digest(open_auth_digest(a));
     Secp256k1::verification_only()
         .verify_ecdsa(&msg, &sig, &pk)
-        .map_err(|_| "open-auth: refund key did not authorize this recipient (front-run mint blocked)".to_string())
+        .map_err(|_| "open-auth: refund key did not authorize these open parameters (front-run blocked)".to_string())
 }
 
 /// An in-memory accepted header (rebuilt from the raw log on restore).
@@ -211,6 +257,11 @@ pub struct HeaderChain {
     /// height → hash of the current best (heaviest-work) chain.
     #[serde(skip)]
     best_chain: BTreeMap<u64, [u8; 32]>,
+    /// Rolling digest of the raw header log (`H(prev ‖ raw)` per accepted header), so the
+    /// SPV root is O(1) per block instead of re-hashing every header ever relayed. Rebuilt
+    /// by replay on restore, exactly like the index.
+    #[serde(skip)]
+    log_digest: Hash,
 }
 
 /// Serialized form: net + checkpoint + raw header log + claimed outpoints. The
@@ -258,7 +309,8 @@ impl TryFrom<Snap> for HeaderChain {
         for raw in s.headers {
             let raw: [u8; 80] =
                 raw.try_into().map_err(|_| "spv snapshot: header is not 80 bytes".to_string())?;
-            chain.accept(raw).map_err(|e| format!("spv snapshot: invalid header in log: {e}"))?;
+            let v = chain.validate_batch(&raw).map_err(|e| format!("spv snapshot: invalid header in log: {e}"))?;
+            chain.apply_validated(v);
         }
         for op in s.claimed {
             let op: [u8; 36] =
@@ -314,6 +366,7 @@ impl HeaderChain {
             index,
             best: hash,
             best_chain,
+            log_digest: h(b"ZC-BTCSPV-LOG0", &[&checkpoint, &height.to_le_bytes()]),
         })
     }
 
@@ -410,9 +463,17 @@ impl HeaderChain {
             let _hdr: Header = deserialize(&raw).map_err(|e| format!("bad header: {e}"))?;
         }
         let first: Header = deserialize(&bytes[..80]).map_err(|e| format!("bad header: {e}"))?;
+        let last: Header = deserialize(&bytes[bytes.len() - 80..]).map_err(|e| format!("bad header: {e}"))?;
+        // A batch whose LAST header is already known adds nothing: it is either a replay
+        // or fully overlapping. Replays of known headers used to be accepted at zero cost
+        // (and cost a full header-chain clone at delivery), a free block-filling spam
+        // vector (bridge M3 / consensus M1).
+        if self.index.contains_key(&last.block_hash().to_byte_array()) {
+            return Err("header relay adds no new headers (already known)".to_string());
+        }
         let fhash = first.block_hash().to_byte_array();
         if self.index.contains_key(&fhash) {
-            return Ok(()); // already known — idempotent relay, harmless
+            return Ok(()); // overlapping prefix, but the tail extends the chain
         }
         let prev = first.prev_blockhash.to_byte_array();
         if !self.index.contains_key(&prev) {
@@ -421,80 +482,106 @@ impl HeaderChain {
         Ok(())
     }
 
-    /// Submit a batch of concatenated raw 80-byte headers. Already-known headers
-    /// are skipped (idempotent, so overlapping relays are harmless); any invalid
-    /// header rejects the whole batch **atomically** — a failed tx must leave
-    /// consensus state untouched, so the batch is applied to a working copy and
-    /// only swapped in on full success. Returns the number newly accepted.
+    /// Submit a batch of concatenated raw 80-byte headers. Already-known headers are
+    /// skipped (so overlapping relays are harmless), but a batch that adds NOTHING is an
+    /// error (a free replay used to be accepted). Any invalid header rejects the whole
+    /// batch **atomically**: the batch is fully validated against the current chain plus
+    /// an overlay of its own earlier headers, and only then applied, so a failed tx never
+    /// touches consensus state and no full copy of the chain is made. Returns the number
+    /// newly accepted.
     pub fn submit_headers(&mut self, bytes: &[u8]) -> Result<usize, String> {
+        let validated = self.validate_batch(bytes)?;
+        if validated.is_empty() {
+            return Err("header relay adds no new headers (already known)".to_string());
+        }
+        let n = validated.len();
+        self.apply_validated(validated);
+        Ok(n)
+    }
+
+    /// Validate every header of a batch WITHOUT mutating the chain. New headers may chain
+    /// onto earlier headers of the same batch via the overlay. Duplicates are skipped.
+    fn validate_batch(&self, bytes: &[u8]) -> Result<Vec<([u8; 32], Entry)>, String> {
         if bytes.is_empty() || bytes.len() % 80 != 0 {
             return Err(format!("headers payload must be a positive multiple of 80 bytes, got {}", bytes.len()));
         }
         if bytes.len() / 80 > MAX_HEADER_BATCH {
             return Err(format!("header batch too large: {} headers > cap {MAX_HEADER_BATCH}", bytes.len() / 80));
         }
-        let mut work = self.clone();
-        let mut accepted = 0;
+        let mut overlay: BTreeMap<[u8; 32], Entry> = BTreeMap::new();
+        let mut out = Vec::new();
         for chunk in bytes.chunks_exact(80) {
             let raw: [u8; 80] = chunk.try_into().unwrap();
-            if work.accept(raw)? {
-                accepted += 1;
+            let header: Header = deserialize(&raw).map_err(|e| format!("bad header: {e}"))?;
+            let hash = header.block_hash().to_byte_array();
+            if self.index.contains_key(&hash) || overlay.contains_key(&hash) {
+                continue; // duplicate
             }
+            let prev = header.prev_blockhash.to_byte_array();
+            let parent = self
+                .lookup(&overlay, &prev)
+                .ok_or_else(|| format!("unknown parent header {}", hex::encode(rev(prev))))?
+                .clone();
+            let height = parent.height + 1;
+
+            // Difficulty rule: regtest never retargets; mainnet retargets every 2016
+            // blocks from the net timespan of the closing epoch (Bitcoin's exact
+            // off-by-one: blocks h-2016 .. h-1), clamped 4x, else inherits parent bits.
+            let expected = self.expected_bits(&overlay, &parent, height)?;
+            if header.bits != expected {
+                return Err(format!(
+                    "wrong difficulty bits at height {height}: got {:#010x}, consensus requires {:#010x}",
+                    header.bits.to_consensus(),
+                    expected.to_consensus()
+                ));
+            }
+            // Proof of work: the header's hash must meet its (consensus-required) target.
+            header
+                .validate_pow(Target::from_compact(expected))
+                .map_err(|e| format!("invalid proof of work at height {height}: {e:?}"))?;
+
+            // Median-time-past: a block's time must exceed the median of its last 11
+            // ancestors, so timestamps cannot be walked backwards to game retargets.
+            let mtp = self.median_time_past(&overlay, &prev);
+            if u64::from(header.time) <= mtp {
+                return Err(format!("header time {} not past median-time-past {mtp}", header.time));
+            }
+
+            let work = parent.work + header.work();
+            let entry = Entry { raw, height, work };
+            overlay.insert(hash, entry.clone());
+            out.push((hash, entry));
         }
-        *self = work;
-        Ok(accepted)
+        Ok(out)
     }
 
-    /// Validate and store one header. `Ok(false)` = duplicate (no-op).
-    fn accept(&mut self, raw: [u8; 80]) -> Result<bool, String> {
-        let header: Header = deserialize(&raw).map_err(|e| format!("bad header: {e}"))?;
-        let hash = header.block_hash().to_byte_array();
-        if self.index.contains_key(&hash) {
-            return Ok(false);
+    /// Commit a validated batch: index it, extend the log + rolling digest, and move the
+    /// best tip whenever cumulative work grows (heaviest-work fork choice).
+    fn apply_validated(&mut self, validated: Vec<([u8; 32], Entry)>) {
+        for (hash, entry) in validated {
+            let best_work = self.index[&self.best].work;
+            let (raw, height, work) = (entry.raw, entry.height, entry.work);
+            self.index.insert(hash, entry);
+            self.log.push(raw);
+            self.log_digest = h(b"ZC-BTCSPV-LOG", &[&self.log_digest, &raw]);
+            if work > best_work {
+                self.reorg_to(hash, height);
+            }
         }
-        let prev = header.prev_blockhash.to_byte_array();
-        let parent = self
-            .index
-            .get(&prev)
-            .ok_or_else(|| format!("unknown parent header {}", hex::encode(rev(prev))))?
-            .clone();
-        let height = parent.height + 1;
+    }
 
-        // Difficulty rule: regtest never retargets; mainnet retargets every 2016
-        // blocks from the net timespan of the closing epoch (Bitcoin's exact
-        // off-by-one: blocks h-2016 .. h-1), clamped 4x, else inherits parent bits.
-        let expected = self.expected_bits(&parent, height)?;
-        if header.bits != expected {
-            return Err(format!(
-                "wrong difficulty bits at height {height}: got {:#010x}, consensus requires {:#010x}",
-                header.bits.to_consensus(),
-                expected.to_consensus()
-            ));
-        }
-        // Proof of work: the header's hash must meet its (consensus-required) target.
-        header
-            .validate_pow(Target::from_compact(expected))
-            .map_err(|e| format!("invalid proof of work at height {height}: {e:?}"))?;
-
-        // Median-time-past: a block's time must exceed the median of its last 11
-        // ancestors, so timestamps cannot be walked backwards to game retargets.
-        let mtp = self.median_time_past(&prev);
-        if u64::from(header.time) <= mtp {
-            return Err(format!("header time {} not past median-time-past {mtp}", header.time));
-        }
-
-        let work = parent.work + header.work();
-        let best_work = self.index[&self.best].work;
-        self.index.insert(hash, Entry { raw, height, work });
-        self.log.push(raw);
-        if work > best_work {
-            self.reorg_to(hash, height);
-        }
-        Ok(true)
+    /// Header lookup through a batch overlay first, then the committed index.
+    fn lookup<'a>(&'a self, overlay: &'a BTreeMap<[u8; 32], Entry>, hash: &[u8; 32]) -> Option<&'a Entry> {
+        overlay.get(hash).or_else(|| self.index.get(hash))
     }
 
     /// Expected compact target for a child of `parent` at `height`.
-    fn expected_bits(&self, parent: &Entry, height: u64) -> Result<CompactTarget, String> {
+    fn expected_bits(
+        &self,
+        overlay: &BTreeMap<[u8; 32], Entry>,
+        parent: &Entry,
+        height: u64,
+    ) -> Result<CompactTarget, String> {
         let parent_header: Header = deserialize(&parent.raw).unwrap();
         let params = self.params();
         if params.no_pow_retargeting || height % 2016 != 0 {
@@ -506,9 +593,8 @@ impl HeaderChain {
             let hdr: Header = deserialize(&cursor.raw).unwrap();
             let prev = hdr.prev_blockhash.to_byte_array();
             cursor = self
-                .index
-                .get(&prev)
-                .ok_or("retarget epoch extends past the checkpoint — pin a boundary checkpoint")?
+                .lookup(overlay, &prev)
+                .ok_or("retarget epoch extends past the checkpoint: pin a boundary checkpoint")?
                 .clone();
         }
         let first: Header = deserialize(&cursor.raw).unwrap();
@@ -517,11 +603,11 @@ impl HeaderChain {
     }
 
     /// Median of the last (up to) 11 ancestor timestamps, starting at `from`.
-    fn median_time_past(&self, from: &[u8; 32]) -> u64 {
+    fn median_time_past(&self, overlay: &BTreeMap<[u8; 32], Entry>, from: &[u8; 32]) -> u64 {
         let mut times = Vec::with_capacity(11);
         let mut cursor = *from;
         for _ in 0..11 {
-            let Some(e) = self.index.get(&cursor) else { break };
+            let Some(e) = self.lookup(overlay, &cursor) else { break };
             let hdr: Header = deserialize(&e.raw).unwrap();
             times.push(u64::from(hdr.time));
             if e.height == self.checkpoint_height {
@@ -571,6 +657,12 @@ impl HeaderChain {
     /// Record a funding outpoint as minted (call ONLY after its escrow opened).
     pub fn claim_outpoint(&mut self, outpoint: [u8; 36]) {
         self.claimed.insert(outpoint);
+    }
+    /// Release a claimed outpoint after its immature mint was VOIDED by a reorg (the value
+    /// was burned back, so the deposit is unspent on ZCrypt again). Lets the depositor
+    /// re-open once the deposit is re-mined instead of losing it forever (bridge M2).
+    pub fn release_outpoint(&mut self, outpoint: &[u8; 36]) {
+        self.claimed.remove(outpoint);
     }
 
     /// Shared deposit verification (used by both the initial mint and re-anchoring).
@@ -624,11 +716,32 @@ impl HeaderChain {
                 out.value.to_sat()
             ));
         }
+        if value < min_deposit_sats(self.net) {
+            return Err(format!(
+                "SPV proof: mint of {value} sats is below the {} sat minimum (unsweepable dust)",
+                min_deposit_sats(self.net)
+            ));
+        }
+        // The refund CLTV must be a block HEIGHT. A timestamp-typed locktime passes the
+        // height comparison below while being immediately spendable on Bitcoin.
+        if proof.btc_locktime >= CLTV_HEIGHT_LIMIT {
+            return Err(format!(
+                "SPV proof: refund locktime {} is a timestamp, not a block height (must be < {CLTV_HEIGHT_LIMIT})",
+                proof.btc_locktime
+            ));
+        }
         if require_locktime_margin {
             let min_locktime = self.tip_height() + self.locktime_margin();
             if u64::from(proof.btc_locktime) < min_locktime {
                 return Err(format!(
-                    "SPV proof: refund locktime {} too soon (need ≥ {min_locktime})",
+                    "SPV proof: refund locktime {} too soon (need >= {min_locktime})",
+                    proof.btc_locktime
+                ));
+            }
+            let max_locktime = self.tip_height() + max_locktime_ahead(self.net);
+            if u64::from(proof.btc_locktime) > max_locktime {
+                return Err(format!(
+                    "SPV proof: refund locktime {} too far ahead (max {max_locktime})",
                     proof.btc_locktime
                 ));
             }
@@ -681,12 +794,11 @@ impl HeaderChain {
     /// Digest of the full SPV state, folded into the app_hash: checkpoint, every
     /// accepted header (in order), the best tip, and all claimed outpoints.
     pub fn root(&self) -> Hash {
-        let mut buf = Vec::with_capacity(80 + self.log.len() * 80 + self.claimed.len() * 36 + 48);
+        let mut buf = Vec::with_capacity(80 + 32 + self.claimed.len() * 36 + 48);
         buf.extend_from_slice(&self.checkpoint);
         buf.extend_from_slice(&self.checkpoint_height.to_le_bytes());
-        for raw in &self.log {
-            buf.extend_from_slice(raw);
-        }
+        buf.extend_from_slice(&self.log_digest);
+        buf.extend_from_slice(&(self.log.len() as u64).to_le_bytes());
         buf.extend_from_slice(&self.best);
         buf.extend_from_slice(&self.tip_height().to_le_bytes());
         for op in &self.claimed {
@@ -696,11 +808,15 @@ impl HeaderChain {
     }
 }
 
-/// The bridge HTLC redeem script — byte-identical to the one the wallet funds on
-/// Bitcoin (`zcrypt-bridge`'s `htlc_script`), reconstructed here so consensus can
-/// verify a deposit pays exactly this script:
-/// `OP_IF OP_SHA256 <hashlock> OP_EQUALVERIFY <claim_pk> OP_CHECKSIG OP_ELSE
-///  <locktime> OP_CLTV OP_DROP <refund_pk> OP_CHECKSIG OP_ENDIF`.
+/// The bridge HTLC redeem script. THE single definition: `zcrypt-bridge`'s `htlc_script`
+/// delegates here, so the script consensus verifies a deposit against and the script the
+/// wallet funds can never diverge.
+/// `OP_IF OP_SIZE 32 OP_EQUALVERIFY OP_SHA256 <hashlock> OP_EQUALVERIFY <claim_pk> OP_CHECKSIG
+///  OP_ELSE <locktime> OP_CLTV OP_DROP <refund_pk> OP_CHECKSIG OP_ENDIF`.
+/// The `OP_SIZE 32` guard pins the preimage to 32 bytes on Bitcoin too, matching the
+/// ZCrypt-side [`crate::htlc_shield::HTLC_PREIMAGE_LEN`] rule: an oversized preimage
+/// (over 520 bytes is consensus-invalid, over 80 non-standard) would otherwise let a
+/// depositor claim zBTC with a preimage the reserve can never use to sweep (bridge C2).
 pub fn btc_htlc_script(
     hashlock: &[u8; 32],
     claim_pk: &[u8; 33],
@@ -715,6 +831,9 @@ pub fn btc_htlc_script(
     lock.extend_from_slice(hashlock).unwrap();
     Ok(bitcoin::script::Builder::new()
         .push_opcode(OP_IF)
+        .push_opcode(OP_SIZE)
+        .push_int(crate::htlc_shield::HTLC_PREIMAGE_LEN as i64)
+        .push_opcode(OP_EQUALVERIFY)
         .push_opcode(OP_SHA256)
         .push_slice(lock)
         .push_opcode(OP_EQUALVERIFY)
@@ -920,24 +1039,35 @@ pub mod testutil {
         bitcoin::secp256k1::SecretKey::from_slice(&[n.max(1); 32]).unwrap()
     }
 
-    /// Produce the refund-key open-authorization signature for `tx`'s output `vout` paying
-    /// `claim_pk`, signed by the refund key `test_pk(refund_n)` — the H1 recipient binding.
-    pub fn open_auth(refund_n: u8, tx: &Transaction, vout: u32, claim_pk: &[u64; 8]) -> [u8; 64] {
-        use bitcoin::hashes::Hash as _;
-        let mut op = [0u8; 36];
-        op[..32].copy_from_slice(&tx.compute_txid().to_byte_array());
-        op[32..].copy_from_slice(&vout.to_le_bytes());
-        super::sign_open_auth(&test_sk(refund_n), &op, claim_pk)
+    /// The escrow parameters an open authorization binds (everything except the outpoint,
+    /// which comes from the proof / funding tx).
+    #[derive(Clone, Copy)]
+    pub struct OpenTerms<'a> {
+        pub chain_id: &'a [u8],
+        pub asset_id: u64,
+        pub value: u64,
+        pub hashlock: &'a [u8; 32],
+        pub timeout_height: u64,
+        pub claim_pk: &'a [u64; 8],
     }
 
-    /// Like [`open_auth`] but reads the outpoint straight from `proof` (its funding txid +
-    /// vout) — convenient when a test has the `MintProof` but not the raw `Transaction`.
-    /// `refund_n` is the `test_pk` seed index used for `proof.refund_pk`.
-    pub fn open_auth_for_proof(refund_n: u8, proof: &super::MintProof, claim_pk: &[u64; 8]) -> [u8; 64] {
+    /// Produce the refund-key open-authorization signature for `proof`'s funding outpoint
+    /// under `terms`, signed by the refund key `test_sk(refund_n)` (the seed index used for
+    /// `proof.refund_pk`).
+    pub fn open_auth_for_proof(refund_n: u8, proof: &super::MintProof, terms: OpenTerms<'_>) -> [u8; 64] {
         let mut op = [0u8; 36];
         op[..32].copy_from_slice(&proof.funding_txid().expect("valid funding tx"));
         op[32..].copy_from_slice(&proof.vout.to_le_bytes());
-        super::sign_open_auth(&test_sk(refund_n), &op, claim_pk)
+        let a = super::OpenAuth {
+            chain_id: terms.chain_id,
+            outpoint: &op,
+            claim_pk: terms.claim_pk,
+            asset_id: terms.asset_id,
+            value: terms.value,
+            hashlock: terms.hashlock,
+            timeout_height: terms.timeout_height,
+        };
+        super::sign_open_auth(&test_sk(refund_n), &a)
     }
 }
 
@@ -992,8 +1122,12 @@ mod tests {
         assert_eq!(c.submit_headers(&batch).unwrap(), 4);
         assert_eq!(c.tip_height(), 4);
         assert_eq!(c.tip_hash(), hdr(MAIN_H4).block_hash().to_byte_array());
-        // Idempotent relay: resubmitting is a no-op, not an error.
-        assert_eq!(c.submit_headers(&batch).unwrap(), 0);
+        // A pure replay adds nothing and is now REJECTED (it was a free spam vector); an
+        // overlapping batch that extends the chain is still fine.
+        assert!(c.submit_headers(&batch).unwrap_err().contains("no new headers"));
+        assert!(c.precheck_headers(&batch).is_err());
+        let root_before = c.root();
+        assert_eq!(c.root(), root_before, "a rejected replay leaves the root untouched");
         // Tamper with the nonce of a fresh header → PoW fails.
         let mut forged = hx(MAIN_H1);
         forged[79] ^= 0x01;
@@ -1225,6 +1359,82 @@ mod tests {
     }
 
     #[test]
+    fn timestamp_typed_locktime_is_rejected() {
+        // Bridge C1: a CLTV value >= 500,000,000 is a UNIX timestamp on Bitcoin. It passes
+        // "locktime >= tip + margin" as if it were a far-future height while being
+        // refundable in the next Bitcoin block, so the depositor could refund AND claim.
+        let mut c = HeaderChain::new(BtcNet::Regtest);
+        let hashlock = crate::nullifier::htlc_hashlock(b"cltv-timestamp-preimage-32-byte!");
+        let (reserve, refund) = (test_pk(7), test_pk(9));
+        let locktime = 600_000_000u32; // 1989 as a timestamp, "height 600M" to a naive check
+        let tx = funding_tx(&hashlock, &reserve, &refund, locktime, 50_000, 77);
+        let block = mine_header(&c_last(&c), &[tx.clone()], 1_296_700_000);
+        c.submit_headers(&block).unwrap();
+        let proof = MintProof {
+            reserve_pk: reserve, refund_pk: refund, btc_locktime: locktime, vout: 0,
+            raw_tx: serialize(&tx), merkle_block: merkle_proof(&block, &[tx.clone()], &tx),
+        };
+        let err = c.verify_mint_proof(&spv_authority(&reserve), 50_000, &hashlock, &proof).unwrap_err();
+        assert!(err.contains("timestamp"), "{err}");
+        // Re-anchoring an already-claimed deposit is bound by the same type check.
+        assert!(c.verify_reanchor(&spv_authority(&reserve), 50_000, &hashlock, &proof).is_err());
+    }
+
+    #[test]
+    fn locktime_too_far_ahead_and_dust_deposits_are_rejected() {
+        let mut c = HeaderChain::new(BtcNet::Regtest);
+        let (reserve, refund) = (test_pk(7), test_pk(9));
+        // Far-ahead lock: the deposit would sit unsweepable for ages while the claim gate
+        // (keyed on this lock) stays open; bounded to twice the honest lock.
+        let hashlock = crate::nullifier::htlc_hashlock(b"far-ahead-preimage-of-32-bytes!!");
+        // The deposit's own block advances the tip by one before verification, so aim two
+        // past the bound measured now.
+        let far = (c.tip_height() + max_locktime_ahead(BtcNet::Regtest) + 2) as u32;
+        let tx = funding_tx(&hashlock, &reserve, &refund, far, 50_000, 78);
+        let block = mine_header(&c_last(&c), &[tx.clone()], 1_296_700_000);
+        c.submit_headers(&block).unwrap();
+        let proof = MintProof {
+            reserve_pk: reserve, refund_pk: refund, btc_locktime: far, vout: 0,
+            raw_tx: serialize(&tx), merkle_block: merkle_proof(&block, &[tx.clone()], &tx),
+        };
+        assert!(c.verify_mint_proof(&spv_authority(&reserve), 50_000, &hashlock, &proof).unwrap_err().contains("too far ahead"));
+        // Dust: below the network minimum, unsweepable for the reserve.
+        let (auth, proof2, lock2) = proven_deposit(&mut c, 500, 79);
+        assert!(c.verify_mint_proof(&auth, 500, &lock2, &proof2).unwrap_err().contains("minimum"));
+    }
+
+    #[test]
+    fn htlc_script_pins_preimage_size() {
+        // Bridge C2: the script must carry OP_SIZE 32 OP_EQUALVERIFY before OP_SHA256.
+        let s = btc_htlc_script(&[1u8; 32], &test_pk(1), &test_pk(2), 100).unwrap();
+        let bytes = s.as_bytes();
+        // OP_IF(0x63) OP_SIZE(0x82) PUSH1 0x20 (0x01 0x20) OP_EQUALVERIFY(0x88) OP_SHA256(0xa8)
+        assert_eq!(&bytes[..6], &[0x63, 0x82, 0x01, 0x20, 0x88, 0xa8], "script prefix");
+    }
+
+    #[test]
+    fn open_auth_binds_every_escrow_parameter() {
+        // Bridge M1 / consensus H4: the depositor's authorization covers value, timeout,
+        // asset, hashlock and chain, so a front-runner cannot open the deposit with any
+        // parameter rewritten.
+        let op = [5u8; 36];
+        let pk = [3u64; 8];
+        let lock = [9u8; 32];
+        let good = OpenAuth { chain_id: b"zcrypt-1", outpoint: &op, claim_pk: &pk, asset_id: 42, value: 1_000, hashlock: &lock, timeout_height: 500 };
+        let sig = sign_open_auth(&test_sk(9), &good);
+        let refund = test_pk(9);
+        assert!(verify_open_auth(&refund, &good, &sig).is_ok());
+        assert!(verify_open_auth(&refund, &OpenAuth { value: 1, ..good }, &sig).is_err(), "value");
+        assert!(verify_open_auth(&refund, &OpenAuth { timeout_height: 0, ..good }, &sig).is_err(), "timeout");
+        assert!(verify_open_auth(&refund, &OpenAuth { asset_id: 43, ..good }, &sig).is_err(), "asset");
+        assert!(verify_open_auth(&refund, &OpenAuth { chain_id: b"fork", ..good }, &sig).is_err(), "chain");
+        let other_lock = [8u8; 32];
+        assert!(verify_open_auth(&refund, &OpenAuth { hashlock: &other_lock, ..good }, &sig).is_err(), "hashlock");
+        let other_pk = [4u64; 8];
+        assert!(verify_open_auth(&refund, &OpenAuth { claim_pk: &other_pk, ..good }, &sig).is_err(), "recipient");
+    }
+
+    #[test]
     fn snapshot_roundtrip_preserves_chain_and_claims() {
         let mut c = HeaderChain::new(BtcNet::Regtest);
         let (_, proof, hashlock) = proven_deposit(&mut c, 75_000, 3);
@@ -1245,6 +1455,11 @@ mod tests {
             .verify_mint_proof(&authority, 75_000, &hashlock, &proof)
             .unwrap_err()
             .contains("already minted"));
+        // Releasing the outpoint (a voided mint) lets the deposit mint again.
+        let mut released = restored;
+        released.release_outpoint(&op);
+        assert!(released.verify_mint_proof(&authority, 75_000, &hashlock, &proof).is_ok());
+        assert_ne!(released.root(), root0, "the released claim set moves the root");
     }
 
     #[test]

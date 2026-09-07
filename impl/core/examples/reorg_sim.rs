@@ -70,8 +70,11 @@ fn main() {
         raw_tx: serialize(&deposit_tx),
         merkle_block: testutil::merkle_proof(&a1, &[deposit_tx.clone()], &deposit_tx),
     };
-    let auth = testutil::open_auth_for_proof(9, &proof, &attacker.pubkey());
-    let escrow = node.htlc_open_spv(asset, value, lock, 500, attacker.pubkey(), &proof, &auth).unwrap();
+    const CHAIN: &[u8] = b"zcrypt-devnet";
+    let auth = testutil::open_auth_for_proof(9, &proof, testutil::OpenTerms {
+        chain_id: CHAIN, asset_id: asset, value, hashlock: &lock, timeout_height: 500, claim_pk: &attacker.pubkey(),
+    });
+    let escrow = node.htlc_open_spv(CHAIN, asset, value, lock, 500, attacker.pubkey(), &proof, &auth).unwrap();
     let coin = node.htlc_claim(&escrow, x).unwrap().unwrap();
     node.process_btc_maturity(); // deposit only 2 deep < maturity_conf 3 ⇒ stays immature
     println!("[mint]  SPV proof accepted → {value} zBTC minted, but held IMMATURE (deposit only");
