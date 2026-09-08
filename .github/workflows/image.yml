@@ -73,7 +73,7 @@ jobs:
           DIGEST: ${{ steps.build.outputs.digest }}
         run: |
           cosign verify "${IMAGE}@${DIGEST}" \
-            --certificate-identity-regexp "^https://github.com/${{ github.repository }}/" \
+            --certificate-identity-regexp "^https://github.com/${{ github.repository }}/\\.github/workflows/image\\.yml@refs/tags/v" \
             --certificate-oidc-issuer https://token.actions.githubusercontent.com
       - name: Publish the digest
         env:
@@ -88,5 +88,5 @@ jobs:
             echo "${IMAGE}@${DIGEST}"
             echo '```'
             echo
-            echo "Verify: \`cosign verify ${IMAGE}@${DIGEST} --certificate-identity-regexp '^https://github.com/${{ github.repository }}/' --certificate-oidc-issuer https://token.actions.githubusercontent.com\`"
+            echo "Verify: \`cosign verify ${IMAGE}@${DIGEST} --certificate-identity-regexp '^https://github.com/${{ github.repository }}/\\.github/workflows/image\\.yml@refs/tags/v' --certificate-oidc-issuer https://token.actions.githubusercontent.com\`"
           } >> "$GITHUB_STEP_SUMMARY"

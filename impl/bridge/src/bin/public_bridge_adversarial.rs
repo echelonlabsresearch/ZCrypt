@@ -13,6 +13,7 @@ use zcrypt_core::spv::MintProof;
 use zcrypt_shield::commit_asset;
 
 fn main() {
+    zcrypt_bridge::zcrypt::set_broadcast_jitter(false); // e2e driver: no privacy delay on hundreds of broadcasts
     let zc_url = std::env::var("ZC_URL").unwrap_or_else(|_| "http://localhost:36657".to_string());
     let btc_url = std::env::var("BTC_URL").unwrap_or_else(|_| "http://localhost:18443".to_string());
     let net = zcrypt_bridge::NETWORK;

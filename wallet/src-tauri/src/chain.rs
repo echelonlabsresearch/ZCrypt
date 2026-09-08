@@ -43,6 +43,26 @@ pub fn socks_isolated(proxy_url: &str, class: &str) -> String {
     format!("{scheme}://zc-{class}-{n}:{n}@{rest}", n = session_nonce())
 }
 
+/// Stream isolation with FRESH credentials on every call: a new random nonce each time,
+/// so two broadcasts from one session (a reshape self-send and the real send seconds
+/// later) never share a Tor circuit and cannot be paired by the exit or the node. Used for
+/// broadcasts and for every Bitcoin-side (Esplora) session; plain queries keep one
+/// per-session circuit.
+pub fn socks_isolated_fresh(proxy_url: &str, class: &str) -> String {
+    use rand::RngCore;
+    let (scheme, rest) = match proxy_url.split_once("://") {
+        Some((s, r)) => (s, r),
+        None => ("socks5", proxy_url),
+    };
+    if rest.contains('@') {
+        return proxy_url.to_string();
+    }
+    let mut b = [0u8; 8];
+    rand::thread_rng().fill_bytes(&mut b);
+    let n = hex::encode(b);
+    format!("{scheme}://zc-{class}-{n}:{n}@{rest}")
+}
+
 /// Enable/disable Tor routing for all subsequent node RPC. `Some(socks_url)` turns
 /// it on; `None` reverts to a direct connection.
 pub fn set_tor(proxy: Option<String>) {
@@ -74,6 +94,20 @@ pub fn agent_for(class: &str, secs: u64) -> ureq::Agent {
         // connection. Only a successfully-parsed proxy is applied; if parsing fails we
         // point at an unusable loopback port so requests error out instead of leaking.
         match ureq::Proxy::new(&socks_isolated(&proxy, class)) {
+            Ok(p) => b = b.proxy(p),
+            Err(_) => {
+                b = b.proxy(ureq::Proxy::new("socks5://127.0.0.1:1").expect("static proxy"));
+            }
+        }
+    }
+    b.build()
+}
+
+/// Like [`agent_for`] but with fresh SOCKS credentials, i.e. a Tor circuit of its own.
+pub fn agent_fresh(class: &str, secs: u64) -> ureq::Agent {
+    let mut b = ureq::builder().timeout(std::time::Duration::from_secs(secs));
+    if let Some(proxy) = TOR_PROXY.read().unwrap().clone() {
+        match ureq::Proxy::new(&socks_isolated_fresh(&proxy, class)) {
             Ok(p) => b = b.proxy(p),
             Err(_) => {
                 b = b.proxy(ureq::Proxy::new("socks5://127.0.0.1:1").expect("static proxy"));
@@ -476,8 +510,9 @@ pub fn broadcast(url: &str, tx: &[u8]) -> Result<(), String> {
         "jsonrpc": "2.0", "id": 1, "method": "broadcast_tx_commit",
         "params": { "tx": B64.encode(tx) }
     });
-    // Broadcasts ride their own Tor circuit, separate from the query traffic.
-    let resp: Value = agent_for("broadcast", TIMEOUT_S)
+    // Every broadcast rides a Tor circuit of its OWN (fresh credentials per call), separate
+    // from the query traffic and from every other broadcast of this session.
+    let resp: Value = agent_fresh("broadcast", TIMEOUT_S)
         .post(base(url))
         .send_json(body)
         .map_err(|e| e.to_string())?
@@ -496,51 +531,109 @@ pub fn broadcast(url: &str, tx: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
-/// Heights in `[from, to]` that actually contain transactions, via CometBFT's
-/// `/blockchain` endpoint (up to 20 block metas per call). Devnets mint empty
-/// blocks every ~1s, so this turns an O(chain-length) scan (one full-block fetch
-/// per height) into O(#tx-blocks) — only the handful of blocks with real txs are
-/// fetched afterward. Returns ascending heights.
-pub fn nonempty_heights(url: &str, from: i64, to: i64) -> Result<Vec<i64>, String> {
-    let mut out = Vec::new();
-    let mut hi = to;
-    while hi >= from {
-        let lo = (hi - 19).max(from); // /blockchain returns at most 20 metas
+/// GET `u` as JSON with backoff on transient failures: a 429 (honouring `Retry-After`),
+/// a 5xx, or a transport error is retried a few times; anything else fails at once.
+fn get_json_retry(u: &str) -> Result<Value, String> {
+    let mut wait = std::time::Duration::from_millis(500);
+    let max_wait = std::time::Duration::from_secs(30);
+    let attempts = 4;
+    for attempt in 1..=attempts {
+        match agent().get(u).call() {
+            Ok(r) => return r.into_json().map_err(|e| e.to_string()),
+            Err(ureq::Error::Status(code, resp)) => {
+                let transient = code == 429 || code >= 500;
+                if !transient || attempt == attempts {
+                    return Err(format!("node returned HTTP {code}"));
+                }
+                let retry_after = resp
+                    .header("Retry-After")
+                    .and_then(|v| v.trim().parse::<u64>().ok())
+                    .map(std::time::Duration::from_secs);
+                std::thread::sleep(retry_after.unwrap_or(wait).min(max_wait));
+            }
+            Err(e) => {
+                if attempt == attempts {
+                    return Err(e.to_string());
+                }
+                std::thread::sleep(wait.min(max_wait));
+            }
+        }
+        wait *= 2;
+    }
+    Err("unreachable".into())
+}
+
+/// What a resumable block fetch produced: every tx-bearing block in `[from, covered_to]`
+/// (ascending), the last height fully covered, and the error that stopped it early (if any).
+pub struct ScanFetch {
+    pub blocks: Vec<(i64, Vec<Vec<u8>>)>,
+    pub covered_to: i64,
+    pub error: Option<String>,
+}
+
+impl ScanFetch {
+    pub fn empty(covered_to: i64) -> ScanFetch {
+        ScanFetch { blocks: Vec::new(), covered_to, error: None }
+    }
+}
+
+/// Fetch the transactions of every tx-bearing block in `[from, to]`, ASCENDING, with retry
+/// and backoff on rate limits. If the node keeps failing, stop and report how far the
+/// contiguous prefix got, so the caller can persist that height and resume later instead
+/// of restarting from `from` (a restore-from-genesis over Tor can take many requests).
+pub fn scan_blocks(url: &str, from: i64, to: i64) -> ScanFetch {
+    let mut out = ScanFetch::empty(from - 1);
+    if from > to {
+        out.covered_to = to;
+        return out;
+    }
+    let mut lo = from;
+    while lo <= to {
+        let hi = (lo + 19).min(to); // /blockchain returns at most 20 metas
         let u = format!("{}/blockchain?minHeight={}&maxHeight={}", base(url), lo, hi);
-        let b: Value = agent().get(&u).call().map_err(|e| e.to_string())?.into_json().map_err(|e| e.to_string())?;
-        if let Some(metas) = b["result"]["block_metas"].as_array() {
-            for m in metas {
-                let n = m["num_txs"]
-                    .as_str()
-                    .and_then(|s| s.parse::<i64>().ok())
-                    .unwrap_or(0);
-                if n > 0 {
-                    if let Some(h) = m["header"]["height"].as_str().and_then(|s| s.parse::<i64>().ok()) {
-                        out.push(h);
-                    }
+        let metas: Vec<i64> = match get_json_retry(&u) {
+            Ok(b) => {
+                let mut hs: Vec<i64> = b["result"]["block_metas"]
+                    .as_array()
+                    .map(|arr| {
+                        arr.iter()
+                            .filter(|m| m["num_txs"].as_str().and_then(|s| s.parse::<i64>().ok()).unwrap_or(0) > 0)
+                            .filter_map(|m| m["header"]["height"].as_str().and_then(|s| s.parse::<i64>().ok()))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                hs.sort_unstable();
+                hs
+            }
+            Err(e) => {
+                out.error = Some(format!("block index {lo}..{hi}: {e}"));
+                return out;
+            }
+        };
+        for h in metas {
+            let bu = format!("{}/block?height={}", base(url), h);
+            match get_json_retry(&bu) {
+                Ok(b) => {
+                    let txs: Vec<Vec<u8>> = b["result"]["block"]["data"]["txs"]
+                        .as_array()
+                        .cloned()
+                        .unwrap_or_default()
+                        .iter()
+                        .filter_map(|t| t.as_str().and_then(|s| B64.decode(s).ok()))
+                        .collect();
+                    out.blocks.push((h, txs));
+                    out.covered_to = h;
+                }
+                Err(e) => {
+                    out.error = Some(format!("block {h}: {e}"));
+                    return out;
                 }
             }
         }
-        hi = lo - 1;
+        out.covered_to = hi;
+        lo = hi + 1;
     }
-    out.sort_unstable();
-    Ok(out)
-}
-
-/// Fetch the (decoded) transactions in a block.
-pub fn block_txs(url: &str, height: i64) -> Vec<Vec<u8>> {
-    let u = format!("{}/block?height={}", base(url), height);
-    let b: Value = match agent().get(&u).call().ok().and_then(|r| r.into_json().ok()) {
-        Some(b) => b,
-        None => return vec![],
-    };
-    b["result"]["block"]["data"]["txs"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default()
-        .iter()
-        .filter_map(|t| t.as_str().and_then(|s| B64.decode(s).ok()))
-        .collect()
+    out
 }
 
 /// The Merkle authentication path of the coin at `leaf_idx` against a tree built
@@ -585,5 +678,10 @@ mod policy_tests {
         assert!(a.ends_with("@127.0.0.1:9050"));
         assert_eq!(socks_isolated(&a, "bridge"), a, "existing credentials are kept");
         assert!(ureq::Proxy::new(&a).is_ok(), "ureq must accept the credentialed proxy URL");
+        // Fresh credentials differ on every call (one circuit per broadcast).
+        let f1 = socks_isolated_fresh("socks5://127.0.0.1:9050", "broadcast");
+        let f2 = socks_isolated_fresh("socks5://127.0.0.1:9050", "broadcast");
+        assert_ne!(f1, f2);
+        assert!(f1.starts_with("socks5://zc-broadcast-") && f1.ends_with("@127.0.0.1:9050"));
     }
 }

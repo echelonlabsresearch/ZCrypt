@@ -44,6 +44,7 @@ fn mnemonic() -> String {
 }
 
 fn main() {
+    zcrypt_bridge::zcrypt::set_broadcast_jitter(false); // e2e driver: no privacy delay on hundreds of broadcasts
     let zc_url = std::env::var("ZC_URL").unwrap_or_else(|_| "http://localhost:36657".to_string());
     let esplora = std::env::var("ESPLORA").unwrap_or_else(|_| "https://mempool.space/signet/api".to_string());
     let mnemonic = mnemonic();

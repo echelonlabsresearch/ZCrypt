@@ -458,9 +458,22 @@ impl HeaderChain {
         if count > MAX_HEADER_BATCH {
             return Err(format!("header batch too large: {count} headers > cap {MAX_HEADER_BATCH}"));
         }
+        // Admission requires every header to (a) satisfy the proof-of-work it claims for
+        // itself (one SHA256d each; the consensus target is checked at delivery) and
+        // (b) chain onto the previous header of the batch, so garbage that merely links
+        // to a known parent is not gossiped and does not occupy block space.
+        let mut prev_hash: Option<[u8; 32]> = None;
         for chunk in bytes.chunks_exact(80) {
             let raw: [u8; 80] = chunk.try_into().unwrap();
-            let _hdr: Header = deserialize(&raw).map_err(|e| format!("bad header: {e}"))?;
+            let hdr: Header = deserialize(&raw).map_err(|e| format!("bad header: {e}"))?;
+            hdr.validate_pow(hdr.target())
+                .map_err(|e| format!("header fails its own proof-of-work: {e}"))?;
+            if let Some(p) = prev_hash {
+                if hdr.prev_blockhash.to_byte_array() != p {
+                    return Err("header batch is not a contiguous chain".to_string());
+                }
+            }
+            prev_hash = Some(hdr.block_hash().to_byte_array());
         }
         let first: Header = deserialize(&bytes[..80]).map_err(|e| format!("bad header: {e}"))?;
         let last: Header = deserialize(&bytes[bytes.len() - 80..]).map_err(|e| format!("bad header: {e}"))?;
@@ -1491,5 +1504,44 @@ mod tests {
         d.submit_headers(&b1).unwrap();
         d.claim_outpoint([5u8; 36]);
         assert_eq!(c.root(), d.root());
+    }
+}
+
+#[cfg(test)]
+mod precheck_admission_regression {
+    //! Re-audit NEW-2: header-relay admission must reject batches that do not satisfy
+    //! their own proof-of-work or are not internally contiguous, so garbage that merely
+    //! links to a known parent is never gossiped or included.
+    use super::testutil::mine_header;
+    use super::{BtcNet, HeaderChain, REGTEST_GENESIS};
+
+    #[test]
+    fn non_contiguous_batches_are_rejected_at_admission() {
+        let chain = HeaderChain::new(BtcNet::Regtest);
+        let a1 = mine_header(&REGTEST_GENESIS, &[], 1_296_689_000);
+        // b1 also chains from genesis, so [a1, b1] is not a contiguous batch.
+        let b1 = mine_header(&REGTEST_GENESIS, &[], 1_296_689_700);
+        let mut batch = Vec::new();
+        batch.extend_from_slice(&a1);
+        batch.extend_from_slice(&b1);
+        let err = chain.precheck_headers(&batch).unwrap_err();
+        assert!(err.contains("contiguous"), "{err}");
+        // A contiguous extension passes admission.
+        let a2 = mine_header(&a1, &[], 1_296_689_600);
+        let mut ok = Vec::new();
+        ok.extend_from_slice(&a1);
+        ok.extend_from_slice(&a2);
+        chain.precheck_headers(&ok).unwrap();
+    }
+
+    #[test]
+    fn a_header_that_fails_its_own_pow_is_rejected_at_admission() {
+        let chain = HeaderChain::new(BtcNet::Regtest);
+        let mut h = mine_header(&REGTEST_GENESIS, &[], 1_296_689_000);
+        // Claim an impossibly hard target (bits) without re-mining: the hash cannot meet it.
+        // nBits occupies bytes 72..76 of the 80-byte header (little-endian compact form).
+        h[72..76].copy_from_slice(&0x0100_0001u32.to_le_bytes());
+        let err = chain.precheck_headers(&h).unwrap_err();
+        assert!(err.contains("proof-of-work"), "{err}");
     }
 }

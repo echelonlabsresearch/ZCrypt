@@ -6,7 +6,7 @@ license.workspace = true
 
 [dependencies]
 bitcoin = { version = "0.32", features = ["rand-std"] }
-bip39 = "2"
+bip39 = { version = "2", features = ["zeroize"] }   # wipe mnemonics on drop
 rand = { workspace = true }
 bitcoincore-rpc = "0.19"
 ureq = { version = "2", features = ["json", "socks-proxy"] }
@@ -18,3 +18,5 @@ ed25519-dalek = "2"
 sha2 = { workspace = true }
 zcrypt-core = { path = "../core" }
 zcrypt-shield = { path = "../shield" }
+url = "2"                                        # strict loopback detection for the Tor bypass
+zeroize = { version = "1", features = ["derive"] }   # wipe BIP-39 seeds and HTLC keys

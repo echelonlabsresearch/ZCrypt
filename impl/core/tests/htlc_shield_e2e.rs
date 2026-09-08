@@ -949,3 +949,30 @@ fn spv_mint_claim_is_refused_once_the_refund_lock_is_within_sweep_margin() {
         }
     }
 }
+
+/// Regression (fix-pass re-audit NEW-1): once a settled escrow is pruned from the book, its
+/// deterministic id must stay retired until its timeout has passed. Otherwise the identical
+/// lock could be re-opened and a claim would mint a byte-identical coin commitment (and
+/// nullifier) to the first one.
+#[test]
+fn pruned_escrow_ids_cannot_be_reopened_before_their_timeout() {
+    use zcrypt_core::htlc_shield::ESCROW_RETENTION_BLOCKS;
+    let (alice, mut node, asset, keyset, signers) = setup();
+    node.set_height(10);
+    let x = &pre("retired-id-regression-preimage-1");
+    let lock = htlc_hashlock(x);
+    let timeout = 10 + 2 * ESCROW_RETENTION_BLOCKS; // still far in the future after pruning
+    let id = open_mint(&mut node, &keyset, &signers, asset, 1_000, lock, timeout, alice.pubkey()).unwrap();
+    node.set_height(11);
+    node.htlc_claim(&id, x).unwrap();
+    // Same parameters while the settled escrow is still in the book: plain duplicate.
+    assert!(open_mint(&mut node, &keyset, &signers, asset, 1_000, lock, timeout, alice.pubkey()).is_err());
+    // Advance past the retention window so end_block prunes the settled entry.
+    node.set_height(11 + ESCROW_RETENTION_BLOCKS + 1);
+    node.end_block();
+    assert!(node.htlc_escrow(&id).is_none(), "settled escrow is pruned");
+    let err = open_mint(&mut node, &keyset, &signers, asset, 1_000, lock, timeout, alice.pubkey()).unwrap_err();
+    assert!(err.contains("already used"), "re-open of a retired id must be refused: {err}");
+    // A different timeout is a different escrow: allowed.
+    open_mint(&mut node, &keyset, &signers, asset, 1_000, lock, timeout + 1, alice.pubkey()).unwrap();
+}

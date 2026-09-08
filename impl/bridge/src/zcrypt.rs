@@ -3,6 +3,66 @@
 
 use base64::Engine;
 use serde_json::Value;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// Pre-broadcast timing jitter (privacy): a random 250 to 2500 ms delay before every
+/// broadcast, so the moment a tx reaches the node does not fingerprint the moment a user
+/// or operator acted (the desktop wallet applies the same jitter). Default ON; the e2e
+/// drivers switch it off with [`set_broadcast_jitter`] (or `ZCRYPT_BROADCAST_JITTER=0`)
+/// so their hundreds of broadcasts stay fast.
+static BROADCAST_JITTER: AtomicBool = AtomicBool::new(true);
+static JITTER_ENV_CHECKED: AtomicBool = AtomicBool::new(false);
+
+/// Turn the pre-broadcast jitter on or off for this process.
+pub fn set_broadcast_jitter(on: bool) {
+    JITTER_ENV_CHECKED.store(true, Ordering::Relaxed);
+    BROADCAST_JITTER.store(on, Ordering::Relaxed);
+}
+
+/// Whether broadcasts are jittered right now (env `ZCRYPT_BROADCAST_JITTER=0` disables it
+/// once, unless [`set_broadcast_jitter`] was called explicitly).
+pub fn broadcast_jitter_enabled() -> bool {
+    if !JITTER_ENV_CHECKED.swap(true, Ordering::Relaxed) {
+        if let Ok(v) = std::env::var("ZCRYPT_BROADCAST_JITTER") {
+            let off = matches!(v.trim(), "0" | "off" | "false" | "no");
+            BROADCAST_JITTER.store(!off, Ordering::Relaxed);
+        }
+    }
+    BROADCAST_JITTER.load(Ordering::Relaxed)
+}
+
+fn jitter_sleep() {
+    if broadcast_jitter_enabled() {
+        use rand::Rng as _;
+        let ms: u64 = rand::thread_rng().gen_range(250..=2500);
+        std::thread::sleep(std::time::Duration::from_millis(ms));
+    }
+}
+
+/// The ZCrypt node operations the bridge's operator-side logic needs, abstracted so the
+/// watcher and the swap orchestration can run against the live CometBFT RPC ([`Zcrypt`])
+/// or an in-memory fake in tests. `&Zcrypt` coerces to `&dyn ZcNode` at every call site.
+pub trait ZcNode {
+    fn height(&self) -> Result<i64, String>;
+    fn block_txs(&self, height: i64) -> Result<Vec<Vec<u8>>, String>;
+    fn query(&self, path: &str) -> Result<String, String>;
+    fn broadcast(&self, tx: &[u8]) -> Result<String, String>;
+}
+
+impl ZcNode for Zcrypt {
+    fn height(&self) -> Result<i64, String> {
+        Zcrypt::height(self)
+    }
+    fn block_txs(&self, height: i64) -> Result<Vec<Vec<u8>>, String> {
+        Zcrypt::block_txs(self, height)
+    }
+    fn query(&self, path: &str) -> Result<String, String> {
+        Zcrypt::query(self, path)
+    }
+    fn broadcast(&self, tx: &[u8]) -> Result<String, String> {
+        Zcrypt::broadcast(self, tx)
+    }
+}
 
 const B64: base64::engine::general_purpose::GeneralPurpose = base64::engine::general_purpose::STANDARD;
 
@@ -23,6 +83,7 @@ impl Zcrypt {
     /// Broadcast a raw tx (with its 1-byte tag). Returns the `tx_result.data`
     /// (base64-decoded JSON string) on success, or an error with the reject log.
     pub fn broadcast(&self, tx: &[u8]) -> Result<String, String> {
+        jitter_sleep();
         let body = serde_json::json!({
             "jsonrpc": "2.0", "id": 1, "method": "broadcast_tx_commit",
             "params": { "tx": B64.encode(tx) }

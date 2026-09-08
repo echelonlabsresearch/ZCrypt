@@ -120,6 +120,9 @@ burn coin, so the stake is real, locked value — not a self-declared number. It
 names a reward address. On the next block the ABCI app emits the `ValidatorUpdate` and
 **your node joins the active set** — it starts proposing/signing blocks and accruing
 rewards each 100-block epoch (withdraw them with **CLAIM `0x58`** into a private coin).
+A CLAIM is unauthenticated, so consensus requires it to take the whole claimable
+balance and refuses balances below 1 ZCRYPT (they keep accruing); this stops a third
+party from forcing dust coins onto a staker.
 
 Watch CometBFT's own validator set grow to confirm:
 

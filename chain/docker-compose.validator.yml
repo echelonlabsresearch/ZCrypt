@@ -16,7 +16,7 @@
 # by the repository's "Publish ABCI image" workflow (.github/workflows/image.yml), so the
 # signing identity is that repository. Verify before trusting it (README-validator.md):
 #   cosign verify ghcr.io/echelonlabsresearch/zcrypt-abci@sha256:<digest> \
-#     --certificate-identity-regexp '^https://github.com/echelonlabsresearch/' \
+#     --certificate-identity-regexp '^https://github.com/echelonlabsresearch/zcrypt-v2/\.github/workflows/image\.yml@refs/tags/v' \
 #     --certificate-oidc-issuer https://token.actions.githubusercontent.com
 # To update: take the digest printed in the workflow run summary (or
 # `docker buildx imagetools inspect ghcr.io/echelonlabsresearch/zcrypt-abci:vX.Y.Z`), verify

@@ -14,13 +14,27 @@ export default function Balance({ balance, onRefresh }: { balance: number; onRef
   const [spinning, setSpinning] = useState(false);
   const [assets, setAssets] = useState<HeldAsset[]>([]);
   const [btc, setBtc] = useState<BtcWallet | null>(null);
+  const [btcBusy, setBtcBusy] = useState(false);
 
+  // Everything here is local to this machine. The Bitcoin balance is NOT fetched
+  // automatically: it asks the configured Esplora server about your deposit address,
+  // which tells that server which address is yours. It runs only when you click.
   const load = useCallback(() => {
     call<string>("get_address").then(setNormal).catch(() => {});
     call<{ coin_count: number }>("get_balance").then((b) => setCount(b.coin_count)).catch(() => {});
     call<HeldAsset[]>("held_assets").then(setAssets).catch(() => {});
-    call<BtcWallet>("btc_wallet_info").then(setBtc).catch(() => setBtc(null));
   }, []);
+
+  async function checkBtc() {
+    setBtcBusy(true);
+    try {
+      setBtc(await call<BtcWallet>("btc_wallet_info"));
+    } catch {
+      setBtc({ connected: false, balance: 0, deposit_address: "" });
+    } finally {
+      setBtcBusy(false);
+    }
+  }
 
   useEffect(() => {
     load();
@@ -74,8 +88,18 @@ export default function Balance({ balance, onRefresh }: { balance: number; onRef
       )}
 
       <div className="card" style={{ marginTop: "1.2rem" }}>
-        <h2>₿ Bitcoin (L1)</h2>
-        {btc && btc.connected ? (
+        <div className="card-row" style={{ borderTop: "none", paddingTop: 0 }}>
+          <h2 style={{ margin: 0 }}>₿ Bitcoin (L1)</h2>
+          <button className="btn-secondary" onClick={checkBtc} disabled={btcBusy}>
+            {btcBusy ? "Checking…" : btc ? "🔄 Re-check" : "Check Bitcoin balance"}
+          </button>
+        </div>
+        {btc === null ? (
+          <div style={{ opacity: 0.7, fontSize: "0.85rem" }}>
+            Not checked. Checking asks your configured Esplora server (Settings) about your
+            deposit address, which reveals that address to it; it is never done automatically.
+          </div>
+        ) : btc.connected ? (
           <>
             <div className="balance-big" style={{ fontSize: "1.6rem" }}>
               <span className="amount">{btc.balance.toLocaleString(undefined, { maximumFractionDigits: 8 })}</span>{" "}

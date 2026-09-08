@@ -42,6 +42,7 @@ pub const OP_CHECK_BURN_OUTPUT: u8 = 0x1C; // output[0] == declared burn coin
 pub const OP_CHECK_THRESHOLD_SIG: u8 = 0x1D; // ≥M valid ML-DSA sigs from the asset's key set
 pub const OP_CHECK_SPV_PROOF: u8 = 0x1E; // a verified Bitcoin SPV deposit proof (trustless mint)
 pub const OP_CHECK_AMOUNT_EQ_CLAIMABLE: u8 = 0x1F; // amount == claimable (full-balance claims only)
+pub const OP_CHECK_CLAIMABLE_MIN: u8 = 0x20; // claimable >= MIN_CLAIM (no forced dust claims)
 
 // ---- one canonical program per transaction type ----
 /// 0x57 bond a validator.
@@ -49,7 +50,10 @@ pub const BOND: &[u8] = &[OP_CHECK_MIN_STAKE, OP_HALT];
 /// 0x58 claim staking rewards → coinbase coins. Full-balance only: a partial-amount claim
 /// let anyone (the tx is unauthenticated) shred a victim's balance into dust coins each
 /// worth less than the gas needed to consolidate them (consensus C2).
-pub const CLAIM: &[u8] = &[OP_CHECK_AMOUNT_POSITIVE, OP_CHECK_AMOUNT_EQ_CLAIMABLE, OP_HALT];
+pub const CLAIM: &[u8] = &[OP_CHECK_AMOUNT_POSITIVE, OP_CHECK_CLAIMABLE_MIN, OP_CHECK_AMOUNT_EQ_CLAIMABLE, OP_HALT];
+/// 0x66 claim in-asset fee rewards (bridge skim). Full-balance only; no ZCRYPT-denominated
+/// floor because the balance is in the asset's own units.
+pub const CLAIM_FEE: &[u8] = &[OP_CHECK_AMOUNT_POSITIVE, OP_CHECK_AMOUNT_EQ_CLAIMABLE, OP_HALT];
 /// 0x59 register a shielded-asset ticker (first-mint-wins).
 pub const REGISTER: &[u8] = &[OP_CHECK_TICKER_VALID, OP_CHECK_TICKER_FREE, OP_HALT];
 /// 0x5A open a mint HTLC escrow with an M-of-N authorization (user-minted assets).
@@ -131,6 +135,7 @@ pub fn evaluate(program: &[u8], ctx: &Ctx) -> Outcome {
             OP_CHECK_BEFORE_TIMEOUT if ctx.height >= ctx.timeout => return Outcome::reject("escrow timed out"),
             OP_CHECK_AT_OR_AFTER_TIMEOUT if ctx.height < ctx.timeout => return Outcome::reject("not yet timed out"),
             OP_CHECK_AMOUNT_EQ_CLAIMABLE if ctx.amount != ctx.claimable => return Outcome::reject("claim must take the full claimable balance"),
+            OP_CHECK_CLAIMABLE_MIN if ctx.claimable < crate::emission::MIN_CLAIM => return Outcome::reject("claimable balance is below the 1 ZCRYPT claim minimum (rewards keep accruing)"),
             // A preimage is exactly 32 bytes. Bitcoin consensus caps a witness element at 520
             // bytes and standard relay at 80, so an oversized preimage that ZCrypt accepted
             // could never be spent on the Bitcoin leg: the depositor would keep both.
@@ -140,7 +145,7 @@ pub fn evaluate(program: &[u8], ctx: &Ctx) -> Outcome {
             OP_CHECK_BURN_OUTPUT if !ctx.burn_output_ok => return Outcome::reject("output[0] is not the declared burn coin"),
             OP_HALT => break,
             // a guard byte that passed, or a no-op position
-            0x10..=0x1F => {}
+            0x10..=0x20 => {}
             _ => return Outcome::reject("unknown opcode"),
         }
     }

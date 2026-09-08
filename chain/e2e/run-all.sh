@@ -24,8 +24,12 @@ BTC=http://localhost:28443
 
 say() { printf '\n\033[1;36m== %s ==\033[0m\n' "$*"; }
 
+# The drivers broadcast hundreds of txs; the library's privacy jitter (250 to 2500 ms before
+# each broadcast) is switched off for them.
+export ZCRYPT_BROADCAST_JITTER=0
+
 say "0/7  Build the RPC test drivers (release)"
-( cd "$IMPL_DIR" && cargo build --release -p zcrypt-bridge \
+( cd "$IMPL_DIR" && cargo build --release --locked -p zcrypt-bridge \
     --bin reserve_pubkey \
     --bin shield_flow_3node --bin product_flow_3node --bin recover_flow_3node \
     --bin swap_demo --bin swap_pool_demo --bin fee_flow_3node \

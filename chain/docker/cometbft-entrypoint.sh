@@ -109,11 +109,19 @@ if [ ! -f "$GENESIS" ]; then
   sed -i 's|^max_tx_bytes =.*|max_tx_bytes = 5000000|' "$CFG"
 
   # Publish the genesis fingerprint for joining validators (GENESIS_SHA256).
-  if command -v sha256sum >/dev/null 2>&1; then
-    SUM=$(sha256sum "$GENESIS" | cut -d' ' -f1)
+  # Canonical form (sorted keys, compact) so the published hash matches whatever
+  # serialisation a validator fetched it in (RPC-unwrapped or a static file).
+  if command -v jq >/dev/null 2>&1 && jq -cS . "$GENESIS" > "$GENESIS.canon" 2>/dev/null; then
+    GENESIS_HASH_INPUT="$GENESIS.canon"
   else
-    SUM=$(openssl dgst -sha256 "$GENESIS" | sed 's/.*= //')
+    GENESIS_HASH_INPUT="$GENESIS"
   fi
+  if command -v sha256sum >/dev/null 2>&1; then
+    SUM=$(sha256sum "$GENESIS_HASH_INPUT" | cut -d' ' -f1)
+  else
+    SUM=$(openssl dgst -sha256 "$GENESIS_HASH_INPUT" | sed 's/.*= //')
+  fi
+  rm -f "$GENESIS.canon"
   printf '%s\n' "$SUM" > "$HOME_DIR/config/genesis.sha256"
   echo "[genesis] chain_id=$CHAIN_ID sha256=$SUM (publish this with genesis.json)"
 fi

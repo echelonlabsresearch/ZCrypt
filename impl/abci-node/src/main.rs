@@ -519,6 +519,13 @@ fn parse_register(b: &[u8]) -> Option<(String, u8, Option<[u8; 32]>, u64, bool)>
 /// capability can ever authorize a zBTC mint on this chain.
 fn zbtc_requires_spv(ticker: &str, is_spv: bool) -> Result<(), String> {
     use zcrypt_core::asset_registry::{canonical_ticker, ZBTC_TICKER};
+    if canonical_ticker(ticker) == canonical_ticker(ZBTC_TICKER) && !SEED_ENABLED && !cfg!(test) {
+        // Production chains bind the peg's reserve key at genesis; the ticker can never be
+        // claimed by a transaction (first-come hijack, bridge H3 / consensus M4).
+        return Err(format!(
+            "'{ZBTC_TICKER}' is bound from genesis (zbtc_reserve_pk) and cannot be registered by transaction"
+        ));
+    }
     if canonical_ticker(ticker) == canonical_ticker(ZBTC_TICKER) && !is_spv {
         return Err(format!(
             "'{ZBTC_TICKER}' must be registered with a 33-byte Bitcoin reserve pubkey \
@@ -1128,8 +1135,16 @@ impl Application for ZcryptApp {
                 ZBTC_MAX_SUPPLY,
             ) {
                 Ok(id) => eprintln!("[zbtc] reserve key pinned from genesis: asset {id}, reserve {}", hex::encode(pk)),
-                Err(e) => eprintln!("[zbtc] genesis registration skipped ({e})"),
+                Err(e) => panic!("[zbtc] genesis registration failed: {e}"),
             }
+        } else if !SEED_ENABLED && !cfg!(test) {
+            // Production: a missing or malformed reserve key must not silently fall back to
+            // first-come registration of the peg ticker (the race the genesis binding exists
+            // to close). Devnet stacks may run without a bridge.
+            panic!(
+                "production genesis must carry `zbtc_reserve_pk` (66-hex compressed secp256k1 \
+                 reserve public key); see chain/.env.example ZCRYPT_RESERVE_PK"
+            );
         }
         s.app_hash = s.node.state_root();
         ResponseInitChain {
@@ -1310,8 +1325,12 @@ impl ZcryptApp {
             match parse_claim(&tx[1..]) {
                 Some((pk, amount)) => {
                     let bal = s.node.claimable(&pk);
-                    // Full-balance claims only (consensus C2: partial claims shred balances).
-                    if amount == 0 || amount != bal {
+                    // Full-balance claims only (consensus C2: partial claims shred balances),
+                    // and never below the 1 ZCRYPT floor (a forced claim per epoch would
+                    // otherwise still dust a small staker).
+                    if bal < zcrypt_core::emission::MIN_CLAIM {
+                        Err(format!("claimable {bal} is below the 1 ZCRYPT claim minimum (rewards keep accruing)"))
+                    } else if amount == 0 || amount != bal {
                         Err(format!("claim {amount} must equal the full claimable balance {bal}"))
                     } else {
                         Ok(())

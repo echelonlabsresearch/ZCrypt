@@ -69,6 +69,7 @@ fn zcry(v: u64) -> String {
 }
 
 fn main() {
+    zcrypt_bridge::zcrypt::set_broadcast_jitter(false); // e2e driver: no privacy delay on hundreds of broadcasts
     let url = std::env::args().nth(1).unwrap_or_else(|| "http://localhost:46657".to_string());
     let zc = Zcrypt::new(&url);
     let foundation = Account::from_seed([0xF0; 32]);

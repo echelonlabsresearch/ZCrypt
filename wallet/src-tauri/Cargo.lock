@@ -187,6 +187,7 @@ dependencies = [
  "bitcoin_hashes",
  "serde",
  "unicode-normalization",
+ "zeroize",
 ]
 
 [[package]]
@@ -5809,8 +5810,10 @@ dependencies = [
  "serde_json",
  "sha2",
  "ureq",
+ "url",
  "zcrypt-core",
  "zcrypt-shield",
+ "zeroize",
 ]
 
 [[package]]

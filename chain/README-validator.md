@@ -31,7 +31,7 @@ Two things worth doing before you trust it with a bond:
   ```sh
   IMG=$(grep -o 'ghcr.io/[^ ]*@sha256:[0-9a-f]*' docker-compose.validator.yml | head -1)
   cosign verify "$IMG" \
-    --certificate-identity-regexp '^https://github.com/echelonlabsresearch/' \
+    --certificate-identity-regexp '^https://github.com/echelonlabsresearch/zcrypt-v2/\.github/workflows/image\.yml@refs/tags/v' \
     --certificate-oidc-issuer https://token.actions.githubusercontent.com
   ```
 
@@ -100,12 +100,12 @@ curl -s 'localhost:56657/abci_query?path="/staking/validators"'   # your key : s
 
 ### CLI alternative (no wallet)
 
-`./validator-bond.sh` reads the consensus key from the container itself and bonds with a
-reward address (or your recovery phrase) — useful for headless/server setups:
+`./validator-bond.sh` reads the consensus key from the container itself and bonds with the
+reward address the wallet allocated (Rewards, Prepare bond): useful for headless setups.
 
 ```sh
-./validator-bond.sh                               # prompts for your recovery phrase
-ZCRYPT_REWARD_ADDR=<64hex> ./validator-bond.sh    # non-interactive, reward to an address
+ZCRYPT_REWARD_ADDR=<64hex> ./validator-bond.sh    # reward address from the wallet's Prepare bond
+./validator-bond.sh                               # prompts for that reward address
 ./validator-bond.sh http://localhost:56657 20000  # custom RPC + stake
 ```
 

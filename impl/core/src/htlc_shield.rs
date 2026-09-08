@@ -215,6 +215,13 @@ pub struct Claim {
 #[derive(Default, Clone, serde::Serialize, serde::Deserialize)]
 pub struct HtlcBook {
     escrows: BTreeMap<Hash, HtlcEscrow>,
+    /// Ids of PRUNED settled escrows, keyed by their `timeout_height`. An escrow id is a
+    /// deterministic function of its lock parameters, so a pruned id could otherwise be
+    /// re-inserted (same asset, value, hashlock, timeout, party) while that timeout is
+    /// still in the future, and a claim would mint a byte-identical coin commitment (and
+    /// nullifier) to the first one. Ids are retired here until `timeout_height` has passed,
+    /// after which `open` can never recreate them (opens require `timeout > now`).
+    retired: BTreeMap<u64, Vec<Hash>>,
 }
 
 impl HtlcBook {
@@ -236,6 +243,9 @@ impl HtlcBook {
         let id = escrow_id(asset_id, value, &hashlock, timeout_height, &party_pk);
         if self.escrows.contains_key(&id) {
             return Err("escrow already exists".to_string());
+        }
+        if self.retired.get(&timeout_height).is_some_and(|ids| ids.contains(&id)) {
+            return Err("escrow id was already used and settled (change a parameter)".to_string());
         }
         self.escrows.insert(
             id,
@@ -260,11 +270,34 @@ impl HtlcBook {
     /// committed height, so every node prunes identically (the book root moves in lockstep).
     pub fn prune_settled(&mut self, height: u64) -> usize {
         let before = self.escrows.len();
-        self.escrows.retain(|_, e| match e.settled_at {
-            Some(at) => height.saturating_sub(at) < ESCROW_RETENTION_BLOCKS,
-            None => true,
+        let mut pruned: Vec<(u64, Hash)> = Vec::new();
+        self.escrows.retain(|id, e| match e.settled_at {
+            Some(at) if height.saturating_sub(at) >= ESCROW_RETENTION_BLOCKS => {
+                pruned.push((e.timeout_height, *id));
+                false
+            }
+            _ => true,
         });
+        for (timeout, id) in pruned {
+            // Only ids whose lock parameters could still be re-opened need retiring.
+            if timeout > height {
+                let ids = self.retired.entry(timeout).or_default();
+                if !ids.contains(&id) {
+                    ids.push(id);
+                }
+            }
+        }
+        // Retired ids whose timeout has passed can never be recreated: drop them.
+        let expired: Vec<u64> = self.retired.range(..=height).map(|(t, _)| *t).collect();
+        for t in expired {
+            self.retired.remove(&t);
+        }
         before - self.escrows.len()
+    }
+
+    /// Number of retired (pruned but not yet re-openable) escrow ids, for tests and metrics.
+    pub fn retired_len(&self) -> usize {
+        self.retired.values().map(Vec::len).sum()
     }
 
     /// Open a **mint** escrow (BTC→zBTC): claiming mints zBTC to `claim_pk`. For an
@@ -398,6 +431,12 @@ impl HtlcBook {
                 EscrowState::Expired => 2,
             });
             buf.extend_from_slice(&e.settled_at.unwrap_or(u64::MAX).to_le_bytes());
+        }
+        for (timeout, ids) in &self.retired {
+            buf.extend_from_slice(&timeout.to_le_bytes());
+            for id in ids {
+                buf.extend_from_slice(id);
+            }
         }
         h(b"ZC-HTLC", &[&buf])
     }

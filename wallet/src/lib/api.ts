@@ -74,20 +74,38 @@ export async function copy(text: string): Promise<void> {
  * after `clearMs` if it still holds the text; if the clipboard cannot be read back it is
  * cleared unconditionally (security over convenience).
  */
+let lastSecret: string | null = null;
+
 export async function copySensitive(text: string, clearMs = 60_000): Promise<void> {
   await navigator.clipboard.writeText(text);
+  lastSecret = text;
   setTimeout(async () => {
-    try {
-      const cur = await navigator.clipboard.readText();
-      if (cur === text) await navigator.clipboard.writeText("");
-    } catch {
-      try {
-        await navigator.clipboard.writeText("");
-      } catch {
-        /* clipboard unavailable */
-      }
-    }
+    await clearIfStillHolds(text);
   }, clearMs);
+}
+
+async function clearIfStillHolds(text: string): Promise<void> {
+  try {
+    const cur = await navigator.clipboard.readText();
+    if (cur === text) await navigator.clipboard.writeText("");
+  } catch {
+    try {
+      await navigator.clipboard.writeText("");
+    } catch {
+      /* clipboard unavailable */
+    }
+  }
+  if (lastSecret === text) lastSecret = null;
+}
+
+/**
+ * Clear the clipboard NOW if it still holds the last secret copied. Called when the wallet
+ * locks or the window closes, so a lock inside the 60 s window does not leave a recovery
+ * phrase or bearer coin behind.
+ */
+export async function clearSensitiveClipboard(): Promise<void> {
+  if (lastSecret === null) return;
+  await clearIfStillHolds(lastSecret);
 }
 
 /** Save `content` to a real file (Downloads) via the backend; returns its path. */

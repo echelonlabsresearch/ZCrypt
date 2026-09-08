@@ -41,15 +41,21 @@ pub fn set_tor(proxy: Option<String>) {
 }
 
 /// Whether `url`'s host is loopback (Tor is pointless and would break a local connection).
-fn is_loopback_url(url: &str) -> bool {
-    let host = url
-        .trim()
-        .trim_start_matches("http://")
-        .trim_start_matches("https://")
-        .split(['/', ':', '?'])
-        .next()
-        .unwrap_or("");
-    matches!(host, "localhost" | "127.0.0.1" | "::1" | "[::1]")
+/// Parsed with `url::Url`, never by string splitting: `http://localhost:1@evil.test/` has
+/// host `evil.test` (the `localhost:1` is userinfo) and must NOT bypass Tor. Any URL that
+/// carries userinfo, or that does not parse, is treated as remote (fail closed: it routes
+/// through the proxy and, with no proxy configured, simply connects to what it names).
+pub fn is_loopback_url(url: &str) -> bool {
+    let Ok(u) = url::Url::parse(url.trim()) else { return false };
+    if !u.username().is_empty() || u.password().is_some() {
+        return false;
+    }
+    match u.host() {
+        Some(url::Host::Domain(d)) => d.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        None => false,
+    }
 }
 
 /// A `ureq` agent for reaching `target_url`, routed through the configured Tor SOCKS proxy
@@ -98,22 +104,34 @@ pub fn reserve_key_from_wallet_seed(seed: &[u8; 32]) -> Key {
 }
 
 /// A user's Bitcoin HTLC refund key for deposit number `index`, derived from the wallet's
-/// 32-byte seed. Index 0 is the legacy single refund key (`H("BTCALIC", seed)`, what the
-/// wallet used for every deposit); index `n > 0` is `H("BTCALIC", seed ‖ n)`. Using a FRESH
+/// 32-byte seed: `H("BTCALIC", seed ‖ index_le32)` for EVERY index (including 0). This is
+/// the CANONICAL rule and is byte-identical to the desktop wallet's `alice_key_at`, so a
+/// recovery tool built on this crate finds exactly the keys the wallet used. Using a FRESH
 /// index per deposit stops a chain-analysis observer from clustering all of one user's
-/// deposits by their shared refund key in the HTLC scripts (privacy H3).
+/// deposits by their shared refund key in the HTLC scripts (privacy H3). Deposits made by
+/// wallets from before the per-deposit scheme used [`refund_key_legacy`].
 pub fn refund_key_for(seed: &[u8; 32], index: u32) -> Key {
-    if index == 0 {
-        Key::from_bytes(&zcrypt_core::hash::h(b"BTCALIC", &[seed]))
-    } else {
-        Key::from_bytes(&zcrypt_core::hash::h(b"BTCALIC", &[seed, &index.to_le_bytes()]))
-    }
+    Key::from_bytes(&zcrypt_core::hash::h(b"BTCALIC", &[seed, &index.to_le_bytes()]))
+}
+
+/// The pre-per-deposit single refund key, `H("BTCALIC", seed)`. Only for finding or
+/// refunding deposits made before refund keys rotated; never use it for a new deposit.
+pub fn refund_key_legacy(seed: &[u8; 32]) -> Key {
+    Key::from_bytes(&zcrypt_core::hash::h(b"BTCALIC", &[seed]))
 }
 
 /// Parse a 32-byte secp256k1 secret from a file's contents: either 64 hex characters
-/// (whitespace tolerated) or exactly 32 raw bytes.
+/// (whitespace tolerated) or exactly 32 raw bytes. A 32-byte file whose every byte is an
+/// ASCII hex digit is REFUSED as ambiguous (it is almost certainly a truncated hex key,
+/// and reading it as raw bytes would silently derive a different, wrong key).
 pub fn parse_secret_bytes(raw: &[u8]) -> Result<[u8; 32], String> {
     if raw.len() == 32 {
+        if raw.iter().all(|b| b.is_ascii_hexdigit()) {
+            return Err("secret: 32 bytes that are all hex characters is ambiguous (a truncated hex \
+                        key?); write the key as 64 hex characters or as 32 raw bytes that are not \
+                        all ASCII hex"
+                .to_string());
+        }
         return raw.try_into().map_err(|_| "secret: not 32 bytes".to_string());
     }
     let text = std::str::from_utf8(raw).map_err(|_| "secret: neither 32 raw bytes nor hex text")?;
@@ -178,6 +196,21 @@ pub fn htlc_address(script: &ScriptBuf, network: Network) -> Address {
 pub struct Key {
     pub sk: SecretKey,
     pub pk: PublicKey,
+}
+
+impl std::fmt::Debug for Key {
+    /// Redacted: only the public key is ever printed.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Key(pk={})", hex::encode(self.pk.inner.serialize()))
+    }
+}
+
+impl Drop for Key {
+    /// Overwrite the secret scalar when the key goes out of scope (best effort: copies the
+    /// compiler made in registers or moved-from stack slots are not covered).
+    fn drop(&mut self) {
+        self.sk.non_secure_erase();
+    }
 }
 
 impl Key {
@@ -411,33 +444,37 @@ impl Btc {
     /// Split out from [`Self::fund_htlc`] so a daemon can persist the txid the moment it is
     /// on the network: a confirmation wait that times out (or a crash during it) must never
     /// lose track of a broadcast that already happened, or the next attempt would fund the
-    /// same escrow twice (bridge H2).
+    /// same escrow twice (bridge H2). If the node cannot read the tx back right after the
+    /// send (transient RPC error), the wallet's own record of the send is consulted; the
+    /// returned error always names the txid so nothing is ever "lost".
     pub fn fund_htlc_unconfirmed(&self, script: &ScriptBuf, amount: Amount) -> Result<HtlcUtxo, String> {
         let addr = htlc_address(script, self.network);
         let txid = self
             .rpc
             .send_to_address(&addr, amount, None, None, None, None, None, None)
             .map_err(|e| e.to_string())?;
-        // find the vout paying our address
-        let tx = self.rpc.get_raw_transaction(&txid, None).map_err(|e| e.to_string())?;
         let spk = addr.script_pubkey();
-        let (vout, txout) = tx
-            .output
-            .iter()
-            .enumerate()
-            .find(|(_, o)| o.script_pubkey == spk)
-            .ok_or("funding vout not found")?;
-        Ok(HtlcUtxo {
-            outpoint: OutPoint { txid, vout: vout as u32 },
-            value: txout.value,
-            script: script.clone(),
-        })
+        let vout_of = |tx: &Transaction| -> Option<(u32, Amount)> {
+            tx.output.iter().enumerate().find(|(_, o)| o.script_pubkey == spk).map(|(i, o)| (i as u32, o.value))
+        };
+        let tx = match self.rpc.get_raw_transaction(&txid, None) {
+            Ok(tx) => tx,
+            // Fall back to the wallet's own copy of the tx it just sent.
+            Err(_) => match self.rpc.get_transaction(&txid, Some(true)) {
+                Ok(info) => bitcoin::consensus::deserialize(&info.hex)
+                    .map_err(|e| format!("funding {txid} BROADCAST but unreadable ({e}); it will be rediscovered"))?,
+                Err(e) => return Err(format!("funding {txid} BROADCAST but unreadable ({e}); it will be rediscovered")),
+            },
+        };
+        let (vout, value) = vout_of(&tx).ok_or_else(|| format!("funding {txid} BROADCAST but its HTLC vout was not found"))?;
+        Ok(HtlcUtxo { outpoint: OutPoint { txid, vout }, value, script: script.clone() })
     }
 
-    /// Every unspent output currently locked to `script`'s P2WSH address (confirmed UTXO
-    /// set via `scantxoutset`). Lets a daemon discover an HTLC it already funded before it
-    /// funds again, and lets a user resume a deposit whose funding landed but whose flow
-    /// aborted before the SPV open (bridge H2 / L3).
+    /// Every output currently locked to `script`'s P2WSH address that this node can see:
+    /// the CONFIRMED UTXO set (`scantxoutset`) PLUS this wallet's own UNCONFIRMED sends to
+    /// that address (`listtransactions`), so a funding that is still in the mempool after a
+    /// crash or a transient RPC error is found before the daemon funds again (bridge H2 /
+    /// L3). A user resuming a deposit uses the same lookup.
     pub fn htlc_utxos(&self, script: &ScriptBuf) -> Result<Vec<HtlcUtxo>, String> {
         use serde_json::json;
         let addr = htlc_address(script, self.network);
@@ -454,7 +491,42 @@ impl Btc {
             let txid = Txid::from_str(txid_str).map_err(|e| e.to_string())?;
             out.push(HtlcUtxo { outpoint: OutPoint { txid, vout }, value: Amount::from_sat(sats), script: script.clone() });
         }
+        // Own unconfirmed sends (mempool) to the HTLC address.
+        let addr_s = addr.to_string();
+        let lt: serde_json::Value = self
+            .rpc
+            .call("listtransactions", &[json!("*"), json!(1000), json!(0), json!(true)])
+            .unwrap_or(serde_json::Value::Null);
+        for t in lt.as_array().into_iter().flatten() {
+            if t["category"].as_str() != Some("send") || t["address"].as_str() != Some(addr_s.as_str()) {
+                continue;
+            }
+            if t["abandoned"].as_bool().unwrap_or(false) || t["confirmations"].as_i64().unwrap_or(0) < 0 {
+                continue;
+            }
+            let (Some(txid_str), Some(vout)) = (t["txid"].as_str(), t["vout"].as_u64()) else { continue };
+            let Ok(txid) = Txid::from_str(txid_str) else { continue };
+            let vout = vout as u32;
+            if out.iter().any(|u| u.outpoint.txid == txid && u.outpoint.vout == vout) {
+                continue;
+            }
+            // listtransactions reports sends as negative BTC amounts.
+            let sats = (t["amount"].as_f64().unwrap_or(0.0).abs() * 1e8).round() as u64;
+            out.push(HtlcUtxo { outpoint: OutPoint { txid, vout }, value: Amount::from_sat(sats), script: script.clone() });
+        }
         Ok(out)
+    }
+
+    /// Whether `utxo` is still unspent on this node's CONFIRMED chain (`gettxout` without
+    /// the mempool). `Some(false)` means a confirmed spend exists; the block scan that
+    /// extracts the preimage can then be limited to spent outputs (bridge N8).
+    pub fn utxo_unspent(&self, utxo: &HtlcUtxo) -> Result<Option<bool>, String> {
+        use serde_json::json;
+        let v: serde_json::Value = self
+            .rpc
+            .call("gettxout", &[json!(utxo.outpoint.txid.to_string()), json!(utxo.outpoint.vout), json!(false)])
+            .map_err(|e| e.to_string())?;
+        Ok(Some(!v.is_null()))
     }
 
     /// The hash of the block `txid` is confirmed in on this node's best chain (internal
@@ -616,6 +688,13 @@ pub trait BtcBackend {
     fn tx_block_hash(&self, _txid: &Txid) -> Result<Option<[u8; 32]>, String> {
         Err("tx_block_hash not supported by this backend".to_string())
     }
+    /// Whether `utxo` is still unspent on the CONFIRMED chain: `Some(true)` unspent,
+    /// `Some(false)` spent, `None` if this backend cannot tell. Lets the redeem watcher skip
+    /// block scans for outputs nobody has touched (bridge N8) and drives the refund-versus-
+    /// claim race after a refund broadcast (bridge N4).
+    fn utxo_unspent(&self, _utxo: &HtlcUtxo) -> Result<Option<bool>, String> {
+        Ok(None)
+    }
     /// If the HTLC `utxo` has been spent via its CLAIM branch (revealing the preimage), return
     /// that preimage; `None` if still unspent or spent via the refund branch. Lets the redeem
     /// watcher detect the user's BTC claim and finalize the burn autonomously, without being
@@ -674,6 +753,9 @@ impl BtcBackend for Btc {
     }
     fn tx_block_hash(&self, txid: &Txid) -> Result<Option<[u8; 32]>, String> {
         Btc::tx_block_hash(self, txid)
+    }
+    fn utxo_unspent(&self, utxo: &HtlcUtxo) -> Result<Option<bool>, String> {
+        Btc::utxo_unspent(self, utxo)
     }
     fn fee_rate_sat_vb(&self, target: u32) -> Result<f64, String> {
         // Regtest has no fee market; use a nominal 1 sat/vB.

@@ -232,7 +232,7 @@ pub struct NodeSnapshot {
 /// v10: role-tagged Poseidon lanes, `SpvDeposit::btc_locktime`, escrow `settled_at`,
 /// the sentinel's decay rule, and block-boundary anchor roots. Positional layout change,
 /// so older state refuses to load (the chain relaunches fresh with these consensus changes).
-const SNAPSHOT_VERSION: u32 = 10;
+const SNAPSHOT_VERSION: u32 = 11;
 /// Public mirror of the postcard snapshot format version (for `state_db` restore).
 pub const SNAPSHOT_VERSION_PUB: u32 = SNAPSHOT_VERSION;
 
@@ -433,8 +433,29 @@ impl Node {
                 &self.spv.root(),
                 &self.immature_root(),
                 &self.sentinel_root(),
+                &self.anchor_roots_digest(),
             ],
         )
+    }
+
+    /// Digest of the anchor-root history (block roots + intra-block roots), folded into the
+    /// app_hash so two nodes that disagree on which anchors are valid diverge at the next
+    /// commit instead of silently accepting different shield transactions.
+    fn anchor_roots_digest(&self) -> Hash {
+        let mut buf = Vec::with_capacity(64 * (self.block_roots.len() + self.recent_roots.len()) + 16);
+        buf.extend_from_slice(&(self.block_roots.len() as u64).to_le_bytes());
+        for r in &self.block_roots {
+            for x in r {
+                buf.extend_from_slice(&x.to_le_bytes());
+            }
+        }
+        buf.extend_from_slice(&(self.recent_roots.len() as u64).to_le_bytes());
+        for r in &self.recent_roots {
+            for x in r {
+                buf.extend_from_slice(&x.to_le_bytes());
+            }
+        }
+        crate::hash::h(b"ZCRYPT-ANCHORS", &[&buf])
     }
 
     /// Digest of the sentinel state, folded into the app_hash (L1): a node restored
@@ -759,6 +780,15 @@ impl Node {
         }
         if !self.spv.is_claimed(&op) {
             return Err("reanchor: deposit outpoint is not in the claimed set".to_string());
+        }
+        // A re-anchor must change something: the deposit was orphaned, or the proof names
+        // a different block. Otherwise the same valid proof could be replayed every block
+        // at zero cost, each copy paying for a full SPV verification.
+        {
+            let m = &self.immature[idx];
+            if m.orphaned_at_btc.is_none() && m.deposit_block == new_block {
+                return Err("reanchor: deposit is already anchored to that block".to_string());
+            }
         }
         let m = &mut self.immature[idx];
         m.deposit_block = new_block;
@@ -1414,7 +1444,7 @@ impl Node {
         let addr = crate::keys::reward_address(pk);
         // VM gate: same shape as a staking claim (positive, and the FULL claimable balance).
         let bal = self.staking.claimable_fee(&addr, asset_id);
-        gate(zvm::CLAIM, &zvm::Ctx { amount, claimable: bal, ..Default::default() })?;
+        gate(zvm::CLAIM_FEE, &zvm::Ctx { amount, claimable: bal, ..Default::default() })?;
         self.staking.debit_fee(&addr, asset_id, amount)?;
         // Mint the claimed fee as asset coins, split into circuit-provable chunks.
         let mut coins = Vec::new();

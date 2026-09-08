@@ -6,6 +6,8 @@ import { CopyButton } from "./Share";
 interface Status {
   btc_connected: boolean;
   btc_balance: number;
+  /** Whether the Bitcoin side was queried at all (only on explicit request). */
+  btc_checked: boolean;
   zbtc_asset: number;
   /** Spendable zBTC (matured — in the on-chain tree). */
   zbtc_balance: number;
@@ -44,16 +46,19 @@ export default function Bridge({
   const [progress, setProgress] = useState<Progress | null>(null);
   const [fixMsg, setFixMsg] = useState("");
 
-  const load = useCallback(async () => {
+  // `withBtc` = also ask the Esplora server for the Bitcoin balance. Off for every
+  // automatic refresh: a hosted Esplora learns the deposit address of whoever asks, so
+  // the Bitcoin side is only queried when the user clicks "Check Bitcoin".
+  const load = useCallback(async (withBtc = false) => {
     try {
-      setStatus(await call<Status>("bridge_status"));
+      setStatus(await call<Status>("bridge_status", { withBtc }));
     } catch {
       setStatus(null);
     }
   }, []);
 
   useEffect(() => {
-    if (active) load();
+    if (active) load(false);
   }, [active, load]);
 
   // While any zBTC is maturing, relay fresh Bitcoin headers to the chain and refresh,
@@ -66,7 +71,7 @@ export default function Bridge({
       } catch {
         /* best-effort */
       }
-      await load();
+      await load(false);
     }, 15_000);
     return () => clearInterval(t);
   }, [active, status, load]);
@@ -185,8 +190,15 @@ export default function Bridge({
           <div className="bridge-stat">
             <span className="util">Bitcoin ({status?.btc_network ?? "…"})</span>
             <div className="reward-amount" style={{ fontSize: "1.5rem", color: "var(--color-cyan)" }}>
-              {status?.btc_connected ? `${status.btc_balance.toFixed(4)} BTC` : "— not connected"}
+              {status?.btc_checked
+                ? status.btc_connected
+                  ? `${status.btc_balance.toFixed(4)} BTC`
+                  : "— not connected"
+                : "not checked"}
             </div>
+            <button className="btn-secondary" style={{ marginTop: 6 }} onClick={() => load(true)} title="Asks your Esplora server about your deposit address (reveals it to that server)">
+              {status?.btc_checked ? "🔄 Re-check Bitcoin" : "Check Bitcoin"}
+            </button>
           </div>
           <div className="bridge-stat">
             <span className="util">Shielded zBTC (spendable)</span>
@@ -343,7 +355,7 @@ export default function Bridge({
         )}
 
         <div style={{ display: "flex", gap: "1rem", marginTop: "0.8rem", flexWrap: "wrap" }}>
-          <button className="btn-link" disabled={busy !== ""} onClick={load}>
+          <button className="btn-link" disabled={busy !== ""} onClick={() => load()}>
             ↻ Refresh
           </button>
           <button

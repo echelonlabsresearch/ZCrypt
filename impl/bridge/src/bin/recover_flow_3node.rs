@@ -47,6 +47,7 @@ fn scan_for(zc: &Zcrypt, who: &Account, from: i64, to: i64) -> Option<Coin> {
 const FEE: u64 = zcrypt_core::emission::MIN_FEE;
 
 fn main() {
+    zcrypt_bridge::zcrypt::set_broadcast_jitter(false); // e2e driver: no privacy delay on hundreds of broadcasts
     let url = std::env::args().nth(1).unwrap_or_else(|| "http://localhost:46657".to_string());
     let zc = Zcrypt::new(&url);
     println!("== mnemonic recover -> spend over the LIVE chain {url} ==");

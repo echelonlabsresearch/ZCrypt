@@ -125,6 +125,7 @@ fn pledge(zc: &Zcrypt, owner: &Account, stake: u64) -> (shield_tx::ShieldTx, Bli
 }
 
 fn main() {
+    zcrypt_bridge::zcrypt::set_broadcast_jitter(false); // e2e driver: no privacy delay on hundreds of broadcasts
     let zc_url = std::env::var("ZC_URL").unwrap_or_else(|_| "http://localhost:46657".into());
     let btc_url = std::env::var("BTC_URL").unwrap_or_else(|_| "http://localhost:28443".into());
     let seedhex = std::env::var("VALIDATOR_SEED_HEX").expect("set VALIDATOR_SEED_HEX (node0 consensus seed)");

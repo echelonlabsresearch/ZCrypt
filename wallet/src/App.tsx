@@ -1,5 +1,5 @@
 import { useEffect, useState, useCallback } from "react";
-import { call, fmt, fmtAsset, trunc, copy, copySensitive } from "./lib/api";
+import { call, fmt, fmtAsset, trunc, copy, copySensitive, clearSensitiveClipboard } from "./lib/api";
 import Balance from "./components/Balance";
 import Send from "./components/Send";
 import Receive from "./components/Receive";
@@ -136,6 +136,7 @@ export default function App() {
   }
 
   async function lock() {
+    await clearSensitiveClipboard();
     await call("lock_wallet").catch(() => {});
     setPw("");
     setMode("unlock");

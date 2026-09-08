@@ -449,6 +449,12 @@ fn decode_note(b: &[u8]) -> Option<(u64, Blind, u64)> {
         zcrypt_shield::field_limb(u64::from_le_bytes(b[8 + i * 8..16 + i * 8].try_into().unwrap()))
     });
     let asset_id = u64::from_le_bytes(b[40..48].try_into().ok()?);
+    // The commitment lane is the asset id reduced into the field, so a sender could write
+    // `id + p` and the recipient would recompute the same commitment while displaying an
+    // unknown asset. Only canonical ids are accepted (registry ids always are).
+    if asset_id >= zcrypt_shield::FIELD_ORDER {
+        return None;
+    }
     Some((value, blind, asset_id))
 }
 
@@ -695,6 +701,9 @@ impl BearerCoin {
             zcrypt_shield::field_limb(u64::from_le_bytes(b[40 + i * 8..48 + i * 8].try_into().unwrap()))
         });
         let asset_id = u64::from_le_bytes(b[104..112].try_into().ok()?);
+        if asset_id >= zcrypt_shield::FIELD_ORDER {
+            return None; // non-canonical asset lane (see decode_note)
+        }
         Some(BearerCoin {
             coin: Coin {
                 value,

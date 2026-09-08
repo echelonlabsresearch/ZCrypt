@@ -53,9 +53,12 @@ impl HdWallet {
     /// to give the demo bridge/LP (account 1) addresses distinct from the user (account 0)
     /// under a single mnemonic.
     pub fn from_mnemonic_account(mnemonic: &str, passphrase: &str, network: Network, account_index: u32) -> Result<Self, String> {
-        let mn = bip39::Mnemonic::parse(mnemonic.trim()).map_err(|e| format!("invalid mnemonic: {e}"))?;
-        let seed = mn.to_seed(passphrase); // 64-byte BIP-39 seed
-        let master = Xpriv::new_master(network, &seed).map_err(|e| e.to_string())?;
+        // The mnemonic (bip39 `zeroize` feature) and the 64-byte seed are wiped on drop.
+        let mn = zeroize::Zeroizing::new(
+            bip39::Mnemonic::parse(mnemonic.trim()).map_err(|e| format!("invalid mnemonic: {e}"))?,
+        );
+        let seed = zeroize::Zeroizing::new(mn.to_seed(passphrase)); // 64-byte BIP-39 seed
+        let master = Xpriv::new_master(network, seed.as_ref()).map_err(|e| e.to_string())?;
         let secp = Secp256k1::signing_only();
         let path = DerivationPath::from_str(&format!("m/84'/{}'/{account_index}'", coin_type(network)))
             .map_err(|e| e.to_string())?;

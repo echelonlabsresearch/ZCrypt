@@ -31,6 +31,10 @@ pub const ATOMIC: u64 = 1_000_000;
 /// nonce-protected), so they do not debit the released value. A flat floor: a sender may
 /// always pay more.
 pub const MIN_FEE: u64 = ATOMIC / 100; // 0.01 ZCRYPT = 10,000 atomic units
+/// Smallest claimable balance a CLAIM (0x58) may take: 1 ZCRYPT (100 x MIN_FEE). Claims are
+/// unauthenticated and full-balance, so without a floor a third party could force one
+/// sub-gas dust coin per epoch onto a small staker. Rewards below the floor keep accruing.
+pub const MIN_CLAIM: u64 = 100 * MIN_FEE;
 
 /// Bridge value-capture fee, in basis points of the bridged amount (10 bps = 0.1%).
 /// A small proportional cut of every zBTC mint is retained by the protocol (taken at

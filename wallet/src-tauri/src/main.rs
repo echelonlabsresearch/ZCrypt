@@ -106,6 +106,47 @@ struct CoinRec {
     #[serde(skip)]
     coin: Coin,
     spent: bool,
+    /// Position in the on-chain commitment tree once this wallet has OBSERVED the coin as
+    /// a leaf (`None` for a coin just created by a send or claim and not yet seen in a leaf
+    /// snapshot). Only an observed coin, or one older than the reconcile grace window, may
+    /// ever be reconciled away as stale.
+    #[serde(default)]
+    leaf_index: Option<u32>,
+    /// Chain height at which the wallet learned of the coin (the tip right after the send
+    /// that created it, or the scan tip). The stale-coin reconcile never touches a coin
+    /// younger than the scan's own starting tip minus the grace window, so a send that
+    /// commits while a scan is in flight cannot lose its change.
+    #[serde(default)]
+    born: i64,
+    /// Set when the stale-coin reconcile marked the coin spent WITHOUT an observed spend of
+    /// its nullifier; cleared (and the coin revived) if a later scan finds the leaf and
+    /// still no spend.
+    #[serde(default)]
+    dropped_stale: bool,
+}
+
+impl CoinRec {
+    /// A coin this wallet just created or reconstructed but has not yet seen in a leaf
+    /// snapshot (a send's change, a claim, a maturing SPV mint).
+    fn new(coin: Coin, born: i64) -> CoinRec {
+        let com = coin.commitment();
+        CoinRec {
+            coin_id: hex::encode(com[0].to_le_bytes()),
+            value: coin.value,
+            coin,
+            spent: false,
+            leaf_index: None,
+            born,
+            dropped_stale: false,
+        }
+    }
+
+    /// A coin observed in the on-chain tree at `leaf_index`.
+    fn observed(coin: Coin, leaf_index: Option<u32>, born: i64) -> CoinRec {
+        let mut c = CoinRec::new(coin, born);
+        c.leaf_index = leaf_index;
+        c
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -144,7 +185,23 @@ struct ActionKey {
     /// Validator consensus pubkey hex for bond/delegate; empty otherwise.
     #[serde(default)]
     target: String,
+    /// The key is the wallet's main (Normal) account, not `stealth(index)`: a bond made
+    /// through the CLI tool or a delegation from before per-action keys bound
+    /// `H(Normal pk)` as its reward address. Kept so those rewards stay visible and
+    /// claimable; new actions never use the main key.
+    #[serde(default)]
+    legacy: bool,
 }
+
+/// One reward key this wallet has bound at bond / delegate time.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct RewardKey {
+    index: u32,
+    legacy: bool,
+}
+
+/// Sentinel index the block scanner uses for the main account's legacy reward address.
+const LEGACY_IDX: u32 = u32::MAX;
 
 /// An HTLC escrow one of our keys is party to, recorded from the chain so the coin a
 /// claim or an expiry re-materializes can be reconstructed locally (no node query).
@@ -162,6 +219,27 @@ struct EscrowRec {
     /// SPV-backed mint (the settled coin is net of the bridge fee).
     #[serde(default)]
     spv: bool,
+}
+
+/// A BTC to zBTC deposit this wallet STARTED: everything needed to pick it back up from
+/// the funding UTXO alone if the flow dies after the Bitcoin HTLC was broadcast (bridge
+/// L3). Recorded (and saved) BEFORE any BTC moves; removed once the zBTC is claimed.
+#[derive(Clone, Serialize, Deserialize)]
+struct PendingDeposit {
+    /// HD index: the zBTC claimer key AND the Bitcoin refund key of this deposit.
+    index: u32,
+    /// The 32-byte HTLC preimage (hex); its hash is the hashlock in the Bitcoin script.
+    preimage_hex: String,
+    #[serde(with = "u64_str")]
+    value_sats: u64,
+    #[serde(with = "u64_str")]
+    asset_id: u64,
+    /// Bitcoin tip when the flow started (the HTLC locktime is tip-at-funding + lock blocks).
+    #[serde(with = "u64_str")]
+    btc_tip: u64,
+    /// Wallet clock when recorded (display only).
+    #[serde(default)]
+    started: u64,
 }
 
 struct Wallet {
@@ -198,6 +276,8 @@ struct Wallet {
     fee_claim_counters: std::collections::BTreeMap<String, u64>,
     /// Escrows one of our keys is party to (for local settlement-coin reconstruction).
     escrows: Vec<EscrowRec>,
+    /// BTC to zBTC deposits started but not yet completed (resumable, see `bridge_recover`).
+    pending_deposits: Vec<PendingDeposit>,
 }
 
 impl Wallet {
@@ -218,6 +298,7 @@ impl Wallet {
             claim_counters: Default::default(),
             fee_claim_counters: Default::default(),
             escrows: vec![],
+            pending_deposits: vec![],
         }
     }
 
@@ -231,12 +312,43 @@ impl Wallet {
 
     /// Record that HD index `index` was used for `kind` (idempotent).
     fn note_action(&mut self, index: u32, kind: &str, target: &str) {
-        if !self.action_keys.iter().any(|a| a.index == index && a.kind == kind && a.target == target) {
-            self.action_keys.push(ActionKey { index, kind: kind.into(), target: target.into() });
+        if !self.action_keys.iter().any(|a| !a.legacy && a.index == index && a.kind == kind && a.target == target) {
+            self.action_keys.push(ActionKey { index, kind: kind.into(), target: target.into(), legacy: false });
         }
         if index >= self.next_change {
             self.next_change = index + 1;
         }
+    }
+
+    /// Record a legacy action bound to the MAIN account's reward address (recovered from a
+    /// chain scan; never created by this wallet's own flows).
+    fn note_legacy_action(&mut self, kind: &str, target: &str) {
+        if !self.action_keys.iter().any(|a| a.legacy && a.kind == kind && a.target == target) {
+            self.action_keys.push(ActionKey { index: 0, kind: kind.into(), target: target.into(), legacy: true });
+        }
+    }
+
+    /// The account behind a reward key: a stealth sub-account, or the main account for a
+    /// legacy binding.
+    fn reward_account(&self, k: RewardKey) -> Account {
+        if k.legacy {
+            Account::from_seed(*Zeroizing::new(self.account.seed()))
+        } else {
+            self.key_at(k.index)
+        }
+    }
+
+    /// Every reward key this wallet has bound (every bond and delegation), deduplicated.
+    fn reward_keys(&self) -> Vec<RewardKey> {
+        let mut v: Vec<RewardKey> = self
+            .action_keys
+            .iter()
+            .filter(|a| a.kind == "bond" || a.kind == "delegate")
+            .map(|a| RewardKey { index: if a.legacy { 0 } else { a.index }, legacy: a.legacy })
+            .collect();
+        v.sort_unstable_by_key(|k| (k.legacy, k.index));
+        v.dedup();
+        v
     }
 
     /// The stealth sub-account at HD `index`.
@@ -244,18 +356,6 @@ impl Wallet {
         self.account.stealth(index)
     }
 
-    /// HD indices bound as REWARD keys (every bond and delegation), deduplicated.
-    fn reward_indices(&self) -> Vec<u32> {
-        let mut v: Vec<u32> = self
-            .action_keys
-            .iter()
-            .filter(|a| a.kind == "bond" || a.kind == "delegate")
-            .map(|a| a.index)
-            .collect();
-        v.sort_unstable();
-        v.dedup();
-        v
-    }
 }
 
 impl Wallet {
@@ -381,6 +481,12 @@ struct PersistCoin {
     #[serde(default)]
     asset_id: u64, // 0 = native ZCRYPT (default for coins saved before assets)
     spent: bool,
+    #[serde(default)]
+    leaf_index: Option<u32>,
+    #[serde(default)]
+    born: i64,
+    #[serde(default)]
+    dropped_stale: bool,
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -405,6 +511,8 @@ struct PersistState {
     fee_claim_counters: std::collections::BTreeMap<String, u64>,
     #[serde(default)]
     escrows: Vec<EscrowRec>,
+    #[serde(default)]
+    pending_deposits: Vec<PendingDeposit>,
 }
 
 // Encryption key for the coin store, bound to the account seed (available while
@@ -429,6 +537,9 @@ fn save_state(w: &Wallet, dir: &str) -> Result<(), String> {
                 spend_secret: c.coin.spend_secret,
                 asset_id: c.coin.asset_id,
                 spent: c.spent,
+                leaf_index: c.leaf_index,
+                born: c.born,
+                dropped_stale: c.dropped_stale,
             })
             .collect(),
         history: w.history.clone(),
@@ -442,6 +553,7 @@ fn save_state(w: &Wallet, dir: &str) -> Result<(), String> {
         claim_counters: w.claim_counters.clone(),
         fee_claim_counters: w.fee_claim_counters.clone(),
         escrows: w.escrows.clone(),
+        pending_deposits: w.pending_deposits.clone(),
     };
     // The plaintext holds every spend secret: keep it in a zeroizing buffer.
     let json = Zeroizing::new(serde_json::to_vec(&ps).map_err(|e| e.to_string())?);
@@ -491,6 +603,9 @@ fn load_state(w: &mut Wallet, dir: &str) {
             value: c.value,
             coin: Coin { value: c.value, blind: c.blind, spend_secret: c.spend_secret, asset_id: c.asset_id },
             spent: c.spent,
+            leaf_index: c.leaf_index,
+            born: c.born,
+            dropped_stale: c.dropped_stale,
         })
         .collect();
     w.history = ps.history;
@@ -504,6 +619,7 @@ fn load_state(w: &mut Wallet, dir: &str) {
     w.claim_counters = ps.claim_counters;
     w.fee_claim_counters = ps.fee_claim_counters;
     w.escrows = ps.escrows;
+    w.pending_deposits = ps.pending_deposits;
     // Every logged action index must stay inside the scan window.
     if let Some(m) = w.action_keys.iter().map(|a| a.index).max() {
         if m >= w.next_change {
@@ -728,6 +844,9 @@ fn get_balance(state: State<AppState>) -> R<Balance> {
 }
 
 /// Demo issuance: credit the wallet with a fresh coin it owns.
+/// Devnet demo only (off-chain coin issuance for UI testing); never registered in a
+/// production build, because it credits coins that do not exist on any chain.
+#[cfg(feature = "devnet")]
 #[tauri::command]
 fn mint_coins(amount: u64, state: State<AppState>) -> R<String> {
     with_wallet(&state, |w| {
@@ -735,7 +854,8 @@ fn mint_coins(amount: u64, state: State<AppState>) -> R<String> {
         let (_commitment, note) = keys::send(&w.account.normal_address(), amount);
         let coin = w.account.receive(&note).ok_or("mint failed")?;
         let id = hex::encode(&coin.commitment()[0].to_le_bytes());
-        w.coins.push(CoinRec { coin_id: id.clone(), value: amount, coin, spent: false });
+        let born = w.scan_height;
+        w.coins.push(CoinRec::new(coin, born));
         w.push_hist("mint", amount as i64, "issuance".into(), zcrypt_shield::ASSET_ZCRYPT);
         Ok(id)
     })
@@ -743,6 +863,7 @@ fn mint_coins(amount: u64, state: State<AppState>) -> R<String> {
 }
 
 #[derive(Serialize)]
+#[cfg_attr(not(feature = "devnet"), allow(dead_code))]
 struct SentTransfer {
     note: String,       // base64 note the recipient imports (bech32-ish blob)
     commitment: String,
@@ -750,6 +871,9 @@ struct SentTransfer {
 
 /// Send `amount` to a `zc1…` address. Produces the recipient's coin commitment +
 /// an encrypted note (ML-KEM) they import to receive. Marks local coins spent.
+/// Devnet demo only (off-chain note hand-off with NO transaction); never registered in a
+/// production build, because it marks real on-chain coins spent locally without a spend.
+#[cfg(feature = "devnet")]
 #[tauri::command]
 fn send_coin(recipient: String, amount: u64, state: State<AppState>) -> R<SentTransfer> {
     with_wallet(&state, |w| {
@@ -774,8 +898,8 @@ fn send_coin(recipient: String, amount: u64, state: State<AppState>) -> R<SentTr
             let change = (-remaining) as u64;
             let (_c, cn) = keys::send(&w.account.normal_address(), change);
             if let Some(coin) = w.account.receive(&cn) {
-                let id = hex::encode(&coin.commitment()[0].to_le_bytes());
-                w.coins.push(CoinRec { coin_id: id, value: change, coin, spent: false });
+                let born = w.scan_height;
+                w.coins.push(CoinRec::new(coin, born));
             }
         }
         w.push_hist("send", -(amount as i64), short(&recipient), zcrypt_shield::ASSET_ZCRYPT);
@@ -828,7 +952,8 @@ fn receive_coin(note: String, state: State<AppState>) -> R<Received> {
         }
         // Never credit a phantom: the commitment must already be a leaf of the
         // on-chain tree (the sender's transaction must have been committed).
-        if chain::find_index(&leaves, &coin.commitment()).is_none() {
+        let leaf_idx = chain::find_index(&leaves, &coin.commitment());
+        if leaf_idx.is_none() {
             return Err(
                 "this note's coin is not on the chain yet (the payment may still be pending). \
                  Ask the sender to confirm it went through, then import it again."
@@ -838,7 +963,8 @@ fn receive_coin(note: String, state: State<AppState>) -> R<Received> {
         let id = hex::encode(coin.commitment()[0].to_le_bytes());
         let value = coin.value;
         let asset = coin.asset_id;
-        w.coins.push(CoinRec { coin_id: id.clone(), value, coin, spent: false });
+        let born = tip_or(&url, w);
+        w.coins.push(CoinRec::observed(coin, leaf_idx, born));
         w.push_hist("receive", value as i64, "incoming".into(), asset);
         let (ticker, decimals) = asset_label(&url, asset);
         Ok(Received { amount: value, coin_id: id, ticker, decimals })
@@ -928,7 +1054,8 @@ fn claim_bearer(token: String, state: State<AppState>) -> R<Received> {
         }
         let mine = w.account.own_asset_coin(net, blind_a, bcoin.asset_id);
         let id = hex::encode(mine.commitment()[0].to_le_bytes());
-        w.coins.push(CoinRec { coin_id: id.clone(), value: net, coin: mine, spent: false });
+        let born = tip_or(&url, w);
+        w.coins.push(CoinRec::new(mine, born));
         w.push_hist("receive", net as i64, "bearer claim".into(), bcoin.asset_id);
         let (ticker, decimals) = asset_label(&url, bcoin.asset_id);
         Ok(Received { amount: net, coin_id: id, ticker, decimals })
@@ -1151,6 +1278,73 @@ mod reshape_tests {
 }
 
 #[cfg(test)]
+mod scan_tests {
+    use super::*;
+
+    #[test]
+    fn cursor_never_advances_past_an_unfinished_gap_walk() {
+        // N1: the pass cap was hit while a wider key window was still needed: stay put.
+        assert_eq!(next_scan_height(true, 100, 500), 100);
+        // Normal completion advances to the covered height, never backwards.
+        assert_eq!(next_scan_height(false, 100, 500), 500);
+        assert_eq!(next_scan_height(false, 600, 500), 600);
+        // Gap rule: a key within 20 of the window edge asks for widening.
+        assert!(gap_needs_widening(Some(85), 100));
+        assert!(!gap_needs_widening(Some(70), 100));
+        assert!(!gap_needs_widening(None, 100));
+    }
+
+    #[test]
+    fn fresh_coins_survive_a_racing_reconcile_but_observed_or_old_ones_do_not() {
+        // N3: a coin born at (or after) the scan's starting tip is never dropped.
+        let (acct, _m) = keys::new_account();
+        let coin = acct.own_coin(5, keys::random_blind());
+        let fresh = CoinRec::new(coin, 1_000);
+        assert!(!stale_droppable(&fresh, 1_000));
+        assert!(!stale_droppable(&fresh, 1_000 + RECONCILE_GRACE_BLOCKS - 1));
+        assert!(stale_droppable(&fresh, 1_000 + RECONCILE_GRACE_BLOCKS));
+        // A coin already observed as a leaf may be dropped when it vanishes (chain reset).
+        let seen = CoinRec::observed(coin, Some(7), 1_000);
+        assert!(stale_droppable(&seen, 1_000));
+    }
+
+    #[test]
+    fn claim_counters_do_not_double_advance_across_gap_walk_passes() {
+        // N2: two passes over the SAME blocks, both seeded from the pre-scan snapshot, must
+        // agree; seeding pass 2 from pass 1's output (the old behaviour) doubles the counter.
+        use std::collections::{HashMap, HashSet};
+        let (acct, _m) = keys::new_account();
+        let amount = 5 * zcrypt_core::emission::ATOMIC;
+        let pk = acct.pubkey();
+        let mut tx = vec![0x58u8];
+        tx.extend_from_slice(&pk64(&pk));
+        tx.extend_from_slice(&amount.to_le_bytes());
+        let chunks = keys::claim_chunks(amount, true);
+        let leaves: Vec<zcrypt_shield::Commitment> =
+            chunks.iter().enumerate().map(|(k, c)| acct.reward_coin(*c, k as u64).commitment()).collect();
+        let blocks = vec![(1i64, vec![tx])];
+        let mut by_pk = HashMap::new();
+        by_pk.insert(pk64(&pk), 0usize);
+        let keys = ScanKeys { accounts: vec![(None, acct)], by_pk, by_reward: HashMap::new(), by_delegator: HashMap::new() };
+        let seed = std::collections::BTreeMap::new();
+        let key = hex::encode(pk64(&pk));
+        let known = HashSet::new();
+        let own_nf = HashMap::new();
+        let p1 = scan_pass(&blocks, &keys, &leaves, &known, &own_nf, &[], &seed, &seed);
+        assert_eq!(p1.coins.len(), chunks.len());
+        assert_eq!(p1.claim_counters.get(&key).copied(), Some(chunks.len() as u64));
+        // Pass 2 seeded from the SNAPSHOT (fixed behaviour): identical counters.
+        let p2 = scan_pass(&blocks, &keys, &leaves, &known, &own_nf, &[], &seed, &seed);
+        assert_eq!(p2.claim_counters, p1.claim_counters);
+        // Pass 2 seeded from pass 1's OUTPUT (the old behaviour): the counter runs AHEAD of
+        // the chain (the same claim is counted again), which is exactly what made a restored
+        // wallet reconstruct later claims at the wrong indices.
+        let p2_bug = scan_pass(&blocks, &keys, &leaves, &known, &own_nf, &[], &p1.claim_counters, &p1.fee_claim_counters);
+        assert!(p2_bug.claim_counters.get(&key).copied().unwrap() > chunks.len() as u64);
+    }
+}
+
+#[cfg(test)]
 mod tor_tests {
     use super::*;
 
@@ -1234,6 +1428,33 @@ fn load_settings(dir: &str) -> Settings {
     s
 }
 
+/// Esplora endpoint policy (privacy M3 residual): the same rule as the node URL. A remote
+/// Esplora must be https or a .onion; plain http to a clearnet host would let a Tor exit
+/// read every address the wallet looks up. Only enforced when self-custody (Esplora) mode
+/// is actually in use on a real network.
+fn check_esplora_policy(s: &Settings) -> Result<(), String> {
+    if s.btc_selfcustody && zcrypt_bridge::network_from_str(&s.btc_network) != bitcoin::Network::Regtest {
+        chain::check_node_url(&s.esplora_url).map_err(|e| format!("Esplora endpoint: {e}"))?;
+    }
+    Ok(())
+}
+
+/// Give the bridge crate (Esplora + bridge node RPC) a Tor circuit with FRESH SOCKS
+/// credentials, so consecutive Bitcoin-side operations (an address lookup, then a
+/// deposit, then a redeem) are not linkable by a shared circuit at the exit.
+fn rotate_bridge_circuit(s: &Settings) {
+    zcrypt_bridge::set_tor(tor_raw_proxy(s).map(|p| chain::socks_isolated_fresh(&p, "esplora")));
+}
+
+/// Settings for a Bitcoin-side operation: enforces the Esplora policy and rotates the
+/// bridge circuit. Every command that reaches Esplora or bitcoind goes through this.
+fn bridge_settings(dir: &str) -> Result<Settings, String> {
+    let s = load_settings(dir);
+    check_esplora_policy(&s)?;
+    rotate_bridge_circuit(&s);
+    Ok(s)
+}
+
 /// Push the persisted transport preferences into the RPC layers: Tor routing for node
 /// RPC (its own isolation class per request kind, see `chain::agent_for`), a SEPARATE
 /// Tor circuit class for the bridge (Esplora + bridge node calls, which skip loopback
@@ -1254,6 +1475,8 @@ fn get_settings(state: State<AppState>) -> R<Settings> {
 fn save_settings(settings: Settings, state: State<AppState>) -> R<bool> {
     // Node-URL policy: remote nodes only over https or as a .onion (see chain::check_node_url).
     chain::check_node_url(&settings.node_url)?;
+    // Same rule for the Esplora endpoint in self-custody mode.
+    check_esplora_policy(&settings)?;
     let dir = state.data_dir.lock().unwrap().clone();
     let json = serde_json::to_string(&settings).map_err(|e| e.to_string())?;
     // 0600: settings carry the bitcoind RPC password (regtest/bitcoind mode only).
@@ -1391,6 +1614,12 @@ fn node_status(state: State<AppState>) -> R<NodeStatus> {
 // ---------------------------------------------------------------------------
 // On-chain transacting (against the configured node)
 // ---------------------------------------------------------------------------
+/// The chain tip right now (for stamping a coin's `born`), never below the wallet's own
+/// last scan height so an unreachable node cannot make a fresh coin look old.
+fn tip_or(url: &str, w: &Wallet) -> i64 {
+    chain::node_height(url).unwrap_or(w.scan_height).max(w.scan_height)
+}
+
 fn node_url(state: &State<AppState>) -> Result<String, String> {
     let dir = state.data_dir.lock().unwrap().clone();
     let url = load_settings(&dir).node_url;
@@ -1423,12 +1652,8 @@ fn fund_onchain(amount: u64, state: State<AppState>) -> R<u32> {
                 tx.extend_from_slice(&x.to_le_bytes());
             }
             chain::broadcast(&url, &tx)?;
-            w.coins.push(CoinRec {
-                coin_id: hex::encode(com[0].to_le_bytes()),
-                value: val,
-                coin,
-                spent: false,
-            });
+            let born = tip_or(&url, w);
+            w.coins.push(CoinRec::new(coin, born));
             w.push_hist("fund", val as i64, "on-chain seed".into(), zcrypt_shield::ASSET_ZCRYPT);
             added += 1;
         }
@@ -1512,12 +1737,7 @@ fn build_gas_note(
     .ok_or("failed to build the gas note proof")?;
     let gchg_rec = if gchg_val > 0 {
         let c = gchg_acct.own_coin(gchg_val, gchg_blind);
-        Some(CoinRec {
-            coin_id: hex::encode(c.commitment()[0].to_le_bytes()),
-            value: gchg_val,
-            coin: c,
-            spent: false,
-        })
+        Some(CoinRec::new(c, w.scan_height))
     } else {
         None
     };
@@ -1707,14 +1927,13 @@ fn shield_pay(
         w.coins[i].spent = true;
     }
     w.coins[gas_i].spent = true;
+    // Stamp both change coins with the post-inclusion tip so a scan that started before
+    // this send (and whose leaf snapshot predates it) never reconciles them away.
+    let born = tip_or(url, w);
     let change_coin = change_acct.own_asset_coin(change, blind_c, asset_id);
-    w.coins.push(CoinRec {
-        coin_id: hex::encode(change_coin.commitment()[0].to_le_bytes()),
-        value: change,
-        coin: change_coin,
-        spent: false,
-    });
-    if let Some(rec) = gchg_rec {
+    w.coins.push(CoinRec::new(change_coin, born));
+    if let Some(mut rec) = gchg_rec {
+        rec.born = born;
         w.coins.push(rec);
     }
     Ok(())
@@ -2243,8 +2462,11 @@ fn scan_pass(
                 0x57 if body.len() >= 72 => {
                     let reward: [u8; 32] = body[40..72].try_into().unwrap();
                     if let Some(&idx) = keys.by_reward.get(&reward) {
-                        seen_idx(&mut out, Some(idx));
-                        out.actions.push(ActionKey { index: idx, kind: "bond".into(), target: hex::encode(&body[0..32]) });
+                        let legacy = idx == LEGACY_IDX;
+                        if !legacy {
+                            seen_idx(&mut out, Some(idx));
+                        }
+                        out.actions.push(ActionKey { index: if legacy { 0 } else { idx }, kind: "bond".into(), target: hex::encode(&body[0..32]), legacy });
                     }
                 }
                 // delegate header: del_pk(32) target(20) stake(8) reward(32) ...
@@ -2253,8 +2475,11 @@ fn scan_pass(
                     let reward: [u8; 32] = body[60..92].try_into().unwrap();
                     let idx = keys.by_reward.get(&reward).or_else(|| keys.by_delegator.get(&del_pk)).copied();
                     if let Some(idx) = idx {
-                        seen_idx(&mut out, Some(idx));
-                        out.actions.push(ActionKey { index: idx, kind: "delegate".into(), target: hex::encode(&body[32..52]) });
+                        let legacy = idx == LEGACY_IDX;
+                        if !legacy {
+                            seen_idx(&mut out, Some(idx));
+                        }
+                        out.actions.push(ActionKey { index: if legacy { 0 } else { idx }, kind: "delegate".into(), target: hex::encode(&body[32..52]), legacy });
                     }
                 }
                 // claim: pk(64) amount(8): the node mints claim_chunks() coins to pk.
@@ -2398,6 +2623,38 @@ fn scan_pass(
     out
 }
 
+/// Blocks a stale-coin reconcile leaves alone after a coin's birth: a send that commits
+/// while a scan is in flight is absent from that scan's leaf snapshot and must not be
+/// dropped as stale (it will be observed by the next scan).
+const RECONCILE_GRACE_BLOCKS: i64 = 200;
+/// Safety cap on HD gap-walk passes per scan (each pass widens the key window by 20 indices).
+const MAX_GAP_PASSES: u32 = 64;
+
+/// Whether the key window must widen: a key at or beyond `change_hi - 20` was seen, so keys
+/// past the window may exist (classic HD gap-limit walk).
+fn gap_needs_widening(max_index_seen: Option<u32>, change_hi: u32) -> bool {
+    max_index_seen.is_some_and(|m| m + 1 > change_hi.saturating_sub(20))
+}
+
+/// May the reconcile drop `c` (unspent, absent from the leaf snapshot, not pending)? Only a
+/// coin this wallet has already seen as a leaf (so its absence means a chain reset), or one
+/// older than the grace window (so its inclusion could not have raced this scan).
+fn stale_droppable(c: &CoinRec, scan_tip: i64) -> bool {
+    c.leaf_index.is_some() || c.born.saturating_add(RECONCILE_GRACE_BLOCKS) <= scan_tip
+}
+
+/// Where the scan cursor lands after a scan. If the gap walk hit its pass cap while a
+/// wider key window was still needed, the scanned range may hide coins of keys beyond the
+/// window, so the cursor must NOT advance (the next scan, with the widened window, re-reads
+/// those blocks). Otherwise it advances to the last height actually covered, never backwards.
+fn next_scan_height(widen_pending: bool, prev: i64, covered_to: i64) -> i64 {
+    if widen_pending {
+        prev
+    } else {
+        covered_to.max(prev)
+    }
+}
+
 /// Scan new blocks for incoming coins (trial-decrypt on-chain notes), reconstruct the
 /// coins our public actions minted (claims, escrows), and mark our coins spent when their
 /// nullifiers appear on-chain. Fully local: the node only ever serves blocks and leaves.
@@ -2414,8 +2671,10 @@ fn scan_onchain(state: State<AppState>) -> R<usize> {
     let node_tag = chain::chain_tag(&url).unwrap_or_default();
 
     // Snapshot what the pass needs under a BRIEF lock; all network I/O and decryption
-    // run without it so the UI never blocks behind a long scan.
-    let (seed, mut from) = {
+    // run without it so the UI never blocks behind a long scan. The claim counters and
+    // escrow records are snapshotted ONCE: every gap-walk pass re-reads the same blocks
+    // from the same starting point, so counters cannot double-advance across passes.
+    let (seed, mut from, claim_seed, fee_seed, escrow_seed) = {
         let mut g = state.wallet.lock().unwrap();
         let w = g.as_mut().ok_or("locked")?;
         let changed = !node_tag.is_empty() && node_tag != w.chain_tag;
@@ -2430,28 +2689,45 @@ fn scan_onchain(state: State<AppState>) -> R<usize> {
             }
             w.scan_height = 0;
         }
-        (Zeroizing::new(w.account.seed()), w.scan_height as i64)
+        (
+            Zeroizing::new(w.account.seed()),
+            w.scan_height as i64,
+            w.claim_counters.clone(),
+            w.fee_claim_counters.clone(),
+            w.escrows.clone(),
+        )
     };
+    let prev_scan_height = from;
     let scan_notes = from < tip;
     if !scan_notes {
         from = tip;
     }
     let leaves = chain::fetch_leaves(&url)?;
     // Fetch every tx-bearing block ONCE (the gap-extension loop below re-reads memory).
-    let heights = if scan_notes { chain::nonempty_heights(&url, from + 1, tip)? } else { Vec::new() };
-    let blocks: Vec<(i64, Vec<Vec<u8>>)> = heights.into_iter().map(|h| (h, chain::block_txs(&url, h))).collect();
+    // Transient node errors (429 rate limits, timeouts) are retried with backoff; if they
+    // persist, the scan keeps what it fetched, records how far it got, and resumes from
+    // there next time instead of starting over.
+    let fetched = if scan_notes { chain::scan_blocks(&url, from + 1, tip) } else { chain::ScanFetch::empty(tip) };
+    let covered_to = fetched.covered_to;
+    let blocks = fetched.blocks;
 
     let mut found = 0usize;
+    let mut spent_seen: HashSet<zcrypt_shield::Commitment> = HashSet::new();
     // HD gap handling: if a pass reveals a key at or beyond the window, widen and rescan
-    // the same blocks (bounded), like an HD wallet's gap-limit walk.
-    for _pass in 0..4 {
-        let (change_hi, stealth_seeds, known, own_nf, escrows, claim_counters, fee_claim_counters) = {
+    // the same blocks, like an HD wallet's gap-limit walk. The loop runs until the window
+    // is wide enough (bounded by a large safety cap); if the cap is hit, the cursor does
+    // not advance so nothing is silently skipped.
+    let mut widen_pending = false;
+    for pass in 0..MAX_GAP_PASSES {
+        let (change_hi, stealth_seeds, known, own_nf) = {
             let g = state.wallet.lock().unwrap();
             let w = g.as_ref().ok_or("locked")?;
+            // Coins the reconcile dropped without an observed spend stay watched, so a
+            // later-seen nullifier keeps them spent (and a never-seen one can revive them).
             let own_nf: HashMap<[u8; 32], zcrypt_shield::Commitment> = w
                 .coins
                 .iter()
-                .filter(|c| !c.spent)
+                .filter(|c| !c.spent || c.dropped_stale)
                 .map(|c| (shield_tx::nf_registry_key(&c.coin.nullifier()), c.coin.commitment()))
                 .collect();
             (
@@ -2459,9 +2735,6 @@ fn scan_onchain(state: State<AppState>) -> R<usize> {
                 w.stealth_seeds.clone(),
                 w.coins.iter().map(|c| c.coin.commitment()).collect::<HashSet<_>>(),
                 own_nf,
-                w.escrows.clone(),
-                w.claim_counters.clone(),
-                w.fee_claim_counters.clone(),
             )
         };
         let master = Account::from_seed(*seed);
@@ -2482,9 +2755,15 @@ fn scan_onchain(state: State<AppState>) -> R<usize> {
                 by_delegator.insert(delegator_key_at(&master, *i).verifying_key().to_bytes(), *i);
             }
         }
+        // Legacy bindings: a CLI bond or a pre-per-action-key delegation used the MAIN
+        // account's reward address / delegator key. Recognise them so those rewards stay
+        // visible and claimable after a restore.
+        by_reward.entry(master.reward_address()).or_insert(LEGACY_IDX);
+        by_delegator.entry(delegator_signing_key(&master).verifying_key().to_bytes()).or_insert(LEGACY_IDX);
         let keys = ScanKeys { accounts, by_pk, by_reward, by_delegator };
-        let res = scan_pass(&blocks, &keys, &leaves, &known, &own_nf, &escrows, &claim_counters, &fee_claim_counters);
-        let widen = res.max_index_seen.is_some_and(|m| m + 1 > change_hi.saturating_sub(20));
+        let res = scan_pass(&blocks, &keys, &leaves, &known, &own_nf, &escrow_seed, &claim_seed, &fee_seed);
+        let widen = gap_needs_widening(res.max_index_seen, change_hi);
+        spent_seen.extend(res.spent.iter().copied());
         // Merge under a BRIEF lock.
         {
             let mut g = state.wallet.lock().unwrap();
@@ -2493,7 +2772,7 @@ fn scan_onchain(state: State<AppState>) -> R<usize> {
                 let com = coin.commitment();
                 if !w.coins.iter().any(|c| c.coin.commitment() == com) {
                     let (v, asset) = (coin.value, coin.asset_id);
-                    w.coins.push(CoinRec { coin_id: hex::encode(com[0].to_le_bytes()), value: v, coin, spent: false });
+                    w.coins.push(CoinRec::observed(coin, chain::find_index(&leaves, &com), tip));
                     found += 1;
                     // A coin from an internal reshaping self-transfer is credited but NOT
                     // logged: it is plumbing, not a real incoming payment.
@@ -2512,10 +2791,15 @@ fn scan_onchain(state: State<AppState>) -> R<usize> {
             for c in w.coins.iter_mut() {
                 if res.spent.contains(&c.coin.commitment()) {
                     c.spent = true;
+                    c.dropped_stale = false;
                 }
             }
             for a in res.actions {
-                w.note_action(a.index, &a.kind, &a.target);
+                if a.legacy {
+                    w.note_legacy_action(&a.kind, &a.target);
+                } else {
+                    w.note_action(a.index, &a.kind, &a.target);
+                }
             }
             for e in res.escrows {
                 if !w.escrows.iter().any(|x| x.id_hex == e.id_hex && x.role == e.role) {
@@ -2531,29 +2815,58 @@ fn scan_onchain(state: State<AppState>) -> R<usize> {
                 }
             }
         }
-        if !widen || blocks.is_empty() {
+        widen_pending = widen && !blocks.is_empty();
+        if !widen_pending {
             break;
+        }
+        if pass + 1 == MAX_GAP_PASSES {
+            eprintln!("[scan] gap walk hit {MAX_GAP_PASSES} passes; the cursor stays put so the next scan re-reads these blocks");
         }
     }
 
     // Reconcile against reality under a BRIEF lock, then persist.
+    let mut paused: Option<String> = fetched.error.clone();
     {
         let mut g = state.wallet.lock().unwrap();
         let w = g.as_mut().ok_or("locked")?;
-        // Drop any coin no longer in the on-chain commitment tree (the "phantom balance"
+        let leaf_pos: HashMap<zcrypt_shield::Commitment, u32> =
+            leaves.iter().enumerate().map(|(i, c)| (*c, i as u32)).collect();
+        // (a) Observe: every coin present in the snapshot gets its leaf index recorded. A
+        // coin an earlier reconcile dropped WITHOUT ever seeing its nullifier, that is a
+        // leaf now, is revived: it was a send racing a scan, not a phantom.
+        let mut revived = 0usize;
+        for c in w.coins.iter_mut() {
+            let com = c.coin.commitment();
+            if let Some(&i) = leaf_pos.get(&com) {
+                c.leaf_index = Some(i);
+                if c.dropped_stale && c.spent && !spent_seen.contains(&com) {
+                    c.spent = false;
+                    c.dropped_stale = false;
+                    revived += 1;
+                }
+            }
+        }
+        if revived > 0 {
+            eprintln!("[scan] revived {revived} coin(s) that an earlier reconcile had dropped but which are on-chain and unspent");
+        }
+        // (b) Drop any coin no longer in the on-chain commitment tree (the "phantom balance"
         // left after a devnet chain reset). Freshly-shielded zBTC is held IMMATURE by
         // design (not a leaf yet): ask the node which commitments are still pending and
-        // spare those. If the node cannot answer, skip the drop this cycle rather than
-        // risk losing a maturing coin.
-        let leaf_set: HashSet<zcrypt_shield::Commitment> = leaves.iter().copied().collect();
+        // spare those. A coin younger than this scan's starting tip (minus a grace window)
+        // is spared too: its leaf may simply postdate our snapshot. If the node cannot
+        // answer, skip the drop this cycle rather than risk losing a maturing coin.
         let mut dropped = 0usize;
         match chain::fetch_pending_coins(&url) {
             Ok(pending) => {
                 let pending_set: HashSet<zcrypt_shield::Commitment> = pending.into_iter().collect();
                 for c in w.coins.iter_mut() {
                     let com = c.coin.commitment();
-                    if !c.spent && !leaf_set.contains(&com) && !pending_set.contains(&com) {
+                    if c.spent || leaf_pos.contains_key(&com) || pending_set.contains(&com) {
+                        continue;
+                    }
+                    if stale_droppable(c, tip) {
                         c.spent = true;
+                        c.dropped_stale = true;
                         dropped += 1;
                     }
                 }
@@ -2565,10 +2878,18 @@ fn scan_onchain(state: State<AppState>) -> R<usize> {
         if dropped > 0 {
             eprintln!("[scan] reconciled: dropped {dropped} stale coin(s) not on the current chain");
         }
-        w.scan_height = tip;
+        w.scan_height = next_scan_height(widen_pending, prev_scan_height, covered_to);
+        if widen_pending {
+            paused = Some(format!(
+                "more keys than the scan window; scanned up to height {covered_to} but kept the cursor at {prev_scan_height} so the next refresh re-reads it with a wider window"
+            ));
+        }
         save_state(w, &dir).map_err(|e| {
             format!("wallet reconciled, but could NOT save to disk: {e}. Fix permissions on ~/.zcrypt (e.g. `sudo chown -R $(whoami) ~/.zcrypt`); otherwise changes won't persist.")
         })?;
+    }
+    if let Some(e) = paused {
+        return Err(format!("scan paused ({e}); refresh again to continue"));
     }
     ok(found)
 }
@@ -2850,12 +3171,7 @@ fn build_stake_pledge(
     .ok_or("failed to build the stake pledge proof")?;
     let chg_rec = if chg_val > 0 {
         let c = chg_acct.own_coin(chg_val, chg_blind);
-        Some(CoinRec {
-            coin_id: hex::encode(c.commitment()[0].to_le_bytes()),
-            value: chg_val,
-            coin: c,
-            spent: false,
-        })
+        Some(CoinRec::new(c, w.scan_height))
     } else {
         None
     };
@@ -3092,7 +3408,7 @@ fn my_unbonding(state: State<AppState>) -> R<Vec<UnbondingEntry>> {
     let reward_hexes: Vec<String> = {
         let g = state.wallet.lock().unwrap();
         let w = g.as_ref().ok_or("wallet locked")?;
-        w.reward_indices().into_iter().map(|i| hex::encode(w.key_at(i).reward_address())).collect()
+        w.reward_keys().into_iter().map(|k| hex::encode(w.reward_account(k).reward_address())).collect()
     };
     let mut out = Vec::new();
     for reward_hex in reward_hexes {
@@ -3112,10 +3428,10 @@ fn my_unbonding(state: State<AppState>) -> R<Vec<UnbondingEntry>> {
 /// ever sent to the node for balance lookups, and only when the user asks (Rewards tab
 /// "Check"): each is already public on-chain in its BOND/DELEGATE, but the query still
 /// tells the operator this session owns them, which is why it is opt-in.
-fn reward_pk_hexes(state: &State<AppState>) -> Result<Vec<(u32, String)>, String> {
+fn reward_pk_hexes(state: &State<AppState>) -> Result<Vec<(RewardKey, String)>, String> {
     let g = state.wallet.lock().unwrap();
     let w = g.as_ref().ok_or("wallet locked")?;
-    Ok(w.reward_indices().into_iter().map(|i| (i, pk_hex(&w.key_at(i).pubkey()))).collect())
+    Ok(w.reward_keys().into_iter().map(|k| (k, pk_hex(&w.reward_account(k).pubkey()))).collect())
 }
 
 /// Unclaimed staking rewards (base units) across every reward key of this wallet.
@@ -3144,7 +3460,7 @@ fn claim_rewards(state: State<AppState>) -> R<ClaimResult> {
     let url = node_url(&state)?;
     let mut claimed_total = 0u64;
     let mut coins_total = 0u32;
-    for (idx, pk_h) in reward_pk_hexes(&state)? {
+    for (rk, pk_h) in reward_pk_hexes(&state)? {
         let claimable = chain::staking_u64(&url, &format!("/staking/claimable/{pk_h}")).unwrap_or(0);
         if claimable == 0 {
             continue;
@@ -3162,20 +3478,17 @@ fn claim_rewards(state: State<AppState>) -> R<ClaimResult> {
         let first_claim = start == 0;
         let leaves = chain::fetch_leaves(&url)?;
         let n = with_wallet(&state, |w| {
-            let acct = w.key_at(idx);
+            let acct = w.reward_account(rk);
             let mut index = start;
             let mut n = 0u32;
             for chunk in zcrypt_core::keys::claim_chunks(claimable, first_claim) {
                 let coin = acct.reward_coin(chunk, index);
                 let com = coin.commitment();
                 let already = w.coins.iter().any(|c| c.coin.commitment() == com);
-                if chain::find_index(&leaves, &com).is_some() && !already {
-                    w.coins.push(CoinRec {
-                        coin_id: hex::encode(com[0].to_le_bytes()),
-                        value: chunk,
-                        coin,
-                        spent: false,
-                    });
+                let leaf = chain::find_index(&leaves, &com);
+                if leaf.is_some() && !already {
+                    let born = w.scan_height;
+                    w.coins.push(CoinRec::observed(coin, leaf, born));
                     w.push_hist("reward", chunk as i64, "staking reward".into(), zcrypt_shield::ASSET_ZCRYPT);
                     n += 1;
                 }
@@ -3234,7 +3547,7 @@ fn claim_fees(asset_id: String, state: State<AppState>) -> R<u64> {
     let asset: u64 = asset_id.trim().parse().map_err(|_| "bad asset id".to_string())?;
     let (ticker, _dec) = asset_label(&url, asset);
     let mut total = 0u64;
-    for (idx, pk_h) in reward_pk_hexes(&state)? {
+    for (rk, pk_h) in reward_pk_hexes(&state)? {
         let claimable = chain::staking_u64(&url, &format!("/staking/fees/{pk_h}/{asset}")).unwrap_or(0);
         if claimable == 0 {
             continue;
@@ -3251,19 +3564,16 @@ fn claim_fees(asset_id: String, state: State<AppState>) -> R<u64> {
         // fee-claim indices from `start`) so our coins match the node's exactly.
         let leaves = chain::fetch_leaves(&url)?;
         with_wallet(&state, |w| {
-            let acct = w.key_at(idx);
+            let acct = w.reward_account(rk);
             let mut index = start;
             for chunk in zcrypt_core::keys::claim_chunks(claimable, false) {
                 let coin = acct.fee_reward_coin(chunk, asset, index);
                 let com = coin.commitment();
                 let already = w.coins.iter().any(|c| c.coin.commitment() == com);
-                if chain::find_index(&leaves, &com).is_some() && !already {
-                    w.coins.push(CoinRec {
-                        coin_id: hex::encode(com[0].to_le_bytes()),
-                        value: chunk,
-                        coin,
-                        spent: false,
-                    });
+                let leaf = chain::find_index(&leaves, &com);
+                if leaf.is_some() && !already {
+                    let born = w.scan_height;
+                    w.coins.push(CoinRec::observed(coin, leaf, born));
                     w.push_hist("fee", chunk as i64, format!("{ticker} bridge fee"), asset);
                 }
                 index += 1;
@@ -3283,7 +3593,7 @@ fn claim_fees(asset_id: String, state: State<AppState>) -> R<u64> {
 // ---------------------------------------------------------------------------
 fn btc_client(state: &State<AppState>) -> Result<Btc, String> {
     let dir = state.data_dir.lock().unwrap().clone();
-    let s = load_settings(&dir);
+    let s = bridge_settings(&dir)?;
     // Create/load the user's bitcoind wallet if it doesn't exist yet, and on a fresh
     // regtest give it spendable BTC to shield — so testing the bridge needs zero manual
     // bitcoin-cli. Idempotent: once funded (> 1 BTC) it never re-mines.
@@ -3302,7 +3612,7 @@ fn btc_client(state: &State<AppState>) -> Result<Btc, String> {
 /// actually move BTC out and redeems move it in. Created + stocked on first use.
 fn btc_bridge(state: &State<AppState>) -> Result<Btc, String> {
     let dir = state.data_dir.lock().unwrap().clone();
-    let s = load_settings(&dir);
+    let s = bridge_settings(&dir)?;
     let network = zcrypt_bridge::network_from_str(&s.btc_network);
     Btc::ensure_wallet(&s.btc_url, &s.btc_user, &s.btc_pass, "bridge")?;
     let b = Btc::connect(&s.btc_url, &s.btc_user, &s.btc_pass, "bridge", network)?;
@@ -3322,7 +3632,7 @@ fn swap_backend(
     account: u32,
 ) -> Result<(Box<dyn zcrypt_bridge::BtcBackend>, bitcoin::Address), String> {
     let dir = state.data_dir.lock().unwrap().clone();
-    let s = load_settings(&dir);
+    let s = bridge_settings(&dir)?;
     let network = zcrypt_bridge::network_from_str(&s.btc_network);
     if s.btc_selfcustody && network != bitcoin::Network::Regtest {
         let mnemonic = {
@@ -3332,7 +3642,9 @@ fn swap_backend(
         let sc = zcrypt_bridge::selfcustody::SelfCustodyBtc::new_account(
             &mnemonic, "", network, &s.esplora_url, account,
         )?;
-        let dest = sc.receive_address()?;
+        // A fresh BIP-84 receive address per swap (gap-limit aware), so redeem payouts and
+        // deposit change never reuse index 0 (privacy H3 residual N14).
+        let dest = sc.fresh_receive_address()?;
         Ok((Box::new(sc), dest))
     } else {
         let b = if account == 0 { btc_client(state)? } else { btc_bridge(state)? };
@@ -3366,6 +3678,8 @@ fn zbtc_asset(zc: &Zcrypt) -> Result<u64, String> {
 struct BridgeStatus {
     btc_connected: bool,
     btc_balance: f64,
+    /// Whether the Bitcoin side was queried at all (false on the tab's automatic load).
+    btc_checked: bool,
     zbtc_asset: u64,
     /// SPENDABLE zBTC: coins that are in the on-chain commitment tree (matured).
     zbtc_balance: u64,
@@ -3426,8 +3740,11 @@ fn bridge_init(state: State<AppState>) -> R<u64> {
     ok(asset)
 }
 
+/// `with_btc = false` (the tab's automatic load) never contacts Esplora / bitcoind: the
+/// Bitcoin balance is only fetched when the user explicitly asks, because a hosted Esplora
+/// learns the deposit address of every wallet that queries it (privacy M4).
 #[tauri::command]
-fn bridge_status(state: State<AppState>) -> R<BridgeStatus> {
+fn bridge_status(with_btc: bool, state: State<AppState>) -> R<BridgeStatus> {
     let zc = zc_client(&state)?;
     let asset = zbtc_asset(&zc).unwrap_or(0);
     let btc_network = {
@@ -3435,9 +3752,14 @@ fn bridge_status(state: State<AppState>) -> R<BridgeStatus> {
         load_settings(&dir).btc_network
     };
     // Reuse the same BTC-backend logic as the Balance tab: self-custody deposit balance
-    // (via Esplora, no node) when enabled, else the local bitcoind wallet.
-    let snap = btc_wallet_snapshot(&state);
-    let (btc_connected, btc_balance) = (snap.connected, snap.balance);
+    // (via Esplora, no node) when enabled, else the local bitcoind wallet. Opt-in only.
+    let (btc_connected, btc_balance) = if with_btc {
+        let snap = btc_wallet_snapshot(&state);
+        (snap.connected, snap.balance)
+    } else {
+        (false, 0.0)
+    };
+    let btc_checked = with_btc;
     // Seed-derived addresses to fund for testing: account 0 (you, shield) + account 1 (the
     // demo LP, redeem). Only meaningful in self-custody mode; empty otherwise.
     let (deposit_address, lp_address) = selfcustody_addresses(&state);
@@ -3464,7 +3786,7 @@ fn bridge_status(state: State<AppState>) -> R<BridgeStatus> {
             None => (0, 0),
         }
     };
-    ok(BridgeStatus { btc_connected, btc_balance, zbtc_asset: asset, zbtc_balance, zbtc_maturing, btc_network, deposit_address, lp_address })
+    ok(BridgeStatus { btc_connected, btc_balance, btc_checked, zbtc_asset: asset, zbtc_balance, zbtc_maturing, btc_network, deposit_address, lp_address })
 }
 
 /// The seed-derived (account 0, account 1) Bitcoin addresses for the self-custody bridge —
@@ -3472,7 +3794,10 @@ fn bridge_status(state: State<AppState>) -> R<BridgeStatus> {
 /// self-custody mode (regtest / bitcoind) or the wallet is locked.
 fn selfcustody_addresses(state: &State<AppState>) -> (String, String) {
     let dir = state.data_dir.lock().unwrap().clone();
-    let s = load_settings(&dir);
+    let s = match bridge_settings(&dir) {
+        Ok(s) => s,
+        Err(_) => return (String::new(), String::new()),
+    };
     let network = zcrypt_bridge::network_from_str(&s.btc_network);
     if !s.btc_selfcustody || network == bitcoin::Network::Regtest {
         return (String::new(), String::new());
@@ -3549,7 +3874,10 @@ fn btc_wallet_info(state: State<AppState>) -> R<BtcWallet> {
 /// the local bitcoind wallet.
 fn btc_wallet_snapshot(state: &State<AppState>) -> BtcWallet {
     let dir = state.data_dir.lock().unwrap().clone();
-    let s = load_settings(&dir);
+    let s = match bridge_settings(&dir) {
+        Ok(s) => s,
+        Err(_) => return BtcWallet { connected: false, balance: 0.0, deposit_address: String::new() },
+    };
     let network = zcrypt_bridge::network_from_str(&s.btc_network);
     let none = || BtcWallet { connected: false, balance: 0.0, deposit_address: String::new() };
     if s.btc_selfcustody && network != bitcoin::Network::Regtest {
@@ -3736,12 +4064,8 @@ fn mint_asset(
         }
         chain::broadcast(&url, &bswap::claim_tx(&escrow, &preimage))?;
         let coin = claimer.htlc_coin(amount, asset_id, &escrow);
-        w.coins.push(CoinRec {
-            coin_id: hex::encode(coin.commitment()[0].to_le_bytes()),
-            value: amount,
-            coin,
-            spent: false,
-        });
+        let born = w.scan_height;
+        w.coins.push(CoinRec::new(coin, born));
         w.push_hist("mint", amount as i64, format!("minted {t}"), asset_id);
         Ok(asset_id.to_string())
     })
@@ -3806,11 +4130,27 @@ fn swap_shield_btc(zbtc_amount: u64, btc: String, window: tauri::Window, state: 
     let zc = zc_client(&state)?;
     let asset = zbtc_asset(&zc)?;
     let btc_amt = bitcoin::Amount::from_sat(btc_sats);
-    let res = with_wallet(&state, |w| {
-        let (bridge_key, _legacy_alice) = bridge_btc_keys(&w.account);
+    // Record the deposit (index + preimage + Bitcoin tip) and SAVE it before any BTC moves,
+    // so a flow that dies after the HTLC broadcast can be resumed from the funding UTXO by
+    // "Diagnose and fix" instead of waiting a week for the CLTV refund.
+    let btc_tip_start = alice_bk.height()?;
+    let preimage = bswap::fresh_preimage(); // 32 random bytes (HTLC hashlock security)
+    let idx = with_wallet(&state, |w| {
         // Fresh HD index for this deposit: its shield claimer pk AND its Bitcoin refund key.
         let idx = w.alloc_index();
         w.note_action(idx, "shield", "");
+        w.pending_deposits.push(PendingDeposit {
+            index: idx,
+            preimage_hex: hex::encode(preimage),
+            value_sats: btc_sats,
+            asset_id: asset,
+            btc_tip: btc_tip_start,
+            started: w.clock,
+        });
+        Ok(idx)
+    })?;
+    let res = with_wallet(&state, |w| {
+        let (bridge_key, _legacy_alice) = bridge_btc_keys(&w.account);
         let claimer = w.key_at(idx);
         let alice_key = alice_key_at(&w.account, idx);
         let b = bswap::BtcParams {
@@ -3821,7 +4161,6 @@ fn swap_shield_btc(zbtc_amount: u64, btc: String, window: tauri::Window, state: 
             alice_dest: &alice_dest,
             bridge_dest: &bridge_dest,
         };
-        let preimage = bswap::fresh_preimage(); // 32 random bytes (HTLC hashlock security)
         let progress = |pct: u8, phase: &str| {
             let _ = window.emit("swap-progress", serde_json::json!({ "percent": pct, "phase": phase }));
         };
@@ -3830,8 +4169,9 @@ fn swap_shield_btc(zbtc_amount: u64, btc: String, window: tauri::Window, state: 
         let coin = bswap::btc_to_zbtc_progress(
             &zc, &b, &claimer, asset, &preimage, btc_amt, zbtc_amount, &progress,
         )?;
-        let com = coin.commitment();
-        w.coins.push(CoinRec { coin_id: hex::encode(com[0].to_le_bytes()), value: coin.value, coin, spent: false });
+        w.pending_deposits.retain(|p| p.index != idx);
+        let born = w.scan_height;
+        w.coins.push(CoinRec::new(coin, born));
         w.push_hist("shield", zbtc_amount as i64, "BTC→zBTC (maturing)".into(), asset);
         Ok(zbtc_amount)
     });
@@ -3965,13 +4305,8 @@ fn swap_redeem_btc(btc: String, window: tauri::Window, state: State<AppState>) -
             // `own_asset_coin` rebuilds the exact commitment the burn tx wrote to our key.
             if change_value > 0 {
                 let change = refund_acct.own_asset_coin(change_value, change_blind, asset);
-                let com = change.commitment();
-                w.coins.push(CoinRec {
-                    coin_id: hex::encode(com[0].to_le_bytes()),
-                    value: change_value,
-                    coin: change,
-                    spent: false,
-                });
+                let born = w.scan_height;
+                w.coins.push(CoinRec::new(change, born));
             }
             redeemed += round_value;
             w.push_hist("redeem", -(round_value as i64), format!("zBTC→BTC (round {round})"), asset);
@@ -3987,6 +4322,9 @@ struct RecoverResult {
     live_zbtc: u64,
     /// Stale zBTC coins cleared from the wallet (no longer on-chain, e.g. a chain reset).
     dropped_stale: usize,
+    /// Interrupted BTC to zBTC deposits picked back up from their funding UTXO and claimed.
+    #[serde(default)]
+    resumed: u32,
     message: String,
 }
 
@@ -3995,12 +4333,118 @@ struct RecoverResult {
 /// reset, which is what produces "input coin not on chain" on redeem) is cleared, so the
 /// wallet's zBTC reflects reality and redeems work again. A half-finished on-chain HTLC
 /// isn't destroyed — it refunds itself after its timeout.
+/// Try to finish every recorded-but-incomplete BTC to zBTC deposit: locate its funding
+/// UTXO on Bitcoin (the HTLC locktime was the Bitcoin tip at funding plus the network's
+/// lock, so a handful of candidate locktimes around the recorded tip are tried), then run
+/// the resumable tail of the shield (SPV proof, escrow open, claim). Returns how many were
+/// completed and a human-readable note per deposit that could not be.
+fn resume_pending_deposits(state: &State<AppState>, notes: &mut Vec<String>) -> Result<u32, String> {
+    let pending: Vec<PendingDeposit> = {
+        let g = state.wallet.lock().unwrap();
+        g.as_ref().ok_or("wallet locked")?.pending_deposits.clone()
+    };
+    if pending.is_empty() {
+        return Ok(0);
+    }
+    let dir = state.data_dir.lock().unwrap().clone();
+    let s = bridge_settings(&dir)?;
+    let net = zcrypt_bridge::network_from_str(&s.btc_network);
+    let (alice_bk, _dest) = swap_backend(state, 0)?;
+    let zc = zc_client(state)?;
+    let btc_tip_now = alice_bk.height()?;
+    let zc_tip = zc.height()? as u64;
+    let lock_blocks = bswap::btc_lock_blocks(net);
+    let mut resumed = 0u32;
+    for p in pending {
+        let preimage = match hex::decode(&p.preimage_hex) {
+            Ok(v) if v.len() == 32 => v,
+            _ => {
+                notes.push(format!("deposit #{}: corrupt preimage record", p.index));
+                continue;
+            }
+        };
+        let lock = zcrypt_core::nullifier::htlc_hashlock(&preimage);
+        let (reserve_pk, refund, claimer) = {
+            let g = state.wallet.lock().unwrap();
+            let w = g.as_ref().ok_or("wallet locked")?;
+            (bridge_btc_keys(&w.account).0.pk, alice_key_at(&w.account, p.index), w.key_at(p.index))
+        };
+        // The funding used locktime = (Bitcoin tip at funding) + lock_blocks; the tip at
+        // funding is within a few blocks of the tip we recorded when the flow started.
+        let base = p.btc_tip.saturating_add(lock_blocks);
+        let mut found: Option<(zcrypt_bridge::HtlcUtxo, u32)> = None;
+        for t in base.saturating_sub(2)..=base.saturating_add(12) {
+            let script = zcrypt_bridge::htlc_script(&lock, &reserve_pk, &refund.pk, t as u32);
+            if let Some(u) = bswap::find_funded_htlc(alice_bk.as_ref(), &script, bitcoin::Amount::from_sat(p.value_sats))? {
+                found = Some((u, t as u32));
+                break;
+            }
+        }
+        let Some((utxo, btc_locktime)) = found else {
+            if btc_tip_now >= base {
+                notes.push(format!(
+                    "deposit #{} ({} sats): no funding found on Bitcoin and its lock has passed; nothing to resume",
+                    p.index, p.value_sats
+                ));
+                let _ = with_wallet(state, |w| {
+                    w.pending_deposits.retain(|d| d.index != p.index);
+                    Ok(())
+                });
+            } else {
+                notes.push(format!(
+                    "deposit #{} ({} sats): no HTLC funding found on Bitcoin yet (it may still be unconfirmed); try again later",
+                    p.index, p.value_sats
+                ));
+            }
+            continue;
+        };
+        if u64::from(btc_locktime) <= btc_tip_now.saturating_add(bswap::btc_lock_blocks(net) / 8) {
+            notes.push(format!(
+                "deposit #{}: its Bitcoin refund lock (block {btc_locktime}) is too close to resume safely; the BTC returns to your refund key after the lock",
+                p.index
+            ));
+            continue;
+        }
+        let (_, zc_timeout) = bswap::shield_timeouts(net, btc_tip_now, zc_tip)?;
+        let progress = |_pct: u8, _phase: &str| {};
+        match bswap::resume_public_shield(
+            &zc, alice_bk.as_ref(), &refund, &reserve_pk, &claimer, p.asset_id, &preimage, &utxo, btc_locktime,
+            zc_timeout, p.value_sats, &progress,
+        ) {
+            Ok(coin) => {
+                with_wallet(state, |w| {
+                    w.pending_deposits.retain(|d| d.index != p.index);
+                    let born = w.scan_height;
+                    let com = coin.commitment();
+                    if !w.coins.iter().any(|c| c.coin.commitment() == com) {
+                        w.coins.push(CoinRec::new(coin, born));
+                        w.push_hist("shield", p.value_sats as i64, "BTC→zBTC (resumed, maturing)".into(), p.asset_id);
+                    }
+                    Ok(())
+                })?;
+                resumed += 1;
+            }
+            Err(e) => notes.push(format!("deposit #{}: found the funding but could not finish it: {e}", p.index)),
+        }
+    }
+    Ok(resumed)
+}
+
 #[tauri::command]
 fn bridge_recover(state: State<AppState>) -> R<RecoverResult> {
     let url = node_url(&state)?;
     let leaves = chain::fetch_leaves(&url)?;
     let zc = zc_client(&state)?;
     let asset = zbtc_asset(&zc).unwrap_or(0);
+    // First: pick up any deposit that died after its Bitcoin HTLC was funded.
+    let mut notes: Vec<String> = Vec::new();
+    let resumed = match resume_pending_deposits(&state, &mut notes) {
+        Ok(n) => n,
+        Err(e) => {
+            notes.push(format!("could not check interrupted deposits: {e}"));
+            0
+        }
+    };
     with_wallet(&state, |w| {
         let mut live = 0u64;
         let mut dropped = 0usize;
@@ -4014,32 +4458,53 @@ fn bridge_recover(state: State<AppState>) -> R<RecoverResult> {
                 }
             }
         }
-        let message = if dropped > 0 {
+        let mut message = if resumed > 0 {
+            format!("Resumed {resumed} interrupted deposit(s) from their Bitcoin funding: the zBTC is now maturing. ")
+        } else {
+            String::new()
+        };
+        message.push_str(&if dropped > 0 {
             format!(
-                "Fixed: cleared {dropped} stale zBTC coin(s) no longer on-chain (e.g. after a chain \
+                "Cleared {dropped} stale zBTC coin(s) no longer on-chain (e.g. after a chain \
                  reset). Your wallet now shows {} zBTC of live, redeemable balance.",
                 live as f64 / 100_000_000.0
             )
         } else {
             format!(
-                "Nothing stuck: {} zBTC is live and redeemable. If a swap looked interrupted, hit \
-                 Refresh to rescan — a half-finished on-chain HTLC refunds itself after its timeout.",
+                "{} zBTC is live and redeemable. A half-finished Bitcoin HTLC that cannot be resumed \
+                 refunds itself to your refund key after its timeout.",
                 live as f64 / 100_000_000.0
             )
-        };
-        Ok(RecoverResult { live_zbtc: live, dropped_stale: dropped, message })
+        });
+        for n in &notes {
+            message.push(' ');
+            message.push_str(n);
+            message.push('.');
+        }
+        Ok(RecoverResult { live_zbtc: live, dropped_stale: dropped, resumed, message })
     })
     .and_then(ok)
 }
 
+/// A secret string that is wiped when dropped. Serialized as a plain string for the IPC
+/// boundary (the webview receives a copy that this type cannot wipe; the frontend clears
+/// it from the clipboard and hides it on a timer).
+struct SecretString(Zeroizing<String>);
+
+impl Serialize for SecretString {
+    fn serialize<S: serde::Serializer>(&self, ser: S) -> Result<S::Ok, S::Error> {
+        ser.serialize_str(&self.0)
+    }
+}
+
 #[tauri::command]
-fn get_seed_phrase(password: String, state: State<AppState>) -> R<String> {
+fn get_seed_phrase(password: String, state: State<AppState>) -> R<SecretString> {
     // Re-verify the password against the keystore before revealing.
     let dir = state.data_dir.lock().unwrap().clone();
     let raw = std::fs::read_to_string(keystore_path(&dir)).map_err(|_| "no wallet")?;
     let ks: Keystore = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
     let phrase = unseal(&password, &ks).ok_or("wrong password")?;
-    ok(phrase.to_string())
+    ok(SecretString(Zeroizing::new(phrase.to_string())))
 }
 
 // ---------------------------------------------------------------------------
@@ -4053,6 +4518,7 @@ fn short(a: &str) -> String {
     }
 }
 // A URL-safe-ish blob using bech32 charset via hex for simplicity.
+#[cfg_attr(not(feature = "devnet"), allow(dead_code))]
 fn base64ish(b: &[u8]) -> String {
     hex::encode(b)
 }
@@ -4092,8 +4558,6 @@ fn main() {
             get_view_key,
             send_stealth,
             get_balance,
-            mint_coins,
-            send_coin,
             receive_coin,
             create_bearer,
             claim_bearer,

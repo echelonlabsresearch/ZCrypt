@@ -14,6 +14,7 @@ use zcrypt_core::keys::{self, Account};
 use zcrypt_shield::{commit_asset, spend_pubkey};
 
 fn main() {
+    zcrypt_bridge::zcrypt::set_broadcast_jitter(false); // e2e driver: no privacy delay on hundreds of broadcasts
     let zc_url = std::env::var("ZC_URL").unwrap_or_else(|_| "http://localhost:36657".to_string());
     println!("In-pool private swap against chain={zc_url}");
     let zc = Zcrypt::new(&zc_url);

@@ -84,6 +84,27 @@ wallet's cross-chain swap screens are not ported.
   submits the signature.
 - A random 0.25 to 2.5 s delay precedes every broadcast (Settings toggle).
 
+### Known protocol-level limits (not fixable in the wallet)
+
+- `reward_address = H(pk)`: a bond or delegation publishes the hash of its reward key, and the
+  first CLAIM on that key publishes the key itself, so every claim on ONE reward key links to
+  that bond. The wallet uses a fresh stealth key per bond and per delegation, which confines
+  the linkage to one action; only a shielded claim path in the protocol would remove it.
+- Legacy bindings: a bond made with the CLI tool (`bond_validator`) or a delegation made before
+  per-action keys used the main account's reward address. The scanner still recognises them
+  (marked `legacy`) so those rewards are visible and claimable, but they are linkable to the
+  payment address.
+
+### What contacts Bitcoin services, and when
+
+- The Bitcoin balance on the Balance tab and the Bridge tab's Bitcoin figure are fetched ONLY
+  when you click "Check Bitcoin"; automatic refreshes never contact the Esplora server, because
+  an address-indexed lookup tells that server which address is yours. Every Bitcoin-side
+  session gets a Tor circuit of its own, and every broadcast gets a fresh circuit too.
+- A remote Esplora endpoint must be https or a .onion (same rule as the node URL).
+- An interrupted BTC to zBTC deposit is recorded (index, preimage, Bitcoin tip) before any BTC
+  moves; "Diagnose and fix" on the Bridge tab finds the funding UTXO and finishes the shield.
+
 ## Files on disk
 
 `~/.zcrypt` is created 0700; `keystore.json` (Argon2id + ChaCha20-Poly1305 sealed phrase),

@@ -219,6 +219,9 @@ impl AssetRegistry {
     /// the state mutation only. This is how a treasury migrates from a single-master key set
     /// to distributed custody, or replaces a compromised/retired signer, with no chain reset.
     pub fn rotate_authority(&mut self, asset_id: u64, new_commitment: Hash) -> Result<(), String> {
+        if self.by_id.iter().any(|(id, m)| *id != asset_id && m.authority == Some(new_commitment)) {
+            return Err("the new mint authority already backs another registered asset".to_string());
+        }
         let m = self.by_id.get_mut(&asset_id).ok_or("asset not registered")?;
         if m.authority.is_none() {
             return Err(format!("asset '{}' has no mint authority to rotate", m.ticker));

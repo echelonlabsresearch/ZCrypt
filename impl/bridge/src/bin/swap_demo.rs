@@ -9,6 +9,7 @@ use zcrypt_core::keys::Account;
 use zcrypt_shield::commit_asset;
 
 fn main() {
+    zcrypt_bridge::zcrypt::set_broadcast_jitter(false); // e2e driver: no privacy delay on hundreds of broadcasts
     // Target chain + bitcoind are configurable, so this can run against the single
     // node (defaults) or the 3-node stack (ZC_URL=http://localhost:46657,
     // BTC_URL=http://localhost:28443).

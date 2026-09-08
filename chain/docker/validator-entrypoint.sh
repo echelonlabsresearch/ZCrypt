@@ -53,7 +53,13 @@ if [ ! -f "$GENESIS" ]; then
   else
     echo "[validator] ERROR: set GENESIS_URL or SEED_RPC to obtain the chain genesis"; exit 1
   fi
-  SUM=$(sha256_of "$GENESIS")
+  # Hash the canonical form (sorted keys, compact) when jq is available, matching what
+  # cometbft-entrypoint.sh publishes as genesis.sha256.
+  if command -v jq >/dev/null 2>&1 && jq -cS . "$GENESIS" > "$GENESIS.canon" 2>/dev/null; then
+    SUM=$(sha256_of "$GENESIS.canon"); rm -f "$GENESIS.canon"
+  else
+    SUM=$(sha256_of "$GENESIS")
+  fi
   if [ -n "$GENESIS_SHA256" ]; then
     # The RPC-unwrapped form may differ byte-for-byte from the published file (jq
     # re-serialises), so the published hash is defined over the compact jq form when jq

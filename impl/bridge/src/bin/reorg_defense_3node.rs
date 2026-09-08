@@ -64,6 +64,7 @@ fn app_hashes(urls: &[String]) -> Vec<String> {
 }
 
 fn main() {
+    zcrypt_bridge::zcrypt::set_broadcast_jitter(false); // e2e driver: no privacy delay on hundreds of broadcasts
     let urls: Vec<String> = std::env::var("ZC_URLS")
         .unwrap_or_else(|_| "http://localhost:46657,http://localhost:46667,http://localhost:46677".into())
         .split(',')

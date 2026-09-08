@@ -7,9 +7,15 @@
 //! the reward address you choose (point it at your wallet).
 //!
 //!   VALIDATOR_SEED_HEX=<64 hex>            # first 32 bytes of priv_validator_key.json
-//!   ZCRYPT_REWARD_ADDR=<64 hex>            # your wallet's reward address, OR:
-//!   ZCRYPT_REWARD_MNEMONIC="word word ..." # derive the reward address from a wallet phrase
-//!   cargo run --release -p zcrypt-bridge --bin bond_validator -- http://localhost:56657 [stake_whole_zcrypt]
+//!   cargo run --release -p zcrypt-bridge --bin bond_validator -- \
+//!       --reward <64 hex> http://localhost:56657 [stake_whole_zcrypt]
+//!
+//! `--reward` (or env ZCRYPT_REWARD_ADDR) is the reward address the desktop wallet's
+//! `bond_request` produced: a FRESH stealth-derived address the wallet scans for, so the
+//! validator's income is never tied to its reusable Normal key on-chain. The old
+//! ZCRYPT_REWARD_MNEMONIC path (reward address = H(Normal pk)) is LEGACY and only runs with
+//! ZCRYPT_REWARD_MNEMONIC_LEGACY=1: rewards then land on the Normal key, which every claim
+//! publishes in plaintext (privacy H1).
 //!
 //! WALLET TWO-STEP BOND (`sign`): the desktop wallet prepares a bond (`bond_request`: chain
 //! id, reward address, stake, commission) and asks the validator HOST for a signature; the
@@ -47,7 +53,7 @@ fn bond_tx(
 ) -> Vec<u8> {
     let pk = sk.verifying_key().to_bytes();
     // Same message the wallet's two-step flow signs on the host (`bond_validator sign`).
-    let sig = swap::sign_bond(sk, swap::CHAIN, stake, &reward, commission, nonce);
+    let sig = swap::sign_bond(sk, swap::chain_id(), stake, &reward, commission, nonce);
     let mut t = vec![0x57u8];
     t.extend_from_slice(&pk);
     t.extend_from_slice(&stake.to_le_bytes());
@@ -81,7 +87,7 @@ fn sign_subcommand(args: &[String]) {
     let mut nonce: Option<u64> = None;
     let mut node: Option<String> = None;
     let mut i = 0;
-    let mut val = |i: &mut usize| -> String {
+    let val = |i: &mut usize| -> String {
         *i += 1;
         args.get(*i).cloned().unwrap_or_else(|| {
             eprintln!("bond_validator sign: missing value for {}", args[*i - 1]);
@@ -147,9 +153,24 @@ fn main() {
         sign_subcommand(&argv[1..]);
         return;
     }
-    let url = std::env::args().nth(1).unwrap_or_else(|| "http://localhost:46657".to_string());
-    let stake: u64 = std::env::args()
-        .nth(2)
+    // `--reward <64 hex>` may appear anywhere; the rest is `[url] [stake_whole_zcrypt]`.
+    let mut reward_arg: Option<String> = None;
+    let mut positional: Vec<String> = Vec::new();
+    let mut it = argv.iter();
+    while let Some(a) = it.next() {
+        if a == "--reward" {
+            reward_arg = it.next().cloned();
+            if reward_arg.is_none() {
+                eprintln!("bond_validator: --reward needs a value (64 hex)");
+                std::process::exit(2);
+            }
+        } else {
+            positional.push(a.clone());
+        }
+    }
+    let url = positional.first().cloned().unwrap_or_else(|| "http://localhost:46657".to_string());
+    let stake: u64 = positional
+        .get(1)
         .and_then(|s| s.parse::<u64>().ok())
         .map(|whole| whole * emission::ATOMIC)
         .unwrap_or(10_000 * emission::ATOMIC);
@@ -165,19 +186,17 @@ fn main() {
     // The /staking/validators set is keyed by the ed25519 consensus pubkey (32B) hex.
     let val_pk_hex = hex::encode(val_pk.to_bytes());
 
-    // 2. Reward address — where block rewards accrue. Point it at YOUR wallet, either by
-    //    its reward address (hex) or by deriving it from your wallet recovery phrase.
-    let reward: [u8; 32] = if let Ok(h) = std::env::var("ZCRYPT_REWARD_ADDR") {
-        if !h.trim().is_empty() {
-            hex::decode(h.trim())
-                .expect("ZCRYPT_REWARD_ADDR: invalid hex")
-                .try_into()
-                .expect("ZCRYPT_REWARD_ADDR must be 64 hex chars (32 bytes)")
-        } else {
-            reward_from_mnemonic()
-        }
+    // 2. Reward address: where block rewards accrue. Take the explicit address the wallet's
+    //    bond_request produced (`--reward` or ZCRYPT_REWARD_ADDR); the mnemonic derivation is
+    //    a clearly labelled legacy path.
+    let reward_hex = reward_arg.or_else(|| std::env::var("ZCRYPT_REWARD_ADDR").ok()).unwrap_or_default();
+    let reward: [u8; 32] = if !reward_hex.trim().is_empty() {
+        hex::decode(reward_hex.trim())
+            .expect("--reward / ZCRYPT_REWARD_ADDR: invalid hex")
+            .try_into()
+            .expect("--reward / ZCRYPT_REWARD_ADDR must be 64 hex chars (32 bytes)")
     } else {
-        reward_from_mnemonic()
+        reward_from_mnemonic_legacy()
     };
 
     // 3. Idempotency: if this consensus key is already in the active set, stop.
@@ -243,14 +262,22 @@ fn main() {
     println!("BOND broadcast, but the validator did not appear in /staking/validators yet — check the node logs.");
 }
 
-/// Derive the reward address from a wallet recovery phrase (ZCRYPT_REWARD_MNEMONIC). The
-/// phrase never leaves this process and is used only to compute the PUBLIC reward address.
-fn reward_from_mnemonic() -> [u8; 32] {
+/// LEGACY: derive the reward address as H(Normal pk) from a wallet recovery phrase
+/// (ZCRYPT_REWARD_MNEMONIC). Requires ZCRYPT_REWARD_MNEMONIC_LEGACY=1 because it ties the
+/// validator's income to the reusable Normal key that every claim publishes; prefer
+/// `--reward` with the stealth-derived address from the wallet's bond_request.
+fn reward_from_mnemonic_legacy() -> [u8; 32] {
     let m = std::env::var("ZCRYPT_REWARD_MNEMONIC").unwrap_or_default();
-    if m.trim().is_empty() {
-        eprintln!("set ZCRYPT_REWARD_ADDR (64 hex) or ZCRYPT_REWARD_MNEMONIC (your wallet phrase)");
+    let legacy_ok = matches!(std::env::var("ZCRYPT_REWARD_MNEMONIC_LEGACY").unwrap_or_default().trim(), "1" | "true" | "yes");
+    if m.trim().is_empty() || !legacy_ok {
+        eprintln!(
+            "pass --reward <64 hex> (the reward address from the wallet's bond_request) or set \
+             ZCRYPT_REWARD_ADDR. The ZCRYPT_REWARD_MNEMONIC derivation (reward = H(Normal pk), \
+             publishes your reusable key) is legacy and needs ZCRYPT_REWARD_MNEMONIC_LEGACY=1."
+        );
         std::process::exit(1);
     }
+    eprintln!("[bond_validator] WARNING: legacy reward derivation from the mnemonic (H(Normal pk)); rewards will be linkable to your Normal address");
     let acct = Account::from_mnemonic(m.trim(), "").expect("invalid ZCRYPT_REWARD_MNEMONIC");
     acct.reward_address()
 }

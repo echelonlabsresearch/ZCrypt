@@ -13,6 +13,7 @@ use zcrypt_core::nullifier::htlc_hashlock;
 use zcrypt_shield::commit_asset;
 
 fn main() {
+    zcrypt_bridge::zcrypt::set_broadcast_jitter(false); // e2e driver: no privacy delay on hundreds of broadcasts
     let zc_url = std::env::var("ZC_URL").unwrap_or_else(|_| "http://localhost:36657".to_string());
     let btc_url = std::env::var("BTC_URL").unwrap_or_else(|_| "http://localhost:18443".to_string());
     let net = zcrypt_bridge::NETWORK;
@@ -82,7 +83,7 @@ fn main() {
     swap::relay_btc_headers(&zc, &user_btc).unwrap();
 
     // TICK 1: the daemon sweeps the deposit autonomously.
-    let mut st = WatcherState::load(&state_path); // starts empty
+    let mut st = WatcherState::load(&state_path).unwrap(); // starts empty
     st.cursor = watch_from; // ignore prior flows' bridge activity — settle only our own
     let r1 = run(&mut st, &zc, &operator_btc, &reserve, &shield_dest, asset);
     st.save(&state_path).unwrap();
@@ -90,7 +91,7 @@ fn main() {
     assert_eq!(r1.swept, 1, "daemon swept the shield deposit");
 
     // Simulate a RESTART: reload state from disk; the swept set must persist (idempotent).
-    let mut st = WatcherState::load(&state_path);
+    let mut st = WatcherState::load(&state_path).unwrap();
     assert_eq!(st.swept.len(), 1, "swept set survived restart");
     let r1b = run(&mut st, &zc, &operator_btc, &reserve, &shield_dest, asset);
     assert_eq!(r1b.swept, 0, "after restart the daemon does NOT re-sweep (idempotent)");

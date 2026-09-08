@@ -67,6 +67,14 @@ impl SelfCustodyBtc {
         self.hd.receive_address(0)
     }
 
+    /// The `index`-th receiving address (BIP-84 external chain). Use a fresh index as the
+    /// payout destination of each redeem instead of always `receive_address()` (index 0),
+    /// so an observer cannot cluster all of a user's redeems by one address (privacy H3).
+    /// Restorable: the gap-limit scan finds every index with history.
+    pub fn receive_address_at(&self, index: u32) -> Result<Address, String> {
+        self.hd.receive_address(index)
+    }
+
     /// Gap-limit scan of one chain (0 = receive, 1 = change): the index right after the
     /// last address with on-chain history, stopping once `GAP` consecutive unused
     /// addresses have been seen (so a restored wallet lands on the same index a running
@@ -323,6 +331,9 @@ impl crate::BtcBackend for SelfCustodyBtc {
     }
     fn tx_confirmations(&self, txid: &Txid) -> Result<u64, String> {
         Ok(self.esplora.confirmations(&txid.to_string())? as u64)
+    }
+    fn utxo_unspent(&self, utxo: &HtlcUtxo) -> Result<Option<bool>, String> {
+        Ok(Some(self.esplora.outspend(&utxo.outpoint.txid.to_string(), utxo.outpoint.vout)?.is_none()))
     }
     fn find_htlc_spend_preimage(&self, utxo: &HtlcUtxo, _since_height: u64) -> Result<Option<Vec<u8>>, String> {
         // Esplora exposes the spender directly — no block scan needed.
