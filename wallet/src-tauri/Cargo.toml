@@ -14,6 +14,11 @@ devnet = []
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
+[dev-dependencies]
+# `tauri::test::mock_app` lets the live 3-node test drive the real `#[tauri::command]`s
+# with a genuine `State<AppState>`, no webview needed.
+tauri = { version = "2", features = ["test"] }
+
 [dependencies]
 tauri = { version = "2", features = [] }
 serde = { version = "1", features = ["derive"] }

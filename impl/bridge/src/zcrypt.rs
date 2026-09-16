@@ -112,6 +112,30 @@ impl Zcrypt {
         String::from_utf8(bytes).map_err(|e| e.to_string())
     }
 
+    /// Fire-and-forget broadcast (`broadcast_tx_sync`): returns the tx hash once CheckTx
+    /// passed, BEFORE the tx is in a block. Test drivers use it to land several txs in one
+    /// block (e.g. a duplicate lock that only fails at delivery).
+    pub fn broadcast_sync(&self, tx: &[u8]) -> Result<String, String> {
+        let body = serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "broadcast_tx_sync",
+            "params": { "tx": B64.encode(tx) }
+        });
+        let resp: Value = self.agent()
+            .post(&self.url)
+            .send_json(body)
+            .map_err(|e| e.to_string())?
+            .into_json()
+            .map_err(|e| e.to_string())?;
+        if let Some(msg) = resp["error"]["data"].as_str().or_else(|| resp["error"]["message"].as_str()) {
+            return Err(format!("node error: {msg}"));
+        }
+        let res = &resp["result"];
+        if res["code"].as_i64().unwrap_or(1) != 0 {
+            return Err(format!("check_tx: {}", res["log"].as_str().unwrap_or("")));
+        }
+        Ok(res["hash"].as_str().unwrap_or("").to_string())
+    }
+
     /// An ABCI query returning its (utf-8) string value.
     pub fn query(&self, path: &str) -> Result<String, String> {
         let u = format!("{}/abci_query?path=%22{}%22", self.url, path);

@@ -19,7 +19,7 @@ use crate::node::{ImmatureMint, Node, NodeSnapshot, Sentinel};
 /// On-disk schema for this module. Bump when key layout changes; older DBs
 /// refuse to open (re-migrate from postcard backup or relaunch) rather than
 /// silently misparse.
-pub const STATE_DB_SCHEMA: u32 = 2;
+pub const STATE_DB_SCHEMA: u32 = 3;
 
 // ---- key layout (default column family) ------------------------------------
 // meta/schema        -> u32 LE
@@ -49,7 +49,9 @@ const P_NF: &[u8] = b"nf/";
 const K_STAKING: &[u8] = b"blob/staking";
 const K_ASSETS: &[u8] = b"blob/assets";
 const K_HTLC: &[u8] = b"blob/htlc";
-const K_SPV: &[u8] = b"blob/spv";
+const K_SPV_META: &[u8] = b"blob/spv_meta"; // network, checkpoint, claimed outpoints (no headers)
+const P_SPV_HDR: &[u8] = b"spvh/"; // spvh/<index BE u64> -> 80-byte header (append-only log)
+const K_SPV_HDR_COUNT: &[u8] = b"meta/spv_count";
 const K_IMMATURE: &[u8] = b"blob/immature";
 const K_RECENT_ROOTS: &[u8] = b"blob/recent_roots";
 const K_SENTINEL: &[u8] = b"blob/sentinel";
@@ -76,6 +78,8 @@ pub struct StateDb {
     commit_count: usize,
     /// How many nullifier keys we believe are on disk (for stats; puts are idempotent).
     nf_count: usize,
+    /// Append cursor: how many SPV headers of the append-only log are already on disk.
+    spv_count: usize,
 }
 
 impl StateDb {
@@ -97,6 +101,7 @@ impl StateDb {
             path,
             commit_count: 0,
             nf_count: 0,
+            spv_count: 0,
         };
         store.init_or_check_schema()?;
         store.refresh_cursors_from_meta()?;
@@ -187,6 +192,7 @@ impl StateDb {
     fn refresh_cursors_from_meta(&mut self) -> Result<(), String> {
         self.commit_count = self.get_u64(K_COMMIT_COUNT)?.unwrap_or(0) as usize;
         self.nf_count = self.get_u64(K_NF_COUNT)?.unwrap_or(0) as usize;
+        self.spv_count = self.get_u64(K_SPV_HDR_COUNT)?.unwrap_or(0) as usize;
         Ok(())
     }
 
@@ -274,7 +280,22 @@ impl StateDb {
         let staking = load_blob(&self.db, K_STAKING)?;
         let assets = load_blob(&self.db, K_ASSETS)?;
         let htlc = load_blob(&self.db, K_HTLC)?;
-        let spv = load_blob(&self.db, K_SPV)?;
+        let spv_meta: crate::spv::Snap = load_blob(&self.db, K_SPV_META)?;
+        let spv_count = self.get_u64(K_SPV_HDR_COUNT)?.unwrap_or(0) as usize;
+        let mut spv_headers: Vec<[u8; 80]> = Vec::with_capacity(spv_count);
+        for i in 0..spv_count {
+            let bytes = self
+                .db
+                .get(spv_hdr_key(i as u64))
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| format!("missing spv header {i}"))?;
+            let raw: [u8; 80] = bytes
+                .as_slice()
+                .try_into()
+                .map_err(|_| format!("spv header {i} is not 80 bytes"))?;
+            spv_headers.push(raw);
+        }
+        let spv = crate::spv::HeaderChain::from_meta_and_headers(spv_meta, &spv_headers)?;
         let immature: Vec<ImmatureMint> = load_blob(&self.db, K_IMMATURE)?;
         let recent_roots: Vec<Commitment> = load_blob(&self.db, K_RECENT_ROOTS)?;
         let sentinel: Option<Sentinel> = match self.db.get(K_SENTINEL).map_err(|e| e.to_string())? {
@@ -341,14 +362,28 @@ impl StateDb {
         new_nfs: Option<Vec<(crate::hash::Hash, crate::hash::Hash)>>,
     ) -> Result<CommitStats, String> {
         let t0 = Instant::now();
-        let snap = node.snapshot(height);
-        let total_c = snap.commitment_leaves.len();
-        let total_nf = snap.smt_leaves.len();
-
+        // INCREMENTAL: only what changed since the last commit is materialized. The previous
+        // implementation took `node.snapshot()` here, cloning every commitment leaf and every
+        // nullifier (and the whole SPV header log) once per block under the consensus lock,
+        // an O(total state) cost per 1 s block. Leaves and SPV headers are append-only and
+        // written from their cursors; nullifiers come from the journal; only the small,
+        // bounded ledgers (staking, assets, escrow book, immature queue, anchors, sentinel,
+        // SPV metadata) are re-serialized whole.
+        let total_c = node.commitment_count();
+        let total_nf = node.smt_len();
         if total_c < self.commit_count {
             return Err(format!(
                 "commitment tree shrank (disk {}, memory {total_c}) — refusing commit",
                 self.commit_count
+            ));
+        }
+        let spv = node.spv();
+        let spv_log = spv.header_log();
+        if spv_log.len() < self.spv_count {
+            return Err(format!(
+                "spv header log shrank (disk {}, memory {}) — refusing commit",
+                self.spv_count,
+                spv_log.len()
             ));
         }
 
@@ -361,20 +396,24 @@ impl StateDb {
         batch.put(K_HEIGHT, height.to_le_bytes());
         puts += 4;
 
-        let new_commitments = total_c - self.commit_count;
-        for i in self.commit_count..total_c {
-            let key = commit_key(i as u64);
-            let val = encode_commitment(&snap.commitment_leaves[i]);
-            batch.put(&key, &val);
+        let new_leaves = node.commitment_leaves_range(self.commit_count, total_c - self.commit_count);
+        let new_commitments = new_leaves.len();
+        for (k, c) in new_leaves.iter().enumerate() {
+            let key = commit_key((self.commit_count + k) as u64);
+            batch.put(&key, encode_commitment(c));
             puts += 1;
         }
         batch.put(K_COMMIT_COUNT, (total_c as u64).to_le_bytes());
         puts += 1;
 
         let prev_nf = self.nf_count;
+        let full_nfs;
         let to_write: &[(crate::hash::Hash, crate::hash::Hash)] = match &new_nfs {
             Some(j) => j,
-            None => &snap.smt_leaves,
+            None => {
+                full_nfs = node.smt_leaf_entries();
+                &full_nfs
+            }
         };
         for (nf, bind) in to_write {
             let mut key = Vec::with_capacity(P_NF.len() + 32);
@@ -386,28 +425,36 @@ impl StateDb {
         batch.put(K_NF_COUNT, (total_nf as u64).to_le_bytes());
         puts += 1;
 
-        put_blob(&mut batch, K_STAKING, &snap.staking)?;
-        put_blob(&mut batch, K_ASSETS, &snap.assets)?;
-        put_blob(&mut batch, K_HTLC, &snap.htlc)?;
-        put_blob(&mut batch, K_SPV, &snap.spv)?;
-        put_blob(&mut batch, K_IMMATURE, &snap.immature)?;
-        put_blob(&mut batch, K_RECENT_ROOTS, &snap.recent_roots)?;
-        put_blob(&mut batch, K_BLOCK_ROOTS, &snap.block_roots)?;
-        puts += 7;
-        let sent_bytes = postcard::to_allocvec(&snap.sentinel)
+        put_blob(&mut batch, K_STAKING, node.staking())?;
+        put_blob(&mut batch, K_ASSETS, node.assets())?;
+        put_blob(&mut batch, K_HTLC, node.htlc_book())?;
+        put_blob(&mut batch, K_IMMATURE, &node.immature())?;
+        put_blob(&mut batch, K_RECENT_ROOTS, &node.recent_roots())?;
+        put_blob(&mut batch, K_BLOCK_ROOTS, &node.block_roots())?;
+        puts += 6;
+        let sent_bytes = postcard::to_allocvec(&node.sentinel())
             .map_err(|e| format!("encode sentinel: {e}"))?;
         batch.put(K_SENTINEL, sent_bytes);
         puts += 1;
 
+        put_blob(&mut batch, K_SPV_META, &spv.meta_snapshot())?;
+        puts += 1;
+        for (k, raw) in spv_log[self.spv_count..].iter().enumerate() {
+            batch.put(spv_hdr_key((self.spv_count + k) as u64), raw);
+            puts += 1;
+        }
+        batch.put(K_SPV_HDR_COUNT, (spv_log.len() as u64).to_le_bytes());
+        puts += 1;
+
         let mut wopts = WriteOptions::default();
-        wopts.set_sync(true); // phase 2: fsync WAL+SST visibility before Commit returns
+        wopts.set_sync(true); // fsync WAL+SST visibility before Commit returns
         self.db
             .write_opt(batch, &wopts)
             .map_err(|e| format!("rocksdb write (height {height}): {e}"))?;
 
         self.commit_count = total_c;
         self.nf_count = total_nf;
-
+        self.spv_count = spv_log.len();
         let new_nullifiers = total_nf.saturating_sub(prev_nf);
         let stats = CommitStats {
             height,
@@ -429,6 +476,7 @@ impl StateDb {
         // Reset cursors so commit writes every leaf.
         self.commit_count = 0;
         self.nf_count = 0;
+        self.spv_count = 0;
         let chain_id = self.chain_id()?.unwrap_or_default();
         let _ = self.commit_full(&mut node, height, &chain_id)?;
         Ok(())
@@ -453,6 +501,13 @@ impl StateDb {
             .map_err(|e| format!("backup rename → {}: {e}", path.display()))?;
         Ok(())
     }
+}
+
+fn spv_hdr_key(index: u64) -> Vec<u8> {
+    let mut k = Vec::with_capacity(P_SPV_HDR.len() + 8);
+    k.extend_from_slice(P_SPV_HDR);
+    k.extend_from_slice(&index.to_be_bytes());
+    k
 }
 
 fn commit_key(index: u64) -> Vec<u8> {

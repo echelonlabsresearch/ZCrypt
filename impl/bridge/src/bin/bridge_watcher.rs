@@ -42,7 +42,9 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use zcrypt_bridge::watcher::{finalize_margin_policy, reserve_key_from_env, watcher_tick_persisting, WatcherState};
+use zcrypt_bridge::watcher::{
+    finalize_margin_policy, previous_reserve_keys_from_env, reserve_key_from_env, watcher_tick_persisting, WatcherState,
+};
 use zcrypt_bridge::zcrypt::Zcrypt;
 use zcrypt_bridge::{swap, Btc};
 
@@ -64,6 +66,15 @@ fn main() {
         println!("{reserve_pk_hex}");
         return;
     }
+    // Keys retired by `rotate_reserve` that still have deposits to sweep / redeems to refund.
+    let previous = match previous_reserve_keys_from_env() {
+        Ok(k) => k,
+        Err(e) => {
+            eprintln!("[bridge-watcher] {e}");
+            std::process::exit(2);
+        }
+    };
+    let keys = swap::ReserveKeys { current: &reserve, previous: &previous };
 
     let zc = Zcrypt::new(&env("ZC_URL", "http://localhost:36657"));
     let btc_url = env("BTC_URL", "http://localhost:18443");
@@ -108,7 +119,8 @@ fn main() {
     let fee_target: u32 = env("WATCHER_FEE_TARGET", "1").parse().unwrap_or(1);
 
     eprintln!(
-        "[bridge-watcher] zBTC asset {asset}, reserve pubkey {reserve_pk_hex}, state {}, poll {}s, finalize margin {margin} ZC blocks",
+        "[bridge-watcher] zBTC asset {asset}, reserve pubkey {reserve_pk_hex} (+{} retired), state {}, poll {}s, finalize margin {margin} ZC blocks",
+        previous.len(),
         state_path.display(),
         poll.as_secs()
     );
@@ -123,7 +135,7 @@ fn main() {
     };
     let persist = |st: &WatcherState| st.save(&state_path);
     loop {
-        match watcher_tick_persisting(&mut state, &zc, &operator_btc, &reserve, &shield_dest, asset, margin, fee_target, &persist) {
+        match watcher_tick_persisting(&mut state, &zc, &operator_btc, &keys, &shield_dest, asset, margin, fee_target, &persist) {
             Ok(r) => {
                 if r.swept + r.locked + r.finalized + r.refunded + r.reanchored + r.resumed + r.deferred + r.at_risk + r.critical + r.rejected > 0
                     || r.pause_new_shields

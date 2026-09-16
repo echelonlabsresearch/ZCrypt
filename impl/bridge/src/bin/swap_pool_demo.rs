@@ -11,6 +11,7 @@
 use zcrypt_bridge::swap::{self, SwapQuote};
 use zcrypt_bridge::zcrypt::Zcrypt;
 use zcrypt_core::keys::{self, Account};
+use zcrypt_core::nullifier::htlc_hashlock;
 use zcrypt_shield::{commit_asset, spend_pubkey};
 
 fn main() {
@@ -55,25 +56,53 @@ fn main() {
         take_amount: 120_000,
         timeout_blocks: 500,
     };
-    println!("\n== SWAP: 100_000 AAAA -> 120_000 BBBB (private, atomic) ==");
+    println!("\n== SWAP: 100_000 AAAA -> 120_000 BBBB (private, atomic, two roles) ==");
+    // The two sides run as separate roles that only communicate through the chain: each
+    // finds the other's lock by scanning blocks and confirms it with consensus before acting.
+    let scan_from = zc.height().unwrap();
     let preimage = swap::fresh_preimage();
-    let result = swap::swap_in_pool_progress(
-        &zc,
-        &alice,
-        &bob,
-        &[alice_a],
-        &[bob_b],
-        &quote,
-        &preimage,
-        &|pct, phase| println!("  [{pct:>3}%] {phase}"),
-    )
-    .unwrap();
+    let lock = htlc_hashlock(&preimage);
 
-    assert_eq!(result.received.asset_id, asset_b);
-    assert_eq!(result.received.value, 120_000);
+    // TAKER: lock A for the maker.
+    let (give_escrow, give_change, give_timeout) =
+        swap::taker_lock_give(&zc, &alice, &[alice_a], &quote, &bob.pubkey(), &lock).expect("taker lock");
+    println!("  [taker] locked {} AAAA, escrow {}, expires at {give_timeout}", quote.give_amount, hex::encode(give_escrow));
+
+    // MAKER: find the taker's lock on chain (claimant = maker), verify it, lock B with a
+    // timeout that expires a margin BEFORE the taker's.
+    let taker_lock = swap::find_swap_lock(&zc, scan_from, zc.height().unwrap(), &lock, &bob.pubkey(), asset_a, quote.give_amount)
+        .expect("scan")
+        .expect("maker finds the taker's confirmed lock");
+    assert_eq!(taker_lock.escrow_id, give_escrow);
+    let (take_escrow, _maker_change) = swap::maker_lock_take(&zc, &bob, &[bob_b], &quote, &taker_lock).expect("maker lock");
+    let take_info = swap::query_escrow(&zc, &take_escrow).unwrap().expect("maker escrow open");
+    assert!(swap::maker_lock_is_safe(taker_lock.timeout, take_info.timeout_height));
+    println!("  [maker] locked {} BBBB, escrow {}, expires at {}", quote.take_amount, hex::encode(take_escrow), take_info.timeout_height);
+
+    // TAKER: find the maker's lock (claimant = taker), then claim it, revealing the preimage.
+    let maker_lock = swap::find_swap_lock(&zc, scan_from, zc.height().unwrap(), &lock, &alice.pubkey(), asset_b, quote.take_amount)
+        .expect("scan")
+        .expect("taker finds the maker's confirmed lock");
+    assert_eq!(maker_lock.escrow_id, take_escrow);
+    zc.broadcast(&swap::claim_tx(&take_escrow, &preimage)).expect("taker claim");
+    let received = alice.htlc_coin(quote.take_amount, asset_b, &take_escrow);
+    println!("  [taker] claimed {} BBBB (preimage now public)", received.value);
+
+    // MAKER: read the preimage from the taker's claim and settle the A side.
+    let (revealed, at) = swap::find_claim_preimage(&zc, scan_from, zc.height().unwrap(), &take_escrow, &lock)
+        .expect("scan")
+        .expect("maker sees the preimage");
+    assert_eq!(revealed, preimage);
+    zc.broadcast(&swap::claim_tx(&give_escrow, &revealed)).expect("maker claim");
+    let bob_got = bob.htlc_coin(quote.give_amount, asset_a, &give_escrow);
+    println!("  [maker] read preimage at height {at}, claimed {} AAAA", bob_got.value);
+
+    assert_eq!(received.asset_id, asset_b);
+    assert_eq!(received.value, 120_000);
     println!(
-        "Alice received {} BBBB; {} AAAA change back.",
-        result.received.value, result.give_change.value
+        "Alice received {} BBBB; {} AAAA change back. Bob received {} AAAA.",
+        received.value, give_change.value, bob_got.value
     );
+
     println!("\nIn-pool private swap (both legs, one hashlock): GREEN");
 }

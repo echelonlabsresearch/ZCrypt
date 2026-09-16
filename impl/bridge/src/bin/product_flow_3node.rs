@@ -9,7 +9,7 @@
 //! VALIDATOR_SEED_HEX=<64 hex chars> (the first 32 bytes of a node's
 //! priv_validator_key.json) to enable it.
 
-use zcrypt_bridge::swap::{self, build_shield_spend};
+use zcrypt_bridge::swap::{self};
 use zcrypt_bridge::zcrypt::Zcrypt;
 use zcrypt_core::keys::{self, Account, BearerCoin, Coin};
 use zcrypt_core::{kem, shield_tx};
@@ -330,13 +330,26 @@ fn main() {
             let cblind = keys::random_blind();
             let change_out = keys::out_coin(&rewarder.normal_address(), 100, cblind);
             let cnote = kem::ciphertext_to_bytes(&keys::encrypt_note(&rewarder.normal_address(), 100, cblind));
-            let pledge = build_shield_spend(&zc, &[fund], &[burn_out, change_out], FEE, vec![keys::cover_note_bytes(), cnote])
-                .expect("build the stake pledge");
             // BOND carries the signer's monotonic auth nonce (M3). Query it — a prior run
             // (e.g. fee_flow's bond/unbond of this same node) may have already advanced it.
             let bond_nonce: u64 = zc
                 .query(&format!("/staking/auth_nonce/{}", hex::encode(sk.verifying_key().to_bytes())))
                 .ok().and_then(|s| s.trim().parse().ok()).unwrap_or(0);
+            // The pledge proof is bound to the bond header (front-run theft defence).
+            let bond_env = zcrypt_core::staking::bond_envelope(
+                &sk.verifying_key().to_bytes(), stake, &reward, zcrypt_core::staking::DEFAULT_COMMISSION_BPS, bond_nonce,
+            );
+            let pledge = swap::build_shield_spend_bound(&zc, &[fund], &[burn_out, change_out], FEE, vec![keys::cover_note_bytes(), cnote], &bond_env)
+                .expect("build the stake pledge");
+            // FRONT-RUN DEFENCE (live): the same pledge + stake_blind re-signed under an
+            // attacker's consensus key must be rejected at admission, because the proof is
+            // bound to the bond header's envelope; the victim's coins stay unspent.
+            let thief = ed25519_dalek::SigningKey::from_bytes(&[0xAA; 32]);
+            let err = zc
+                .broadcast(&bond_tx(&thief, stake, reward, stake_blind, 0, &pledge))
+                .expect_err("a re-wrapped pledge must be rejected");
+            assert!(err.contains("envelope"), "front-run rejected for the right reason: {err}");
+            println!("[6] re-wrapped BOND pledge under another consensus key: REJECTED ({err})");
             zc.broadcast(&bond_tx(&sk, stake, reward, stake_blind, bond_nonce, &pledge)).expect("BOND accepted");
             println!("[6] BOND accepted (pledged {stake} ZCRYPT into a burn coin); waiting for the reward epoch...");
 
@@ -358,7 +371,12 @@ fn main() {
             let dcblind = keys::random_blind();
             let del_change = keys::out_coin(&delegator.normal_address(), 100, dcblind);
             let dcnote = kem::ciphertext_to_bytes(&keys::encrypt_note(&delegator.normal_address(), 100, dcblind));
-            let del_pledge = build_shield_spend(&zc, &[dfund], &[del_burn, del_change], FEE, vec![keys::cover_note_bytes(), dcnote])
+            let del_id = {
+                use sha2::{Digest, Sha256};
+                Sha256::digest(del_sk.verifying_key().to_bytes())[..20].to_vec()
+            };
+            let del_env = zcrypt_core::staking::delegate_envelope(&del_id, &val_addr, del_stake, &del_reward);
+            let del_pledge = swap::build_shield_spend_bound(&zc, &[dfund], &[del_burn, del_change], FEE, vec![keys::cover_note_bytes(), dcnote], &del_env)
                 .expect("build the delegation pledge");
             zc.broadcast(&delegate_tx(&del_sk, &val_addr, del_stake, del_reward, del_blind, &del_pledge))
                 .expect("DELEGATE accepted");

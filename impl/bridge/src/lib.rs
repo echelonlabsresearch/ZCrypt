@@ -650,6 +650,17 @@ impl Btc {
 /// the swap can run over EITHER a local node ([`Btc`], regtest/dev) OR a node-free
 /// self-custody wallet on an Esplora API ([`selfcustody::SelfCustodyBtc`], production).
 /// Both the user and the bridge/LP use the same interface, so no bitcoind is required.
+/// Outcome of looking for the spend of an HTLC output.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HtlcSpend {
+    /// No confirmed spend found in the scanned range.
+    Unspent,
+    /// Spent via the claim branch; the revealed preimage.
+    Claimed(Vec<u8>),
+    /// Spent via the refund (CLTV) branch.
+    Refunded,
+}
+
 pub trait BtcBackend {
     /// Fund an HTLC's P2WSH address with `amount`; return the confirmed funding UTXO.
     fn fund_htlc(&self, script: &ScriptBuf, amount: Amount) -> Result<HtlcUtxo, String>;
@@ -699,7 +710,18 @@ pub trait BtcBackend {
     /// that preimage; `None` if still unspent or spent via the refund branch. Lets the redeem
     /// watcher detect the user's BTC claim and finalize the burn autonomously, without being
     /// handed the claim txid. `since_height` bounds any block scan (the lock's funding height).
-    fn find_htlc_spend_preimage(&self, utxo: &HtlcUtxo, since_height: u64) -> Result<Option<Vec<u8>>, String>;
+    /// How (if at all) the HTLC `utxo` has been spent, scanning blocks from `since_height`
+    /// where a scan is needed. Distinguishes the refund branch from a claim so the watcher
+    /// can stop tracking a refunded lock instead of rescanning forever (bridge M15).
+    fn find_htlc_spend(&self, utxo: &HtlcUtxo, since_height: u64) -> Result<HtlcSpend, String>;
+
+    /// Back-compat shim: the claim preimage if spent via the claim branch, else `None`.
+    fn find_htlc_spend_preimage(&self, utxo: &HtlcUtxo, since_height: u64) -> Result<Option<Vec<u8>>, String> {
+        Ok(match self.find_htlc_spend(utxo, since_height)? {
+            HtlcSpend::Claimed(pre) => Some(pre),
+            _ => None,
+        })
+    }
 
     /// Confirmations of `txid` on this backend's best chain (0 if unconfirmed/unknown). Used
     /// by the operator watcher to DEFER sweeping a deposit until it is buried past the mint's
@@ -771,7 +793,7 @@ impl BtcBackend for Btc {
         // Never act on an absurd estimate (bridge M4).
         Ok(cap_fee_rate(if sat_vb >= 1.0 { sat_vb } else { 2.0 }))
     }
-    fn find_htlc_spend_preimage(&self, utxo: &HtlcUtxo, since_height: u64) -> Result<Option<Vec<u8>>, String> {
+    fn find_htlc_spend(&self, utxo: &HtlcUtxo, since_height: u64) -> Result<HtlcSpend, String> {
         let tip = self.height()?;
         let want_txid = utxo.outpoint.txid.to_string();
         for h in since_height..=tip {
@@ -789,14 +811,16 @@ impl BtcBackend for Btc {
                         // Claim witness = [sig, PREIMAGE, selector=1, script]; refund has an empty item 1.
                         let pre = vin["txinwitness"].as_array().and_then(|w| w.get(1)).and_then(|x| x.as_str());
                         return Ok(match pre {
-                            Some(hexpre) if !hexpre.is_empty() => Some(hex::decode(hexpre).map_err(|e| e.to_string())?),
-                            _ => None, // spent via refund — no preimage
+                            Some(hexpre) if !hexpre.is_empty() => {
+                                HtlcSpend::Claimed(hex::decode(hexpre).map_err(|e| e.to_string())?)
+                            }
+                            _ => HtlcSpend::Refunded, // refund branch: empty preimage slot
                         });
                     }
                 }
             }
         }
-        Ok(None) // not spent yet
+        Ok(HtlcSpend::Unspent) // not spent in the scanned range
     }
     fn tx_confirmations(&self, txid: &Txid) -> Result<u64, String> {
         match self.rpc.get_raw_transaction_info(txid, None) {
@@ -829,6 +853,7 @@ pub mod hdwallet;
 pub mod selfcustody;
 pub mod swap;
 pub mod txbuilder;
+pub mod wallet_flows;
 pub mod watcher;
 pub mod zcrypt;
 

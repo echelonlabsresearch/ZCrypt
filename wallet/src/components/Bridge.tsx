@@ -24,6 +24,16 @@ interface Progress {
   phase: string;
 }
 
+interface PendingDeposit {
+  index: number;
+  value_sats: number;
+  asset_id: string;
+  btc_locktime: number;
+  funded: boolean;
+  refund_txid: string | null;
+  started: number;
+}
+
 /** 1 zBTC = 100,000,000 base units (8 decimals, like BTC). */
 const ZBTC_BASE = 100_000_000;
 const zfmt = (base: number) => (base / ZBTC_BASE).toLocaleString(undefined, { maximumFractionDigits: 8 });
@@ -45,6 +55,7 @@ export default function Bridge({
   const [err, setErr] = useState("");
   const [progress, setProgress] = useState<Progress | null>(null);
   const [fixMsg, setFixMsg] = useState("");
+  const [pendingDeposits, setPendingDeposits] = useState<PendingDeposit[]>([]);
 
   // `withBtc` = also ask the Esplora server for the Bitcoin balance. Off for every
   // automatic refresh: a hosted Esplora learns the deposit address of whoever asks, so
@@ -55,7 +66,27 @@ export default function Bridge({
     } catch {
       setStatus(null);
     }
+    try {
+      setPendingDeposits(await call<PendingDeposit[]>("list_pending_deposits"));
+    } catch {
+      setPendingDeposits([]);
+    }
   }, []);
+
+  async function refundDeposit(index: number) {
+    setErr("");
+    setFixMsg("");
+    setBusy("refund");
+    try {
+      const txid = await call<string>("bridge_refund_deposit", { index });
+      setFixMsg(`Refund broadcast: ${txid}. The BTC returns to your wallet once it confirms.`);
+      await load();
+    } catch (e) {
+      setErr(String(e));
+    } finally {
+      setBusy("");
+    }
+  }
 
   useEffect(() => {
     if (active) load(false);
@@ -245,6 +276,32 @@ export default function Bridge({
               automatically once the deposit matures (near-instant on regtest, up to ~a few
               hours on mainnet). This tab keeps relaying Bitcoin headers to advance it.
             </div>
+          </div>
+        )}
+
+        {pendingDeposits.length > 0 && (
+          <div className="card" style={{ marginTop: "0.75rem", background: "var(--bg-grid)", borderLeft: "3px solid var(--color-amber, #d99a00)" }}>
+            <div style={{ fontWeight: "bold" }}>⏸ {pendingDeposits.length} BTC deposit(s) in flight</div>
+            <div style={{ fontSize: "0.72rem", color: "var(--color-text-dim)", marginTop: 4 }}>
+              Each locks BTC in a Bitcoin HTLC until its zBTC is minted. "Diagnose &amp; fix" resumes the
+              mint while the lock holds; once the Bitcoin lock block has passed, Refund takes the BTC back.
+            </div>
+            {pendingDeposits.map((d) => (
+              <div key={d.index} style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 6, fontSize: "0.8rem" }}>
+                <span>#{d.index}: {zfmt(d.value_sats)} BTC</span>
+                <span style={{ color: "var(--color-text-dim)" }}>
+                  {d.funded ? "funded" : "funding not seen yet"}
+                  {d.btc_locktime > 0 ? ` · refundable from Bitcoin block ${d.btc_locktime}` : ""}
+                  {d.refund_txid ? ` · refund sent ${d.refund_txid.slice(0, 12)}…` : ""}
+                </span>
+                <span className="spacer" />
+                {!d.refund_txid && (
+                  <button className="btn-secondary" disabled={busy !== ""} onClick={() => refundDeposit(d.index)}>
+                    {busy === "refund" ? "Refunding…" : "Refund"}
+                  </button>
+                )}
+              </div>
+            ))}
           </div>
         )}
 

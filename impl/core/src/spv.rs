@@ -32,12 +32,26 @@ use bitcoin::pow::{CompactTarget, Target, Work};
 use bitcoin::script::PushBytesBuf;
 use bitcoin::{MerkleBlock, ScriptBuf, Transaction};
 
+use crate::asset_registry::ReserveAuth;
 use crate::hash::{h, Hash};
 
 /// Max headers accepted in a single `BTC_HEADERS` (0x63) relay tx. Caps the mempool
 /// pre-check and deliver-time validation cost. One retargeting epoch (2016) is ample for
 /// catch-up relays; larger histories arrive across multiple txs.
 pub const MAX_HEADER_BATCH: usize = 2016;
+
+/// See [`HeaderChain::max_tip_age_secs`].
+pub const MAX_SPV_TIP_AGE_SECS: u64 = 4 * 3600;
+/// Regtest bound: blocks are mined on demand there, so a live test can let the tip go stale
+/// in minutes instead of hours; the sweep margin on regtest is 20 blocks, so 5 minutes is
+/// still far inside it.
+pub const MAX_SPV_TIP_AGE_SECS_REGTEST: u64 = 5 * 60;
+
+/// After a reserve-key rotation, deposits paying the RETIRED key are still accepted for
+/// mint if they were mined no deeper than this many Bitcoin blocks past the tip height at
+/// which the rotation was recorded (a deposit funded just before the rotation but mined just
+/// after it is not stranded). Anything later must pay the current key.
+pub const RESERVE_RETIRE_GRACE_BLOCKS: u64 = 6;
 
 /// `OP_CHECKLOCKTIMEVERIFY` treats a script number at or above this as a UNIX timestamp,
 /// not a block height. Consensus compares a deposit's refund locktime against the SPV
@@ -215,6 +229,64 @@ pub fn sign_open_auth(refund_sk: &bitcoin::secp256k1::SecretKey, a: &OpenAuth<'_
     secp.sign_ecdsa(&msg, refund_sk).serialize_compact()
 }
 
+/// Domain-separated digest the CURRENT reserve key signs to rotate an SPV asset's reserve
+/// to `new_pk`. Bound to the chain, the asset, the asset's monotonic authority epoch (so a
+/// captured rotation cannot be replayed after the key moves again) and both keys.
+pub fn reserve_rotation_digest(
+    chain_id: &[u8],
+    asset_id: u64,
+    epoch: u64,
+    old_pk: &[u8; 33],
+    new_pk: &[u8; 33],
+) -> [u8; 32] {
+    use bitcoin::hashes::{sha256, Hash as _};
+    let mut buf = Vec::with_capacity(20 + 4 + chain_id.len() + 8 + 8 + 33 + 33);
+    buf.extend_from_slice(b"ZC-RESERVE-ROTATE-1");
+    buf.extend_from_slice(&(chain_id.len() as u32).to_le_bytes());
+    buf.extend_from_slice(chain_id);
+    buf.extend_from_slice(&asset_id.to_le_bytes());
+    buf.extend_from_slice(&epoch.to_le_bytes());
+    buf.extend_from_slice(old_pk);
+    buf.extend_from_slice(new_pk);
+    sha256::Hash::hash(&buf).to_byte_array()
+}
+
+/// Operator side: sign a reserve rotation with the current reserve secret key.
+pub fn sign_reserve_rotation(
+    reserve_sk: &bitcoin::secp256k1::SecretKey,
+    chain_id: &[u8],
+    asset_id: u64,
+    epoch: u64,
+    old_pk: &[u8; 33],
+    new_pk: &[u8; 33],
+) -> [u8; 64] {
+    let secp = bitcoin::secp256k1::Secp256k1::signing_only();
+    let msg = bitcoin::secp256k1::Message::from_digest(reserve_rotation_digest(chain_id, asset_id, epoch, old_pk, new_pk));
+    secp.sign_ecdsa(&msg, reserve_sk).serialize_compact()
+}
+
+/// Consensus side: verify that `old_pk` (the asset's current reserve key) authorised the
+/// rotation to `new_pk` at `epoch`.
+pub fn verify_reserve_rotation(
+    chain_id: &[u8],
+    asset_id: u64,
+    epoch: u64,
+    old_pk: &[u8; 33],
+    new_pk: &[u8; 33],
+    sig: &[u8],
+) -> Result<(), String> {
+    use bitcoin::secp256k1::{ecdsa::Signature, PublicKey, Secp256k1};
+    let pk = PublicKey::from_slice(old_pk).map_err(|e| format!("reserve-rotate: bad current key: {e}"))?;
+    if PublicKey::from_slice(new_pk).is_err() {
+        return Err("reserve-rotate: new key is not a valid compressed secp256k1 point".to_string());
+    }
+    let sig = Signature::from_compact(sig).map_err(|e| format!("reserve-rotate: bad signature: {e}"))?;
+    let msg = bitcoin::secp256k1::Message::from_digest(reserve_rotation_digest(chain_id, asset_id, epoch, old_pk, new_pk));
+    Secp256k1::verification_only()
+        .verify_ecdsa(&msg, &sig, &pk)
+        .map_err(|_| "reserve-rotate: signature is not by the asset's current reserve key".to_string())
+}
+
 /// Consensus side: verify the refund-key authorization for an SPV mint open. `sig` is a
 /// 64-byte compact ECDSA signature by `refund_pk` over [`open_auth_digest`].
 pub fn verify_open_auth(refund_pk: &[u8; 33], a: &OpenAuth<'_>, sig: &[u8]) -> Result<(), String> {
@@ -267,13 +339,17 @@ pub struct HeaderChain {
 /// Serialized form: net + checkpoint + raw header log + claimed outpoints. The
 /// derived index is rebuilt by re-validating the log (guaranteed to succeed for
 /// a log this code accepted; corruption fails the restore loudly).
-#[derive(serde::Serialize, serde::Deserialize)]
-struct Snap {
-    net: u8,
-    checkpoint: Vec<u8>,
-    checkpoint_height: u64,
-    headers: Vec<Vec<u8>>,
-    claimed: Vec<Vec<u8>>,
+/// Serializable form of the chain. The state store persists the header log incrementally
+/// (append-only keys) and only this struct's non-header fields per block, via
+/// [`HeaderChain::meta_snapshot`] / [`HeaderChain::from_meta_and_headers`]; the postcard
+/// backup file still carries the full form (headers included).
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
+pub struct Snap {
+    pub net: u8,
+    pub checkpoint: Vec<u8>,
+    pub checkpoint_height: u64,
+    pub headers: Vec<Vec<u8>>,
+    pub claimed: Vec<Vec<u8>>,
 }
 
 impl From<HeaderChain> for Snap {
@@ -295,24 +371,68 @@ impl From<HeaderChain> for Snap {
 impl TryFrom<Snap> for HeaderChain {
     type Error = String;
     fn try_from(s: Snap) -> Result<HeaderChain, String> {
-        let net = match s.net {
+        let mut headers = Vec::with_capacity(s.headers.len());
+        for raw in &s.headers {
+            let raw: [u8; 80] = raw
+                .as_slice()
+                .try_into()
+                .map_err(|_| "spv snapshot: header is not 80 bytes".to_string())?;
+            headers.push(raw);
+        }
+        HeaderChain::from_meta_and_headers(s, &headers)
+    }
+}
+
+impl HeaderChain {
+    /// Everything except the header log (network, checkpoint, claimed outpoints).
+    pub fn meta_snapshot(&self) -> Snap {
+        Snap {
+            net: match self.net {
+                BtcNet::Regtest => 0,
+                BtcNet::Mainnet => 1,
+                BtcNet::Signet => 2,
+            },
+            checkpoint: self.checkpoint.to_vec(),
+            checkpoint_height: self.checkpoint_height,
+            headers: Vec::new(),
+            claimed: self.claimed.iter().map(|o| o.to_vec()).collect(),
+        }
+    }
+
+    /// The append-only header log in insertion order (what `apply_validated` recorded).
+    pub fn header_log(&self) -> &[[u8; 80]] {
+        &self.log
+    }
+
+    /// Rebuild from metadata plus the header log (`meta.headers` is ignored). Every header is
+    /// re-validated against consensus rules, in batches, exactly as it was when relayed.
+    pub fn from_meta_and_headers(meta: Snap, headers: &[[u8; 80]]) -> Result<HeaderChain, String> {
+        let net = match meta.net {
             0 => BtcNet::Regtest,
             1 => BtcNet::Mainnet,
             2 => BtcNet::Signet,
             other => return Err(format!("spv snapshot: unknown network {other}")),
         };
-        let cp: [u8; 80] = s
+        let cp: [u8; 80] = meta
             .checkpoint
             .try_into()
             .map_err(|_| "spv snapshot: checkpoint is not 80 bytes".to_string())?;
-        let mut chain = HeaderChain::with_checkpoint(net, cp, s.checkpoint_height)?;
-        for raw in s.headers {
-            let raw: [u8; 80] =
-                raw.try_into().map_err(|_| "spv snapshot: header is not 80 bytes".to_string())?;
-            let v = chain.validate_batch(&raw).map_err(|e| format!("spv snapshot: invalid header in log: {e}"))?;
+        let mut chain = HeaderChain::with_checkpoint(net, cp, meta.checkpoint_height)?;
+        for chunk in headers.chunks(MAX_HEADER_BATCH) {
+            let bytes: Vec<u8> = chunk.concat();
+            let v = chain
+                .validate_batch(&bytes)
+                .map_err(|e| format!("spv snapshot: invalid header in log: {e}"))?;
             chain.apply_validated(v);
         }
-        for op in s.claimed {
+        if chain.log.len() != headers.len() {
+            return Err(format!(
+                "spv snapshot: header log replay kept {} of {} headers (duplicates in log)",
+                chain.log.len(),
+                headers.len()
+            ));
+        }
+        for op in meta.claimed {
             let op: [u8; 36] =
                 op.try_into().map_err(|_| "spv snapshot: outpoint is not 36 bytes".to_string())?;
             chain.claimed.insert(op);
@@ -432,6 +552,24 @@ impl HeaderChain {
     pub fn tip_height(&self) -> u64 {
         self.index[&self.best].height
     }
+    /// The best tip header's `nTime` (Unix seconds): the freshness clock for the SPV view.
+    pub fn tip_time(&self) -> u64 {
+        let hdr: Header = deserialize(&self.index[&self.best].raw).expect("indexed header is valid");
+        u64::from(hdr.time)
+    }
+    /// How stale (block time minus tip header time) the consensus Bitcoin view may be
+    /// before SPV mint opens and claims are refused. The refund-lock sweep margin is 144
+    /// Bitcoin blocks (~24 h); if the relayed tip lags real Bitcoin by that much, a
+    /// depositor can refund on Bitcoin and still claim zBTC against the stale tip. Bitcoin
+    /// timestamps may run ~2 h ahead of real time and inter-block gaps of over an hour do
+    /// occur, so 4 h refuses only a genuinely stalled relay while staying far inside the
+    /// margin.
+    pub fn max_tip_age_secs(&self) -> u64 {
+        match self.net {
+            BtcNet::Regtest => MAX_SPV_TIP_AGE_SECS_REGTEST,
+            _ => MAX_SPV_TIP_AGE_SECS,
+        }
+    }
     pub fn header_count(&self) -> usize {
         self.index.len()
     }
@@ -458,16 +596,13 @@ impl HeaderChain {
         if count > MAX_HEADER_BATCH {
             return Err(format!("header batch too large: {count} headers > cap {MAX_HEADER_BATCH}"));
         }
-        // Admission requires every header to (a) satisfy the proof-of-work it claims for
-        // itself (one SHA256d each; the consensus target is checked at delivery) and
-        // (b) chain onto the previous header of the batch, so garbage that merely links
-        // to a known parent is not gossiped and does not occupy block space.
+        // Mempool policy: a batch is one contiguous chain segment (cheap, and what every
+        // honest relayer produces). Consensus itself accepts any set of headers that link
+        // to known ones, but there is no reason to admit branchy batches.
         let mut prev_hash: Option<[u8; 32]> = None;
         for chunk in bytes.chunks_exact(80) {
             let raw: [u8; 80] = chunk.try_into().unwrap();
             let hdr: Header = deserialize(&raw).map_err(|e| format!("bad header: {e}"))?;
-            hdr.validate_pow(hdr.target())
-                .map_err(|e| format!("header fails its own proof-of-work: {e}"))?;
             if let Some(p) = prev_hash {
                 if hdr.prev_blockhash.to_byte_array() != p {
                     return Err("header batch is not a contiguous chain".to_string());
@@ -475,22 +610,14 @@ impl HeaderChain {
             }
             prev_hash = Some(hdr.block_hash().to_byte_array());
         }
-        let first: Header = deserialize(&bytes[..80]).map_err(|e| format!("bad header: {e}"))?;
-        let last: Header = deserialize(&bytes[bytes.len() - 80..]).map_err(|e| format!("bad header: {e}"))?;
-        // A batch whose LAST header is already known adds nothing: it is either a replay
-        // or fully overlapping. Replays of known headers used to be accepted at zero cost
-        // (and cost a full header-chain clone at delivery), a free block-filling spam
-        // vector (bridge M3 / consensus M1).
-        if self.index.contains_key(&last.block_hash().to_byte_array()) {
+        // Admission runs the SAME validation as delivery (difficulty against the
+        // consensus-required bits, PoW at that target, MTP, linkage), as a pure dry run.
+        // Checking a header only against its own self-declared `bits` let anyone forge
+        // 2016-header batches with ~2 hash attempts each, fill the per-block header budget
+        // and starve honest relay for free (bridge review H2). A batch must add ≥1 header.
+        let validated = self.validate_batch(bytes)?;
+        if validated.is_empty() {
             return Err("header relay adds no new headers (already known)".to_string());
-        }
-        let fhash = first.block_hash().to_byte_array();
-        if self.index.contains_key(&fhash) {
-            return Ok(()); // overlapping prefix, but the tail extends the chain
-        }
-        let prev = first.prev_blockhash.to_byte_array();
-        if !self.index.contains_key(&prev) {
-            return Err("header batch does not connect to any known header".to_string());
         }
         Ok(())
     }
@@ -555,9 +682,16 @@ impl HeaderChain {
 
             // Median-time-past: a block's time must exceed the median of its last 11
             // ancestors, so timestamps cannot be walked backwards to game retargets.
-            let mtp = self.median_time_past(&overlay, &prev);
-            if u64::from(header.time) <= mtp {
-                return Err(format!("header time {} not past median-time-past {mtp}", header.time));
+            // Bitcoin's rule: time > median of the 11 previous blocks. Below the checkpoint we
+            // hold no headers, so for the first ten post-checkpoint heights the window is short;
+            // enforcing a median over fewer blocks is STRICTER than Bitcoin (e.g. C+1 would need
+            // time > T_C, which mainnet does not guarantee) and would freeze the chain forever
+            // at genesis. Enforce only once the full 11-block window exists; those few headers
+            // are still bound by exact `bits` and full PoW.
+            if let Some(mtp) = self.median_time_past(&overlay, &prev) {
+                if u64::from(header.time) <= mtp {
+                    return Err(format!("header time {} not past median-time-past {mtp}", header.time));
+                }
             }
 
             let work = parent.work + header.work();
@@ -616,7 +750,9 @@ impl HeaderChain {
     }
 
     /// Median of the last (up to) 11 ancestor timestamps, starting at `from`.
-    fn median_time_past(&self, overlay: &BTreeMap<[u8; 32], Entry>, from: &[u8; 32]) -> u64 {
+    /// Median of the 11 ancestors' timestamps, or `None` when the window is cut short by
+    /// the checkpoint (fewer than 11 headers available), in which case no MTP rule applies.
+    fn median_time_past(&self, overlay: &BTreeMap<[u8; 32], Entry>, from: &[u8; 32]) -> Option<u64> {
         let mut times = Vec::with_capacity(11);
         let mut cursor = *from;
         for _ in 0..11 {
@@ -628,8 +764,11 @@ impl HeaderChain {
             }
             cursor = hdr.prev_blockhash.to_byte_array();
         }
+        if times.len() < 11 {
+            return None;
+        }
         times.sort_unstable();
-        times[times.len() / 2]
+        Some(times[times.len() / 2])
     }
 
     /// Point the best chain at `tip`, rewriting the height→hash map back to the
@@ -690,21 +829,33 @@ impl HeaderChain {
     /// a first mint needs depth + unclaimed; a re-anchor needs neither).
     fn check_deposit(
         &self,
-        authority: &Hash,
+        reserve: &ReserveAuth<'_>,
         value: u64,
         hashlock: &Hash,
         proof: &MintProof,
         require_locktime_margin: bool,
     ) -> Result<([u8; 36], [u8; 32], u64), String> {
-        if spv_authority(&proof.reserve_pk) != *authority {
-            return Err("SPV proof: claim key is not the asset's pinned reserve key".to_string());
-        }
         let mb: MerkleBlock =
             deserialize(&proof.merkle_block).map_err(|e| format!("SPV proof: bad merkle block: {e}"))?;
         let block_hash = mb.header.block_hash().to_byte_array();
         let conf = self
             .confirmations(&block_hash)
             .ok_or("SPV proof: block not on the best Bitcoin header chain")?;
+        // Reserve-key binding: the current key always; a RETIRED key only for deposits mined
+        // before (or within the grace after) its rotation on an initial mint, and without a
+        // height bound on re-anchor (the outpoint is already claimed and fixed to that key).
+        let proof_auth = spv_authority(&proof.reserve_pk);
+        if proof_auth != reserve.current {
+            let deposit_height = self.index[&block_hash].height;
+            let retired_ok = reserve.retired.iter().any(|r| {
+                r.authority == proof_auth
+                    && (!require_locktime_margin
+                        || deposit_height <= r.retired_at_btc_height + RESERVE_RETIRE_GRACE_BLOCKS)
+            });
+            if !retired_ok {
+                return Err("SPV proof: claim key is not the asset's pinned reserve key".to_string());
+            }
+        }
         let mut matched = Vec::new();
         let mut indexes = Vec::new();
         mb.extract_matches(&mut matched, &mut indexes)
@@ -776,7 +927,19 @@ impl HeaderChain {
         hashlock: &Hash,
         proof: &MintProof,
     ) -> Result<([u8; 36], [u8; 32]), String> {
-        let (op, block_hash, conf) = self.check_deposit(authority, value, hashlock, proof, true)?;
+        self.verify_mint_proof_with(&ReserveAuth::sole(authority), value, hashlock, proof)
+    }
+
+    /// [`Self::verify_mint_proof`] against the asset's full reserve history (current key
+    /// plus retired keys with their grace windows).
+    pub fn verify_mint_proof_with(
+        &self,
+        reserve: &ReserveAuth<'_>,
+        value: u64,
+        hashlock: &Hash,
+        proof: &MintProof,
+    ) -> Result<([u8; 36], [u8; 32]), String> {
+        let (op, block_hash, conf) = self.check_deposit(reserve, value, hashlock, proof, true)?;
         if conf < self.min_conf() {
             return Err(format!("SPV proof: {conf} confirmation(s) < required {}", self.min_conf()));
         }
@@ -800,7 +963,18 @@ impl HeaderChain {
         hashlock: &Hash,
         proof: &MintProof,
     ) -> Result<([u8; 36], [u8; 32]), String> {
-        let (op, block_hash, _conf) = self.check_deposit(authority, value, hashlock, proof, false)?;
+        self.verify_reanchor_with(&ReserveAuth::sole(authority), value, hashlock, proof)
+    }
+
+    /// [`Self::verify_reanchor`] against the asset's full reserve history.
+    pub fn verify_reanchor_with(
+        &self,
+        reserve: &ReserveAuth<'_>,
+        value: u64,
+        hashlock: &Hash,
+        proof: &MintProof,
+    ) -> Result<([u8; 36], [u8; 32]), String> {
+        let (op, block_hash, _conf) = self.check_deposit(reserve, value, hashlock, proof, false)?;
         Ok((op, block_hash))
     }
 
@@ -1235,14 +1409,30 @@ mod tests {
         let mut c = HeaderChain::new(BtcNet::Regtest);
         let t0 = 1_296_688_602u32;
         let mut prev = REGTEST_GENESIS;
+        // Fewer than 11 headers above the checkpoint: Bitcoin's 11-block median would reach
+        // below the checkpoint, which we do not hold, so NO median rule applies yet (a
+        // stricter short-window median would freeze a real chain whose first post-checkpoint
+        // timestamp is not monotonic). Exact bits + full PoW still gate these headers.
         for i in 1..=3u32 {
             let raw = mine_header(&prev, &[], t0 + 600 * i);
             c.submit_headers(&raw).unwrap();
             prev = raw;
         }
-        // A child timestamped at (or before) the median of its ancestors fails.
+        let early = mine_header(&prev, &[], t0);
+        c.submit_headers(&early).expect("short window: no median rule");
+        prev = early;
+        // Fill the window to 11 ancestors; from here Bitcoin's rule is enforced exactly.
+        for i in 4..=10u32 {
+            let raw = mine_header(&prev, &[], t0 + 600 * i);
+            c.submit_headers(&raw).unwrap();
+            prev = raw;
+        }
+        // A child timestamped at (or before) the median of its 11 ancestors fails.
         let backdated = mine_header(&prev, &[], t0);
         assert!(c.submit_headers(&backdated).unwrap_err().contains("median-time-past"));
+        // ...while one just past the median is accepted.
+        let ok = mine_header(&prev, &[], t0 + 600 * 6);
+        c.submit_headers(&ok).unwrap();
     }
 
     #[test]
@@ -1513,7 +1703,7 @@ mod precheck_admission_regression {
     //! their own proof-of-work or are not internally contiguous, so garbage that merely
     //! links to a known parent is never gossiped or included.
     use super::testutil::mine_header;
-    use super::{BtcNet, HeaderChain, REGTEST_GENESIS};
+    use super::{deserialize, BtcNet, Header, HeaderChain, Target, REGTEST_GENESIS};
 
     #[test]
     fn non_contiguous_batches_are_rejected_at_admission() {
@@ -1542,6 +1732,36 @@ mod precheck_admission_regression {
         // nBits occupies bytes 72..76 of the 80-byte header (little-endian compact form).
         h[72..76].copy_from_slice(&0x0100_0001u32.to_le_bytes());
         let err = chain.precheck_headers(&h).unwrap_err();
-        assert!(err.contains("proof-of-work"), "{err}");
+        assert!(err.contains("difficulty") || err.contains("proof of work"), "{err}");
+    }
+
+    /// The header-flood vector (bridge review H2): a MAINNET header whose self-declared
+    /// `bits` is the easiest possible target, "mined" in a couple of hash attempts. It meets
+    /// its OWN target, so a precheck that only validated PoW against the header's own bits
+    /// admitted it into the mempool, where it burned the per-block header budget and was
+    /// only rejected at delivery. Admission must now refuse it outright.
+    #[test]
+    fn junk_easy_bits_headers_are_refused_at_admission() {
+        use bitcoin::consensus::serialize;
+        let chain = HeaderChain::new(BtcNet::Mainnet);
+        let genesis: Header = deserialize(&chain.checkpoint).unwrap();
+        let mut junk = Header {
+            version: genesis.version,
+            prev_blockhash: genesis.block_hash(),
+            merkle_root: genesis.merkle_root,
+            time: genesis.time + 600,
+            bits: bitcoin::pow::CompactTarget::from_consensus(0x207f_ffff),
+            nonce: 0,
+        };
+        while !Target::from_compact(junk.bits).is_met_by(junk.block_hash()) {
+            junk.nonce += 1;
+        }
+        // It DOES satisfy its own declared target (the old admission check)...
+        assert!(junk.validate_pow(junk.target()).is_ok());
+        let raw: [u8; 80] = serialize(&junk).try_into().unwrap();
+        // ...but consensus requires mainnet difficulty, and admission now agrees with delivery.
+        let err = chain.precheck_headers(&raw).unwrap_err();
+        assert!(err.contains("difficulty"), "{err}");
+        assert!(chain.clone().submit_headers(&raw).unwrap_err().contains("difficulty"));
     }
 }

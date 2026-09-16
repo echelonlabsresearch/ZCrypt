@@ -124,6 +124,11 @@ pub struct HtlcEscrow {
     /// [`ESCROW_RETENTION_BLOCKS`]. `None` while open.
     #[serde(default)]
     pub settled_at: Option<u64>,
+    /// Burn-lock-for-BTC only: the user's compressed secp256k1 key the operator must pay
+    /// the BTC HTLC to. Committed in consensus so the watcher reads it from state (not
+    /// from raw block txs, where a failed duplicate lock could carry a different key).
+    #[serde(default)]
+    pub btc_claim_pk: Vec<u8>,
 }
 
 /// Envelope discriminants, matching the transaction tags that carry each lock kind. Folding
@@ -236,17 +241,13 @@ impl HtlcBook {
         party_pk: PubKey,
         refund_pk: PubKey,
         spv_deposit: Option<SpvDeposit>,
+        btc_claim_pk: Vec<u8>,
     ) -> Result<Hash, String> {
         if value == 0 {
             return Err("escrow value must be positive".to_string());
         }
         let id = escrow_id(asset_id, value, &hashlock, timeout_height, &party_pk);
-        if self.escrows.contains_key(&id) {
-            return Err("escrow already exists".to_string());
-        }
-        if self.retired.get(&timeout_height).is_some_and(|ids| ids.contains(&id)) {
-            return Err("escrow id was already used and settled (change a parameter)".to_string());
-        }
+        self.id_available(&id, timeout_height)?;
         self.escrows.insert(
             id,
             HtlcEscrow {
@@ -260,9 +261,24 @@ impl HtlcBook {
                 spv_deposit,
                 state: EscrowState::Open,
                 settled_at: None,
+                btc_claim_pk,
             },
         );
         Ok(id)
+    }
+
+    /// The exact admission rule `insert` applies to an escrow id: not live, and not in the
+    /// retired window (a settled id whose timeout is still ahead). Callers that apply a
+    /// shielded spend BEFORE inserting the escrow MUST run this first, otherwise a rejected
+    /// insert leaves the spend applied (coins burned) with no escrow to refund from.
+    pub fn id_available(&self, id: &Hash, timeout_height: u64) -> Result<(), String> {
+        if self.escrows.contains_key(id) {
+            return Err("escrow already exists".to_string());
+        }
+        if self.retired.get(&timeout_height).is_some_and(|ids| ids.contains(id)) {
+            return Err("escrow id was already used and settled (change a parameter)".to_string());
+        }
+        Ok(())
     }
 
     /// Drop every settled escrow whose settlement is older than
@@ -312,7 +328,7 @@ impl HtlcBook {
         claim_pk: PubKey,
         spv_deposit: Option<SpvDeposit>,
     ) -> Result<Hash, String> {
-        self.insert(EscrowKind::Mint, asset_id, value, hashlock, timeout_height, claim_pk, claim_pk, spv_deposit)
+        self.insert(EscrowKind::Mint, asset_id, value, hashlock, timeout_height, claim_pk, claim_pk, spv_deposit, Vec::new())
     }
 
     /// Open a **burn** escrow (zBTC→BTC): Alice's zBTC is already locked; claiming
@@ -324,8 +340,12 @@ impl HtlcBook {
         hashlock: Hash,
         timeout_height: u64,
         refund_pk: PubKey,
+        btc_claim_pk: &[u8],
     ) -> Result<Hash, String> {
-        self.insert(EscrowKind::Burn, asset_id, value, hashlock, timeout_height, refund_pk, refund_pk, None)
+        self.insert(
+            EscrowKind::Burn, asset_id, value, hashlock, timeout_height, refund_pk, refund_pk, None,
+            btc_claim_pk.to_vec(),
+        )
     }
 
     /// Open a **swap** escrow (in-pool asset↔asset): the locker's coins are already
@@ -341,7 +361,7 @@ impl HtlcBook {
         counterparty_pk: PubKey,
         refund_pk: PubKey,
     ) -> Result<Hash, String> {
-        self.insert(EscrowKind::Swap, asset_id, value, hashlock, timeout_height, counterparty_pk, refund_pk, None)
+        self.insert(EscrowKind::Swap, asset_id, value, hashlock, timeout_height, counterparty_pk, refund_pk, None, Vec::new())
     }
 
     /// Claim with a preimage before the timeout. Returns the escrow's `(kind,
@@ -431,6 +451,8 @@ impl HtlcBook {
                 EscrowState::Expired => 2,
             });
             buf.extend_from_slice(&e.settled_at.unwrap_or(u64::MAX).to_le_bytes());
+            buf.extend_from_slice(&(e.btc_claim_pk.len() as u32).to_le_bytes());
+            buf.extend_from_slice(&e.btc_claim_pk);
         }
         for (timeout, ids) in &self.retired {
             buf.extend_from_slice(&timeout.to_le_bytes());
@@ -446,6 +468,44 @@ impl HtlcBook {
 mod tests {
     use super::*;
     use crate::nullifier::htlc_hashlock;
+
+    /// H4: the id admission rule a lock path must run BEFORE applying the shielded spend
+    /// covers both the live table and the retired window (settled, pruned, timeout ahead).
+    #[test]
+    fn id_available_covers_live_and_retired_ids() {
+        let mut b = HtlcBook::default();
+        let lock = htlc_hashlock(b"preimage-of-exactly-32-bytes!!!!");
+        let (asset, value, timeout) = (0xB7Cu64, 100u64, 500_000u64);
+        let id = b.lock_burn(asset, value, lock, timeout, pk(1), &[]).unwrap();
+        assert!(b.id_available(&id, timeout).unwrap_err().contains("already exists"));
+        // Settle it, then prune past the retention window while the timeout is still ahead:
+        // the id moves to `retired` and stays unavailable until the timeout passes.
+        b.claim(&id, b"preimage-of-exactly-32-bytes!!!!", 10).unwrap();
+        assert_eq!(b.prune_settled(10 + ESCROW_RETENTION_BLOCKS), 1);
+        assert!(b.get(&id).is_none(), "pruned from the live table");
+        assert!(b.id_available(&id, timeout).unwrap_err().contains("already used"), "retired id refused");
+        assert!(b.lock_burn(asset, value, lock, timeout, pk(1), &[]).is_err(), "insert agrees with id_available");
+        // A different parameter is a different id: available.
+        let other = escrow_id(asset, value + 1, &lock, timeout, &pk(1));
+        assert!(b.id_available(&other, timeout).is_ok());
+        // Once the timeout passes the retired entry is dropped (the id can no longer be
+        // re-opened anyway: the horizon check requires timeout > now).
+        b.prune_settled(timeout);
+        assert!(b.id_available(&id, timeout).is_ok());
+    }
+
+    /// C1: the burn-for-BTC payout key is consensus state and part of the book root.
+    #[test]
+    fn btc_claim_pk_is_committed_in_the_root() {
+        let lock = htlc_hashlock(b"another-32-byte-preimage-value!!");
+        let mut a = HtlcBook::default();
+        let mut b = HtlcBook::default();
+        let ida = a.lock_burn(1, 5, lock, 100, pk(2), &[0x02; 33]).unwrap();
+        let idb = b.lock_burn(1, 5, lock, 100, pk(2), &[0x03; 33]).unwrap();
+        assert_eq!(ida, idb, "the key is not part of the escrow id (same lock params)");
+        assert_eq!(a.get(&ida).unwrap().btc_claim_pk, vec![0x02; 33]);
+        assert_ne!(a.root(), b.root(), "different committed payout keys, different roots");
+    }
 
     fn pk(n: u64) -> PubKey {
         [n, n + 1, n + 2, n + 3, n + 4, n + 5, n + 6, n + 7]

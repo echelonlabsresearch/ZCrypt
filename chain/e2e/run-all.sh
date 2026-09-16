@@ -33,7 +33,12 @@ say "0/7  Build the RPC test drivers (release)"
     --bin reserve_pubkey \
     --bin shield_flow_3node --bin product_flow_3node --bin recover_flow_3node \
     --bin swap_demo --bin swap_pool_demo --bin fee_flow_3node \
-    --bin public_roundtrip_e2e --bin public_bridge_adversarial --bin watcher_daemon_e2e )
+    --bin public_roundtrip_e2e --bin public_bridge_adversarial --bin watcher_daemon_e2e \
+    --bin spv_guards_3node --bin rotate_reserve --bin rotate_reserve_3node \
+    --bin audit_fixes_3node )
+WALLET_DIR="$(cd "$CHAIN_DIR/../wallet/src-tauri" && pwd)"
+say "0b/7 Build the WALLET backend test (release, tauri mock app)"
+( cd "$WALLET_DIR" && cargo test --release --locked --no-run 2>&1 | tail -1 )
 BIN="$IMPL_DIR/target/release"
 # zBTC is bound to its reserve pubkey in GENESIS: derive it from the dev reserve key every
 # regtest driver uses (Key::from_bytes([0xB1; 32])) BEFORE the chain is created.
@@ -81,7 +86,7 @@ VALIDATOR_SEED_HEX="$VSEED" "$BIN/product_flow_3node" "$N0"
 say "7/8  BTC <-> zBTC atomic swap, both directions, vs the 3-node chain + bitcoind"
 ZC_URL="$N0" BTC_URL="$BTC" "$BIN/swap_demo"
 
-say "7b/8 Private in-pool asset<->asset swap (shielded DEX) vs the 3-node chain"
+say "7b/8 Private in-pool asset<->asset swap (shielded DEX, two roles via on-chain lookup) vs the 3-node chain"
 ZC_URL="$N0" "$BIN/swap_pool_demo"
 
 say "8/8  PUBLIC bridge: cross-seed shield+redeem round-trip (on-chain redeem)"
@@ -92,6 +97,39 @@ ZC_URL="$N0" BTC_URL="$BTC" "$BIN/public_bridge_adversarial"
 
 say "8c/8 PUBLIC bridge: operator watcher DAEMON (autonomous settle + restart idempotency)"
 ZC_URL="$N0" BTC_URL="$BTC" "$BIN/watcher_daemon_e2e"
+
+say "8c2/9 AUDIT-FIX regressions: aliased value refused, duplicate escrow id refused before the burn, ONE HTLC per escrow on the consensus payout key, refund-branch spend recognized"
+ZC_URL="$N0" BTC_URL="$BTC" "$BIN/audit_fixes_3node"
+
+say "8d/9 WALLET backend (the real tauri commands) against the live chain: create/fund/send/stealth/bearer/bond/delegate/claim/restore/shield/recover/redeem"
+( cd "$WALLET_DIR" && ZC_E2E_URL="$N0" BTC_URL="$BTC" VALIDATOR_SEED_HEX="$VSEED" \
+    cargo test --release --locked live_3node -- --nocapture --test-threads=1 2>&1 | grep -vE '^\s*(Running|Compiling|Finished)' )
+
+say "8d2/9 Node RESTART: abci1 reloads the incremental state DB (schema 3) and rejoins consensus"
+$COMPOSE restart abci1 cometbft1 >/dev/null
+echo -n "  waiting for $N1 "
+for _ in $(seq 1 90); do curl -sf "$N1/status" >/dev/null 2>&1 && { echo "up"; break; }; echo -n .; sleep 2; done
+docker logs zcrypt-abci1 2>&1 | grep -q "\[state-db\] resumed from" || { echo "FAIL: abci1 did not resume from its RocksDB state"; docker logs --tail 40 zcrypt-abci1; exit 1; }
+echo "  abci1 resumed from RocksDB: $(docker logs zcrypt-abci1 2>&1 | grep -o '\[state-db\] resumed from.*' | tail -1)"
+rh1=$(curl -s "$N1/status" | grep -o '"latest_block_height":"[0-9]*"' | grep -o '[0-9]*'); sleep 8
+rh2=$(curl -s "$N1/status" | grep -o '"latest_block_height":"[0-9]*"' | grep -o '[0-9]*')
+[ "$rh2" -gt "$rh1" ] || { echo "FAIL: node1 not advancing after restart ($rh1 -> $rh2)"; exit 1; }
+RH=$(curl -s "$N0/status" | grep -o '"latest_block_height":"[0-9]*"' | grep -o '[0-9]*'); RTH=$((RH-3))
+rah(){ curl -s "$1/commit?height=$2" | grep -o '"app_hash":"[^"]*"' | head -1 | cut -d'"' -f4; }
+ra0=$(rah "$N0" "$RTH"); ra1=$(rah "$N1" "$RTH"); ra2=$(rah "$N2" "$RTH")
+if [ -n "$ra0" ] && [ "$ra0" = "$ra1" ] && [ "$ra1" = "$ra2" ]; then
+  echo "  PASS: after restart node1 advances ($rh1 -> $rh2) and agrees on app_hash @ $RTH ($ra1)"
+else
+  echo "  FAIL: app_hash after restart: $ra0 / $ra1 / $ra2"; exit 1
+fi
+
+say "8e/9 SPV admission guards: self-declared-difficulty header refused; stale tip refuses open+claim, fresh header allows (~5.5 min)"
+ZC_URL="$N0" BTC_URL="$BTC" "$BIN/spv_guards_3node"
+
+say "9/9  Reserve-key ROTATION via the operator CLI: pre-rotation deposit swept only with the retired key; late old-key deposit refused; new key mints"
+# Runs LAST: every bridge flow above deposited to the dev reserve key; after this the chain pins
+# a new key (deposits already mined to the old one still mint within the grace window).
+ZC_URL="$N0" BTC_URL="$BTC" ROTATE_RESERVE_BIN="$BIN/rotate_reserve" "$BIN/rotate_reserve_3node"
 
 say "FINAL  All 3 validators agree on the app_hash"
 H=$(curl -s "$N0/status" | grep -o '"latest_block_height":"[0-9]*"' | grep -o '[0-9]*'); TH=$((H-3))

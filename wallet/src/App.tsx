@@ -19,6 +19,21 @@ interface Toast {
   body: string;
 }
 
+interface WalletHealth {
+  save_error: string | null;
+  pending_secrets: number;
+  pending_deposits: number;
+  pending_redeems: number;
+}
+
+interface PendingSecret {
+  id: number;
+  kind: string;
+  label: string;
+  secret: string;
+  created: number;
+}
+
 const VERSION = "0.1.0";
 
 export default function App() {
@@ -38,6 +53,11 @@ export default function App() {
   const [busy, setBusy] = useState(false);
   const [recovering, setRecovering] = useState(false);
   const [err, setErr] = useState("");
+  // Persistent-banner state (wallet H2): a failed post-action save, and secrets the wallet
+  // still owes the user (bearer tokens / stealth notes) until they are dismissed.
+  const [health, setHealth] = useState<WalletHealth | null>(null);
+  const [secrets, setSecrets] = useState<PendingSecret[]>([]);
+  const [showSecrets, setShowSecrets] = useState(false);
 
   const toast = useCallback((title: string, body: string) => {
     const id = Date.now() + Math.random();
@@ -76,6 +96,36 @@ export default function App() {
   useEffect(() => {
     if (mode === "ready") refresh();
   }, [mode, refresh]);
+
+  const pollHealth = useCallback(async () => {
+    try {
+      const h = await call<WalletHealth>("wallet_health");
+      setHealth(h);
+      if (h.pending_secrets > 0) {
+        setSecrets(await call<PendingSecret[]>("list_pending_secrets"));
+      } else {
+        setSecrets([]);
+      }
+    } catch {
+      /* locked */
+    }
+  }, []);
+
+  useEffect(() => {
+    if (mode !== "ready") return;
+    pollHealth();
+    const t = setInterval(pollHealth, 15000);
+    return () => clearInterval(t);
+  }, [mode, pollHealth]);
+
+  async function dismissSecret(id: number) {
+    try {
+      await call("dismiss_pending_secret", { id });
+      await pollHealth();
+    } catch (e) {
+      toast("Could not dismiss", String(e));
+    }
+  }
 
   async function doCreate() {
     setErr("");
@@ -310,6 +360,46 @@ export default function App() {
         </div>
         <button className="btn-lock" onClick={lock}>🔒 Lock</button>
       </nav>
+
+      {health?.save_error && (
+        <div className="msg err" style={{ margin: "0.6rem 1rem 0" }}>
+          <b>Wallet could not save to disk.</b> {health.save_error}
+        </div>
+      )}
+      {secrets.length > 0 && (
+        <div className="card" style={{ margin: "0.6rem 1rem 0", borderLeft: "3px solid var(--color-amber, #d99a00)" }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            <b>🔑 {secrets.length} secret{secrets.length === 1 ? "" : "s"} waiting for you</b>
+            <span style={{ fontSize: "0.74rem", color: "var(--color-text-dim)" }}>
+              bearer tokens and stealth notes are the ONLY copy of that money: hand them over, then dismiss
+            </span>
+            <span className="spacer" />
+            <button className="btn-link" onClick={() => setShowSecrets((v) => !v)}>
+              {showSecrets ? "Hide" : "Show"}
+            </button>
+          </div>
+          {showSecrets &&
+            secrets.map((sx) => (
+              <div key={sx.id} style={{ marginTop: 8, fontSize: "0.8rem" }}>
+                <div style={{ color: "var(--color-text-dim)" }}>
+                  {sx.kind === "bearer" ? "Bearer coin" : "Stealth note"}: {sx.label}
+                </div>
+                <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 4 }}>
+                  <code style={{ wordBreak: "break-all", flex: 1 }}>{trunc(sx.secret, 40, 12)}</code>
+                  <button
+                    className="btn-secondary"
+                    onClick={() => { copySensitive(sx.secret); toast("Copied", "Secret copied (clipboard clears shortly)."); }}
+                  >
+                    Copy
+                  </button>
+                  <button className="btn-link" onClick={() => dismissSecret(sx.id)} title="I have handed this over safely">
+                    Dismiss
+                  </button>
+                </div>
+              </div>
+            ))}
+        </div>
+      )}
 
       <main className="main">
         <div style={{ display: tab === "balance" ? "block" : "none" }}>

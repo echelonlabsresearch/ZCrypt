@@ -41,6 +41,55 @@ pub const COMMISSION_DEN: u64 = 100;
 pub const DEFAULT_COMMISSION_BPS: u16 = (COMMISSION_NUM * 10_000 / COMMISSION_DEN) as u16;
 pub const MAX_COMMISSION_BPS: u16 = 10_000;
 
+/// Envelope kind byte for a validator self-bond pledge (matches the BOND tx tag).
+pub const BOND_ENVELOPE_KIND: u8 = 0x57;
+/// Envelope kind byte for a delegation pledge (matches the DELEGATE tx tag).
+pub const DELEGATE_ENVELOPE_KIND: u8 = 0x5F;
+
+/// The proof envelope a BOND pledge must be bound to: every field of the signed bond
+/// header that names WHO receives the stake. The pledge shield tx is proven against
+/// `aux_digest(enc_notes, envelope)`, so a mempool front-runner who re-wraps the same
+/// pledge under their own consensus key / reward address / nonce produces a digest the
+/// proof was not made for and the tx fails. (Without this binding the pledge coins were
+/// stealable by any proposer.) `chain_id` is already a public input of the proof.
+pub fn bond_envelope(
+    consensus_pubkey: &[u8],
+    stake: u64,
+    reward_address: &Hash,
+    commission_bps: u16,
+    nonce: u64,
+) -> Vec<u8> {
+    let mut v = Vec::with_capacity(1 + 4 + consensus_pubkey.len() + 8 + 32 + 2 + 8);
+    v.push(BOND_ENVELOPE_KIND);
+    v.extend_from_slice(&(consensus_pubkey.len() as u32).to_le_bytes());
+    v.extend_from_slice(consensus_pubkey);
+    v.extend_from_slice(&stake.to_le_bytes());
+    v.extend_from_slice(reward_address);
+    v.extend_from_slice(&commission_bps.to_le_bytes());
+    v.extend_from_slice(&nonce.to_le_bytes());
+    v
+}
+
+/// The proof envelope a DELEGATE pledge must be bound to: the delegator identity, the
+/// target validator, the stake and the reward address of the signed delegate header.
+/// Same front-run defence as [`bond_envelope`].
+pub fn delegate_envelope(
+    delegator_id: &[u8],
+    validator_id: &[u8],
+    stake: u64,
+    reward_address: &Hash,
+) -> Vec<u8> {
+    let mut v = Vec::with_capacity(1 + 4 + delegator_id.len() + 4 + validator_id.len() + 8 + 32);
+    v.push(DELEGATE_ENVELOPE_KIND);
+    v.extend_from_slice(&(delegator_id.len() as u32).to_le_bytes());
+    v.extend_from_slice(delegator_id);
+    v.extend_from_slice(&(validator_id.len() as u32).to_le_bytes());
+    v.extend_from_slice(validator_id);
+    v.extend_from_slice(&stake.to_le_bytes());
+    v.extend_from_slice(reward_address);
+    v
+}
+
 /// Unbonding period: how long a validator's stake stays **locked** after it unbonds
 /// before it is released. Measured in seconds of consensus (BFT) block time so it is a
 /// true wall-clock delay regardless of block rate. 10 days — long enough that any

@@ -9,7 +9,7 @@
 //!     VALIDATOR_SEED_HEX=<node0 consensus seed> fee_flow_3node
 
 use bitcoin::Amount;
-use zcrypt_bridge::swap::{self, build_shield_spend, BtcParams};
+use zcrypt_bridge::swap::{self, BtcParams};
 use zcrypt_bridge::zcrypt::Zcrypt;
 use zcrypt_bridge::{Btc, Key};
 use zcrypt_core::keys::{self, Account};
@@ -110,7 +110,7 @@ fn unbond_tx(sk: &ed25519_dalek::SigningKey, nonce: u64) -> Vec<u8> {
     t
 }
 /// Fund `owner` with a SEED coin and spend it into `[burn(stake -> BURN_PK), change]`.
-fn pledge(zc: &Zcrypt, owner: &Account, stake: u64) -> (shield_tx::ShieldTx, Blind) {
+fn pledge(zc: &Zcrypt, owner: &Account, stake: u64, envelope: &[u8]) -> (shield_tx::ShieldTx, Blind) {
     // The pledge now pays MIN_FEE (M2), so fund covers stake + fee + change.
     let fee = zcrypt_core::emission::MIN_FEE;
     let fund = owner.own_coin(stake + fee + 100, keys::random_blind());
@@ -120,7 +120,7 @@ fn pledge(zc: &Zcrypt, owner: &Account, stake: u64) -> (shield_tx::ShieldTx, Bli
     let cblind = keys::random_blind();
     let change = keys::out_coin(&owner.normal_address(), 100, cblind);
     let cnote = kem::ciphertext_to_bytes(&keys::encrypt_note(&owner.normal_address(), 100, cblind));
-    let p = build_shield_spend(zc, &[fund], &[burn, change], fee, vec![zcrypt_core::keys::cover_note_bytes(), cnote]).expect("pledge");
+    let p = swap::build_shield_spend_bound(zc, &[fund], &[burn, change], fee, vec![zcrypt_core::keys::cover_note_bytes(), cnote], envelope).expect("pledge");
     (p, blind)
 }
 
@@ -150,11 +150,12 @@ fn main() {
     let validator = Account::from_seed([0xC1; 32]);
     let v_reward = keys::reward_address(&validator.pubkey());
     let v_stake = 10_000 * zcrypt_core::emission::ATOMIC;
-    let (vp, vb) = pledge(&zc, &validator, v_stake);
     // BOND carries the signer's monotonic auth nonce (M3); query the current value.
     let bond_nonce: u64 = zc
         .query(&format!("/staking/auth_nonce/{}", hex::encode(sk.verifying_key().to_bytes())))
         .ok().and_then(|s| s.trim().parse().ok()).unwrap_or(0);
+    let v_env = zcrypt_core::staking::bond_envelope(&sk.verifying_key().to_bytes(), v_stake, &v_reward, commission, bond_nonce);
+    let (vp, vb) = pledge(&zc, &validator, v_stake, &v_env);
     zc.broadcast(&bond_tx(&sk, v_stake, v_reward, commission, vb, bond_nonce, &vp)).expect("BOND accepted");
     println!("[1] BOND accepted (node0 validator @ {}% commission)", commission / 100);
 
@@ -167,7 +168,12 @@ fn main() {
     let delegator = Account::from_seed([0xD2; 32]);
     let d_reward = keys::reward_address(&delegator.pubkey());
     let d_stake = 5_000 * zcrypt_core::emission::ATOMIC;
-    let (dp, db) = pledge(&zc, &delegator, d_stake);
+    let d_id = {
+        use sha2::{Digest, Sha256};
+        Sha256::digest(del_sk.verifying_key().to_bytes())[..20].to_vec()
+    };
+    let d_env = zcrypt_core::staking::delegate_envelope(&d_id, &target, d_stake, &d_reward);
+    let (dp, db) = pledge(&zc, &delegator, d_stake, &d_env);
     zc.broadcast(&delegate_tx(&del_sk, &target, d_stake, d_reward, db, &dp)).expect("DELEGATE accepted");
     println!("[2] DELEGATE accepted (delegator pledged 5,000 ZCRYPT)");
 

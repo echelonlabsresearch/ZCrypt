@@ -74,6 +74,36 @@ pub fn valid_ticker(t: &str) -> bool {
         && t.chars().all(|c| c.is_ascii_alphanumeric())
 }
 
+/// A Bitcoin reserve key an SPV asset used to be pinned to, retired by a reserve rotation.
+/// Deposits that paid it are still accepted for mint if they were mined no later than
+/// `retired_at_btc_height + RESERVE_RETIRE_GRACE_BLOCKS` (see `spv::check_deposit`), and
+/// can always be re-anchored, so a rotation never strands an in-flight deposit.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RetiredReserve {
+    /// `spv_authority(reserve_pk)` of the retired key.
+    pub authority: Hash,
+    /// The retired 33-byte compressed reserve pubkey (published so wallets/watchers can
+    /// recognise old deposit scripts).
+    pub reserve_pk: Vec<u8>,
+    /// The consensus Bitcoin tip height when the rotation was recorded.
+    pub retired_at_btc_height: u64,
+}
+
+/// The set of reserve authorities an SPV deposit proof may name: the current one, plus
+/// retired ones (bounded by deposit height at mint time).
+#[derive(Clone, Copy, Debug)]
+pub struct ReserveAuth<'a> {
+    pub current: Hash,
+    pub retired: &'a [RetiredReserve],
+}
+
+impl<'a> ReserveAuth<'a> {
+    /// A single, never-rotated authority (what a freshly registered asset has).
+    pub fn sole(current: &'a Hash) -> Self {
+        ReserveAuth { current: *current, retired: &[] }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AssetMeta {
     pub asset_id: u64,
@@ -98,6 +128,25 @@ pub struct AssetMeta {
     /// UNLIMITED counterfeiting authority into a bounded one. (Full 1:1 backing
     /// still requires the BTC SPV verifier; this caps the blast radius until then.)
     pub max_supply: u64,
+    /// The 33-byte compressed Bitcoin reserve pubkey for an SPV-gated asset (empty for
+    /// key-set / protocol assets). `authority == spv_authority(reserve_pk)` whenever set.
+    #[serde(default)]
+    pub reserve_pk: Vec<u8>,
+    /// Reserve keys retired by rotation, oldest first.
+    #[serde(default)]
+    pub retired_reserves: Vec<RetiredReserve>,
+}
+
+impl AssetMeta {
+    /// The reserve authorities a deposit proof for this asset may name, or `None` when the
+    /// asset has no mint authority at all.
+    pub fn reserve_auth(&self) -> Option<ReserveAuth<'_>> {
+        self.authority.map(|current| ReserveAuth { current, retired: &self.retired_reserves })
+    }
+    /// The current reserve pubkey as a fixed array, if this is an SPV asset.
+    pub fn reserve_pk33(&self) -> Option<[u8; 33]> {
+        self.reserve_pk.as_slice().try_into().ok()
+    }
 }
 
 #[derive(Default, Clone, serde::Serialize, serde::Deserialize)]
@@ -171,9 +220,73 @@ impl AssetRegistry {
                 minted: 0,
                 max_supply,
                 authority_epoch: 0,
+                reserve_pk: Vec::new(),
+                retired_reserves: Vec::new(),
             },
         );
         Ok(id)
+    }
+
+    /// Register an SPV-gated asset pinned to `reserve_pk` (its authority is derived here,
+    /// never chosen by the registrant) and remember the key so it can later be rotated.
+    pub fn register_spv(
+        &mut self,
+        ticker: &str,
+        decimals: u8,
+        reserve_pk: &[u8; 33],
+        max_supply: u64,
+    ) -> Result<u64, String> {
+        if !crate::spv::reserve_pk_ok(reserve_pk) {
+            return Err("reserve pubkey is not a valid compressed secp256k1 point".to_string());
+        }
+        let id = self.register(ticker, decimals, Some(crate::spv::spv_authority(reserve_pk)), max_supply)?;
+        if let Some(m) = self.by_id.get_mut(&id) {
+            m.reserve_pk = reserve_pk.to_vec();
+        }
+        Ok(id)
+    }
+
+    /// Rotate an SPV asset's reserve key to `new_pk` (bridge review H3: the whole BTC
+    /// reserve used to sit behind one hot key with no rotation path, so a compromise or
+    /// loss meant a new chain). The old key is retired (kept for its in-flight deposits and
+    /// re-anchors, see [`RetiredReserve`]), the authority moves to
+    /// `spv_authority(new_pk)` and the epoch advances so the signed rotation can never be
+    /// replayed. Authorisation (a signature by the CURRENT reserve key) is checked by the
+    /// caller in consensus; this only updates the registry.
+    pub fn rotate_spv_reserve(
+        &mut self,
+        asset_id: u64,
+        new_pk: &[u8; 33],
+        retired_at_btc_height: u64,
+    ) -> Result<(), String> {
+        if !crate::spv::reserve_pk_ok(new_pk) {
+            return Err("new reserve pubkey is not a valid compressed secp256k1 point".to_string());
+        }
+        let new_auth = crate::spv::spv_authority(new_pk);
+        if self.by_id.iter().any(|(id, m)| {
+            *id != asset_id
+                && (m.authority == Some(new_auth) || m.retired_reserves.iter().any(|r| r.authority == new_auth))
+        }) {
+            return Err("the new reserve key already backs (or backed) another registered asset".to_string());
+        }
+        let m = self.by_id.get_mut(&asset_id).ok_or("asset not registered")?;
+        let Some(old_auth) = m.authority else {
+            return Err(format!("asset '{}' has no mint authority to rotate", m.ticker));
+        };
+        if m.reserve_pk.len() != 33 {
+            return Err(format!("asset '{}' is not SPV-gated: rotate its key set instead", m.ticker));
+        }
+        if m.reserve_pk.as_slice() == new_pk.as_slice() || m.retired_reserves.iter().any(|r| r.reserve_pk == new_pk) {
+            return Err("new reserve key must differ from the current and every retired key".to_string());
+        }
+        m.retired_reserves.push(RetiredReserve {
+            authority: old_auth,
+            reserve_pk: std::mem::replace(&mut m.reserve_pk, new_pk.to_vec()),
+            retired_at_btc_height,
+        });
+        m.authority = Some(new_auth);
+        m.authority_epoch += 1;
+        Ok(())
     }
 
     pub fn asset_of(&self, ticker: &str) -> Option<u64> {
@@ -201,6 +314,9 @@ impl AssetRegistry {
     /// single point where supply increases, so enforcing here makes
     /// `minted <= max_supply` an inviolable consensus invariant.
     pub fn record_mint(&mut self, asset_id: u64, amount: u64) -> Result<(), String> {
+        if amount > zcrypt_shield::MAX_COIN_VALUE {
+            return Err(format!("mint amount {amount} exceeds the maximum coin value"));
+        }
         let m = self.by_id.get_mut(&asset_id).ok_or("asset not registered")?;
         let next = m.minted.checked_add(amount).ok_or("mint supply overflow")?;
         if next > m.max_supply {
@@ -254,6 +370,11 @@ impl AssetRegistry {
     /// Record `amount` of `asset_id` burned (e.g. a zBTC→BTC redemption). Reduces
     /// the tracked supply. Rejects an unregistered asset.
     pub fn record_burn(&mut self, asset_id: u64, amount: u64) -> Result<(), String> {
+        // Backstop for the value-aliasing class: an amount above the circuit's coin bound can
+        // never have been minted, so it must never be subtracted (it would zero `minted`).
+        if amount > zcrypt_shield::MAX_COIN_VALUE {
+            return Err(format!("burn amount {amount} exceeds the maximum coin value"));
+        }
         let m = self.by_id.get_mut(&asset_id).ok_or("asset not registered")?;
         m.minted = m.minted.saturating_sub(amount);
         Ok(())
@@ -278,6 +399,15 @@ impl AssetRegistry {
             buf.extend_from_slice(&m.minted.to_le_bytes());
             buf.extend_from_slice(&m.max_supply.to_le_bytes());
             buf.extend_from_slice(&m.authority_epoch.to_le_bytes());
+            buf.extend_from_slice(&(m.reserve_pk.len() as u32).to_le_bytes());
+            buf.extend_from_slice(&m.reserve_pk);
+            buf.extend_from_slice(&(m.retired_reserves.len() as u32).to_le_bytes());
+            for r in &m.retired_reserves {
+                buf.extend_from_slice(&r.authority);
+                buf.extend_from_slice(&(r.reserve_pk.len() as u32).to_le_bytes());
+                buf.extend_from_slice(&r.reserve_pk);
+                buf.extend_from_slice(&r.retired_at_btc_height.to_le_bytes());
+            }
         }
         h(b"ZC-ASSETS", &[&buf])
     }
@@ -335,6 +465,7 @@ mod tests {
         r.by_id.insert(lane, AssetMeta {
             asset_id: lane, ticker: "OTHER".into(), decimals: 8, authority: None,
             minted: 0, max_supply: 1, authority_epoch: 0,
+            reserve_pk: Vec::new(), retired_reserves: Vec::new(),
         });
         let err = r.register("GOLD", 8, None, CAP).unwrap_err();
         assert!(err.contains("collision"), "{err}");

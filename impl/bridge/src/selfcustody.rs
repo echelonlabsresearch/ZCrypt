@@ -335,15 +335,18 @@ impl crate::BtcBackend for SelfCustodyBtc {
     fn utxo_unspent(&self, utxo: &HtlcUtxo) -> Result<Option<bool>, String> {
         Ok(Some(self.esplora.outspend(&utxo.outpoint.txid.to_string(), utxo.outpoint.vout)?.is_none()))
     }
-    fn find_htlc_spend_preimage(&self, utxo: &HtlcUtxo, _since_height: u64) -> Result<Option<Vec<u8>>, String> {
-        // Esplora exposes the spender directly — no block scan needed.
-        // `preimage_from_claim` returns None for refund spends (empty witness item).
+    fn find_htlc_spend(&self, utxo: &HtlcUtxo, _since_height: u64) -> Result<crate::HtlcSpend, String> {
+        // Esplora exposes the spender directly — no block scan needed. A spend with an empty
+        // witness slot 1 took the refund branch.
         match self.esplora.outspend(&utxo.outpoint.txid.to_string(), utxo.outpoint.vout)? {
             Some(spend_txid) => {
                 let txid = Txid::from_str(&spend_txid).map_err(|e| e.to_string())?;
-                Ok(self.preimage_from_claim(&txid))
+                Ok(match self.preimage_from_claim(&txid) {
+                    Some(pre) => crate::HtlcSpend::Claimed(pre),
+                    None => crate::HtlcSpend::Refunded,
+                })
             }
-            None => Ok(None),
+            None => Ok(crate::HtlcSpend::Unspent),
         }
     }
     fn block_header(&self, height: u64) -> Result<[u8; 80], String> {

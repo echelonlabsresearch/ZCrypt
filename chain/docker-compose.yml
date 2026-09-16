@@ -138,6 +138,10 @@ services:
     environment:
       ZC_URL: http://cometbft:26657
       ZCRYPT_RESERVE_KEY_FILE: /run/secrets/reserve_key
+      # After a reserve-key ROTATION (`rotate_reserve`), keep the retired key(s) available
+      # here (comma-separated 0600 files mounted as extra secrets) until every deposit and
+      # redeem that names them has been swept/refunded; then drop them. Empty = none.
+      ZCRYPT_RESERVE_PREV_KEY_FILES: ${ZCRYPT_RESERVE_PREV_KEY_FILES:-}
       WATCHER_STATE: /data/bridge-watcher-state.json
       WATCHER_POLL_SECS: ${WATCHER_POLL_SECS:-10}
       # ZCrypt blocks a redeem escrow must have left before the operator locks BTC.

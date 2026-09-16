@@ -469,10 +469,31 @@ fn coin_backed_bond_pledges_coins_and_unbonding_returns_them() {
     let change_blind = keys::random_blind();
     let burn_out: OutCoin = (stake, stake_blind, BURN_PK, 0);
     let change_out = keys::out_coin(&bonder.normal_address(), 100, change_blind);
-    let stx = build_shield(&node, &[fund.clone()], [burn_out, change_out], fee, notes()).unwrap();
-
     let reward = keys::reward_address(&bonder.pubkey());
-    node.bond_with_stake(CHAIN, &stx, stake, stake_blind, b"val".to_vec(), b"val".to_vec(), reward, zcrypt_core::staking::DEFAULT_COMMISSION_BPS)
+    let commission = zcrypt_core::staking::DEFAULT_COMMISSION_BPS;
+    // The pledge proof is bound to the bond header (consensus key, stake, reward,
+    // commission, nonce): the envelope consensus rebuilds from the signed header.
+    let env = zcrypt_core::staking::bond_envelope(b"val", stake, &reward, commission, 0);
+    let stx = build_shield_bound(&node, &[fund.clone()], [burn_out, change_out], fee, notes(), &env).unwrap();
+
+    // FRONT-RUN DEFENCE: the same pledge bytes + stake_blind re-wrapped under ANOTHER
+    // validator's header (a mempool thief re-signing with their own key / reward address)
+    // must be rejected, and must not spend the victim's coins.
+    let thief_reward = keys::reward_address(&Account::from_seed([0xBA; 32]).pubkey());
+    let err = node
+        .bond_with_stake(CHAIN, &stx, stake, stake_blind, b"thief".to_vec(), b"thief".to_vec(), thief_reward, commission, 0)
+        .unwrap_err();
+    assert!(err.contains("envelope-binding"), "re-wrapped pledge must fail proof binding: {err}");
+    assert!(!node.is_validator(b"thief"));
+    // ...and re-wrapping under the right key but a different nonce/reward fails the same way.
+    assert!(node
+        .bond_with_stake(CHAIN, &stx, stake, stake_blind, b"val".to_vec(), b"val".to_vec(), reward, commission, 1)
+        .is_err());
+    assert!(node
+        .bond_with_stake(CHAIN, &stx, stake, stake_blind, b"val".to_vec(), b"val".to_vec(), thief_reward, commission, 0)
+        .is_err());
+
+    node.bond_with_stake(CHAIN, &stx, stake, stake_blind, b"val".to_vec(), b"val".to_vec(), reward, commission, 0)
         .expect("coin-backed bond accepted");
     assert!(node.is_validator(b"val"));
 
@@ -492,7 +513,7 @@ fn coin_backed_bond_pledges_coins_and_unbonding_returns_them() {
         notes(),
     ).unwrap();
     assert!(
-        node.bond_with_stake(CHAIN, &normal, stake, stake_blind, b"v2".to_vec(), b"v2".to_vec(), reward, zcrypt_core::staking::DEFAULT_COMMISSION_BPS).is_err(),
+        node.bond_with_stake(CHAIN, &normal, stake, stake_blind, b"v2".to_vec(), b"v2".to_vec(), reward, zcrypt_core::staking::DEFAULT_COMMISSION_BPS, 0).is_err(),
         "output[0] must be the declared stake burn coin"
     );
     assert!(!node.is_validator(b"v2"), "rejected bond records no validator");
@@ -540,9 +561,10 @@ fn coin_backed_delegation_shares_rewards_and_returns_stake() {
     let vblind = keys::random_blind();
     let vburn: OutCoin = (vstake, vblind, BURN_PK, 0);
     let vchange = keys::out_coin(&validator.normal_address(), 100, keys::random_blind());
-    let vtx = build_shield(&node, &[vfund], [vburn, vchange], fee, notes()).unwrap();
     let vreward = keys::reward_address(&validator.pubkey());
-    node.bond_with_stake(CHAIN, &vtx, vstake, vblind, b"val".to_vec(), b"val".to_vec(), vreward, zcrypt_core::staking::DEFAULT_COMMISSION_BPS)
+    let venv = zcrypt_core::staking::bond_envelope(b"val", vstake, &vreward, zcrypt_core::staking::DEFAULT_COMMISSION_BPS, 0);
+    let vtx = build_shield_bound(&node, &[vfund], [vburn, vchange], fee, notes(), &venv).unwrap();
+    node.bond_with_stake(CHAIN, &vtx, vstake, vblind, b"val".to_vec(), b"val".to_vec(), vreward, zcrypt_core::staking::DEFAULT_COMMISSION_BPS, 0)
         .expect("bond");
     assert!(node.is_validator(b"val"));
 
@@ -554,8 +576,14 @@ fn coin_backed_delegation_shares_rewards_and_returns_stake() {
     let dblind = keys::random_blind();
     let dburn: OutCoin = (dstake, dblind, BURN_PK, 0);
     let dchange = keys::out_coin(&delegator.normal_address(), 100, keys::random_blind());
-    let dtx = build_shield(&node, &[dfund], [dburn, dchange], fee, notes()).unwrap();
     let dreward = keys::reward_address(&delegator.pubkey());
+    let denv = zcrypt_core::staking::delegate_envelope(b"del", b"val", dstake, &dreward);
+    let dtx = build_shield_bound(&node, &[dfund], [dburn, dchange], fee, notes(), &denv).unwrap();
+    // A thief re-wrapping the delegation under their own delegator id is rejected.
+    assert!(node
+        .delegate_with_stake(CHAIN, &dtx, dstake, dblind, b"val".to_vec(), b"thief".to_vec(), dreward)
+        .unwrap_err()
+        .contains("envelope-binding"));
     node.delegate_with_stake(CHAIN, &dtx, dstake, dblind, b"val".to_vec(), b"del".to_vec(), dreward)
         .expect("coin-backed delegation accepted");
 

@@ -976,3 +976,202 @@ fn pruned_escrow_ids_cannot_be_reopened_before_their_timeout() {
     // A different timeout is a different escrow: allowed.
     open_mint(&mut node, &keyset, &signers, asset, 1_000, lock, timeout + 1, alice.pubkey()).unwrap();
 }
+
+
+/// Bridge review H1: the SPV mint claim gate measures the deposit's refund lock against the
+/// consensus Bitcoin tip. If that tip is allowed to go stale, a depositor can refund on
+/// Bitcoin and still claim zBTC. Opens and claims must therefore refuse a tip whose header
+/// time lags the block clock by more than the freshness bound.
+#[test]
+fn spv_open_and_claim_refuse_a_stale_bitcoin_tip() {
+    use zcrypt_core::bitcoin::consensus::serialize;
+    use zcrypt_core::spv::{self, testutil, MintProof};
+
+    let (alice, _mn) = keys::new_account();
+    let mut node = Node::new();
+    let reserve = testutil::test_pk(7);
+    let refund = testutil::test_pk(9);
+    let asset = node.register_spv_asset("zBTC", 8, &reserve, 21_000_000 * 100_000_000).unwrap();
+    node.set_height(10);
+    let max_age = node.spv().max_tip_age_secs();
+
+    let x = &pre("stale-tip-preimage-0123456789abcdef");
+    let lock = htlc_hashlock(x);
+    let value = 250_000u64;
+    let btc_locktime = 100u32;
+    let tx = testutil::funding_tx(&lock, &reserve, &refund, btc_locktime, value, 1);
+    let header_time = 1_296_689_000u32;
+    let block = testutil::mine_header(&spv::REGTEST_GENESIS, &[tx.clone()], header_time);
+    node.submit_btc_headers(&block).unwrap();
+    let proof = MintProof {
+        reserve_pk: reserve,
+        refund_pk: refund,
+        btc_locktime,
+        vout: 0,
+        raw_tx: serialize(&tx),
+        merkle_block: testutil::merkle_proof(&block, &[tx.clone()], &tx),
+    };
+
+    // Block clock far past the tip's header time: the open is refused.
+    node.set_block_time(u64::from(header_time) + max_age + 1);
+    let err = open_spv(&mut node, 9, asset, value, lock, 100, alice.pubkey(), &proof).unwrap_err();
+    assert!(err.contains("behind the block clock"), "{err}");
+
+    // Fresh again (within the bound): the open succeeds.
+    node.set_block_time(u64::from(header_time) + max_age);
+    let id = open_spv(&mut node, 9, asset, value, lock, 100, alice.pubkey(), &proof).unwrap();
+
+    // The tip goes stale before the claim (relay outage / header flood): claim refused, the
+    // escrow stays Open (so it can still be claimed once headers catch up).
+    node.set_block_time(u64::from(header_time) + max_age + 1);
+    let err = node.htlc_claim(&id, x).unwrap_err();
+    assert!(err.contains("behind the block clock"), "{err}");
+    assert_eq!(node.htlc_escrow(&id).unwrap().state, EscrowState::Open);
+
+    // Headers catch up (a newer header with a recent time): the claim goes through.
+    let newer = testutil::mine_header(&block, &[], header_time + max_age as u32);
+    node.submit_btc_headers(&newer).unwrap();
+    node.htlc_claim(&id, x).unwrap().expect("mint escrow yields a coin");
+}
+
+/// Bridge review H3: the reserve key can be rotated on a running chain. The rotation must
+/// be signed by the CURRENT key and is epoch-bound (no replay); after it, deposits already
+/// mined to the old key (plus a short grace) still mint, later deposits to the old key are
+/// refused, and deposits to the new key are accepted.
+#[test]
+fn spv_reserve_key_rotation() {
+    use zcrypt_core::bitcoin::consensus::serialize;
+    use zcrypt_core::spv::{self, testutil, MintProof, RESERVE_RETIRE_GRACE_BLOCKS};
+
+    let (alice, _mn) = keys::new_account();
+    let mut node = Node::new();
+    let old_pk = testutil::test_pk(7);
+    let new_pk = testutil::test_pk(8);
+    let refund = testutil::test_pk(9);
+    let cap = 21_000_000 * 100_000_000;
+    let asset = node.register_spv_asset("zBTC", 8, &old_pk, cap).unwrap();
+    assert_eq!(node.asset_meta(asset).unwrap().reserve_pk33(), Some(old_pk));
+    node.set_height(10);
+
+    // Deposit A: paid to the OLD key, mined at height 1 (before the rotation).
+    let xa = &pre("rotation-deposit-a-0123456789abcdef");
+    let lock_a = htlc_hashlock(xa);
+    let value = 250_000u64;
+    let tx_a = testutil::funding_tx(&lock_a, &old_pk, &refund, 100, value, 1);
+    let block1 = testutil::mine_header(&spv::REGTEST_GENESIS, &[tx_a.clone()], 1_296_689_000);
+    node.submit_btc_headers(&block1).unwrap();
+    let proof_a = MintProof {
+        reserve_pk: old_pk, refund_pk: refund, btc_locktime: 100, vout: 0,
+        raw_tx: serialize(&tx_a), merkle_block: testutil::merkle_proof(&block1, &[tx_a.clone()], &tx_a),
+    };
+
+    // A rotation signed by a key that is NOT the current reserve is refused.
+    let wrong = spv::sign_reserve_rotation(&testutil::test_sk(9), CHAIN, asset, 0, &old_pk, &new_pk);
+    assert!(node.rotate_spv_reserve(CHAIN, asset, &old_pk, &new_pk, &wrong).unwrap_err().contains("current reserve key"));
+    // Naming a key that is not the pinned one as "old" is refused too.
+    let sig9 = spv::sign_reserve_rotation(&testutil::test_sk(9), CHAIN, asset, 0, &refund, &new_pk);
+    assert!(node.rotate_spv_reserve(CHAIN, asset, &refund, &new_pk, &sig9).is_err());
+
+    // The genuine rotation (current key signs, epoch 0) is accepted at BTC tip height 1.
+    let sig = spv::sign_reserve_rotation(&testutil::test_sk(7), CHAIN, asset, 0, &old_pk, &new_pk);
+    let root_before = node.state_root();
+    assert_eq!(node.rotate_spv_reserve(CHAIN, asset, &old_pk, &new_pk, &sig).unwrap(), 1);
+    assert_ne!(node.state_root(), root_before, "rotation is committed in the app hash");
+    let m = node.asset_meta(asset).unwrap();
+    assert_eq!(m.reserve_pk33(), Some(new_pk));
+    assert_eq!(m.authority, Some(spv::spv_authority(&new_pk)));
+    assert_eq!(m.retired_reserves.len(), 1);
+    assert_eq!(m.retired_reserves[0].retired_at_btc_height, 1);
+    // Replaying the same signature fails: the epoch advanced.
+    assert!(node.rotate_spv_reserve(CHAIN, asset, &old_pk, &new_pk, &sig).is_err());
+    assert!(node.rotate_spv_reserve(CHAIN, asset, &new_pk, &old_pk, &sig).is_err());
+
+    // Deposit A (old key, mined before the rotation) still opens and mints.
+    let id_a = open_spv(&mut node, 9, asset, value, lock_a, 100, alice.pubkey(), &proof_a).unwrap();
+    node.htlc_claim(&id_a, xa).unwrap().expect("old-key deposit still mints");
+
+    // Deposit B: paid to the NEW key, mined after the rotation: accepted.
+    let xb = &pre("rotation-deposit-b-0123456789abcdef");
+    let lock_b = htlc_hashlock(xb);
+    let tx_b = testutil::funding_tx(&lock_b, &new_pk, &refund, 100, value, 2);
+    let block2 = testutil::mine_header(&block1, &[tx_b.clone()], 1_296_689_600);
+    node.submit_btc_headers(&block2).unwrap();
+    let proof_b = MintProof {
+        reserve_pk: new_pk, refund_pk: refund, btc_locktime: 100, vout: 0,
+        raw_tx: serialize(&tx_b), merkle_block: testutil::merkle_proof(&block2, &[tx_b.clone()], &tx_b),
+    };
+    let id_b = open_spv(&mut node, 9, asset, value, lock_b, 100, alice.pubkey(), &proof_b).unwrap();
+    node.htlc_claim(&id_b, xb).unwrap().expect("new-key deposit mints");
+
+    // Deposit C: paid to the OLD key but mined well past the retirement grace: refused.
+    let mut prev = block2;
+    for k in 0..RESERVE_RETIRE_GRACE_BLOCKS as u32 {
+        prev = testutil::mine_header(&prev, &[], 1_296_690_000 + 600 * k);
+        node.submit_btc_headers(&prev).unwrap();
+    }
+    let xc = &pre("rotation-deposit-c-0123456789abcdef");
+    let lock_c = htlc_hashlock(xc);
+    let tx_c = testutil::funding_tx(&lock_c, &old_pk, &refund, 100, value, 3);
+    let late = testutil::mine_header(&prev, &[tx_c.clone()], 1_296_695_000);
+    node.submit_btc_headers(&late).unwrap();
+    let proof_c = MintProof {
+        reserve_pk: old_pk, refund_pk: refund, btc_locktime: 100, vout: 0,
+        raw_tx: serialize(&tx_c), merkle_block: testutil::merkle_proof(&late, &[tx_c.clone()], &tx_c),
+    };
+    let err = open_spv(&mut node, 9, asset, value, lock_c, 100, alice.pubkey(), &proof_c).unwrap_err();
+    assert!(err.contains("pinned reserve key"), "{err}");
+
+    // The rotation survives a snapshot round trip (it is source-of-truth state).
+    let (restored, _) = Node::restore(node.snapshot(node.height()));
+    assert_eq!(restored.state_root(), node.state_root());
+    assert_eq!(restored.asset_meta(asset).unwrap().reserve_pk33(), Some(new_pk));
+}
+
+
+/// The atomic-swap timeout ordering. The leg the preimage-revealer claims must expire FIRST.
+/// With the order reversed, the revealer (Alice, the taker) can let her own lock expire,
+/// refund it, and still claim Bob's lock, taking both sides. Consensus only enforces the
+/// timeouts the parties chose, so this is the rule every swap wallet must apply
+/// (`zcrypt_bridge::swap::swap_timeouts` / `maker_lock_is_safe`).
+#[test]
+fn swap_leg_claimed_by_the_revealer_must_expire_first() {
+    let run = |a_timeout: u64, b_timeout: u64| -> (bool, bool) {
+        let alice = Account::from_seed([0xA3; 32]);
+        let bob = Account::from_seed([0xB3; 32]);
+        let mut node = Node::new();
+        let asset_a = node.register_asset("AAA", 8, None, 1_000_000_000).unwrap();
+        let asset_b = node.register_asset("BBB", 8, None, 1_000_000_000).unwrap();
+        node.set_height(10);
+        let x = &pre("swap-ordering-preimage-0123456789");
+        let lock = htlc_hashlock(x);
+        // Alice (taker) locks A, claimable by Bob; Bob (maker) locks B, claimable by Alice.
+        let a_blind = keys::random_blind();
+        let a_tx = burn_lock_tx(&alice, &mut node, asset_a, 100_000, a_blind,
+            &swap_env(asset_a, 100_000, lock, a_timeout, &bob, &alice));
+        let a_escrow = node
+            .swap_lock(CHAIN, &a_tx, 100_000, a_blind, asset_a, lock, a_timeout, bob.pubkey(), alice.pubkey())
+            .unwrap();
+        let b_blind = keys::random_blind();
+        let b_tx = burn_lock_tx(&bob, &mut node, asset_b, 120_000, b_blind,
+            &swap_env(asset_b, 120_000, lock, b_timeout, &alice, &bob));
+        let b_escrow = node
+            .swap_lock(CHAIN, &b_tx, 120_000, b_blind, asset_b, lock, b_timeout, alice.pubkey(), bob.pubkey())
+            .unwrap();
+        // Alice waits until the EARLIER of the two timeouts has passed, then tries to take
+        // both: refund her own lock, and claim Bob's with the preimage.
+        node.set_height(a_timeout.min(b_timeout));
+        let alice_refunded = node.htlc_expire(&a_escrow).is_ok();
+        let alice_claimed_b = node.htlc_claim(&b_escrow, x).is_ok();
+        (alice_refunded, alice_claimed_b)
+    };
+
+    // WRONG order: Alice's lock (claimed by Bob) expires first. She refunds it AND claims B.
+    let (refunded, claimed) = run(100, 200);
+    assert!(refunded && claimed, "reversed timeouts let the revealer keep both legs");
+
+    // RIGHT order: Bob's lock (claimed by Alice) expires first. Once it has, Alice's claim
+    // fails; her own lock is still live for Bob to claim, and only later refunds to her.
+    let (refunded, claimed) = run(200, 100);
+    assert!(!claimed, "after the maker's lock expires the revealer can no longer claim it");
+    assert!(!refunded, "the taker's lock is still live for the maker");
+}

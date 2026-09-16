@@ -455,6 +455,12 @@ fn decode_note(b: &[u8]) -> Option<(u64, Blind, u64)> {
     if asset_id >= zcrypt_shield::FIELD_ORDER {
         return None;
     }
+    // Same aliasing on the value lanes: `v + k*p*2^26` commits identically to `v`, so a
+    // sender could make a 1-unit payment display as an astronomical balance. The circuit
+    // only ever commits values <= MAX_COIN_VALUE, so anything above is not a real note.
+    if value > zcrypt_shield::MAX_COIN_VALUE {
+        return None;
+    }
     Some((value, blind, asset_id))
 }
 
@@ -703,6 +709,9 @@ impl BearerCoin {
         let asset_id = u64::from_le_bytes(b[104..112].try_into().ok()?);
         if asset_id >= zcrypt_shield::FIELD_ORDER {
             return None; // non-canonical asset lane (see decode_note)
+        }
+        if value > zcrypt_shield::MAX_COIN_VALUE {
+            return None; // aliased value lanes (see decode_note)
         }
         Some(BearerCoin {
             coin: Coin {

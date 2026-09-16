@@ -232,7 +232,8 @@ pub struct NodeSnapshot {
 /// v10: role-tagged Poseidon lanes, `SpvDeposit::btc_locktime`, escrow `settled_at`,
 /// the sentinel's decay rule, and block-boundary anchor roots. Positional layout change,
 /// so older state refuses to load (the chain relaunches fresh with these consensus changes).
-const SNAPSHOT_VERSION: u32 = 11;
+/// v12: `AssetMeta::{reserve_pk, retired_reserves}` (SPV reserve-key rotation).
+const SNAPSHOT_VERSION: u32 = 13;
 /// Public mirror of the postcard snapshot format version (for `state_db` restore).
 pub const SNAPSHOT_VERSION_PUB: u32 = SNAPSHOT_VERSION;
 
@@ -546,6 +547,7 @@ impl Node {
             return Err("asset id is not a canonical field element".to_string());
         }
         self.check_timeout_horizon(timeout_height, crate::htlc_shield::MAX_ESCROW_HORIZON_BLOCKS)?;
+        lock_value_ok(value)?;
         // VM gate: HTLC_OPEN = [CHECK_ASSET_HAS_AUTHORITY, CHECK_THRESHOLD_SIG]. The mint
         // message is derived HERE from the actual escrow parameters (and the chain id), so
         // the M-of-N signatures authorize exactly this asset/value/hashlock/timeout/recipient
@@ -618,12 +620,14 @@ impl Node {
         // The ZCrypt claim window is bounded so it can never outlive the Bitcoin refund
         // lock (see the claim gate in `htlc_claim`).
         self.check_timeout_horizon(timeout_height, MAX_SPV_CLAIM_WINDOW)?;
-        let authority = self.assets.meta(asset_id).and_then(|m| m.authority);
+        lock_value_ok(value)?;
+        let meta = self.assets.meta(asset_id);
+        let authority = meta.and_then(|m| m.authority);
         // Verify the deposit against the consensus header chain FIRST (pure read),
         // then run the VM gate over the result — same single-source-of-truth shape
         // as `burn_output_ok`. The detailed rejection reason is surfaced on failure.
-        let verified = match authority {
-            Some(auth) => self.spv.verify_mint_proof(&auth, value, &hashlock, proof),
+        let verified = match meta.and_then(|m| m.reserve_auth()) {
+            Some(reserve) => self.spv.verify_mint_proof_with(&reserve, value, &hashlock, proof),
             None => Err("asset not registered / no mint authority".to_string()),
         };
         let ctx = zvm::Ctx { authority, spv_ok: verified.is_ok(), ..Default::default() };
@@ -649,6 +653,9 @@ impl Node {
             timeout_height,
         };
         crate::spv::verify_open_auth(&proof.refund_pk, &auth, open_auth)?;
+        // The locktime window above was measured from the known tip; that tip must be fresh.
+        // Checked after the proof so a bad proof still reports its own reason.
+        self.require_fresh_btc_tip("SPV mint open")?;
         if value > self.assets.mint_headroom(asset_id) {
             return Err(format!(
                 "htlc-open would exceed asset {asset_id} supply cap (headroom {})",
@@ -671,6 +678,37 @@ impl Node {
         // authorize a second mint.
         self.spv.claim_outpoint(outpoint);
         Ok(id)
+    }
+
+    /// Refuse SPV mint opens/claims while the consensus Bitcoin tip is stale relative to
+    /// this chain's block clock (bridge review H1). The claim gate compares the deposit's
+    /// refund lock only against the *known* tip height; nothing else bounded how far that
+    /// tip could lag real Bitcoin, so a relay outage (or a relay flood) of ~24 h let a
+    /// depositor refund the BTC on Bitcoin and then still claim the zBTC here. Both the
+    /// block time (`FinalizeBlock.time`) and the tip header time are committed data, so
+    /// every validator evaluates this identically. Before the first block (no clock yet)
+    /// the check is a no-op.
+    fn require_fresh_btc_tip(&self, what: &str) -> Result<(), String> {
+        if self.current_block_time == 0 {
+            return Ok(());
+        }
+        let tip_time = self.spv.tip_time();
+        let age = self.current_block_time.saturating_sub(tip_time);
+        if age > self.spv.max_tip_age_secs() {
+            return Err(format!(
+                "{what} refused: consensus Bitcoin tip (height {}, time {tip_time}) is {age}s behind the \
+                 block clock {} (max {}s); relay fresh headers first",
+                self.spv.tip_height(),
+                self.current_block_time,
+                self.spv.max_tip_age_secs()
+            ));
+        }
+        Ok(())
+    }
+
+    /// Public form of [`Self::require_fresh_btc_tip`] for mempool admission parity.
+    pub fn btc_tip_fresh(&self, what: &str) -> Result<(), String> {
+        self.require_fresh_btc_tip(what)
     }
 
     /// The consensus Bitcoin header-chain tip (height, hash) — what a wallet
@@ -769,12 +807,12 @@ impl Node {
             op[32..].copy_from_slice(&m.deposit_vout.to_le_bytes());
             (m.asset_id, m.value, m.hashlock, op)
         };
-        let authority = self
+        let reserve = self
             .assets
             .meta(asset_id)
-            .and_then(|a| a.authority)
+            .and_then(|a| a.reserve_auth())
             .ok_or("reanchor: asset has no SPV authority")?;
-        let (op, new_block) = self.spv.verify_reanchor(&authority, value, &hashlock, proof)?;
+        let (op, new_block) = self.spv.verify_reanchor_with(&reserve, value, &hashlock, proof)?;
         if op != expected_op {
             return Err("reanchor: proof outpoint does not match the immature mint's deposit".to_string());
         }
@@ -900,6 +938,7 @@ impl Node {
         if value == 0 {
             return Err("escrow value must be positive".to_string());
         }
+        lock_value_ok(value)?;
         // Anti-bypass: the lock spend must burn ≥ MIN_FEE gas (in-asset), so an escrow lock
         // cannot be used to move value through output[1..] for free (see `bond_with_stake`).
         if shield_tx.fee < crate::emission::MIN_FEE {
@@ -920,9 +959,9 @@ impl Node {
         }
         // Escrow id is deterministic; refuse before burning coins if it already exists.
         let eid = crate::htlc_shield::escrow_id(asset_id, value, &hashlock, timeout_height, &refund_pk);
-        if self.htlc.get(&eid).is_some() {
-            return Err("escrow already exists".to_string());
-        }
+        // Same rule the book applies at insert (live OR retired id): checked BEFORE the spend is
+        // applied, so a rejected id can never burn the locker's coins without an escrow.
+        self.htlc.id_available(&eid, timeout_height)?;
         // Bind every plaintext lock parameter to the proof. Without this a mempool observer can
         // keep the proof and nullifiers and rewrite the hashlock, timeout, refund key or payout
         // key to redirect the funds to themselves (see `lock_envelope`).
@@ -936,7 +975,7 @@ impl Node {
         );
         // Verify + apply the shield spend (records nullifiers, appends outputs).
         self.submit_shield_bound(chain_id, shield_tx, &envelope)?;
-        self.htlc.lock_burn(asset_id, value, hashlock, timeout_height, refund_pk)
+        self.htlc.lock_burn(asset_id, value, hashlock, timeout_height, refund_pk, btc_claim_pk)
     }
 
     /// Lock existing coins of `asset_id` into a **swap** escrow (in-pool asset↔asset). Like
@@ -975,6 +1014,7 @@ impl Node {
         if value == 0 {
             return Err("escrow value must be positive".to_string());
         }
+        lock_value_ok(value)?;
         // Anti-bypass: the lock spend must burn ≥ MIN_FEE gas (in-asset), so a swap lock cannot
         // move value through output[1..] for free (see `bond_with_stake`).
         if shield_tx.fee < crate::emission::MIN_FEE {
@@ -987,9 +1027,8 @@ impl Node {
         // Escrow id is keyed by counterparty (party_pk); pre-check before burning.
         let eid =
             crate::htlc_shield::escrow_id(asset_id, value, &hashlock, timeout_height, &counterparty_pk);
-        if self.htlc.get(&eid).is_some() {
-            return Err("escrow already exists".to_string());
-        }
+        // Live OR retired id, checked before the spend is applied (see `htlc_burn_lock`).
+        self.htlc.id_available(&eid, timeout_height)?;
         // Bind the lock parameters to the proof: a swap lock names BOTH the counterparty who
         // claims and the locker who is refunded, so leaving them unbound would let a front-runner
         // redirect either leg of the trade to themselves (see `lock_envelope`).
@@ -1043,6 +1082,9 @@ impl Node {
                 // the depositor could refund the BTC and claim the zBTC too. The committed
                 // SPV tip is the clock, so this is deterministic across validators.
                 if let Some(d) = e.spv_deposit {
+                    // The tip is only a trustworthy clock while it is fresh (see
+                    // `require_fresh_btc_tip`): a stale tip under-reports `now`.
+                    self.require_fresh_btc_tip("SPV mint claim")?;
                     let deadline = u64::from(d.btc_locktime);
                     let now = self.spv.tip_height() + self.spv.locktime_margin();
                     if now >= deadline {
@@ -1172,6 +1214,70 @@ impl Node {
         gate(zvm::REGISTER, &ctx)?;
         self.assets.register(ticker, decimals, authority, max_supply)
     }
+    /// Register an SPV-gated asset pinned to a 33-byte compressed Bitcoin reserve pubkey.
+    /// The mint authority is derived from the key in consensus; the key itself is kept so
+    /// it can later be rotated with [`Self::rotate_spv_reserve`].
+    pub fn register_spv_asset(
+        &mut self,
+        ticker: &str,
+        decimals: u8,
+        reserve_pk: &[u8; 33],
+        max_supply: u64,
+    ) -> Result<u64, String> {
+        let ctx = zvm::Ctx {
+            ticker: ticker.to_string(),
+            ticker_taken: self.assets.asset_of(ticker).is_some(),
+            id_taken: self.assets.is_registered(crate::asset_registry::asset_id_for(ticker)),
+            ..Default::default()
+        };
+        gate(zvm::REGISTER, &ctx)?;
+        self.assets.register_spv(ticker, decimals, reserve_pk, max_supply)
+    }
+
+    /// Pure check of a reserve-key rotation request (what CheckTx runs): the asset must be
+    /// SPV-gated and currently pinned to `old_pk`, `new_pk` must be a fresh valid key, and
+    /// `sig` must be `old_pk`'s ECDSA signature over the epoch-bound rotation digest.
+    pub fn verify_rotate_spv_reserve(
+        &self,
+        chain_id: &[u8],
+        asset_id: u64,
+        old_pk: &[u8; 33],
+        new_pk: &[u8; 33],
+        sig: &[u8],
+    ) -> Result<(), String> {
+        let m = self.assets.meta(asset_id).ok_or("reserve-rotate: asset not registered")?;
+        if m.reserve_pk33() != Some(*old_pk) || m.authority != Some(crate::spv::spv_authority(old_pk)) {
+            return Err("reserve-rotate: old key is not the asset's current reserve key".to_string());
+        }
+        if !crate::spv::reserve_pk_ok(new_pk) {
+            return Err("reserve-rotate: new key is not a valid compressed secp256k1 point".to_string());
+        }
+        if new_pk == old_pk || m.retired_reserves.iter().any(|r| r.reserve_pk == new_pk) {
+            return Err("reserve-rotate: new key must differ from the current and every retired key".to_string());
+        }
+        crate::spv::verify_reserve_rotation(chain_id, asset_id, m.authority_epoch, old_pk, new_pk, sig)
+    }
+
+    /// Rotate an SPV asset's Bitcoin reserve key (bridge review H3). Authorised by the
+    /// CURRENT reserve key's signature over `(chain, asset, epoch, old, new)`; the epoch
+    /// advances on success so the same signature can never re-apply. The old key is
+    /// retired at the current consensus Bitcoin tip: deposits already mined to it (plus a
+    /// short grace) still mint, so nothing in flight is stranded, while every later deposit
+    /// must pay the new key. Escrows already open keep their own script/key unchanged.
+    pub fn rotate_spv_reserve(
+        &mut self,
+        chain_id: &[u8],
+        asset_id: u64,
+        old_pk: &[u8; 33],
+        new_pk: &[u8; 33],
+        sig: &[u8],
+    ) -> Result<u64, String> {
+        self.verify_rotate_spv_reserve(chain_id, asset_id, old_pk, new_pk, sig)?;
+        let at = self.spv.tip_height();
+        self.assets.rotate_spv_reserve(asset_id, new_pk, at)?;
+        Ok(self.assets.authority_epoch(asset_id))
+    }
+
     pub fn asset_id_of(&self, ticker: &str) -> Option<u64> {
         self.assets.asset_of(ticker)
     }
@@ -1230,6 +1336,7 @@ impl Node {
         consensus_pubkey: Vec<u8>,
         reward_address: Hash,
         commission_bps: u16,
+        nonce: u64,
     ) -> Result<(), String> {
         // VM gate: stake ≥ MIN_STAKE (checked before touching state).
         gate(zvm::BOND, &zvm::Ctx { stake, ..Default::default() })?;
@@ -1277,7 +1384,19 @@ impl Node {
         }
         // Verify + apply the shield spend, THEN record the validator (pre-checks above
         // ensure staking.bond cannot fail after this point for policy reasons).
-        self.submit_shield(chain_id, shield_tx)?;
+        // The pledge proof must be bound to THIS bond header (consensus key, stake, reward,
+        // commission, nonce). A front-runner who copies the pledge bytes + stake_blind from
+        // the mempool and re-signs a header with their own key gets a different envelope,
+        // so the proof's aux digest no longer matches and the copy is rejected before any
+        // coin is spent. Previously the pledge was submitted unbound and was stealable.
+        let envelope = crate::staking::bond_envelope(
+            &consensus_pubkey,
+            stake,
+            &reward_address,
+            commission_bps,
+            nonce,
+        );
+        self.submit_shield_bound(chain_id, shield_tx, &envelope)?;
         self.staking.bond(validator_id, consensus_pubkey, stake, reward_address, commission_bps)
     }
 
@@ -1331,7 +1450,11 @@ impl Node {
                 shield_tx.fee
             ));
         }
-        self.submit_shield(chain_id, shield_tx)?;
+        // Bind the pledge proof to the delegate header (delegator, target, stake, reward):
+        // see `bond_with_stake` for why an unbound pledge is a theft vector.
+        let envelope =
+            crate::staking::delegate_envelope(&delegator_id, &validator_id, stake, &reward_address);
+        self.submit_shield_bound(chain_id, shield_tx, &envelope)?;
         self.staking.delegate(validator_id, delegator_id, stake, reward_address)
     }
 
@@ -2039,6 +2162,53 @@ impl Node {
 
     pub fn contains(&self, nf: &Hash) -> bool {
         self.smt.contains(nf)
+    }
+}
+
+/// Every revealed value that enters consensus (escrow locks, mint opens) must be a value the
+/// circuit could actually have committed. `commit_asset` reduces the upper limb mod p, so
+/// `v + k*p*2^26` yields the SAME commitment as `v`; without this bound a lock could declare an
+/// aliased value, and a Burn claim would then `record_burn` it and zero the asset's minted
+/// counter (cap bypass). One bound, applied everywhere a plaintext value is accepted.
+pub fn lock_value_ok(value: u64) -> Result<(), String> {
+    if value > zcrypt_shield::MAX_COIN_VALUE {
+        return Err(format!(
+            "value {value} exceeds the maximum coin value {} (aliased / non-canonical amount)",
+            zcrypt_shield::MAX_COIN_VALUE
+        ));
+    }
+    Ok(())
+}
+
+impl Node {
+    /// Mempool mirror of the escrow-id admission rule used by the lock paths: live OR retired.
+    pub fn escrow_id_available(
+        &self,
+        asset_id: u64,
+        value: u64,
+        hashlock: &Hash,
+        timeout_height: u64,
+        party_pk: &zcrypt_shield::PubKey,
+    ) -> Result<(), String> {
+        let eid = crate::htlc_shield::escrow_id(asset_id, value, hashlock, timeout_height, party_pk);
+        self.htlc.id_available(&eid, timeout_height)
+    }
+
+    // Read-only views used by the incremental state store (no cloning of the big sets).
+    pub fn assets(&self) -> &crate::asset_registry::AssetRegistry {
+        &self.assets
+    }
+    pub fn htlc_book(&self) -> &crate::htlc_shield::HtlcBook {
+        &self.htlc
+    }
+    pub fn immature(&self) -> &[ImmatureMint] {
+        &self.immature
+    }
+    pub fn recent_roots(&self) -> Vec<Commitment> {
+        self.recent_roots.iter().copied().collect()
+    }
+    pub fn sentinel(&self) -> Option<&Sentinel> {
+        self.sentinel.as_ref()
     }
 }
 

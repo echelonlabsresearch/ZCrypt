@@ -103,10 +103,12 @@ pub const REDEEM_FINALIZE_SLA_SECS: u64 = 6 * 3600;
 pub const MIN_USER_CLAIM_BLOCKS_MAINNET: u64 = 144;
 // The default operator redeem lock (504 blocks) plus the finalize SLA fits inside the
 // default ZC redeem escrow with the user's minimum window to spare.
+// The default redeem escrow must leave room for at least the MINIMUM user claim window at
+// half-speed Bitcoin plus the finalize SLA (the derived lock is min(nominal, what fits)).
 const _: () = assert!(
-    504 * BTC_BLOCK_TIME_SECS
-        + 504 * BTC_BLOCK_TIME_SECS / 4 // proportional slack (>= the 6h SLA at this lock)
-        + MIN_USER_CLAIM_BLOCKS_MAINNET * BTC_BLOCK_TIME_SECS
+    MIN_USER_CLAIM_BLOCKS_MAINNET * BTC_BLOCK_TIME_SECS * 2
+        + MIN_USER_CLAIM_BLOCKS_MAINNET * BTC_BLOCK_TIME_SECS / 4
+        + REDEEM_FINALIZE_SLA_SECS
         <= ZC_REDEEM_TIMEOUT_BLOCKS * ZC_BLOCK_TIME_SECS
 );
 
@@ -137,6 +139,13 @@ pub fn min_user_claim_blocks(network: bitcoin::Network) -> u64 {
 /// SLA that a variance of a few percent in block times could eat (bridge N9).
 pub const SLACK_FRACTION_DEN: u64 = 4;
 
+/// How much slower than nominal (600 s) Bitcoin blocks are assumed to be able to run for the
+/// whole life of a redeem lock. The BTC CLTV is in Bitcoin HEIGHTS while the ZC escrow expires
+/// by ZC height (wall time); if Bitcoin runs slow enough the escrow expires first and the user
+/// refunds the zBTC while still able to claim the BTC. Sizing the lock for half-speed Bitcoin
+/// (2x) covers every historical hashrate shock with a wide margin.
+pub const BTC_SLOWDOWN_FACTOR: u64 = 2;
+
 /// The slack (seconds) required for a BTC lock of `lock_blocks` on `network`.
 pub fn redeem_slack_secs(network: bitcoin::Network, lock_blocks: u64) -> u64 {
     redeem_finalize_sla_secs(network).max(lock_blocks * BTC_BLOCK_TIME_SECS / SLACK_FRACTION_DEN)
@@ -147,7 +156,8 @@ pub fn redeem_slack_secs(network: bitcoin::Network, lock_blocks: u64) -> u64 {
 /// `WATCHER_FINALIZE_MARGIN` can only raise this floor, never lower it.
 pub fn min_redeem_margin_blocks(network: bitcoin::Network) -> u64 {
     let min_lock = min_user_claim_blocks(network);
-    (min_lock * BTC_BLOCK_TIME_SECS + redeem_slack_secs(network, min_lock)) / ZC_BLOCK_TIME_SECS
+    (min_lock * BTC_BLOCK_TIME_SECS * BTC_SLOWDOWN_FACTOR + redeem_slack_secs(network, min_lock))
+        / ZC_BLOCK_TIME_SECS
 }
 
 /// The BTC HTLC refund locktime the operator may fund for a redeem escrow that times out at
@@ -165,8 +175,11 @@ pub fn redeem_btc_locktime_for(
     let remaining_zc = timeout_height.saturating_sub(zc_tip);
     let remaining_secs = remaining_zc * ZC_BLOCK_TIME_SECS;
     let sla = redeem_finalize_sla_secs(network);
-    let by_sla = remaining_secs.saturating_sub(sla) / BTC_BLOCK_TIME_SECS;
-    let by_fraction = remaining_secs / (BTC_BLOCK_TIME_SECS + BTC_BLOCK_TIME_SECS / SLACK_FRACTION_DEN);
+    // Every bound is evaluated with Bitcoin at 1/BTC_SLOWDOWN_FACTOR speed: the lock's wall
+    // time is `lock * 600 * factor`, and the slack is on top of that.
+    let slow_block = BTC_BLOCK_TIME_SECS * BTC_SLOWDOWN_FACTOR;
+    let by_sla = remaining_secs.saturating_sub(sla) / slow_block;
+    let by_fraction = remaining_secs / (slow_block + BTC_BLOCK_TIME_SECS / SLACK_FRACTION_DEN);
     let max_lock = by_sla.min(by_fraction);
     let lock = btc_redeem_lock_blocks(network).min(max_lock);
     let min_lock = min_user_claim_blocks(network);
@@ -178,7 +191,9 @@ pub fn redeem_btc_locktime_for(
              reserve BTC (the user's zBTC refunds at the escrow expiry; nobody loses)"
         ));
     }
-    debug_assert!(lock * BTC_BLOCK_TIME_SECS + redeem_slack_secs(network, lock) <= remaining_secs);
+    debug_assert!(
+        lock * BTC_BLOCK_TIME_SECS * BTC_SLOWDOWN_FACTOR + redeem_slack_secs(network, lock) <= remaining_secs
+    );
     let lt = btc_tip.checked_add(lock).ok_or("btc tip + lock overflow")?;
     u32::try_from(lt).map_err(|_| "btc locktime overflow".to_string())
 }
@@ -413,6 +428,78 @@ pub fn register_spv_tx(ticker: &str, decimals: u8, reserve_pk: &[u8; 33], max_su
     t.extend_from_slice(&max_supply.to_le_bytes());
     t.extend_from_slice(reserve_pk);
     t
+}
+
+/// Build a ROTATE_RESERVE tx (`0x69`): move an SPV asset's Bitcoin reserve to `new_pk`,
+/// authorised by the CURRENT reserve key's signature (`spv::sign_reserve_rotation`). The
+/// chain retires the old key (its in-flight deposits still mint and can be re-anchored) and
+/// requires every later deposit to pay the new key.
+pub fn rotate_reserve_tx(asset: u64, old_pk: &[u8; 33], new_pk: &[u8; 33], sig: &[u8; 64]) -> Vec<u8> {
+    let mut t = vec![0x69u8];
+    t.extend_from_slice(&asset.to_le_bytes());
+    t.extend_from_slice(old_pk);
+    t.extend_from_slice(new_pk);
+    t.extend_from_slice(sig);
+    t
+}
+
+/// The asset's CURRENT Bitcoin reserve pubkey as published by consensus (`/asset/id`), or
+/// `None` for a non-SPV asset / a node that predates reserve rotation. Wallets must fund
+/// deposits to THIS key: after a rotation the previously known key only mints for deposits
+/// mined within a short grace window.
+pub fn chain_reserve_pk(zc: &dyn ZcNode, asset: u64) -> Result<Option<[u8; 33]>, String> {
+    let raw = zc.query(&format!("/asset/id/{asset}"))?;
+    let v: serde_json::Value = serde_json::from_str(&raw).map_err(|e| format!("/asset/id/{asset}: {e}"))?;
+    match v.get("reserve_pk").and_then(|p| p.as_str()) {
+        Some(h) if !h.is_empty() => {
+            let b = hex::decode(h).map_err(|e| format!("reserve_pk hex: {e}"))?;
+            let pk: [u8; 33] = b.as_slice().try_into().map_err(|_| "reserve_pk is not 33 bytes".to_string())?;
+            Ok(Some(pk))
+        }
+        _ => Ok(None),
+    }
+}
+
+/// The asset's authority epoch (the value a reserve rotation must be signed against).
+pub fn chain_authority_epoch(zc: &dyn ZcNode, asset: u64) -> Result<u64, String> {
+    let raw = zc.query(&format!("/asset/id/{asset}"))?;
+    let v: serde_json::Value = serde_json::from_str(&raw).map_err(|e| format!("/asset/id/{asset}: {e}"))?;
+    Ok(v.get("authority_epoch").and_then(|e| e.as_u64()).unwrap_or(0))
+}
+
+/// The operator's reserve keys: the CURRENT one (funds redeems, is what the chain pins) and
+/// keys RETIRED by rotation that still have deposits to sweep or redeems to refund. Every
+/// deposit/refund is signed with the key whose pubkey is in that HTLC's script.
+pub struct ReserveKeys<'a> {
+    pub current: &'a Key,
+    pub previous: &'a [Key],
+}
+
+impl<'a> ReserveKeys<'a> {
+    /// A never-rotated operator.
+    pub fn single(current: &'a Key) -> Self {
+        ReserveKeys { current, previous: &[] }
+    }
+    /// The key whose compressed pubkey is `pk33`, if the operator holds it.
+    pub fn key_for(&self, pk33: &[u8]) -> Option<&'a Key> {
+        std::iter::once(self.current)
+            .chain(self.previous.iter())
+            .find(|k| k.pk.inner.serialize().as_slice() == pk33)
+    }
+    /// The key whose pubkey appears in an HTLC `script` (the refund key of a redeem the
+    /// operator funded), if held.
+    pub fn key_in_script(&self, script: &[u8]) -> Option<&'a Key> {
+        std::iter::once(self.current)
+            .chain(self.previous.iter())
+            .find(|k| script.windows(33).any(|w| w == k.pk.inner.serialize()))
+    }
+    /// Every held pubkey, current first.
+    pub fn pubkeys(&self) -> Vec<[u8; 33]> {
+        std::iter::once(self.current)
+            .chain(self.previous.iter())
+            .map(|k| k.pk.inner.serialize())
+            .collect()
+    }
 }
 
 // ---- Validator BOND authentication (signed on the validator HOST, never in the wallet) ----
@@ -745,6 +832,35 @@ pub fn swap_lock_tx(
     t
 }
 
+/// Parse a SWAP_LOCK (`0x62`) payload (the bytes after the tag):
+/// `value(8) ‖ blind(32) ‖ asset(8) ‖ hashlock(32) ‖ timeout(8) ‖ counterparty_pk(64) ‖
+/// refund_pk(64) ‖ shield_tx`. Returns `(value, blind, asset, hashlock, timeout,
+/// counterparty_pk, refund_pk)`; the shield tx is left to consensus.
+#[allow(clippy::type_complexity)]
+pub fn parse_swap_lock(payload: &[u8]) -> Option<(u64, [u64; 4], u64, [u8; 32], u64, PubKey, PubKey)> {
+    const HEAD: usize = 8 + 32 + 8 + 32 + 8 + 64 + 64;
+    if payload.len() < HEAD {
+        return None;
+    }
+    let value = u64::from_le_bytes(payload[0..8].try_into().ok()?);
+    let mut blind = [0u64; 4];
+    for (i, limb) in blind.iter_mut().enumerate() {
+        *limb = u64::from_le_bytes(payload[8 + i * 8..16 + i * 8].try_into().ok()?);
+    }
+    let asset = u64::from_le_bytes(payload[40..48].try_into().ok()?);
+    let mut hashlock = [0u8; 32];
+    hashlock.copy_from_slice(&payload[48..80]);
+    let timeout = u64::from_le_bytes(payload[80..88].try_into().ok()?);
+    let pk = |off: usize| -> Option<PubKey> {
+        let mut k = [0u64; 8];
+        for (i, limb) in k.iter_mut().enumerate() {
+            *limb = u64::from_le_bytes(payload[off + i * 8..off + i * 8 + 8].try_into().ok()?);
+        }
+        Some(k)
+    };
+    Some((value, blind, asset, hashlock, timeout, pk(88)?, pk(152)?))
+}
+
 pub fn seed_tx(c: &Commitment) -> Vec<u8> {
     let mut t = vec![0x56u8];
     for x in c {
@@ -753,7 +869,48 @@ pub fn seed_tx(c: &Commitment) -> Vec<u8> {
     t
 }
 
-fn escrow_id_from(data: &str) -> Result<[u8; 32], String> {
+/// A funded, confirmed, header-relayed SPV deposit with its mint proof built, NOT yet
+/// opened on ZCrypt. Drivers use it to exercise the open/claim gates step by step.
+pub struct PreparedDeposit {
+    pub proof: zcrypt_core::spv::MintProof,
+    pub lock: [u8; 32],
+    pub zc_timeout: u64,
+    pub btc_locktime: u32,
+    pub utxo: HtlcUtxo,
+    pub sats: u64,
+}
+
+/// Fund a Bitcoin HTLC to `reserve_pk` for `preimage`, confirm it, relay the headers, and
+/// build the SPV mint proof. Returns everything an `open_spv_tx` needs, without opening.
+#[allow(clippy::too_many_arguments)]
+pub fn prepare_spv_deposit(
+    zc: &Zcrypt,
+    user_btc: &dyn BtcBackend,
+    user_refund: &Key,
+    reserve_pk: &PublicKey,
+    preimage: &[u8],
+    btc_amount: Amount,
+) -> Result<PreparedDeposit, String> {
+    let lock = htlc_hashlock(preimage);
+    let net = user_btc.network();
+    let (btc_locktime, zc_timeout) = shield_timeouts(net, user_btc.height()?, zc.height()? as u64)?;
+    let script = htlc_script(&lock, reserve_pk, &user_refund.pk, btc_locktime);
+    let utxo = user_btc.fund_htlc(&script, btc_amount)?;
+    user_btc.confirm(&utxo.outpoint.txid)?;
+    relay_btc_headers(zc, user_btc)?;
+    let proof = MintProof {
+        reserve_pk: reserve_pk.inner.serialize(),
+        refund_pk: user_refund.pk.inner.serialize(),
+        btc_locktime,
+        vout: utxo.outpoint.vout,
+        raw_tx: user_btc.raw_tx(&utxo.outpoint.txid)?,
+        merkle_block: user_btc.txout_proof(&utxo.outpoint.txid)?,
+    };
+    Ok(PreparedDeposit { proof, lock, zc_timeout, btc_locktime, utxo, sats: btc_amount.to_sat() })
+}
+
+/// The escrow id a successful open/lock broadcast reports in its result data.
+pub fn escrow_id_from(data: &str) -> Result<[u8; 32], String> {
     let v: serde_json::Value = serde_json::from_str(data).map_err(|e| e.to_string())?;
     let hexs = v["escrow_id"].as_str().ok_or("no escrow_id in tx result")?;
     let raw = hex::decode(hexs).map_err(|e| e.to_string())?;
@@ -1212,6 +1369,14 @@ pub struct EscrowInfo {
     pub hashlock: [u8; 32],
     pub timeout_height: u64,
     pub state: String, // "open" | "claimed" | "expired"
+    /// "mint" | "burn" | "swap" (empty when the node predates the field).
+    pub kind: String,
+    /// The consensus-committed Bitcoin payout key of a burn-for-BTC escrow (33 bytes), empty
+    /// otherwise. The operator MUST take the payout key from here, never from raw block
+    /// txs: a duplicate lock that failed delivery can carry a different key.
+    pub btc_claim_pk: Vec<u8>,
+    pub party_pk: Vec<u8>,
+    pub refund_pk: Vec<u8>,
 }
 
 /// Query one escrow by id; `Ok(None)` if consensus has no such escrow (rejected/garbage tx).
@@ -1228,12 +1393,19 @@ pub fn query_escrow(zc: &dyn ZcNode, escrow_id: &[u8; 32]) -> Result<Option<Escr
         .ok()
         .and_then(|b| b.try_into().ok())
         .ok_or("escrow: bad hashlock")?;
+    let hex_field = |k: &str| -> Vec<u8> {
+        v.get(k).and_then(|x| x.as_str()).and_then(|h| hex::decode(h).ok()).unwrap_or_default()
+    };
     Ok(Some(EscrowInfo {
         asset_id: v.get("asset_id").and_then(|x| x.as_u64()).unwrap_or(0),
         value: v.get("value").and_then(|x| x.as_u64()).unwrap_or(0),
         hashlock,
         timeout_height: v.get("timeout_height").and_then(|x| x.as_u64()).unwrap_or(0),
         state: v.get("state").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+        kind: v.get("kind").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+        btc_claim_pk: hex_field("btc_claim_pk"),
+        party_pk: hex_field("party_pk"),
+        refund_pk: hex_field("refund_pk"),
     }))
 }
 
@@ -1494,12 +1666,11 @@ pub struct DeferredSweep {
 /// so [`query_escrow`] filters it out: a garbage-open flood cannot poison the index.
 pub fn index_reserve_deposits(
     zc: &dyn ZcNode,
-    reserve: &Key,
+    keys: &ReserveKeys<'_>,
     from: i64,
     to: i64,
 ) -> Result<(Vec<TrackedDeposit>, Vec<([u8; 32], String)>), String> {
     use zcrypt_core::htlc_shield::escrow_id as derive_escrow_id;
-    let reserve_ser = reserve.pk.inner.serialize();
     let mut found = Vec::new();
     let mut errors = Vec::new();
     for h in from..=to {
@@ -1510,7 +1681,8 @@ pub fn index_reserve_deposits(
             let Some((asset, value, lock, timeout, claim_pk, proof)) = parse_open_spv(&tx[1..]) else {
                 continue;
             };
-            if proof.reserve_pk != reserve_ser {
+            // Deposits to the current key AND to retired keys this operator still holds.
+            if keys.key_for(&proof.reserve_pk).is_none() {
                 continue;
             }
             let eid = derive_escrow_id(asset, value, &lock, timeout, &claim_pk);
@@ -1584,7 +1756,7 @@ pub enum SweepOutcome {
 pub fn sweep_deposit(
     zc: &dyn ZcNode,
     operator_btc: &dyn BtcBackend,
-    reserve: &Key,
+    keys: &ReserveKeys<'_>,
     dest: &Address,
     dep: &TrackedDeposit,
     preimage: &[u8],
@@ -1595,6 +1767,13 @@ pub fn sweep_deposit(
     let net = spv_net(operator_btc.network());
     let (Some(eid), Some(proof), Some(lock)) = (dep.escrow_id_bytes(), dep.proof(), dep.hashlock_bytes()) else {
         return SweepOutcome::Failed("corrupt tracked deposit".to_string());
+    };
+    // Sign with the key the deposit script actually names (a retired key after a rotation).
+    let Some(reserve) = keys.key_for(&proof.reserve_pk) else {
+        return SweepOutcome::Failed(format!(
+            "no reserve key loaded for this deposit's reserve pubkey {} (retired key missing from ZCRYPT_RESERVE_PREV_KEY_FILES?)",
+            hex::encode(proof.reserve_pk)
+        ));
     };
     // Require a consensus-accepted claim (minted / immature) before taking BTC.
     match query_escrow(zc, &eid) {
@@ -1652,7 +1831,8 @@ pub fn reserve_claim_revealed(
 ) -> Result<WatchReport, String> {
     let btc_tip = operator_btc.height().unwrap_or(0);
     let mut report = WatchReport::default();
-    let (deposits, errs) = index_reserve_deposits(zc, reserve, from, to)?;
+    let keys = ReserveKeys::single(reserve);
+    let (deposits, errs) = index_reserve_deposits(zc, &keys, from, to)?;
     report.errors.extend(errs);
     report.tracked = deposits.clone();
     let known: std::collections::HashMap<[u8; 32], TrackedDeposit> =
@@ -1664,7 +1844,7 @@ pub fn reserve_claim_revealed(
             continue;
         }
         let prox = refund_proximity(dep.btc_locktime, btc_tip);
-        match sweep_deposit(zc, operator_btc, reserve, dest, &dep, &preimage, fee_target, btc_tip) {
+        match sweep_deposit(zc, operator_btc, &keys, dest, &dep, &preimage, fee_target, btc_tip) {
             SweepOutcome::Swept(txid) => {
                 already_swept.insert(eid);
                 report.swept.push((eid, txid));
@@ -1858,6 +2038,15 @@ pub fn reserve_lock_for_redeem(
     if info.state != "open" {
         return Err(format!("redeem: escrow is not open (state={}) — refusing to lock BTC", info.state));
     }
+    if info.kind != "burn" {
+        return Err(format!("redeem: escrow kind '{}' is not a burn escrow — refusing to pay BTC", info.kind));
+    }
+    if info.btc_claim_pk != user_btc_pk.inner.serialize() {
+        return Err(
+            "redeem: the requested payout key is not the one consensus committed for this escrow — refusing to lock BTC"
+                .to_string(),
+        );
+    }
     if info.asset_id != zbtc_asset {
         return Err(format!("redeem: escrow asset {} is not zBTC ({zbtc_asset}) — refusing to pay BTC", info.asset_id));
     }
@@ -2017,18 +2206,29 @@ pub fn plan_redeems(
     let btc_tip = operator_btc.height()?;
     let margin = min_finalize_margin.max(min_redeem_margin_blocks(net));
     let mut report = RedeemPlanReport::default();
+    // One plan per escrow id per pass. A block can carry two 0x67 txs with identical lock
+    // parameters (same id) where only the first succeeded at delivery; without this the
+    // second, failed copy would get its own funded HTLC (bridge C1).
+    let mut planned_ids: std::collections::HashSet<[u8; 32]> = std::collections::HashSet::new();
     for h in from..=to {
         let txs = zc.block_txs(h)?;
         for tx in txs {
             if tx.first() != Some(&0x67) {
                 continue;
             }
-            let Some((btc_pk_ser, asset, value, hashlock, timeout, refund_pk)) = parse_burn_lock_btc(&tx[1..]) else {
+            let Some((tx_btc_pk, asset, value, hashlock, timeout, refund_pk)) = parse_burn_lock_btc(&tx[1..]) else {
                 continue;
             };
             let eid = derive_escrow_id(asset, value, &hashlock, timeout, &refund_pk);
             if skip.contains(&eid) {
                 report.skipped += 1;
+                continue;
+            }
+            if !planned_ids.insert(eid) {
+                report.rejected.push((eid, format!(
+                    "duplicate burn-lock for an escrow already planned this pass (tx payout key {})",
+                    hex::encode(tx_btc_pk)
+                )));
                 continue;
             }
             let info = match query_escrow(zc, &eid) {
@@ -2042,6 +2242,13 @@ pub fn plan_redeems(
             // Validate every peg-critical property BEFORE committing reserve BTC.
             let reject = if info.state != "open" {
                 Some(format!("escrow not open (state={})", info.state))
+            } else if info.kind != "burn" {
+                Some(format!("escrow kind '{}' is not a burn escrow", info.kind))
+            } else if info.btc_claim_pk.len() != 33 {
+                Some(format!(
+                    "consensus committed no 33-byte payout key for this escrow ({} bytes); the key in the raw tx is not trusted",
+                    info.btc_claim_pk.len()
+                ))
             } else if info.asset_id != zbtc_asset {
                 Some(format!("escrow asset {} is not zBTC ({zbtc_asset})", info.asset_id))
             } else if info.hashlock != hashlock {
@@ -2075,10 +2282,12 @@ pub fn plan_redeems(
                     continue;
                 }
             };
-            let btc_pk = match PublicKey::from_slice(&btc_pk_ser) {
+            // Payout key from CONSENSUS STATE (the escrow the successful tx created), not from
+            // whichever raw tx we happened to parse.
+            let btc_pk = match PublicKey::from_slice(&info.btc_claim_pk) {
                 Ok(pk) => pk,
                 Err(e) => {
-                    report.rejected.push((eid, format!("bad user btc key: {e}")));
+                    report.rejected.push((eid, format!("bad user btc key in consensus escrow: {e}")));
                     continue;
                 }
             };
@@ -2290,6 +2499,183 @@ pub struct SwapQuote {
     pub timeout_blocks: u64,
 }
 
+/// ZC blocks the MAKER must keep between the expiry of the leg the taker claims (the maker's
+/// lock) and the expiry of the leg the maker claims (the taker's lock). The taker reveals the
+/// preimage by claiming the maker's lock, possibly in its last block; the maker then needs
+/// time to see the preimage and land its own claim before the taker's lock can be refunded.
+pub const SWAP_MAKER_CLAIM_MARGIN_BLOCKS: u64 = 600;
+
+/// The two swap-escrow timeouts for a quote, as `(give_timeout, take_timeout)`: the TAKER's
+/// lock (`give`, claimable by the maker) and the MAKER's lock (`take`, claimable by the taker).
+///
+/// Ordering is the whole safety argument of an atomic swap. The party who reveals the
+/// preimage is the taker, by claiming the maker's `take` lock. That lock must therefore
+/// expire FIRST: if it outlived the taker's own `give` lock, a patient taker could wait for
+/// `give` to expire, refund it, and still claim `take`, walking away with both sides. So
+/// `take` expires at `base + timeout`, and `give` expires at least
+/// [`SWAP_MAKER_CLAIM_MARGIN_BLOCKS`] (and at least one further `timeout`) after that, which
+/// is the window the maker has to claim after the reveal.
+pub fn swap_timeouts(base: u64, timeout_blocks: u64) -> (u64, u64) {
+    let t = timeout_blocks.max(1);
+    let take_timeout = base + t;
+    let give_timeout = take_timeout + t.max(SWAP_MAKER_CLAIM_MARGIN_BLOCKS);
+    (give_timeout, take_timeout)
+}
+
+/// MAKER-side check before locking: the maker's lock (which the taker will claim, revealing
+/// the preimage) must expire at least [`SWAP_MAKER_CLAIM_MARGIN_BLOCKS`] before the taker's
+/// lock (which the maker claims afterwards). A maker wallet must refuse any quote for which
+/// this is false, whatever the taker proposes.
+pub fn maker_lock_is_safe(taker_give_timeout: u64, maker_take_timeout: u64) -> bool {
+    maker_take_timeout.saturating_add(SWAP_MAKER_CLAIM_MARGIN_BLOCKS) <= taker_give_timeout
+}
+
+/// The least ZC blocks of life a lock must have when its counterparty is expected to claim
+/// it: below this a swap cannot realistically complete and the lock only costs its fee.
+pub const SWAP_MIN_CLAIM_BLOCKS: u64 = 60;
+
+/// A counterparty's swap lock as read from the chain AND confirmed by consensus.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SwapLock {
+    pub escrow_id: [u8; 32],
+    pub asset: u64,
+    pub value: u64,
+    pub hashlock: [u8; 32],
+    pub timeout: u64,
+    /// The locker (the escrow's refund key).
+    pub locker_pk: PubKey,
+    /// ZC height the lock transaction appeared in.
+    pub height: i64,
+}
+
+/// Scan ZC blocks `from..=to` for a SWAP_LOCK whose hashlock is `hashlock`, whose claimant is
+/// `claimant_pk`, and which locks exactly `value` of `asset`, then confirm with consensus that
+/// the escrow exists and is `open` with those parameters. The escrow id binds the claimant
+/// key, so deriving it with `claimant_pk` and finding it open is proof that the lock really
+/// pays this claimant; nothing in the raw transaction is trusted on its own. Returns the
+/// first confirmed match.
+pub fn find_swap_lock(
+    zc: &dyn ZcNode,
+    from: i64,
+    to: i64,
+    hashlock: &[u8; 32],
+    claimant_pk: &PubKey,
+    asset: u64,
+    value: u64,
+) -> Result<Option<SwapLock>, String> {
+    use zcrypt_core::htlc_shield::escrow_id as derive_escrow_id;
+    for h in from..=to {
+        for tx in zc.block_txs(h)? {
+            if tx.first() != Some(&0x62) {
+                continue;
+            }
+            let Some((v, _blind, a, lock, timeout, counterparty, refund)) = parse_swap_lock(&tx[1..]) else {
+                continue;
+            };
+            if lock != *hashlock || counterparty != *claimant_pk || a != asset || v != value {
+                continue;
+            }
+            let eid = derive_escrow_id(a, v, &lock, timeout, claimant_pk);
+            match query_escrow(zc, &eid)? {
+                Some(info)
+                    if info.state == "open"
+                        && info.asset_id == a
+                        && info.value == v
+                        && info.hashlock == lock
+                        && info.timeout_height == timeout =>
+                {
+                    return Ok(Some(SwapLock { escrow_id: eid, asset: a, value: v, hashlock: lock, timeout, locker_pk: refund, height: h }));
+                }
+                _ => continue, // rejected by consensus, already settled, or parameters differ
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// MAKER side: the timeout for the maker's own lock given the taker's confirmed lock, or
+/// `Err` if the taker's lock leaves too little room for a safe swap. The maker's lock must
+/// expire [`SWAP_MAKER_CLAIM_MARGIN_BLOCKS`] before the taker's and still give the taker at
+/// least [`SWAP_MIN_CLAIM_BLOCKS`] to claim it.
+pub fn maker_take_timeout_for(taker_lock: &SwapLock, zc_tip: u64) -> Result<u64, String> {
+    let take_timeout = taker_lock.timeout.saturating_sub(SWAP_MAKER_CLAIM_MARGIN_BLOCKS);
+    if take_timeout < zc_tip.saturating_add(SWAP_MIN_CLAIM_BLOCKS) {
+        return Err(format!(
+            "swap: taker lock expires at {} (tip {zc_tip}); after the {SWAP_MAKER_CLAIM_MARGIN_BLOCKS}-block maker margin \
+             the taker would have under {SWAP_MIN_CLAIM_BLOCKS} blocks to claim; refusing to lock",
+            taker_lock.timeout
+        ));
+    }
+    debug_assert!(maker_lock_is_safe(taker_lock.timeout, take_timeout));
+    Ok(take_timeout)
+}
+
+/// TAKER side, step 1: lock `quote.give` for `maker_pk` under `hashlock`. Returns the escrow
+/// id, the taker's change coin, and the lock's timeout (which the maker's lock must undercut).
+pub fn taker_lock_give(
+    zc: &Zcrypt,
+    taker: &Account,
+    coins: &[Coin],
+    quote: &SwapQuote,
+    maker_pk: &PubKey,
+    hashlock: &[u8; 32],
+) -> Result<([u8; 32], Coin, u64), String> {
+    let base = zc.height()? as u64;
+    let (give_timeout, _take_timeout) = swap_timeouts(base, quote.timeout_blocks);
+    let (eid, change) = send_swap_lock(zc, taker, quote.give_asset, quote.give_amount, coins, hashlock, give_timeout, maker_pk)?;
+    Ok((eid, change, give_timeout))
+}
+
+/// MAKER side, step 2: given the taker's CONFIRMED lock (from [`find_swap_lock`] with the
+/// maker as claimant), check it matches the quote, derive a safe timeout, and lock
+/// `quote.take` for the taker under the same hashlock. Returns the maker's escrow id and
+/// change coin.
+pub fn maker_lock_take(
+    zc: &Zcrypt,
+    maker: &Account,
+    coins: &[Coin],
+    quote: &SwapQuote,
+    taker_lock: &SwapLock,
+) -> Result<([u8; 32], Coin), String> {
+    if taker_lock.asset != quote.give_asset || taker_lock.value != quote.give_amount {
+        return Err(format!(
+            "swap: taker lock is {} of asset {}, quote says {} of asset {}",
+            taker_lock.value, taker_lock.asset, quote.give_amount, quote.give_asset
+        ));
+    }
+    let zc_tip = zc.height()? as u64;
+    let take_timeout = maker_take_timeout_for(taker_lock, zc_tip)?;
+    if !maker_lock_is_safe(taker_lock.timeout, take_timeout) {
+        return Err("swap: maker lock would not expire safely before the taker's lock; refusing".to_string());
+    }
+    send_swap_lock(zc, maker, quote.take_asset, quote.take_amount, coins, &taker_lock.hashlock, take_timeout, &taker_lock.locker_pk)
+}
+
+/// Scan ZC blocks `from..=to` for an HTLC_CLAIM (`0x5B`) of `escrow_id` whose preimage opens
+/// `hashlock`. This is how the MAKER learns the preimage once the taker claims the maker's
+/// lock, and how the TAKER can confirm the maker settled. Returns the preimage and the height
+/// it was revealed at.
+pub fn find_claim_preimage(
+    zc: &dyn ZcNode,
+    from: i64,
+    to: i64,
+    escrow_id: &[u8; 32],
+    hashlock: &[u8; 32],
+) -> Result<Option<(Vec<u8>, i64)>, String> {
+    for h in from..=to {
+        for tx in zc.block_txs(h)? {
+            if tx.first() != Some(&0x5B) || tx.len() <= 33 || tx[1..33] != escrow_id[..] {
+                continue;
+            }
+            let preimage = &tx[33..];
+            if htlc_hashlock(preimage) == *hashlock {
+                return Ok(Some((preimage.to_vec(), h)));
+            }
+        }
+    }
+    Ok(None)
+}
+
 /// The taker's outcome of a swap: the coin received (of `take_asset`) plus the change coin
 /// left over from the coins they spent to fund their leg.
 pub struct SwapResult {
@@ -2379,18 +2765,23 @@ pub fn swap_in_pool_progress(
         return Err(format!("HTLC preimage must be exactly {PREIMAGE_LEN} bytes (got {})", preimage.len()));
     }
     let lock = htlc_hashlock(preimage);
-    // Stagger timeouts: maker's locked leg (give) expires first; taker's locked leg
-    // (take) expires later so the party that reveals the preimage cannot outrun the
-    // counterparty claim + refund race.
+    // Stagger the timeouts so the leg the TAKER claims (the maker's `take` lock, whose claim
+    // reveals the preimage) expires first, and the leg the MAKER claims (the taker's `give`
+    // lock) expires a margin later. See `swap_timeouts` for why the reverse order lets the
+    // taker keep both sides.
     let base = zc.height()? as u64;
-    let give_timeout = base + quote.timeout_blocks as u64;
-    let take_timeout = give_timeout + quote.timeout_blocks.max(1) as u64;
+    let (give_timeout, take_timeout) = swap_timeouts(base, quote.timeout_blocks);
+    debug_assert!(maker_lock_is_safe(give_timeout, take_timeout));
 
     progress(15, "Locking your side of the swap…");
     let (give_escrow, give_change) =
         send_swap_lock(zc, taker, quote.give_asset, quote.give_amount, taker_give_coins, &lock, give_timeout, &maker.pubkey())?;
 
     progress(40, "Maker locking their side…");
+    // What a maker wallet must check against the taker's on-chain lock before committing.
+    if !maker_lock_is_safe(give_timeout, take_timeout) {
+        return Err("swap: maker lock would not expire safely before the taker's lock; refusing".to_string());
+    }
     let (take_escrow, _maker_change) =
         send_swap_lock(zc, maker, quote.take_asset, quote.take_amount, maker_take_coins, &lock, take_timeout, &taker.pubkey())?;
 
@@ -2577,14 +2968,17 @@ mod public_shield_tests {
         for net in [Network::Bitcoin, Network::Signet, Network::Regtest] {
             let btc_tip = 800_000u64;
             let zc_tip = 5_000u64;
-            // An honest wallet's escrow (network redeem window) gets the full network lock.
+            // An honest wallet's escrow (network redeem window) gets the largest lock that
+            // still fits at half-speed Bitcoin (bridge M14): never more than the nominal
+            // network lock, never below the minimum user claim window.
             let honest = zc_tip + zc_redeem_timeout_blocks(net);
             let lt = redeem_btc_locktime_for(net, btc_tip, zc_tip, honest).expect("honest escrow funds");
-            assert_eq!(lt as u64 - btc_tip, btc_redeem_lock_blocks(net), "{net:?}: full lock");
-            // The lock plus its slack (max of the SLA and a quarter of the lock) always expires
-            // before the ZC escrow (bridge N9).
             let lock_blocks = lt as u64 - btc_tip;
-            let lock_secs = lock_blocks * BTC_BLOCK_TIME_SECS + redeem_slack_secs(net, lock_blocks);
+            assert!(lock_blocks <= btc_redeem_lock_blocks(net), "{net:?}: never above the nominal lock");
+            assert!(lock_blocks >= min_user_claim_blocks(net), "{net:?}: never below the claim window");
+            // The lock at half-speed Bitcoin plus its slack (max of the SLA and a quarter of the
+            // lock) always expires before the ZC escrow (bridge N9 / M14).
+            let lock_secs = lock_blocks * BTC_BLOCK_TIME_SECS * BTC_SLOWDOWN_FACTOR + redeem_slack_secs(net, lock_blocks);
             assert!(lock_secs <= (honest - zc_tip) * ZC_BLOCK_TIME_SECS, "{net:?}: lock outlives escrow");
             assert!(redeem_slack_secs(net, lock_blocks) >= lock_blocks * BTC_BLOCK_TIME_SECS / SLACK_FRACTION_DEN);
             // The audit's theft: a burn with a 36h escrow against an 84h BTC lock. Now the
@@ -2595,7 +2989,7 @@ mod public_shield_tests {
             let lt2 = redeem_btc_locktime_for(net, btc_tip, zc_tip, just_enough).expect("minimum escrow funds");
             assert!(lt2 as u64 - btc_tip >= min_user_claim_blocks(net));
             let lb2 = lt2 as u64 - btc_tip;
-            let lock2 = lb2 * BTC_BLOCK_TIME_SECS + redeem_slack_secs(net, lb2);
+            let lock2 = lb2 * BTC_BLOCK_TIME_SECS * BTC_SLOWDOWN_FACTOR + redeem_slack_secs(net, lb2);
             assert!(lock2 <= (just_enough - zc_tip) * ZC_BLOCK_TIME_SECS);
             // Whatever escrow life the user picks, the slack never collapses to the bare SLA
             // once the lock is long enough for a quarter of it to exceed the SLA.
@@ -2603,17 +2997,19 @@ mod public_shield_tests {
                 let t = just_enough + extra;
                 if let Ok(lt3) = redeem_btc_locktime_for(net, btc_tip, zc_tip, t) {
                     let lb3 = lt3 as u64 - btc_tip;
-                    let slack = (t - zc_tip) * ZC_BLOCK_TIME_SECS - lb3 * BTC_BLOCK_TIME_SECS;
+                    let slack = (t - zc_tip) * ZC_BLOCK_TIME_SECS - lb3 * BTC_BLOCK_TIME_SECS * BTC_SLOWDOWN_FACTOR;
                     assert!(slack >= redeem_slack_secs(net, lb3), "{net:?}: slack {slack}s below the rule for a {lb3}-block lock");
                 }
             }
         }
         // The daemon's margin floor is at least the user's claim window plus its slack.
         assert!(min_redeem_margin_blocks(Network::Bitcoin) >= MIN_USER_CLAIM_BLOCKS_MAINNET * BTC_BLOCK_TIME_SECS);
-        // Mainnet at the default margin: a full 504-block lock keeps far more than the SLA.
+        // Mainnet at the default margin: the lock is the largest that fits at half-speed
+        // Bitcoin (below the 504 nominal), and still well above the 144-block claim window.
         let lt = redeem_btc_locktime_for(Network::Bitcoin, 800_000, 5_000, 5_000 + default_finalize_margin(Network::Bitcoin)).unwrap();
-        assert_eq!(lt as u64 - 800_000, 504);
-        assert!(default_finalize_margin(Network::Bitcoin) - 504 * 600 >= 504 * 600 / 4);
+        let lock = lt as u64 - 800_000;
+        assert!(lock <= 504 && lock >= 2 * MIN_USER_CLAIM_BLOCKS_MAINNET, "lock {lock}");
+        assert!(default_finalize_margin(Network::Bitcoin) >= lock * 600 * BTC_SLOWDOWN_FACTOR + redeem_slack_secs(Network::Bitcoin, lock));
     }
 
     #[test]
@@ -2663,8 +3059,8 @@ mod public_shield_tests {
         fn fee_rate_sat_vb(&self, _: u32) -> Result<f64, String> {
             Ok(1.0)
         }
-        fn find_htlc_spend_preimage(&self, _: &HtlcUtxo, _: u64) -> Result<Option<Vec<u8>>, String> {
-            Ok(None)
+        fn find_htlc_spend(&self, _: &HtlcUtxo, _: u64) -> Result<crate::HtlcSpend, String> {
+            Ok(crate::HtlcSpend::Unspent)
         }
         fn block_header(&self, _: u64) -> Result<[u8; 80], String> {
             Err("mock".into())
@@ -2713,6 +3109,243 @@ mod public_shield_tests {
         assert!(find_funded_htlc(&strays, &script, Amount::from_sat(50_000)).unwrap().is_none());
         // ...and a resume lookup finds a real funding by script (bridge L3).
         assert!(find_funded_htlc(&funded, &script, Amount::from_sat(50_000)).unwrap().is_some());
+    }
+
+    /// Minimal in-memory node for the maker-side lookups: raw blocks plus the consensus
+    /// escrow table the `/htlc/<id>` query reads.
+    struct SwapFakeZc {
+        blocks: Vec<Vec<Vec<u8>>>,
+        escrows: std::collections::HashMap<[u8; 32], (u64, u64, [u8; 32], u64, &'static str)>,
+        /// Consensus-committed payout key per burn escrow (what `/htlc/<id>` reports).
+        btc_keys: std::collections::HashMap<[u8; 32], Vec<u8>>,
+    }
+    impl ZcNode for SwapFakeZc {
+        fn height(&self) -> Result<i64, String> {
+            Ok(self.blocks.len() as i64)
+        }
+        fn block_txs(&self, height: i64) -> Result<Vec<Vec<u8>>, String> {
+            Ok(self.blocks.get((height - 1).max(0) as usize).cloned().unwrap_or_default())
+        }
+        fn query(&self, path: &str) -> Result<String, String> {
+            let Some(h) = path.strip_prefix("/htlc/") else { return Err(format!("unexpected query {path}")) };
+            let raw = hex::decode(h).map_err(|e| e.to_string())?;
+            let eid: [u8; 32] = raw.as_slice().try_into().map_err(|_| "bad id".to_string())?;
+            match self.escrows.get(&eid) {
+                Some((a, v, l, t, s)) => {
+                    let key = self.btc_keys.get(&eid).cloned().unwrap_or_default();
+                    Ok(serde_json::json!({
+                        "asset_id": a, "value": v, "hashlock": hex::encode(l), "timeout_height": t, "state": s,
+                        "kind": if key.is_empty() { "swap" } else { "burn" },
+                        "btc_claim_pk": hex::encode(&key),
+                    })
+                    .to_string())
+                }
+                None => Err("no such escrow".into()),
+            }
+        }
+        fn broadcast(&self, _tx: &[u8]) -> Result<String, String> {
+            Err("not used".into())
+        }
+    }
+
+    /// A SWAP_LOCK tx as it appears in a block (the shield tx bytes are irrelevant to the
+    /// lookup, which trusts consensus, not the raw proof).
+    fn raw_swap_lock(value: u64, asset: u64, lock: &[u8; 32], timeout: u64, claimant: &PubKey, locker: &PubKey) -> Vec<u8> {
+        let mut t = vec![0x62u8];
+        t.extend_from_slice(&value.to_le_bytes());
+        t.extend_from_slice(&[0u8; 32]);
+        t.extend_from_slice(&asset.to_le_bytes());
+        t.extend_from_slice(lock);
+        t.extend_from_slice(&timeout.to_le_bytes());
+        t.extend_from_slice(&pk_bytes(claimant));
+        t.extend_from_slice(&pk_bytes(locker));
+        t.extend_from_slice(b"proof-bytes-not-parsed-here");
+        t
+    }
+
+    #[test]
+    fn maker_finds_only_a_consensus_confirmed_lock_that_pays_it() {
+        use zcrypt_core::htlc_shield::escrow_id;
+        let maker: PubKey = [11; 8];
+        let taker: PubKey = [22; 8];
+        let other: PubKey = [33; 8];
+        let preimage = [7u8; 32];
+        let lock = htlc_hashlock(&preimage);
+        let (asset, value, timeout) = (5u64, 100_000u64, 2_000u64);
+        let good = raw_swap_lock(value, asset, &lock, timeout, &maker, &taker);
+        let wrong_claimant = raw_swap_lock(value, asset, &lock, timeout, &other, &taker);
+        let wrong_value = raw_swap_lock(value - 1, asset, &lock, timeout, &maker, &taker);
+        let wrong_lock = raw_swap_lock(value, asset, &[9u8; 32], timeout, &maker, &taker);
+        // A lock that LOOKS right on the wire but consensus rejected (no escrow), and one that
+        // is already settled.
+        let unconfirmed = raw_swap_lock(value, asset, &lock, timeout + 1, &maker, &taker);
+        let settled = raw_swap_lock(value, asset, &lock, timeout + 2, &maker, &taker);
+        let mut escrows = std::collections::HashMap::new();
+        escrows.insert(escrow_id(asset, value, &lock, timeout, &maker), (asset, value, lock, timeout, "open"));
+        escrows.insert(escrow_id(asset, value - 1, &lock, timeout, &maker), (asset, value - 1, lock, timeout, "open"));
+        escrows.insert(escrow_id(asset, value, &lock, timeout + 2, &maker), (asset, value, lock, timeout + 2, "claimed"));
+        let zc = SwapFakeZc {
+            blocks: vec![vec![wrong_claimant, wrong_value], vec![wrong_lock, unconfirmed, settled], vec![good]],
+            escrows,
+            btc_keys: Default::default(),
+        };
+        let found = find_swap_lock(&zc, 1, 3, &lock, &maker, asset, value).unwrap().expect("the good lock is found");
+        assert_eq!(found.height, 3);
+        assert_eq!(found.timeout, timeout);
+        assert_eq!(found.locker_pk, taker);
+        assert_eq!(found.escrow_id, escrow_id(asset, value, &lock, timeout, &maker));
+        // Scanning only the blocks with decoys finds nothing.
+        assert!(find_swap_lock(&zc, 1, 2, &lock, &maker, asset, value).unwrap().is_none());
+        // The maker's own timeout undercuts the taker's by the margin, and is refused when the
+        // taker's lock is too short to leave a claim window.
+        assert_eq!(maker_take_timeout_for(&found, 100).unwrap(), timeout - SWAP_MAKER_CLAIM_MARGIN_BLOCKS);
+        let err = maker_take_timeout_for(&found, timeout - SWAP_MAKER_CLAIM_MARGIN_BLOCKS - SWAP_MIN_CLAIM_BLOCKS + 1).unwrap_err();
+        assert!(err.contains("refusing to lock"), "{err}");
+    }
+
+    #[test]
+    fn maker_reads_the_preimage_from_the_takers_claim() {
+        let preimage = [4u8; 32];
+        let lock = htlc_hashlock(&preimage);
+        let eid = [0xEE; 32];
+        let other_eid = [0xEF; 32];
+        let zc = SwapFakeZc {
+            blocks: vec![
+                vec![claim_tx(&other_eid, &preimage)],   // someone else's escrow
+                vec![claim_tx(&eid, &[5u8; 32])],       // wrong preimage (consensus rejects it)
+                vec![claim_tx(&eid, &preimage)],
+            ],
+            escrows: Default::default(),
+            btc_keys: Default::default(),
+        };
+        assert!(find_claim_preimage(&zc, 1, 2, &eid, &lock).unwrap().is_none());
+        let (p, h) = find_claim_preimage(&zc, 1, 3, &eid, &lock).unwrap().expect("found");
+        assert_eq!(p, preimage);
+        assert_eq!(h, 3);
+    }
+
+    /// A 0x67 burn-lock-for-BTC as it appears in a block (the shield tx bytes are not parsed by
+    /// the planner, which trusts consensus for the escrow and its payout key).
+    fn raw_burn_lock_btc(btc_pk: &[u8; 33], value: u64, asset: u64, lock: &[u8; 32], timeout: u64, refund: &PubKey) -> Vec<u8> {
+        let mut t = vec![0x67u8];
+        t.extend_from_slice(btc_pk);
+        t.extend_from_slice(&value.to_le_bytes());
+        t.extend_from_slice(&[0u8; 32]);
+        t.extend_from_slice(&asset.to_le_bytes());
+        t.extend_from_slice(lock);
+        t.extend_from_slice(&timeout.to_le_bytes());
+        t.extend_from_slice(&pk_bytes(refund));
+        t.extend_from_slice(b"proof-bytes-not-parsed-here");
+        t
+    }
+
+    /// Bridge C1: two burn-locks with identical lock parameters (one accepted, one that failed
+    /// delivery but still sits in the block) carry different BTC payout keys. The planner must
+    /// produce ONE plan for the escrow, and its script must use the key CONSENSUS committed,
+    /// never the key parsed from whichever raw tx came first.
+    #[test]
+    fn planner_funds_one_htlc_per_escrow_using_the_consensus_payout_key() {
+        use zcrypt_core::htlc_shield::escrow_id;
+        let reserve = Key::from_bytes(&[9u8; 32]);
+        let k_real = Key::from_bytes(&[1u8; 32]).pk.inner.serialize();
+        let k_dup = Key::from_bytes(&[2u8; 32]).pk.inner.serialize();
+        let refund: PubKey = [7; 8];
+        let preimage = [3u8; 32];
+        let lock = htlc_hashlock(&preimage);
+        let (asset, value) = (5u64, 200_000u64);
+        let zc_tip = 2u64; // two blocks below
+        let timeout = zc_tip + zc_redeem_timeout_blocks(Network::Bitcoin);
+        let eid = escrow_id(asset, value, &lock, timeout, &refund);
+        let mut escrows = std::collections::HashMap::new();
+        escrows.insert(eid, (asset, value, lock, timeout, "open"));
+        let mut btc_keys = std::collections::HashMap::new();
+        btc_keys.insert(eid, k_real.to_vec());
+        // The duplicate (attacker) copy is ordered FIRST in the block on purpose.
+        let zc = SwapFakeZc {
+            blocks: vec![
+                vec![
+                    raw_burn_lock_btc(&k_dup, value, asset, &lock, timeout, &refund),
+                    raw_burn_lock_btc(&k_real, value, asset, &lock, timeout, &refund),
+                ],
+                vec![raw_burn_lock_btc(&k_dup, value, asset, &lock, timeout, &refund)],
+            ],
+            escrows,
+            btc_keys,
+        };
+        let btc = MockBtc { existing: vec![], broadcasts: std::cell::Cell::new(0) };
+        let skip = std::collections::HashSet::new();
+        let report = plan_redeems(&zc, &btc, &reserve, 1, 2, asset, 0, &skip).unwrap();
+        assert_eq!(report.plans.len(), 1, "exactly one plan per escrow id per pass");
+        let plan = &report.plans[0];
+        assert_eq!(plan.escrow_id, eid);
+        let real_pk = PublicKey::from_slice(&k_real).unwrap();
+        let expected = htlc_script(&lock, &real_pk, &reserve.pk, plan.btc_locktime);
+        assert_eq!(plan.script, expected, "the script pays the CONSENSUS key, not the raw-tx key");
+        let dup_pk = PublicKey::from_slice(&k_dup).unwrap();
+        assert_ne!(plan.script, htlc_script(&lock, &dup_pk, &reserve.pk, plan.btc_locktime));
+        assert_eq!(report.rejected.len(), 2, "both duplicate copies are rejected, not planned");
+        assert!(report.rejected.iter().all(|(id, why)| *id == eid && why.contains("duplicate")));
+
+        // Same block, but consensus committed NO payout key (older node): nothing is funded.
+        let zc_nokey = SwapFakeZc {
+            blocks: vec![vec![raw_burn_lock_btc(&k_real, value, asset, &lock, timeout, &refund)]],
+            escrows: {
+                let mut e = std::collections::HashMap::new();
+                e.insert(eid, (asset, value, lock, timeout, "open"));
+                e
+            },
+            btc_keys: Default::default(),
+        };
+        let report = plan_redeems(&zc_nokey, &btc, &reserve, 1, 1, asset, 0, &skip).unwrap();
+        assert!(report.plans.is_empty(), "no consensus payout key means no funding");
+        assert_eq!(report.rejected.len(), 1);
+    }
+
+    /// Bridge M14: the operator lock is sized for half-speed Bitcoin. A 60% slowdown over the
+    /// lock's life must still leave the ZC escrow alive when the CLTV passes.
+    #[test]
+    fn redeem_lock_survives_a_sixty_percent_bitcoin_slowdown() {
+        for net in [Network::Bitcoin, Network::Signet] {
+            let (btc_tip, zc_tip) = (800_000u64, 5_000u64);
+            let honest = zc_tip + zc_redeem_timeout_blocks(net);
+            let lt = redeem_btc_locktime_for(net, btc_tip, zc_tip, honest).expect("funds");
+            let lock_blocks = lt as u64 - btc_tip;
+            // Bitcoin at 16 min/block for the whole lock: wall time until the CLTV passes.
+            let slow_secs = lock_blocks * (BTC_BLOCK_TIME_SECS * 16 / 10);
+            let escrow_secs = (honest - zc_tip) * ZC_BLOCK_TIME_SECS;
+            assert!(
+                slow_secs + redeem_finalize_sla_secs(net) <= escrow_secs,
+                "{net:?}: lock {lock_blocks} blocks at 60% slowdown ({slow_secs}s) must end before the escrow ({escrow_secs}s)"
+            );
+        }
+    }
+
+    #[test]
+    fn swap_lock_payload_round_trips() {
+        let claimant: PubKey = [1; 8];
+        let locker: PubKey = [2; 8];
+        let lock = [3u8; 32];
+        let raw = raw_swap_lock(42, 7, &lock, 999, &claimant, &locker);
+        let (v, _b, a, l, t, c, r) = parse_swap_lock(&raw[1..]).unwrap();
+        assert_eq!((v, a, l, t, c, r), (42, 7, lock, 999, claimant, locker));
+        assert!(parse_swap_lock(&raw[1..100]).is_none());
+    }
+
+    #[test]
+    fn swap_timeouts_expire_the_revealed_leg_first() {
+        // The maker's lock (claimed by the taker, revealing the preimage) expires at base + T;
+        // the taker's lock (claimed by the maker afterwards) expires a full margin later.
+        let (give, take) = swap_timeouts(1_000, 500);
+        assert_eq!(take, 1_500);
+        assert!(give >= take + SWAP_MAKER_CLAIM_MARGIN_BLOCKS);
+        assert!(maker_lock_is_safe(give, take));
+        // The reverse ordering (the bug) is exactly what the maker check refuses.
+        assert!(!maker_lock_is_safe(take, give));
+        assert!(!maker_lock_is_safe(give, give));
+        // A tiny quote timeout still leaves the maker the full margin.
+        let (give, take) = swap_timeouts(1_000, 1);
+        assert_eq!(take, 1_001);
+        assert_eq!(give, 1_001 + SWAP_MAKER_CLAIM_MARGIN_BLOCKS);
     }
 
     #[test]

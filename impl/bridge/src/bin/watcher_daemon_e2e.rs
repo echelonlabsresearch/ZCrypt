@@ -50,7 +50,7 @@ fn main() {
 
     // One watcher pass with this test's fixed config (finalize margin 130k, aggressive fee target).
     fn run(st: &mut WatcherState, zc: &Zcrypt, op: &Btc, reserve: &Key, dest: &bitcoin::Address, asset: u64) -> zcrypt_bridge::watcher::TickReport {
-        watcher_tick(st, zc, op, reserve, dest, asset, 130_000, 1).expect("tick")
+        watcher_tick(st, zc, op, &swap::ReserveKeys::single(reserve), dest, asset, 130_000, 1).expect("tick")
     }
 
     // Watch only from HERE onward. Earlier public-bridge flows (public_roundtrip / adversarial)

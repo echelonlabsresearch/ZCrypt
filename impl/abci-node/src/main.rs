@@ -162,6 +162,11 @@ const HTLC_BURN_LOCK_BTC_TAG: u8 = 0x67;
 /// threshold). Payload: sentinel_pubkey(32) ‖ nonce(8) ‖ sig(64), signed over
 /// "ZCRYPT-SENTINEL-DISABLE-v1" ‖ chain_id ‖ pubkey ‖ nonce (nonce = replay protection).
 const SENTINEL_DISABLE_TAG: u8 = 0x68;
+/// Rotate an SPV asset's Bitcoin reserve key (bridge review H3): `asset_le(8) ‖ old_pk(33) ‖
+/// new_pk(33) ‖ sig(64)`, where `sig` is the CURRENT reserve key's compact ECDSA signature
+/// over `spv::reserve_rotation_digest(chain, asset, epoch, old, new)`. The old key is
+/// retired (its in-flight deposits still mint), new deposits must pay the new key.
+const ROTATE_RESERVE_TAG: u8 = 0x69;
 
 /// Devnet foundation account seed. The genesis foundation allocation is registered to
 /// this account's REWARD ADDRESS (`h("ZC-REWARD-ADDR", pk)`), so the matching wallet
@@ -488,7 +493,7 @@ fn parse_swap_lock(
 /// pubkey**, from which consensus derives the SPV sentinel authority itself —
 /// the registrant never chooses the hash, so an SPV asset can only ever be minted
 /// against proven Bitcoin deposits claimable by that reserve key.
-fn parse_register(b: &[u8]) -> Option<(String, u8, Option<[u8; 32]>, u64, bool)> {
+fn parse_register(b: &[u8]) -> Option<(String, u8, Option<[u8; 32]>, u64, Option<[u8; 33]>)> {
     if b.len() < 2 {
         return None;
     }
@@ -500,18 +505,19 @@ fn parse_register(b: &[u8]) -> Option<(String, u8, Option<[u8; 32]>, u64, bool)>
     let ticker = String::from_utf8(b[2..2 + tlen].to_vec()).ok()?;
     let max_supply = u64::from_le_bytes(b[2 + tlen..2 + tlen + 8].try_into().ok()?);
     let rest = &b[2 + tlen + 8..];
-    let (authority, is_spv) = if rest.is_empty() {
-        (None, false)
+    let (authority, reserve_pk) = if rest.is_empty() {
+        (None, None)
     } else if rest.len() == 32 {
         let mut a = [0u8; 32];
         a.copy_from_slice(rest);
-        (Some(a), false)
+        (Some(a), None)
     } else if rest.len() == 33 {
-        (Some(zcrypt_core::spv::spv_authority(rest)), true)
+        let pk: [u8; 33] = rest.try_into().ok()?;
+        (Some(zcrypt_core::spv::spv_authority(&pk)), Some(pk))
     } else {
         return None;
     };
-    Some((ticker, decimals, authority, max_supply, is_spv))
+    Some((ticker, decimals, authority, max_supply, reserve_pk))
 }
 
 /// zBTC may ONLY be registered in SPV form (a 33-byte reserve key): its mint
@@ -536,6 +542,18 @@ fn zbtc_requires_spv(ticker: &str, is_spv: bool) -> Result<(), String> {
     Ok(())
 }
 
+/// Parse a ROTATE_RESERVE (`0x69`) payload: `asset_le(8) ‖ old_pk(33) ‖ new_pk(33) ‖ sig(64)`.
+fn parse_rotate_reserve(b: &[u8]) -> Option<(u64, [u8; 33], [u8; 33], [u8; 64])> {
+    if b.len() != 8 + 33 + 33 + 64 {
+        return None;
+    }
+    let asset = u64::from_le_bytes(b[0..8].try_into().ok()?);
+    let old_pk: [u8; 33] = b[8..41].try_into().ok()?;
+    let new_pk: [u8; 33] = b[41..74].try_into().ok()?;
+    let sig: [u8; 64] = b[74..138].try_into().ok()?;
+    Some((asset, old_pk, new_pk, sig))
+}
+
 /// Parse a 64-byte shield pubkey (8×u64 LE).
 fn parse_pubkey(b: &[u8]) -> Option<[u64; 8]> {
     if b.len() != 64 {
@@ -549,6 +567,14 @@ fn parse_pubkey(b: &[u8]) -> Option<[u64; 8]> {
 }
 
 /// Parse a 72-byte claim payload into (pk, amount).
+fn pubkey_bytes(pk: &[u64; 8]) -> Vec<u8> {
+    let mut b = Vec::with_capacity(64);
+    for x in pk {
+        b.extend_from_slice(&x.to_le_bytes());
+    }
+    b
+}
+
 fn parse_claim(b: &[u8]) -> Option<([u64; 8], u64)> {
     if b.len() != 72 {
         return None;
@@ -909,6 +935,7 @@ fn tag_name(b: Option<u8>) -> &'static str {
         Some(HTLC_OPEN_SPV_TAG) => "HTLC_OPEN_SPV",
         Some(BTC_REANCHOR_TAG) => "BTC_REANCHOR",
         Some(CLAIM_FEE_TAG) => "CLAIM_FEE",
+        Some(ROTATE_RESERVE_TAG) => "ROTATE_RESERVE",
         _ => "UNKNOWN",
     }
 }
@@ -1128,12 +1155,7 @@ impl Application for ZcryptApp {
         // ticker fails as "already registered".
         if let Some(pk) = genesis_pubkey33(&req.app_state_bytes, "zbtc_reserve_pk") {
             use zcrypt_core::asset_registry::{ZBTC_DECIMALS, ZBTC_MAX_SUPPLY, ZBTC_TICKER};
-            match s.node.register_asset(
-                ZBTC_TICKER,
-                ZBTC_DECIMALS,
-                Some(zcrypt_core::spv::spv_authority(&pk)),
-                ZBTC_MAX_SUPPLY,
-            ) {
+            match s.node.register_spv_asset(ZBTC_TICKER, ZBTC_DECIMALS, &pk, ZBTC_MAX_SUPPLY) {
                 Ok(id) => eprintln!("[zbtc] reserve key pinned from genesis: asset {id}, reserve {}", hex::encode(pk)),
                 Err(e) => panic!("[zbtc] genesis registration failed: {e}"),
             }
@@ -1237,7 +1259,7 @@ impl ZcryptApp {
             }
         } else if tx.first() == Some(&BOND_TAG) {
             match parse_bond_coin(&tx[1..], chain_id) {
-                Some((addr, pubkey, stake, _, commission, nonce, stake_blind, stx)) => {
+                Some((addr, pubkey, stake, reward, commission, nonce, stake_blind, stx)) => {
                     let pk32: Option<[u8; 32]> = pubkey.as_slice().try_into().ok();
                     if stake < zcrypt_core::staking::MIN_STAKE {
                         Err("stake below minimum (10,000 ZCRYPT)".to_string())
@@ -1258,7 +1280,10 @@ impl ZcryptApp {
                         if stx.output_commitments.first() != Some(&expected) {
                             Err("bond: output[0] is not the declared stake burn coin".to_string())
                         } else {
-                            s.node.precheck_shield(&stx).map(|()| deferred.push((stx, Vec::new())))
+                            // The pledge proof must be bound to this exact header (see
+                            // `Node::bond_with_stake`): verified with the same envelope.
+                            let env = zcrypt_core::staking::bond_envelope(&pubkey, stake, &reward, commission, nonce);
+                            s.node.precheck_shield(&stx).map(|()| deferred.push((stx, env)))
                         }
                     }
                 }
@@ -1278,7 +1303,7 @@ impl ZcryptApp {
             }
         } else if tx.first() == Some(&DELEGATE_TAG) {
             match parse_delegate_coin(&tx[1..], chain_id) {
-                Some((target, _, stake, _, stake_blind, stx)) => {
+                Some((target, delegator, stake, reward, stake_blind, stx)) => {
                     if stake == 0 {
                         Err("delegation must be a positive stake".to_string())
                     } else if !s.node.is_validator(&target) {
@@ -1294,7 +1319,8 @@ impl ZcryptApp {
                         if stx.output_commitments.first() != Some(&expected) {
                             Err("delegate: output[0] is not the declared stake burn coin".to_string())
                         } else {
-                            s.node.precheck_shield(&stx).map(|()| deferred.push((stx, Vec::new())))
+                            let env = zcrypt_core::staking::delegate_envelope(&delegator, &target, stake, &reward);
+                            s.node.precheck_shield(&stx).map(|()| deferred.push((stx, env)))
                         }
                     }
                 }
@@ -1362,10 +1388,10 @@ impl ZcryptApp {
                     Some((_, _, _, max_supply, _)) if max_supply == 0 => {
                         Err("asset must declare a non-zero max supply".to_string())
                     }
-                    Some((ticker, _, _, _, is_spv))
+                    Some((ticker, _, _, _, reserve_pk))
                         if zcrypt_core::asset_registry::valid_ticker(&ticker) =>
                     {
-                        zbtc_requires_spv(&ticker, is_spv)
+                        zbtc_requires_spv(&ticker, reserve_pk.is_some())
                             .and_then(|()| s.node.precheck_gas_note(&gas_tx, gas_blind))
                             .map(|()| deferred.push((gas_tx, Vec::new())))
                     }
@@ -1415,6 +1441,13 @@ impl ZcryptApp {
                 }
                 None => Err("malformed rotate-authority tx".to_string()),
             }
+        } else if tx.first() == Some(&ROTATE_RESERVE_TAG) {
+            match parse_rotate_reserve(&tx[1..]) {
+                Some((asset, old_pk, new_pk, sig)) => {
+                    s.node.verify_rotate_spv_reserve(chain_id, asset, &old_pk, &new_pk, &sig)
+                }
+                None => Err("malformed rotate-reserve tx".to_string()),
+            }
         } else if tx.first() == Some(&BTC_HEADERS_TAG) {
             // Borrow-only pre-check (size cap + parse + first-parent-known). Full PoW/linkage
             // validation runs authoritatively at deliver. Avoids cloning the whole header
@@ -1423,12 +1456,14 @@ impl ZcryptApp {
         } else if tx.first() == Some(&HTLC_OPEN_SPV_TAG) {
             match parse_htlc_open_spv(&tx[1..]) {
                 Some((asset, value, lock, timeout, claim_pk, open_auth, proof)) => {
-                    let authority = s.node.asset_meta(asset).and_then(|m| m.authority);
-                    match authority {
-                        Some(auth) => s
+                    // Same reserve history (current + retired keys) and tip-freshness rule as
+                    // delivery, so admission and block execution agree.
+                    let reserve = s.node.asset_meta(asset).and_then(|m| m.reserve_auth());
+                    match reserve {
+                        Some(reserve) => s
                             .node
                             .spv()
-                            .verify_mint_proof(&auth, value, &lock, &proof)
+                            .verify_mint_proof_with(&reserve, value, &lock, &proof)
                             .and_then(|(outpoint, _)| {
                                 // The depositor's authorization over EVERY open parameter is
                                 // checked at admission too, so a front-run never reaches a block.
@@ -1442,7 +1477,8 @@ impl ZcryptApp {
                                     timeout_height: timeout,
                                 };
                                 zcrypt_core::spv::verify_open_auth(&proof.refund_pk, &a, &open_auth)
-                            }),
+                            })
+                            .and_then(|()| s.node.btc_tip_fresh("SPV mint open")),
                         None => Err("asset not registered / no mint authority".to_string()),
                     }
                 }
@@ -1471,6 +1507,10 @@ impl ZcryptApp {
                                 Err("preimage must be exactly 32 bytes".to_string())
                             } else if zcrypt_core::nullifier::htlc_hashlock(preimage) != e.hashlock {
                                 Err("preimage does not match the hashlock".to_string())
+                            } else if e.spv_deposit.is_some() {
+                                // SPV mint claims need a fresh consensus Bitcoin tip (parity
+                                // with `Node::htlc_claim`).
+                                s.node.btc_tip_fresh("SPV mint claim")
                             } else {
                                 Ok(())
                             }
@@ -1514,7 +1554,12 @@ impl ZcryptApp {
                                 zcrypt_core::htlc_shield::ENV_BURN_LOCK,
                                 asset, value, &lock, timeout, &refund, &refund, &[],
                             );
-                            s.node.precheck_shield(&stx).map(|()| deferred.push((stx, env)))
+                            // Mirror the delivery-time admission rules that would otherwise
+                            // only fail AFTER the pledge is applied: value bound and escrow id.
+                            zcrypt_core::node::lock_value_ok(value)
+                                .and_then(|()| s.node.escrow_id_available(asset, value, &lock, timeout, &refund))
+                                .and_then(|()| s.node.precheck_shield(&stx))
+                                .map(|()| deferred.push((stx, env)))
                         }
                     }
                 }
@@ -1540,7 +1585,10 @@ impl ZcryptApp {
                                     zcrypt_core::htlc_shield::ENV_BURN_LOCK_BTC,
                                     asset, value, &lock, timeout, &refund, &refund, btc_claim_pk,
                                 );
-                                s.node.precheck_shield(&stx).map(|()| deferred.push((stx, env)))
+                                zcrypt_core::node::lock_value_ok(value)
+                                    .and_then(|()| s.node.escrow_id_available(asset, value, &lock, timeout, &refund))
+                                    .and_then(|()| s.node.precheck_shield(&stx))
+                                    .map(|()| deferred.push((stx, env)))
                             }
                         }
                     }
@@ -1563,7 +1611,10 @@ impl ZcryptApp {
                                 zcrypt_core::htlc_shield::ENV_SWAP_LOCK,
                                 asset, value, &lock, timeout, &cp, &refund, &[],
                             );
-                            s.node.precheck_shield(&stx).map(|()| deferred.push((stx, env)))
+                            zcrypt_core::node::lock_value_ok(value)
+                                .and_then(|()| s.node.escrow_id_available(asset, value, &lock, timeout, &cp))
+                                .and_then(|()| s.node.precheck_shield(&stx))
+                                .map(|()| deferred.push((stx, env)))
                         }
                     }
                 }
@@ -1655,7 +1706,7 @@ impl ZcryptApp {
                             Err(format!("bond nonce {nonce} != expected {expected} (replay?)"))
                         } else {
                             match s.node.bond_with_stake(
-                                chain_id, &stx, stake, stake_blind, addr, pubkey, reward, commission,
+                                chain_id, &stx, stake, stake_blind, addr, pubkey, reward, commission, nonce,
                             ) {
                                 Ok(()) => {
                                     // Advance the nonce so the exact BOND signature can never be replayed.
@@ -1806,15 +1857,17 @@ impl ZcryptApp {
                 match parse_gas_prefix(&bytes[1..]) {
                     None => Err("malformed register tx (needs a ZCRYPT gas note prefix)".to_string()),
                     Some((gas_blind, gas_tx, rest)) => match parse_register(rest) {
-                        Some((ticker, decimals, authority, max_supply, is_spv)) => {
+                        Some((ticker, decimals, authority, max_supply, reserve_pk)) => {
                             // Gas is burned FIRST (a rejected registration still pays), then
                             // the registration is applied.
-                            match zbtc_requires_spv(&ticker, is_spv)
+                            match zbtc_requires_spv(&ticker, reserve_pk.is_some())
                                 .and_then(|()| s.node.submit_gas_note(chain_id, &gas_tx, gas_blind))
                                 .and_then(|_| {
-                                    s.node
-                                        .register_asset(&ticker, decimals, authority, max_supply)
-                                        .map_err(|e| format!("{e} (gas consumed)"))
+                                    match reserve_pk {
+                                        Some(pk) => s.node.register_spv_asset(&ticker, decimals, &pk, max_supply),
+                                        None => s.node.register_asset(&ticker, decimals, authority, max_supply),
+                                    }
+                                    .map_err(|e| format!("{e} (gas consumed)"))
                                 }) {
                                 Ok(id) => {
                                     let data = serde_json::json!({
@@ -1866,6 +1919,30 @@ impl ZcryptApp {
                         }
                         None => Err("malformed htlc-open tx".to_string()),
                     },
+                }
+            } else if bytes.first() == Some(&ROTATE_RESERVE_TAG) {
+                match parse_rotate_reserve(&bytes[1..]) {
+                    Some((asset, old_pk, new_pk, sig)) => {
+                        match s.node.rotate_spv_reserve(chain_id, asset, &old_pk, &new_pk, &sig) {
+                            Ok(epoch) => {
+                                let data = serde_json::json!({
+                                    "asset_id": asset.to_string(),
+                                    "new_reserve_pk": hex::encode(new_pk),
+                                    "retired_reserve_pk": hex::encode(old_pk),
+                                    "epoch": epoch,
+                                })
+                                .to_string();
+                                tx_results.push(ExecTxResult {
+                                    code: OK,
+                                    data: data.into_bytes().into(),
+                                    ..Default::default()
+                                });
+                                continue;
+                            }
+                            Err(e) => Err(e),
+                        }
+                    }
+                    None => Err("malformed rotate-reserve tx".to_string()),
                 }
             } else if bytes.first() == Some(&ROTATE_AUTH_TAG) {
                 match parse_rotate(&bytes[1..]).and_then(|(asset, new_commitment, auth)| {
@@ -1967,9 +2044,15 @@ impl ZcryptApp {
                     None => Err("malformed swap-lock tx".to_string()),
                 }
             } else if bytes.first() == Some(&BTC_HEADERS_TAG) {
+                // The per-block budget is charged only for batches consensus ACCEPTS. Charging
+                // up front let rejected junk batches (which CheckTx now also refuses, see
+                // `precheck_headers`) eat the whole budget and starve honest relay for free.
                 let relay = if header_budget_ok(header_bytes_used, bytes.len() - 1) {
-                    header_bytes_used += bytes.len() - 1;
-                    s.node.submit_btc_headers(&bytes[1..])
+                    let r = s.node.submit_btc_headers(&bytes[1..]);
+                    if r.is_ok() {
+                        header_bytes_used += bytes.len() - 1;
+                    }
+                    r
                 } else {
                     Err(format!("header relay exceeds the {MAX_HEADER_BYTES_PER_BLOCK}-byte per-block budget"))
                 };
@@ -2369,6 +2452,18 @@ impl ZcryptApp {
                                     zcrypt_core::htlc_shield::EscrowState::Claimed => "claimed",
                                     zcrypt_core::htlc_shield::EscrowState::Expired => "expired",
                                 },
+                                "kind": match e.kind {
+                                    zcrypt_core::htlc_shield::EscrowKind::Mint => "mint",
+                                    zcrypt_core::htlc_shield::EscrowKind::Burn => "burn",
+                                    zcrypt_core::htlc_shield::EscrowKind::Swap => "swap",
+                                },
+                                "party_pk": hex::encode(pubkey_bytes(&e.party_pk)),
+                                "refund_pk": hex::encode(pubkey_bytes(&e.refund_pk)),
+                                // Consensus-committed payout key for burn-for-BTC escrows (empty
+                                // otherwise). The watcher MUST read it from here, never from raw
+                                // block txs: a failed duplicate lock in the same block can carry a
+                                // different key and would otherwise get its own funded HTLC.
+                                "btc_claim_pk": hex::encode(&e.btc_claim_pk),
                             })
                             .to_string()
                             .into_bytes(),
@@ -2402,6 +2497,15 @@ impl ZcryptApp {
                         // One-way, so publishing it reveals no secret; the minter's
                         // wallet re-derives its capability to prove ownership.
                         "authority": m.authority.map(hex::encode),
+                        "authority_epoch": m.authority_epoch,
+                        // SPV assets: the CURRENT Bitcoin reserve pubkey deposits must pay
+                        // (wallets fetch this instead of assuming a fixed key), plus keys
+                        // retired by rotation and the BTC height each was retired at.
+                        "reserve_pk": m.reserve_pk33().map(hex::encode),
+                        "retired_reserves": m.retired_reserves.iter().map(|r| serde_json::json!({
+                            "reserve_pk": hex::encode(&r.reserve_pk),
+                            "retired_at_btc_height": r.retired_at_btc_height,
+                        })).collect::<Vec<_>>(),
                     })
                     .to_string()
                     .into_bytes(),

@@ -307,7 +307,15 @@ pub fn chain_tag(url: &str) -> Result<String, String> {
 fn abci_query_hex(url: &str, path: &str) -> Result<String, String> {
     let u = format!("{}/abci_query?path=%22{}%22", base(url), path);
     let b: Value = agent().get(&u).call().map_err(|e| e.to_string())?.into_json().map_err(|e| e.to_string())?;
-    let v = b["result"]["response"]["value"].as_str().ok_or("query: no value")?;
+    let resp = &b["result"]["response"];
+    if resp["code"].as_i64().unwrap_or(0) != 0 {
+        return Err(format!("query {path}: {}", resp["log"].as_str().unwrap_or("rejected")));
+    }
+    // CometBFT encodes an EMPTY value as null: a successful query with nothing to report
+    // (e.g. no pending coins) is an empty string, not an error.
+    let Some(v) = resp["value"].as_str() else {
+        return Ok(String::new());
+    };
     let bytes = B64.decode(v).map_err(|e| e.to_string())?;
     String::from_utf8(bytes).map_err(|e| e.to_string())
 }

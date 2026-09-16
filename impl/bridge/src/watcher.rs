@@ -30,7 +30,11 @@ use std::str::FromStr;
 
 use crate::swap::{self, DeferredSweep, RefundProximity, SweepOutcome, TrackedDeposit};
 use crate::zcrypt::ZcNode;
-use crate::{BtcBackend, HtlcUtxo, Key};
+use crate::{BtcBackend, HtlcSpend, HtlcUtxo, Key};
+
+/// How many recent Bitcoin blocks the finalize scan re-covers each tick for a lock whose
+/// spend is reported but not yet confirmed (reorg safety without a full-history rescan).
+const REORG_WINDOW_BLOCKS: u64 = 12;
 
 fn hex32(s: &str) -> Option<[u8; 32]> {
     hex::decode(s).ok()?.try_into().ok()
@@ -72,6 +76,14 @@ pub struct PendingRedeem {
     /// Bitcoin tip when the refund was broadcast.
     #[serde(default)]
     pub refund_at_btc: u64,
+    /// Set once a full rescan from the funding height has been done for a "spent but spender
+    /// not found" report; a second such report never rescans from funding again (bridge M15).
+    #[serde(default)]
+    pub rescanned_from_funding: bool,
+    /// The claim preimage once seen on Bitcoin. Kept so a failed finalize retries from here
+    /// without rescanning blocks.
+    #[serde(default)]
+    pub claim_preimage_hex: Option<String>,
 }
 
 impl PendingRedeem {
@@ -255,7 +267,7 @@ pub fn watcher_tick(
     state: &mut WatcherState,
     zc: &dyn ZcNode,
     operator_btc: &dyn BtcBackend,
-    reserve: &Key,
+    reserve: &swap::ReserveKeys<'_>,
     shield_dest: &Address,
     zbtc_asset: u64,
     min_finalize_margin: u64,
@@ -286,13 +298,21 @@ enum IntentStep {
 /// txid is recorded yet, then poll confirmations. `Err` means nothing could be recorded this
 /// call; the caller keeps the intent and backs off, never releasing the escrow's funding slot
 /// (a broadcast whose read-back failed is rediscovered by the mempool-aware reuse check).
+/// Insert-or-replace a deferred sweep by escrow id (no duplicates across ticks).
+fn defer_sweep(deferred: &mut Vec<DeferredSweep>, d: DeferredSweep) {
+    deferred.retain(|x| x.deposit.escrow_id != d.deposit.escrow_id);
+    deferred.push(d);
+}
+
 fn drive_intent(
     intent: &mut FundingIntent,
     operator_btc: &dyn BtcBackend,
     report: &mut TickReport,
 ) -> Result<IntentStep, String> {
     let script = intent.script()?;
-    let btc_tip = operator_btc.height().unwrap_or(0);
+    // A failed height read must NOT be treated as tip 0: `btc_tip + 1 - confs` would wrap and
+    // put the scan floor out of reach forever (bridge M13). Err keeps the intent for retry.
+    let btc_tip = operator_btc.height().map_err(|e| format!("btc height: {e}"))?;
     let mut just_recorded = false;
     if intent.funding.is_none() {
         let (utxo, reused) = swap::fund_redeem_plan(
@@ -312,7 +332,11 @@ fn drive_intent(
         intent.funding = Some((utxo.outpoint.txid.to_string(), utxo.outpoint.vout));
         intent.funding_value_sat = Some(utxo.value.to_sat());
         // Lowest block the funding can be in: already mined `confs` deep, or the next block.
-        intent.funding_height = Some(if confs > 0 { btc_tip + 1 - confs } else { btc_tip + 1 });
+        intent.funding_height = Some(if confs > 0 {
+            btc_tip.saturating_add(1).saturating_sub(confs)
+        } else {
+            btc_tip.saturating_add(1)
+        });
         just_recorded = true;
     }
     let (txid_s, vout) = intent.funding.clone().expect("recorded above");
@@ -335,6 +359,8 @@ fn drive_intent(
         locktime: intent.locktime,
         refund_txid: None,
         refund_at_btc: 0,
+        rescanned_from_funding: false,
+        claim_preimage_hex: None,
     }))
 }
 
@@ -346,7 +372,7 @@ pub fn watcher_tick_persisting(
     state: &mut WatcherState,
     zc: &dyn ZcNode,
     operator_btc: &dyn BtcBackend,
-    reserve: &Key,
+    reserve: &swap::ReserveKeys<'_>,
     shield_dest: &Address,
     zbtc_asset: u64,
     min_finalize_margin: u64,
@@ -360,7 +386,10 @@ pub fn watcher_tick_persisting(
     // Block heights are 1-indexed (height 0 is the CometBFT genesis, which has no queryable
     // block). A fresh operator has cursor 0, so start the scan at 1.
     let from = state.cursor.max(1);
-    let btc_tip = operator_btc.height().unwrap_or(0);
+    // Every step below takes a Bitcoin action or a CLTV decision keyed on the tip; a tip of 0
+    // from a failed read would silently disable refund-proximity alerts and mis-stamp
+    // sweeps, so a tick with no Bitcoin tip does nothing (bridge M13).
+    let btc_tip = operator_btc.height().map_err(|e| format!("btc height unavailable, skipping tick: {e}"))?;
     let regtest = operator_btc.network() == bitcoin::Network::Regtest;
     let mut report = TickReport::default();
     // Do not advance the cursor if a block-scan pass fails: empty/error blocks would
@@ -413,7 +442,10 @@ pub fn watcher_tick_persisting(
         }
     }
     // 2b. Plus every deferred sweep from earlier ticks (bridge N1), retried regardless of cursor.
-    for d in std::mem::take(&mut state.deferred) {
+    // Deferred sweeps stay IN `state.deferred` while they are processed: if a persist fails
+    // mid-loop and this function returns early, nothing is lost from memory or from the next
+    // successful persist (bridge M12). Each entry is removed/replaced only once handled.
+    for d in state.deferred.clone() {
         let pre = hex::decode(&d.preimage_hex).unwrap_or_default();
         work.push((d.deposit, pre, d.first_seen_zc));
     }
@@ -438,6 +470,7 @@ pub fn watcher_tick_persisting(
         match swap::sweep_deposit(zc, operator_btc, reserve, shield_dest, &dep, &preimage, fee_target, btc_tip) {
             SweepOutcome::Swept(txid) => {
                 swept.insert(eid);
+                state.deferred.retain(|d| d.deposit.escrow_id != dep.escrow_id);
                 report.swept += 1;
                 if let Some(t) = state.tracked.iter_mut().find(|t| t.escrow_id == dep.escrow_id) {
                     t.claimed = true;
@@ -459,15 +492,18 @@ pub fn watcher_tick_persisting(
                     "shield {} deferred: deposit has {confs} of {need} confirmations",
                     hex::encode(eid)
                 ));
-                state.deferred.push(DeferredSweep { deposit: dep, preimage_hex: hex::encode(&preimage), first_seen_zc: first_seen });
+                defer_sweep(&mut state.deferred, DeferredSweep { deposit: dep, preimage_hex: hex::encode(&preimage), first_seen_zc: first_seen });
             }
             SweepOutcome::NotClaimed(why) => {
                 // Keep retrying while the escrow is open (the claim may still be settling);
                 // drop once consensus says it can never be claimed.
                 let still_open = matches!(swap::query_escrow(zc, &eid), Ok(Some(ref i)) if i.state == "open");
                 report.errors.push(format!("shield {}: {why}", hex::encode(eid)));
+                if !still_open {
+                    state.deferred.retain(|d| d.deposit.escrow_id != dep.escrow_id);
+                }
                 if still_open {
-                    state.deferred.push(DeferredSweep { deposit: dep, preimage_hex: hex::encode(&preimage), first_seen_zc: first_seen });
+                    defer_sweep(&mut state.deferred, DeferredSweep { deposit: dep, preimage_hex: hex::encode(&preimage), first_seen_zc: first_seen });
                 }
             }
             SweepOutcome::Failed(e) => {
@@ -475,7 +511,7 @@ pub fn watcher_tick_persisting(
                     report.pause_new_shields = true;
                 }
                 report.errors.push(format!("shield {}: {e}", hex::encode(eid)));
-                state.deferred.push(DeferredSweep { deposit: dep, preimage_hex: hex::encode(&preimage), first_seen_zc: first_seen });
+                defer_sweep(&mut state.deferred, DeferredSweep { deposit: dep, preimage_hex: hex::encode(&preimage), first_seen_zc: first_seen });
             }
         }
     }
@@ -565,7 +601,7 @@ pub fn watcher_tick_persisting(
     let mut skip = funded.clone();
     skip.extend(state.set(&state.rejected));
     skip.extend(state.funding.iter().filter_map(|i| hex32(&i.escrow_id)));
-    match swap::plan_redeems(zc, operator_btc, reserve, from, tip, zbtc_asset, min_finalize_margin, &skip) {
+    match swap::plan_redeems(zc, operator_btc, reserve.current, from, tip, zbtc_asset, min_finalize_margin, &skip) {
         Ok(pr) => {
             report.rejected = pr.rejected.len();
             for (eid, why) in pr.rejected {
@@ -645,29 +681,43 @@ pub fn watcher_tick_persisting(
                 continue;
             }
         }
-        // Cheap check first: an untouched output needs no block scan.
-        let unspent = operator_btc.utxo_unspent(&utxo).unwrap_or(None);
-        let mut claim_preimage: Option<Vec<u8>> = None;
+        // A preimage already seen on Bitcoin: retry the finalize directly, no block scan.
+        let mut claim_preimage: Option<Vec<u8>> =
+            p.claim_preimage_hex.as_deref().and_then(|h| hex::decode(h).ok()).filter(|v| !v.is_empty());
         let mut refund_spent = false;
-        if unspent != Some(true) {
-            let since = p.scan_floor().max(p.scanned_to);
-            match operator_btc.find_htlc_spend_preimage(&utxo, since) {
-                Ok(Some(pre)) if pre.is_empty() => refund_spent = true,
-                Ok(Some(pre)) => claim_preimage = Some(pre),
-                Ok(None) => {
-                    if unspent == Some(false) {
-                        // Confirmed spend that the scan window missed: rescan from the floor.
-                        report.errors.push(format!("finalize-scan {}: spent but spender not found; rescanning from funding", p.escrow_id));
-                        p.scanned_to = p.scan_floor().saturating_sub(1);
-                    } else if btc_tip > 0 {
-                        // Nothing through the tip: resume next time from just below it.
-                        p.scanned_to = btc_tip.saturating_sub(1);
+        if claim_preimage.is_none() {
+            // Cheap check first: an untouched output needs no block scan.
+            let unspent = operator_btc.utxo_unspent(&utxo).unwrap_or(None);
+            if unspent != Some(true) {
+                let since = p.scan_floor().max(p.scanned_to);
+                match operator_btc.find_htlc_spend(&utxo, since) {
+                    Ok(HtlcSpend::Refunded) => refund_spent = true,
+                    Ok(HtlcSpend::Claimed(pre)) => {
+                        p.claim_preimage_hex = Some(hex::encode(&pre));
+                        claim_preimage = Some(pre);
                     }
+                    Ok(HtlcSpend::Unspent) => {
+                        if unspent == Some(false) && !p.rescanned_from_funding {
+                            // Backend says spent but the window missed it (e.g. a reorg moved
+                            // the spend): ONE full rescan from the funding height.
+                            report.errors.push(format!("finalize-scan {}: spent but spender not found; rescanning once from funding", p.escrow_id));
+                            p.scanned_to = p.scan_floor().saturating_sub(1);
+                            p.rescanned_from_funding = true;
+                        } else if unspent == Some(false) {
+                            // Still unresolved (typically an unconfirmed spend in the mempool):
+                            // keep a short reorg-safe window, never the whole history again.
+                            report.errors.push(format!("finalize-scan {}: spent but spender not yet confirmed; watching recent blocks", p.escrow_id));
+                            p.scanned_to = btc_tip.saturating_sub(REORG_WINDOW_BLOCKS).max(p.scan_floor()).saturating_sub(1);
+                        } else if btc_tip > 0 {
+                            // Nothing through the tip: resume next time from just below it.
+                            p.scanned_to = btc_tip.saturating_sub(1);
+                        }
+                    }
+                    Err(e) => report.errors.push(format!("finalize-scan {}: {e}", p.escrow_id)),
                 }
-                Err(e) => report.errors.push(format!("finalize-scan {}: {e}", p.escrow_id)),
+            } else if btc_tip > 0 {
+                p.scanned_to = btc_tip.saturating_sub(1);
             }
-        } else if btc_tip > 0 {
-            p.scanned_to = btc_tip.saturating_sub(1);
         }
         if refund_spent {
             // The refund branch spent it (ours confirmed, or an older daemon's): done.
@@ -690,7 +740,11 @@ pub fn watcher_tick_persisting(
                 Ok(()) => report.finalized += 1,
                 Err(e) => {
                     report.errors.push(format!("finalize {}: {e}", p.escrow_id));
-                    still_pending.push(p); // retry next tick
+                    // Retry from the STORED preimage next tick; the block scan is done.
+                    if btc_tip > 0 {
+                        p.scanned_to = btc_tip.saturating_sub(1);
+                    }
+                    still_pending.push(p);
                 }
             }
             continue;
@@ -699,7 +753,10 @@ pub fn watcher_tick_persisting(
         if p.refund_txid.is_none() && p.locktime > 0 && btc_tip >= p.locktime as u64 {
             let outcome = (|| -> Result<Txid, String> {
                 let fee = swap::htlc_spend_fee_for(operator_btc, fee_target, utxo.value.to_sat())?;
-                operator_btc.refund(&utxo, reserve, p.locktime, shield_dest, fee)
+                // A redeem funded before a reserve rotation names the retired key as its
+                // refund key: sign with whichever held key the script commits to.
+                let key = reserve.key_in_script(utxo.script.as_bytes()).unwrap_or(reserve.current);
+                operator_btc.refund(&utxo, key, p.locktime, shield_dest, fee)
             })();
             match outcome {
                 Ok(txid) => {
@@ -781,6 +838,22 @@ pub fn reserve_key_from_env() -> Result<Key, String> {
         .to_string())
 }
 
+/// Reserve keys RETIRED by a rotation that this operator still needs to sweep old deposits
+/// and refund old redeems with: `ZCRYPT_RESERVE_PREV_KEY_FILES`, a comma-separated list of
+/// 0600 key files (same format as `ZCRYPT_RESERVE_KEY_FILE`). Empty when unset.
+pub fn previous_reserve_keys_from_env() -> Result<Vec<Key>, String> {
+    let Ok(list) = std::env::var("ZCRYPT_RESERVE_PREV_KEY_FILES") else {
+        return Ok(Vec::new());
+    };
+    let mut keys = Vec::new();
+    for path in list.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+        let raw = std::fs::read(path).map_err(|e| format!("ZCRYPT_RESERVE_PREV_KEY_FILES {path}: {e}"))?;
+        let k = crate::parse_secret_bytes(&raw)?;
+        keys.push(Key::from_bytes(&k));
+    }
+    Ok(keys)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -796,12 +869,24 @@ mod tests {
     struct FakeZc {
         blocks: RefCell<Vec<Vec<Vec<u8>>>>,
         escrows: RefCell<HashMap<[u8; 32], (u64, u64, [u8; 32], u64, String)>>,
+        /// Consensus-committed payout key per burn escrow (what `/htlc/<id>` reports).
+        btc_keys: RefCell<HashMap<[u8; 32], Vec<u8>>>,
         broadcasts: RefCell<Vec<Vec<u8>>>,
         authority: String,
     }
     impl FakeZc {
         fn new() -> Self {
-            FakeZc { blocks: RefCell::new(vec![]), escrows: RefCell::new(HashMap::new()), broadcasts: RefCell::new(vec![]), authority: String::new() }
+            FakeZc {
+                blocks: RefCell::new(vec![]),
+                escrows: RefCell::new(HashMap::new()),
+                btc_keys: RefCell::new(HashMap::new()),
+                broadcasts: RefCell::new(vec![]),
+                authority: String::new(),
+            }
+        }
+        #[allow(dead_code)]
+        fn set_escrow_btc_key(&self, eid: [u8; 32], pk: &[u8]) {
+            self.btc_keys.borrow_mut().insert(eid, pk.to_vec());
         }
         fn push_block(&self, txs: Vec<Vec<u8>>) -> i64 {
             self.blocks.borrow_mut().push(txs);
@@ -828,10 +913,15 @@ mod tests {
             if let Some(h) = path.strip_prefix("/htlc/") {
                 let eid = hex32(h).ok_or("bad id")?;
                 return match self.escrows.borrow().get(&eid) {
-                    Some((a, v, l, t, s)) => Ok(serde_json::json!({
-                        "asset_id": a, "value": v, "hashlock": hex::encode(l), "timeout_height": t, "state": s
-                    })
-                    .to_string()),
+                    Some((a, v, l, t, s)) => {
+                        let key = self.btc_keys.borrow().get(&eid).cloned().unwrap_or_default();
+                        Ok(serde_json::json!({
+                            "asset_id": a, "value": v, "hashlock": hex::encode(l), "timeout_height": t, "state": s,
+                            "kind": if key.is_empty() { "mint" } else { "burn" },
+                            "btc_claim_pk": hex::encode(&key),
+                        })
+                        .to_string())
+                    }
                     None => Err("no such escrow".into()),
                 };
             }
@@ -981,15 +1071,18 @@ mod tests {
         fn fee_rate_sat_vb(&self, _: u32) -> Result<f64, String> {
             Ok(1.0)
         }
-        fn find_htlc_spend_preimage(&self, utxo: &HtlcUtxo, since_height: u64) -> Result<Option<Vec<u8>>, String> {
+        fn find_htlc_spend(&self, utxo: &HtlcUtxo, since_height: u64) -> Result<HtlcSpend, String> {
             for u in self.utxos.borrow().iter().filter(|u| u.outpoint == utxo.outpoint) {
                 if let Some((Some(h), pre)) = &u.spend {
                     if *h >= since_height {
-                        return Ok(Some(pre.clone().unwrap_or_default()));
+                        return Ok(match pre {
+                            Some(p) => HtlcSpend::Claimed(p.clone()),
+                            None => HtlcSpend::Refunded,
+                        });
                     }
                 }
             }
-            Ok(None)
+            Ok(HtlcSpend::Unspent)
         }
         fn tx_confirmations(&self, txid: &Txid) -> Result<u64, String> {
             let tip = self.tip.get();
@@ -1062,7 +1155,7 @@ mod tests {
         Address::p2wpkh(&Key::from_bytes(&[0xEE; 32]).compressed(), Network::Signet)
     }
     fn tick(st: &mut WatcherState, zc: &FakeZc, btc: &SimBtc, reserve: &Key) -> TickReport {
-        watcher_tick(st, zc, btc, reserve, &dest(), ASSET, swap::default_finalize_margin(Network::Signet), 3).expect("tick")
+        watcher_tick(st, zc, btc, &swap::ReserveKeys::single(reserve), &dest(), ASSET, swap::default_finalize_margin(Network::Signet), 3).expect("tick")
     }
 
     // ------------------------------------------------------------------ tests ----------
@@ -1143,6 +1236,8 @@ mod tests {
             locktime: 15,
             refund_txid: None,
             refund_at_btc: 0,
+            rescanned_from_funding: false,
+            claim_preimage_hex: None,
         }
     }
 
@@ -1301,7 +1396,7 @@ mod tests {
             snapshots.borrow_mut().push(ids);
             Ok(())
         };
-        watcher_tick_persisting(&mut st, &zc, &btc, &d1.reserve, &dest(), ASSET, swap::default_finalize_margin(Network::Signet), 3, &persist).unwrap();
+        watcher_tick_persisting(&mut st, &zc, &btc, &swap::ReserveKeys::single(&d1.reserve), &dest(), ASSET, swap::default_finalize_margin(Network::Signet), 3, &persist).unwrap();
         assert!(!snapshots.borrow().is_empty());
         for snap in snapshots.borrow().iter() {
             assert!(snap.contains(&hex::encode(d1.eid)) && snap.contains(&hex::encode(d2.eid)), "snapshot dropped an intent: {snap:?}");

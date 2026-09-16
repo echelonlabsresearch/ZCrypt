@@ -240,6 +240,61 @@ struct PendingDeposit {
     /// Wallet clock when recorded (display only).
     #[serde(default)]
     started: u64,
+    /// The chain reserve key (hex, 33 bytes) the HTLC pays. Persisted at funding so resume
+    /// and refund rebuild the EXACT funded script even after the operator rotates keys
+    /// (wallet H1). Empty on records written before this field existed.
+    #[serde(default)]
+    reserve_pk_hex: String,
+    /// The exact CLTV of the funded script (0 on pre-field records: those search a window).
+    #[serde(default)]
+    btc_locktime: u32,
+    /// The funding outpoint once the HTLC was broadcast (txid hex, vout).
+    #[serde(default)]
+    funding: Option<(String, u32)>,
+    /// The refund tx this wallet broadcast after the CLTV passed, if any.
+    #[serde(default)]
+    refund_txid: Option<String>,
+}
+
+/// A zBTC -> BTC redeem in flight (wallet M11). Written and SAVED before the burn escrow is
+/// broadcast, so a crash at any later point can resume: claim the operator's HTLC with the
+/// stored preimage, or expire the escrow to get the zBTC back.
+#[derive(Clone, Serialize, Deserialize)]
+struct PendingRedeemRec {
+    index: u32,
+    preimage_hex: String,
+    hashlock_hex: String,
+    #[serde(with = "u64_str")]
+    value_sats: u64,
+    #[serde(with = "u64_str")]
+    asset_id: u64,
+    btc_claim_pk_hex: String,
+    reserve_pk_hex: String,
+    #[serde(default)]
+    escrow_id_hex: Option<String>,
+    #[serde(default)]
+    zc_timeout: u64,
+    #[serde(default)]
+    started: u64,
+    #[serde(default)]
+    funding: Option<(String, u32)>,
+    #[serde(default)]
+    claim_txid: Option<String>,
+    #[serde(default)]
+    expired: bool,
+}
+
+/// A secret the wallet must hand to the user and that lives NOWHERE else (a bearer token, a
+/// stealth note file). Persisted BEFORE the action that makes it the only copy of the money,
+/// and shown until the user dismisses it (wallet H2).
+#[derive(Clone, Serialize, Deserialize)]
+struct PendingSecret {
+    id: u64,
+    kind: String, // "bearer" | "stealth_note"
+    label: String,
+    secret: String,
+    #[serde(default)]
+    created: u64,
 }
 
 struct Wallet {
@@ -278,6 +333,9 @@ struct Wallet {
     escrows: Vec<EscrowRec>,
     /// BTC to zBTC deposits started but not yet completed (resumable, see `bridge_recover`).
     pending_deposits: Vec<PendingDeposit>,
+    pending_redeems: Vec<PendingRedeemRec>,
+    pending_secrets: Vec<PendingSecret>,
+    next_secret_id: u64,
 }
 
 impl Wallet {
@@ -299,7 +357,18 @@ impl Wallet {
             fee_claim_counters: Default::default(),
             escrows: vec![],
             pending_deposits: vec![],
+            pending_redeems: vec![],
+            pending_secrets: vec![],
+            next_secret_id: 1,
         }
+    }
+
+    /// Record a secret that must reach the user (see [`PendingSecret`]).
+    fn add_pending_secret(&mut self, kind: &str, label: String, secret: String) -> u64 {
+        let id = self.next_secret_id.max(1);
+        self.next_secret_id = id + 1;
+        self.pending_secrets.push(PendingSecret { id, kind: kind.to_string(), label, secret, created: self.clock });
+        id
     }
 
     /// Consume the next HD stealth index (shared counter with change outputs, so the
@@ -398,6 +467,9 @@ impl Wallet {
 struct AppState {
     wallet: Mutex<Option<Wallet>>,
     data_dir: Mutex<String>,
+    /// The last failed post-action save, surfaced to the UI as a persistent banner
+    /// (wallet H2): a failed save must never cost the user the result of an action.
+    last_save_error: Mutex<Option<String>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -513,6 +585,12 @@ struct PersistState {
     escrows: Vec<EscrowRec>,
     #[serde(default)]
     pending_deposits: Vec<PendingDeposit>,
+    #[serde(default)]
+    pending_redeems: Vec<PendingRedeemRec>,
+    #[serde(default)]
+    pending_secrets: Vec<PendingSecret>,
+    #[serde(default)]
+    next_secret_id: u64,
 }
 
 // Encryption key for the coin store, bound to the account seed (available while
@@ -554,6 +632,9 @@ fn save_state(w: &Wallet, dir: &str) -> Result<(), String> {
         fee_claim_counters: w.fee_claim_counters.clone(),
         escrows: w.escrows.clone(),
         pending_deposits: w.pending_deposits.clone(),
+        pending_redeems: w.pending_redeems.clone(),
+        pending_secrets: w.pending_secrets.clone(),
+        next_secret_id: w.next_secret_id,
     };
     // The plaintext holds every spend secret: keep it in a zeroizing buffer.
     let json = Zeroizing::new(serde_json::to_vec(&ps).map_err(|e| e.to_string())?);
@@ -620,6 +701,9 @@ fn load_state(w: &mut Wallet, dir: &str) {
     w.fee_claim_counters = ps.fee_claim_counters;
     w.escrows = ps.escrows;
     w.pending_deposits = ps.pending_deposits;
+    w.pending_redeems = ps.pending_redeems;
+    w.pending_secrets = ps.pending_secrets;
+    w.next_secret_id = ps.next_secret_id.max(w.pending_secrets.iter().map(|p| p.id + 1).max().unwrap_or(1));
     // Every logged action index must stay inside the scan window.
     if let Some(m) = w.action_keys.iter().map(|a| a.index).max() {
         if m >= w.next_change {
@@ -709,18 +793,30 @@ fn with_wallet<T>(state: &State<AppState>, f: impl FnOnce(&mut Wallet) -> Result
     let w = g.as_mut().ok_or("wallet is locked")?;
     let r = f(w);
     if r.is_ok() {
-        // Persist coins/history/scan-height after every change. If the save FAILS (the
-        // classic cause: a root-owned ~/.zcrypt the wallet can't write), surface it loudly
-        // instead of silently freezing the wallet on a stale on-disk snapshot.
-        if let Err(e) = save_state(w, &dir) {
-            return Err(format!(
-                "the action went through, but the wallet could NOT save to disk: {e}. \
-                 Fix permissions on ~/.zcrypt (e.g. `sudo chown -R $(whoami) ~/.zcrypt`) — \
-                 otherwise nothing you do will persist across restarts."
-            ));
+        match save_state(w, &dir) {
+            Ok(()) => *state.last_save_error.lock().unwrap() = None,
+            Err(e) => {
+                // H2: the action already happened (coins may have moved on-chain), so the
+                // result is NEVER discarded: for a bearer token or a stealth note it is the
+                // only copy of the money. The failure is kept for the UI banner instead.
+                let msg = format!(
+                    "the action went through, but the wallet could NOT save to disk: {e}. \
+                     Fix permissions on ~/.zcrypt (e.g. `sudo chown -R $(whoami) ~/.zcrypt`) — \
+                     until then nothing persists across restarts: copy any token or note shown to you now."
+                );
+                eprintln!("[wallet] {msg}");
+                *state.last_save_error.lock().unwrap() = Some(msg);
+            }
         }
     }
     r
+}
+
+/// Save NOW, inside a `with_wallet` closure, before an irreversible action. Errors abort the
+/// action (nothing has moved yet).
+fn save_now(state: &State<AppState>, w: &Wallet, why: &str) -> Result<(), String> {
+    let dir = state.data_dir.lock().unwrap().clone();
+    save_state(w, &dir).map_err(|e| format!("refusing to {why}: the wallet cannot save first ({e})"))
 }
 
 #[tauri::command]
@@ -747,6 +843,12 @@ fn new_stealth_address(state: State<AppState>) -> R<StealthInfo> {
     with_wallet(&state, |w| {
         let seed = keys::random_seed();
         w.stealth_seeds.push(seed);
+        // H2: the seed is random (not mnemonic-derived); hand out the address only once it is
+        // on disk, otherwise funds sent to it would be unrecoverable after a restart.
+        if let Err(e) = save_now(&state, w, "create a stealth address") {
+            w.stealth_seeds.pop();
+            return Err(e);
+        }
         let index = (w.stealth_seeds.len() - 1) as u32;
         let acct = Account::from_seed(seed);
         Ok(StealthInfo {
@@ -984,14 +1086,23 @@ fn create_bearer(amount: u64, asset_id: String, state: State<AppState>) -> R<Str
     let leaves = chain::fetch_leaves(&url)?;
     with_wallet(&state, |w| {
         let bearer = BearerCoin::create_asset(amount, asset_id);
+        let token = bearer.to_bech32();
+        // H2: the token is the ONLY spend instrument for these coins. Persist it BEFORE the
+        // spend so a failed post-action save can never burn the funds.
+        let sid = w.add_pending_secret("bearer", format!("bearer coin: {amount} base units of asset {asset_id}"), token.clone());
+        save_now(&state, w, "create a bearer coin")?;
         // Its on-chain output commitment = commit_asset(amount, blind, pk, asset).
         let bearer_out: zcrypt_shield::OutCoin =
             (amount, bearer.coin.blind, bearer.coin.pubkey(), asset_id);
         // Fixed-size cover note on-chain so bearer outputs match normal pays;
         // the token itself remains the secret spend instrument.
-        shield_pay(w, &url, &leaves, asset_id, amount, bearer_out, keys::cover_note_bytes())?;
+        if let Err(e) = shield_pay(w, &url, &leaves, asset_id, amount, bearer_out, keys::cover_note_bytes()) {
+            w.pending_secrets.retain(|p| p.id != sid); // nothing moved: forget the draft token
+            let _ = save_now(&state, w, "discard an unused bearer token");
+            return Err(e);
+        }
         w.push_hist("bearer", -(amount as i64), "bearer coin".into(), asset_id);
-        Ok(bearer.to_bech32())
+        Ok(token)
     })
     .and_then(ok)
 }
@@ -2154,7 +2265,26 @@ fn do_shield_send_raw(
         } else {
             None
         };
-        shield_pay(w, &url, &leaves, asset_id, amount, recipient_out, onchain_note)?;
+        // H2: for a stealth send the on-chain note is cover junk and the REAL note exists only
+        // in this function's return value. Persist it before the spend.
+        let note_sid = if stealth {
+            let sid = w.add_pending_secret(
+                "stealth_note",
+                format!("stealth note for {} ({amount} base units of asset {asset_id})", short(recipient)),
+                format!("zct1{}", hex::encode(&real_note)),
+            );
+            save_now(state, w, "send a stealth payment")?;
+            Some(sid)
+        } else {
+            None
+        };
+        if let Err(e) = shield_pay(w, &url, &leaves, asset_id, amount, recipient_out, onchain_note) {
+            if let Some(sid) = note_sid {
+                w.pending_secrets.retain(|p| p.id != sid);
+                let _ = save_now(state, w, "discard an unsent stealth note");
+            }
+            return Err(e);
+        }
         if let Some(com) = reshape_com {
             w.hist_suppress.insert(com);
         } else {
@@ -3067,8 +3197,9 @@ fn bond_validator_signed(
         let vk = ed25519_dalek::VerifyingKey::from_bytes(&pk).map_err(|e| format!("consensus pubkey: {e}"))?;
         vk.verify_strict(&msg, &ed25519_dalek::Signature::from_bytes(&sig))
             .map_err(|_| "signature does not verify for these bond parameters (check pubkey, nonce, stake, commission, chain)".to_string())?;
+        let envelope = zcrypt_core::staking::bond_envelope(&pk, stake, &reward, commission_bps, nonce);
         let (pledge, stake_blind, inputs, chg_rec) =
-            build_stake_pledge(w, &leaves, stake, &cid).map_err(|e| format!("bonding: {e}"))?;
+            build_stake_pledge(w, &leaves, stake, &cid, &envelope).map_err(|e| format!("bonding: {e}"))?;
         chain::broadcast(&url, &bond_tx_presigned(&pk, &sig, stake, reward, commission_bps, stake_blind, nonce, &pledge))?;
         for &i in &inputs {
             w.coins[i].spent = true;
@@ -3102,6 +3233,9 @@ fn build_stake_pledge(
     leaves: &[zcrypt_shield::Commitment],
     stake: u64,
     chain_id: &[u8],
+    // The signed header's envelope (`staking::bond_envelope` / `delegate_envelope`): the
+    // proof is bound to it, so nobody can re-wrap this pledge under another key.
+    envelope: &[u8],
 ) -> Result<(shield_tx::ShieldTx, [u64; 4], Vec<usize>, Option<CoinRec>), String> {
     let mut cand: Vec<usize> = w
         .coins
@@ -3161,12 +3295,13 @@ fn build_stake_pledge(
     let chg_addr = chg_acct.stealth_address();
     let chg_out = keys::out_coin(&chg_addr, chg_val, chg_blind);
     let chg_note = kem::ciphertext_to_bytes(&keys::encrypt_note(&chg_addr, chg_val, chg_blind));
-    let pledge = shield_tx::build(
+    let pledge = shield_tx::build_bound(
         chain_id,
         &spends,
         &[burn_out, chg_out],
         zcrypt_core::emission::MIN_FEE,
         vec![keys::cover_note_bytes(), chg_note],
+        envelope,
     )
     .ok_or("failed to build the stake pledge proof")?;
     let chg_rec = if chg_val > 0 {
@@ -3323,9 +3458,14 @@ fn delegate_validator(validator_pubkey_hex: String, stake_zcrypt: String, state:
         let idx = w.alloc_index();
         let del_sk = delegator_key_at(&w.account, idx);
         let cid = chain_id_for(&url)?;
-        let (pledge, stake_blind, inputs, chg_rec) =
-            build_stake_pledge(w, &leaves, stake, &cid).map_err(|e| format!("delegating: {e}"))?;
         let reward = w.key_at(idx).reward_address();
+        let delegator_id = {
+            use sha2::{Digest, Sha256};
+            Sha256::digest(del_sk.verifying_key().to_bytes())[..20].to_vec()
+        };
+        let envelope = zcrypt_core::staking::delegate_envelope(&delegator_id, &target, stake, &reward);
+        let (pledge, stake_blind, inputs, chg_rec) =
+            build_stake_pledge(w, &leaves, stake, &cid, &envelope).map_err(|e| format!("delegating: {e}"))?;
         chain::broadcast(&url, &delegate_tx(&del_sk, &target, stake, reward, stake_blind, &pledge, &cid))?;
         w.note_action(idx, "delegate", validator_pubkey_hex.trim());
         for &i in &inputs {
@@ -4106,37 +4246,234 @@ fn parse_decimal_units(s: &str, decimals: u32) -> Result<u64, String> {
 
 /// BTC → zBTC: lock BTC, receive shielded zBTC (atomic, hashlocked).
 /// `btc` is a decimal BTC string (or whole sats if you pass integer base via zbtc_amount 1:1).
+
+/// How long a redeem waits for the operator to fund the BTC HTLC before handing back to the
+/// user (the record stays pending; "Diagnose & fix" resumes it), and how often it polls.
+const REDEEM_WAIT_SECS: u64 = 15 * 60;
+const REDEEM_POLL_SECS: u64 = 45;
+
+fn parse_hex32(h: &str) -> Option<[u8; 32]> {
+    hex::decode(h).ok()?.try_into().ok()
+}
+
+/// The reserve key a pending bridge record was created against: the persisted one, else (for
+/// records written before the field existed) the chain's current key.
+fn reserve_pk_for(zc: &Zcrypt, asset: u64, persisted_hex: &str) -> Result<bitcoin::PublicKey, String> {
+    let bytes: Vec<u8> = match hex::decode(persisted_hex) {
+        Ok(b) if b.len() == 33 => b,
+        _ => bswap::chain_reserve_pk(zc, asset)?
+            .ok_or("the chain has no zBTC reserve key pinned")?
+            .to_vec(),
+    };
+    bitcoin::PublicKey::from_slice(&bytes).map_err(|e| format!("reserve key is malformed: {e}"))
+}
+
+/// Candidate CLTVs for a shield deposit's funded script: the exact persisted one, else (older
+/// records) a window around tip-at-start + the network lock.
+fn shield_locktime_candidates(p: &PendingDeposit, net: bitcoin::Network) -> Vec<u64> {
+    if p.btc_locktime > 0 {
+        vec![u64::from(p.btc_locktime)]
+    } else {
+        let base = p.btc_tip.saturating_add(bswap::btc_lock_blocks(net));
+        (base.saturating_sub(2)..=base.saturating_add(12)).collect()
+    }
+}
+
+/// Locate the funded HTLC of a shield deposit on Bitcoin (exact script per candidate CLTV).
+fn find_shield_funding(
+    backend: &dyn zcrypt_bridge::BtcBackend,
+    p: &PendingDeposit,
+    net: bitcoin::Network,
+    lock: &[u8; 32],
+    reserve_pk: &bitcoin::PublicKey,
+    refund_pk: &bitcoin::PublicKey,
+) -> Result<Option<(zcrypt_bridge::HtlcUtxo, u32)>, String> {
+    for t in shield_locktime_candidates(p, net) {
+        let script = zcrypt_bridge::htlc_script(lock, reserve_pk, refund_pk, t as u32);
+        if let Some(u) = bswap::find_funded_htlc(backend, &script, bitcoin::Amount::from_sat(p.value_sats))? {
+            return Ok(Some((u, t as u32)));
+        }
+    }
+    Ok(None)
+}
+
+#[derive(Serialize)]
+struct PendingDepositView {
+    index: u32,
+    value_sats: u64,
+    asset_id: String,
+    btc_locktime: u32,
+    funded: bool,
+    refund_txid: Option<String>,
+    started: u64,
+}
+
+/// The wallet's in-flight BTC→zBTC deposits (for the Bridge tab's pending list).
+#[tauri::command]
+fn list_pending_deposits(state: State<AppState>) -> R<Vec<PendingDepositView>> {
+    let g = state.wallet.lock().unwrap();
+    let w = g.as_ref().ok_or("wallet locked")?;
+    ok(w.pending_deposits
+        .iter()
+        .map(|p| PendingDepositView {
+            index: p.index,
+            value_sats: p.value_sats,
+            asset_id: p.asset_id.to_string(),
+            btc_locktime: p.btc_locktime,
+            funded: p.funding.is_some(),
+            refund_txid: p.refund_txid.clone(),
+            started: p.started,
+        })
+        .collect())
+}
+
+/// Take the BTC of a stuck shield deposit back through the HTLC's refund branch (wallet H1).
+/// Only possible once the Bitcoin tip has passed the deposit's CLTV.
+#[tauri::command]
+fn bridge_refund_deposit(index: u32, state: State<AppState>) -> R<String> {
+    let p = {
+        let g = state.wallet.lock().unwrap();
+        g.as_ref()
+            .ok_or("wallet locked")?
+            .pending_deposits
+            .iter()
+            .find(|d| d.index == index)
+            .cloned()
+            .ok_or("no such pending deposit")?
+    };
+    let preimage = hex::decode(&p.preimage_hex).ok().filter(|v| v.len() == 32).ok_or("corrupt preimage record")?;
+    let lock = zcrypt_core::nullifier::htlc_hashlock(&preimage);
+    let (alice_bk, dest) = swap_backend(&state, 0)?;
+    let zc = zc_client(&state)?;
+    let reserve_pk = reserve_pk_for(&zc, p.asset_id, &p.reserve_pk_hex)?;
+    let refund = {
+        let g = state.wallet.lock().unwrap();
+        alice_key_at(&g.as_ref().ok_or("wallet locked")?.account, p.index)
+    };
+    let dir = state.data_dir.lock().unwrap().clone();
+    let net = zcrypt_bridge::network_from_str(&bridge_settings(&dir)?.btc_network);
+    let (utxo, locktime) = find_shield_funding(alice_bk.as_ref(), &p, net, &lock, &reserve_pk, &refund.pk)?
+        .ok_or("no funded HTLC found on Bitcoin for this deposit (it may be unconfirmed, or already spent)")?;
+    let tip = alice_bk.height()?;
+    if tip < u64::from(locktime) {
+        return Err(format!("the refund lock has not passed yet: refundable from Bitcoin block {locktime} (tip {tip})"));
+    }
+    let fee = bswap::htlc_spend_fee_for(alice_bk.as_ref(), 3, utxo.value.to_sat())?;
+    let txid = alice_bk.refund(&utxo, &refund, locktime, &dest, fee)?;
+    with_wallet(&state, |w| {
+        if let Some(d) = w.pending_deposits.iter_mut().find(|d| d.index == index) {
+            d.refund_txid = Some(txid.to_string());
+            d.btc_locktime = locktime;
+        }
+        Ok(())
+    })?;
+    ok(txid.to_string())
+}
+
+#[derive(Serialize)]
+struct PendingSecretView {
+    id: u64,
+    kind: String,
+    label: String,
+    secret: String,
+    created: u64,
+}
+
+/// Secrets the wallet still owes the user (bearer tokens, stealth notes) until dismissed.
+#[tauri::command]
+fn list_pending_secrets(state: State<AppState>) -> R<Vec<PendingSecretView>> {
+    let g = state.wallet.lock().unwrap();
+    let w = g.as_ref().ok_or("wallet locked")?;
+    ok(w.pending_secrets
+        .iter()
+        .map(|p| PendingSecretView { id: p.id, kind: p.kind.clone(), label: p.label.clone(), secret: p.secret.clone(), created: p.created })
+        .collect())
+}
+
+#[tauri::command]
+fn dismiss_pending_secret(id: u64, state: State<AppState>) -> R<bool> {
+    with_wallet(&state, |w| {
+        let before = w.pending_secrets.len();
+        w.pending_secrets.retain(|p| p.id != id);
+        Ok(before != w.pending_secrets.len())
+    })
+    .and_then(ok)
+}
+
+#[derive(Serialize)]
+struct WalletHealth {
+    save_error: Option<String>,
+    pending_secrets: usize,
+    pending_deposits: usize,
+    pending_redeems: usize,
+}
+
+/// Persistent-banner state for the UI: a failed save and anything the user still has to act
+/// on (wallet H2).
+#[tauri::command]
+fn wallet_health(state: State<AppState>) -> R<WalletHealth> {
+    let g = state.wallet.lock().unwrap();
+    let (ps, pd, pr) = g
+        .as_ref()
+        .map(|w| (w.pending_secrets.len(), w.pending_deposits.len(), w.pending_redeems.len()))
+        .unwrap_or((0, 0, 0));
+    ok(WalletHealth {
+        save_error: state.last_save_error.lock().unwrap().clone(),
+        pending_secrets: ps,
+        pending_deposits: pd,
+        pending_redeems: pr,
+    })
+}
+
 #[tauri::command]
 fn swap_shield_btc(zbtc_amount: u64, btc: String, window: tauri::Window, state: State<AppState>) -> R<u64> {
-    // A shielded coin holds a multi-limb value up to MAX_COIN_VALUE (2^52-1 base
-    // units ≈ 45M zBTC at 8 decimals) — no practical per-shield cap. Guard only the
-    // absolute maximum so we never mint a coin the circuit can't range-prove.
+    let progress = |pct: u8, phase: &str| {
+        let _ = window.emit("swap-progress", serde_json::json!({ "percent": pct, "phase": phase }));
+    };
+    swap_shield_btc_impl(zbtc_amount, &btc, &progress, &state).and_then(ok)
+}
+
+/// The shield flow without the Tauri window (the live test drives it directly).
+fn swap_shield_btc_impl(
+    zbtc_amount: u64,
+    btc: &str,
+    progress: &dyn Fn(u8, &str),
+    state: &State<AppState>,
+) -> Result<u64, String> {
     if zbtc_amount > MAX_COIN {
         return Err(format!(
             "amount too large: max {} zBTC per shield; shield a smaller amount",
             MAX_COIN / 100_000_000
         ));
     }
-    let btc_sats = parse_decimal_units(&btc, 8)?;
+    let btc_sats = parse_decimal_units(btc, 8)?;
     if btc_sats != zbtc_amount {
-        return Err(format!(
-            "shield must be 1:1: {btc_sats} sats != {zbtc_amount} zBTC base units"
-        ));
+        return Err(format!("shield must be 1:1: {btc_sats} sats != {zbtc_amount} zBTC base units"));
     }
-    // Node-free Bitcoin backends (self-custody via Esplora) for both sides; falls back to
-    // bitcoind only on regtest. Account 0 = user, 1 = demo LP.
-    let (alice_bk, alice_dest) = swap_backend(&state, 0)?;
-    let (bridge_bk, bridge_dest) = swap_backend(&state, 1)?;
-    let zc = zc_client(&state)?;
+    let (alice_bk, _alice_dest) = swap_backend(state, 0)?;
+    let zc = zc_client(state)?;
     let asset = zbtc_asset(&zc)?;
+    let net = alice_bk.network();
+    // H1: everything consensus will check is checked BEFORE any BTC moves. The HTLC must pay
+    // the chain's pinned reserve key: a wallet's own key is refused at the SPV open, which
+    // used to strand the BTC in an HTLC this wallet could neither claim nor refund.
+    let reserve_bytes = bswap::chain_reserve_pk(&zc, asset)?
+        .ok_or("the chain has no zBTC reserve key pinned; shielding is not available on this network")?;
+    let reserve_pk = bitcoin::PublicKey::from_slice(&reserve_bytes)
+        .map_err(|e| format!("chain reserve key is malformed: {e}"))?;
+    let min = bswap::min_redeem_sats(net);
+    if btc_sats < min {
+        return Err(format!("deposit of {btc_sats} sats is below the {min}-sat minimum the chain accepts"));
+    }
     let btc_amt = bitcoin::Amount::from_sat(btc_sats);
-    // Record the deposit (index + preimage + Bitcoin tip) and SAVE it before any BTC moves,
-    // so a flow that dies after the HTLC broadcast can be resumed from the funding UTXO by
-    // "Diagnose and fix" instead of waiting a week for the CLTV refund.
-    let btc_tip_start = alice_bk.height()?;
+    let btc_tip = alice_bk.height()?;
+    let zc_tip = zc.height()? as u64;
+    let (btc_locktime, zc_timeout) = bswap::shield_timeouts(net, btc_tip, zc_tip)?;
     let preimage = bswap::fresh_preimage(); // 32 random bytes (HTLC hashlock security)
-    let idx = with_wallet(&state, |w| {
-        // Fresh HD index for this deposit: its shield claimer pk AND its Bitcoin refund key.
+    let lock = zcrypt_core::nullifier::htlc_hashlock(&preimage);
+    // Record and SAVE the preimage plus the exact script parameters before funding, so a
+    // crash or a rejected mint can always be resumed or refunded from the record alone.
+    let (idx, alice_key, claimer) = with_wallet(state, |w| {
         let idx = w.alloc_index();
         w.note_action(idx, "shield", "");
         w.pending_deposits.push(PendingDeposit {
@@ -4144,48 +4481,56 @@ fn swap_shield_btc(zbtc_amount: u64, btc: String, window: tauri::Window, state: 
             preimage_hex: hex::encode(preimage),
             value_sats: btc_sats,
             asset_id: asset,
-            btc_tip: btc_tip_start,
+            btc_tip,
             started: w.clock,
+            reserve_pk_hex: hex::encode(reserve_bytes),
+            btc_locktime,
+            funding: None,
+            refund_txid: None,
         });
-        Ok(idx)
+        save_now(state, w, "shield BTC")?;
+        Ok((idx, alice_key_at(&w.account, idx), w.key_at(idx)))
     })?;
-    let res = with_wallet(&state, |w| {
-        let (bridge_key, _legacy_alice) = bridge_btc_keys(&w.account);
-        let claimer = w.key_at(idx);
-        let alice_key = alice_key_at(&w.account, idx);
-        let b = bswap::BtcParams {
-            alice: alice_bk.as_ref(),
-            bridge: bridge_bk.as_ref(),
-            bridge_key: &bridge_key,
-            alice_key: &alice_key,
-            alice_dest: &alice_dest,
-            bridge_dest: &bridge_dest,
-        };
-        let progress = |pct: u8, phase: &str| {
-            let _ = window.emit("swap-progress", serde_json::json!({ "percent": pct, "phase": phase }));
-        };
-        // Trustless mint: the swap relays Bitcoin headers to the chain and submits
-        // an SPV proof of the deposit; every validator verifies it, nobody signs.
-        let coin = bswap::btc_to_zbtc_progress(
-            &zc, &b, &claimer, asset, &preimage, btc_amt, zbtc_amount, &progress,
-        )?;
+    progress(10, "Locking your BTC in a hashlocked HTLC to the chain's reserve key…");
+    let script = zcrypt_bridge::htlc_script(&lock, &reserve_pk, &alice_key.pk, btc_locktime);
+    let utxo = match alice_bk.fund_htlc(&script, btc_amt) {
+        Ok(u) => u,
+        Err(e) => {
+            // Nothing moved: drop the draft record.
+            let _ = with_wallet(state, |w| {
+                w.pending_deposits.retain(|p| p.index != idx);
+                Ok(())
+            });
+            return Err(format!("could not fund the Bitcoin HTLC: {e}"));
+        }
+    };
+    with_wallet(state, |w| {
+        if let Some(p) = w.pending_deposits.iter_mut().find(|p| p.index == idx) {
+            p.funding = Some((utxo.outpoint.txid.to_string(), utxo.outpoint.vout));
+        }
+        Ok(())
+    })?;
+    let coin = bswap::resume_public_shield(
+        &zc, alice_bk.as_ref(), &alice_key, &reserve_pk, &claimer, asset, &preimage, &utxo, btc_locktime, zc_timeout,
+        zbtc_amount, progress,
+    )
+    .map_err(|e| {
+        format!(
+            "{e}. Your BTC stays in the HTLC: 'Diagnose & fix a stuck swap' resumes the mint while the \
+             lock holds, and offers a Refund once Bitcoin block {btc_locktime} passes"
+        )
+    })?;
+    let res = with_wallet(state, |w| {
         w.pending_deposits.retain(|p| p.index != idx);
         let born = w.scan_height;
         w.coins.push(CoinRec::new(coin, born));
         w.push_hist("shield", zbtc_amount as i64, "BTC→zBTC (maturing)".into(), asset);
         Ok(zbtc_amount)
     });
-    // The minted zBTC is held IMMATURE (deep-reorg defense) until its Bitcoin deposit is
-    // buried past reorg risk. Relay the latest headers so the chain can start maturing it,
-    // and tell the UI the coin is maturing (it shows under "maturing", not spendable, until
-    // the deposit matures (value-scaled: small amounts fast, whales deeper)).
     let _ = bswap::relay_btc_headers(&zc, alice_bk.as_ref());
     let pending = zc.query("/spv/pending").unwrap_or_default();
-    let _ = window.emit("swap-progress", serde_json::json!({
-        "percent": 100u8,
-        "phase": format!("Shielded — zBTC is maturing before it can be spent ({})", pending.trim()),
-    }));
-    res.and_then(ok)
+    progress(100, &format!("Shielded — zBTC is maturing before it can be spent ({})", pending.trim()));
+    res
 }
 
 /// Relay the latest Bitcoin headers to the chain and report SPV maturity progress. The
@@ -4211,109 +4556,163 @@ fn bridge_mature(state: State<AppState>) -> R<String> {
 /// under the request, since every round burns a 0.0001 zBTC fee).
 #[tauri::command]
 fn swap_redeem_btc(btc: String, window: tauri::Window, state: State<AppState>) -> R<u64> {
-    let want_total = parse_decimal_units(&btc, 8)?;
+    let progress = |pct: u8, phase: &str| {
+        let _ = window.emit("swap-progress", serde_json::json!({ "percent": pct, "phase": phase }));
+    };
+    swap_redeem_btc_impl(&btc, &progress, &state).and_then(ok)
+}
+
+/// The redeem flow without the Tauri window (the live test drives it directly).
+fn swap_redeem_btc_impl(btc: &str, progress: &dyn Fn(u8, &str), state: &State<AppState>) -> Result<u64, String> {
+    let want_total = parse_decimal_units(btc, 8)?;
     if want_total == 0 {
         return Err("enter a zBTC amount to redeem".to_string());
     }
     let fee = zcrypt_core::emission::MIN_FEE;
-    let url = node_url(&state)?;
-    // Node-free backends (self-custody via Esplora) for both sides; bitcoind only on regtest.
-    let (alice_bk, alice_dest) = swap_backend(&state, 0)?;
-    let (bridge_bk, bridge_dest) = swap_backend(&state, 1)?;
-    let zc = zc_client(&state)?;
+    let url = node_url(state)?;
+    let (alice_bk, alice_dest) = swap_backend(state, 0)?;
+    let zc = zc_client(state)?;
     let asset = zbtc_asset(&zc)?;
-    with_wallet(&state, |w| {
-        let (bridge_key, _legacy_alice) = bridge_btc_keys(&w.account);
-        let mut redeemed: u64 = 0;
-        let mut round: u32 = 0;
-        while redeemed < want_total {
-            // Fresh HD index per round: refund pk, change key and the Bitcoin payout key.
-            let idx = w.alloc_index();
-            w.note_action(idx, "redeem", "");
-            let refund_acct = w.key_at(idx);
-            let alice_key = alice_key_at(&w.account, idx);
-            // Re-fetch leaves each round: the previous round's change coin (if any) is a
-            // committed leaf by now (broadcast_tx_commit), so it is selectable here.
-            let leaves = chain::fetch_leaves(&url)?;
-            let mut sel: Vec<usize> = w
-                .coins
-                .iter()
-                .enumerate()
-                .filter(|(_, c)| {
-                    !c.spent
-                        && asset != 0
-                        && c.coin.asset_id == asset
-                        && chain::find_index(&leaves, &c.coin.commitment()).is_some()
-                })
-                .map(|(i, _)| i)
-                .collect();
-            sel.sort_by_key(|&i| std::cmp::Reverse(w.coins[i].value));
-            if sel.is_empty() {
-                if redeemed == 0 {
-                    return Err(
-                        "no on-chain zBTC coins to redeem — shield some BTC first \
-                         (stale coins from a chain reset are ignored)"
-                            .to_string(),
-                    );
-                }
-                break; // ran out of coins mid-way; report what actually went out
-            }
-            // This round spends the largest N_IN coins; it can burn up to their sum minus
-            // the per-tx zBTC fee.
-            let chosen: Vec<usize> = sel.iter().take(zcrypt_shield::N_IN).copied().collect();
-            let sum: u64 = chosen.iter().map(|&i| w.coins[i].value).sum();
-            let round_cap = sum.saturating_sub(fee);
-            if round_cap == 0 {
-                if redeemed == 0 {
-                    return Err(format!(
-                        "your largest {} zBTC coin(s) total {:.8}, which cannot cover the \
-                         {:.8} zBTC redeem fee. Shield more BTC so a coin exceeds the fee.",
-                        chosen.len(),
-                        sum as f64 / 1e8,
-                        fee as f64 / 1e8,
-                    ));
-                }
-                break;
-            }
-            let round_value = (want_total - redeemed).min(round_cap);
-            round += 1;
-            let b = bswap::BtcParams {
-                alice: alice_bk.as_ref(),
-                bridge: bridge_bk.as_ref(),
-                bridge_key: &bridge_key,
-                alice_key: &alice_key,
-                alice_dest: &alice_dest,
-                bridge_dest: &bridge_dest,
-            };
-            let coins: Vec<Coin> = chosen.iter().map(|&i| w.coins[i].coin).collect();
-            let btc_amt = bitcoin::Amount::from_sat(round_value);
-            let preimage = bswap::fresh_preimage(); // 32 random bytes (HTLC hashlock security)
-            let this_round = round;
-            let progress = |pct: u8, phase: &str| {
-                let _ = window.emit(
-                    "swap-progress",
-                    serde_json::json!({ "percent": pct, "phase": phase, "round": this_round }),
-                );
-            };
-            let (change_value, change_blind) = bswap::zbtc_to_btc_progress(
-                &zc, &b, &refund_acct, asset, &coins, &preimage, round_value, btc_amt, &progress,
-            )?;
-            for &i in &chosen {
-                w.coins[i].spent = true;
-            }
-            // Record the change coin so an un-redeemed remainder stays spendable.
-            // `own_asset_coin` rebuilds the exact commitment the burn tx wrote to our key.
-            if change_value > 0 {
-                let change = refund_acct.own_asset_coin(change_value, change_blind, asset);
-                let born = w.scan_height;
-                w.coins.push(CoinRec::new(change, born));
-            }
-            redeemed += round_value;
-            w.push_hist("redeem", -(round_value as i64), format!("zBTC→BTC (round {round})"), asset);
+    let net = alice_bk.network();
+    // M11: everything that could leave zBTC burned with nobody to pay BTC is checked BEFORE
+    // the burn: an operator reserve key must exist on-chain, the amount must be one the
+    // operator serves, and the inputs must be committed leaves.
+    let reserve_bytes = bswap::chain_reserve_pk(&zc, asset)?.ok_or(
+        "the chain has no zBTC reserve key pinned, so no operator can pay out BTC; redeem is not available on this network",
+    )?;
+    let reserve_pk = bitcoin::PublicKey::from_slice(&reserve_bytes)
+        .map_err(|e| format!("chain reserve key is malformed: {e}"))?;
+    let min = bswap::min_redeem_sats(net);
+    if want_total < min {
+        return Err(format!("redeem of {want_total} sats is below the {min}-sat minimum the operator serves"));
+    }
+    if want_total > MAX_COIN {
+        return Err(format!("amount too large: max {} zBTC per redeem", MAX_COIN / 100_000_000));
+    }
+    let leaves = chain::fetch_leaves(&url)?;
+    let (idx, refund_acct, alice_key, coins, chosen, round_value, preimage, lock) = with_wallet(state, |w| {
+        let mut sel: Vec<usize> = w
+            .coins
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| {
+                !c.spent && c.coin.asset_id == asset && chain::find_index(&leaves, &c.coin.commitment()).is_some()
+            })
+            .map(|(i, _)| i)
+            .collect();
+        sel.sort_by_key(|&i| std::cmp::Reverse(w.coins[i].value));
+        if sel.is_empty() {
+            return Err(
+                "no on-chain zBTC coins to redeem — shield some BTC first (maturing and stale coins are not redeemable yet)"
+                    .to_string(),
+            );
         }
-        Ok(redeemed)
-    })
-    .and_then(ok)
+        // One round spends the largest N_IN coins; it can burn up to their sum minus the fee.
+        let chosen: Vec<usize> = sel.iter().take(zcrypt_shield::N_IN).copied().collect();
+        let sum: u64 = chosen.iter().map(|&i| w.coins[i].value).sum();
+        let round_cap = sum.saturating_sub(fee);
+        if round_cap < min {
+            return Err(format!(
+                "your largest {} zBTC coin(s) total {:.8}, which cannot cover a {:.8}-zBTC redeem plus the {:.8} fee. \
+                 Shield more BTC or consolidate first.",
+                chosen.len(),
+                sum as f64 / 1e8,
+                min as f64 / 1e8,
+                fee as f64 / 1e8,
+            ));
+        }
+        let round_value = want_total.min(round_cap);
+        let idx = w.alloc_index();
+        w.note_action(idx, "redeem", "");
+        let alice_key = alice_key_at(&w.account, idx);
+        let preimage = bswap::fresh_preimage(); // 32 random bytes (HTLC hashlock security)
+        let lock = zcrypt_core::nullifier::htlc_hashlock(&preimage);
+        w.pending_redeems.push(PendingRedeemRec {
+            index: idx,
+            preimage_hex: hex::encode(preimage),
+            hashlock_hex: hex::encode(lock),
+            value_sats: round_value,
+            asset_id: asset,
+            btc_claim_pk_hex: hex::encode(alice_key.pk.inner.serialize()),
+            reserve_pk_hex: hex::encode(reserve_bytes),
+            escrow_id_hex: None,
+            zc_timeout: 0,
+            started: w.clock,
+            funding: None,
+            claim_txid: None,
+            expired: false,
+        });
+        // The preimage is what claims the operator's BTC: it must be on disk BEFORE the burn.
+        save_now(state, w, "redeem zBTC")?;
+        let coins: Vec<Coin> = chosen.iter().map(|&i| w.coins[i].coin).collect();
+        Ok((idx, w.key_at(idx), alice_key, coins, chosen, round_value, preimage, lock))
+    })?;
+    progress(10, "Burning zBTC into a redeem escrow (your Bitcoin payout key is committed on-chain)…");
+    let (escrow_id, change_value, change_blind) =
+        match bswap::redeem_user_burn(&zc, &refund_acct, &coins, asset, &lock, round_value, &alice_key.pk) {
+            Ok(r) => r,
+            Err(e) => {
+                let _ = with_wallet(state, |w| {
+                    w.pending_redeems.retain(|r| r.index != idx);
+                    Ok(())
+                });
+                return Err(format!("burn not accepted (nothing was spent): {e}"));
+            }
+        };
+    let info = bswap::query_escrow(&zc, &escrow_id)?
+        .ok_or("the burn escrow is not visible on the node after broadcast")?;
+    with_wallet(state, |w| {
+        for &i in &chosen {
+            w.coins[i].spent = true;
+        }
+        // Record the change coin so an un-redeemed remainder stays spendable.
+        if change_value > 0 {
+            let change = refund_acct.own_asset_coin(change_value, change_blind, asset);
+            let born = w.scan_height;
+            w.coins.push(CoinRec::new(change, born));
+        }
+        if let Some(r) = w.pending_redeems.iter_mut().find(|r| r.index == idx) {
+            r.escrow_id_hex = Some(hex::encode(escrow_id));
+            r.zc_timeout = info.timeout_height;
+        }
+        w.push_hist("redeem", -(round_value as i64), "zBTC→BTC (awaiting operator)".into(), asset);
+        Ok(())
+    })?;
+    progress(40, "Waiting for the bridge operator to lock BTC for you…");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(REDEEM_WAIT_SECS);
+    let (utxo, _lt) = loop {
+        let zc_tip = zc.height()? as u64;
+        if let Some(found) = zcrypt_bridge::wallet_flows::find_operator_redeem_htlc(
+            alice_bk.as_ref(), zc_tip, info.timeout_height, &lock, &alice_key.pk, &reserve_pk,
+            bitcoin::Amount::from_sat(round_value),
+        )? {
+            break found;
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(format!(
+                "the operator has not locked BTC yet. Your redeem stays pending: 'Diagnose & fix a stuck swap' \
+                 claims the BTC once it is funded, and recovers the zBTC automatically if the escrow expires \
+                 (zcrypt block {}).",
+                info.timeout_height
+            ));
+        }
+        std::thread::sleep(std::time::Duration::from_secs(REDEEM_POLL_SECS));
+        progress(50, "Still waiting for the operator's Bitcoin lock…");
+    };
+    with_wallet(state, |w| {
+        if let Some(r) = w.pending_redeems.iter_mut().find(|r| r.index == idx) {
+            r.funding = Some((utxo.outpoint.txid.to_string(), utxo.outpoint.vout));
+        }
+        Ok(())
+    })?;
+    progress(80, "Claiming your BTC (revealing the preimage)…");
+    let txid = bswap::redeem_user_claim(alice_bk.as_ref(), &alice_key, &utxo, &preimage, &alice_dest)?;
+    with_wallet(state, |w| {
+        w.pending_redeems.retain(|r| r.index != idx);
+        Ok(())
+    })?;
+    progress(100, &format!("Done — BTC claimed ({txid}); the operator finalizes the burn from the revealed preimage."));
+    Ok(round_value)
 }
 
 #[derive(Serialize)]
@@ -4356,40 +4755,42 @@ fn resume_pending_deposits(state: &State<AppState>, notes: &mut Vec<String>) -> 
     let lock_blocks = bswap::btc_lock_blocks(net);
     let mut resumed = 0u32;
     for p in pending {
-        let preimage = match hex::decode(&p.preimage_hex) {
-            Ok(v) if v.len() == 32 => v,
-            _ => {
-                notes.push(format!("deposit #{}: corrupt preimage record", p.index));
+        let Some(preimage) = hex::decode(&p.preimage_hex).ok().filter(|v| v.len() == 32) else {
+            notes.push(format!("deposit #{}: corrupt preimage record", p.index));
+            continue;
+        };
+        let lock = zcrypt_core::nullifier::htlc_hashlock(&preimage);
+        // H1: the funded script is rebuilt from the SAME keys it was funded with (persisted
+        // reserve key + this deposit's refund key), never from the chain's current key.
+        let reserve_pk = match reserve_pk_for(&zc, p.asset_id, &p.reserve_pk_hex) {
+            Ok(k) => k,
+            Err(e) => {
+                notes.push(format!("deposit #{}: {e}", p.index));
                 continue;
             }
         };
-        let lock = zcrypt_core::nullifier::htlc_hashlock(&preimage);
-        let (reserve_pk, refund, claimer) = {
+        let (refund, claimer) = {
             let g = state.wallet.lock().unwrap();
             let w = g.as_ref().ok_or("wallet locked")?;
-            (bridge_btc_keys(&w.account).0.pk, alice_key_at(&w.account, p.index), w.key_at(p.index))
+            (alice_key_at(&w.account, p.index), w.key_at(p.index))
         };
-        // The funding used locktime = (Bitcoin tip at funding) + lock_blocks; the tip at
-        // funding is within a few blocks of the tip we recorded when the flow started.
-        let base = p.btc_tip.saturating_add(lock_blocks);
-        let mut found: Option<(zcrypt_bridge::HtlcUtxo, u32)> = None;
-        for t in base.saturating_sub(2)..=base.saturating_add(12) {
-            let script = zcrypt_bridge::htlc_script(&lock, &reserve_pk, &refund.pk, t as u32);
-            if let Some(u) = bswap::find_funded_htlc(alice_bk.as_ref(), &script, bitcoin::Amount::from_sat(p.value_sats))? {
-                found = Some((u, t as u32));
-                break;
-            }
-        }
-        let Some((utxo, btc_locktime)) = found else {
-            if btc_tip_now >= base {
+        let horizon = shield_locktime_candidates(&p, net).into_iter().max().unwrap_or(0);
+        let Some((utxo, btc_locktime)) = find_shield_funding(alice_bk.as_ref(), &p, net, &lock, &reserve_pk, &refund.pk)? else {
+            if p.funding.is_none() && btc_tip_now >= horizon.saturating_add(2016) {
+                // Two weeks past the lock with no funding ever seen: the HTLC was never broadcast.
                 notes.push(format!(
-                    "deposit #{} ({} sats): no funding found on Bitcoin and its lock has passed; nothing to resume",
+                    "deposit #{} ({} sats): no funding was ever found on Bitcoin and its lock passed two weeks ago; dropping the record (nothing was locked)",
                     p.index, p.value_sats
                 ));
                 let _ = with_wallet(state, |w| {
                     w.pending_deposits.retain(|d| d.index != p.index);
                     Ok(())
                 });
+            } else if btc_tip_now >= horizon {
+                notes.push(format!(
+                    "deposit #{} ({} sats): its Bitcoin lock (block {horizon}) has passed but no funding is visible; the record is kept so a Refund is possible once your Bitcoin backend shows the HTLC",
+                    p.index, p.value_sats
+                ));
             } else {
                 notes.push(format!(
                     "deposit #{} ({} sats): no HTLC funding found on Bitcoin yet (it may still be unconfirmed); try again later",
@@ -4398,9 +4799,38 @@ fn resume_pending_deposits(state: &State<AppState>, notes: &mut Vec<String>) -> 
             }
             continue;
         };
-        if u64::from(btc_locktime) <= btc_tip_now.saturating_add(bswap::btc_lock_blocks(net) / 8) {
+        // Funded. Persist what we learned (exact CLTV, outpoint) so later runs need no search.
+        let _ = with_wallet(state, |w| {
+            if let Some(d) = w.pending_deposits.iter_mut().find(|d| d.index == p.index) {
+                d.funding = Some((utxo.outpoint.txid.to_string(), utxo.outpoint.vout));
+                d.btc_locktime = btc_locktime;
+                d.reserve_pk_hex = hex::encode(reserve_pk.inner.serialize());
+            }
+            Ok(())
+        });
+        // Past the CLTV the mint can no longer be claimed safely: the BTC comes back through
+        // the refund branch (the Refund button, or the refund we already broadcast). The record
+        // is NEVER dropped while the HTLC output is unspent.
+        if u64::from(btc_locktime) <= btc_tip_now {
+            if alice_bk.utxo_unspent(&utxo).unwrap_or(None) == Some(false) {
+                notes.push(format!("deposit #{}: its HTLC output has been spent (refund confirmed or mint settled); record closed", p.index));
+                let _ = with_wallet(state, |w| {
+                    w.pending_deposits.retain(|d| d.index != p.index);
+                    Ok(())
+                });
+            } else if let Some(t) = &p.refund_txid {
+                notes.push(format!("deposit #{}: refund {t} broadcast, waiting for it to confirm", p.index));
+            } else {
+                notes.push(format!(
+                    "deposit #{} ({} sats): its Bitcoin lock (block {btc_locktime}) has passed; press Refund to take the BTC back",
+                    p.index, p.value_sats
+                ));
+            }
+            continue;
+        }
+        if u64::from(btc_locktime) <= btc_tip_now.saturating_add(lock_blocks / 8) {
             notes.push(format!(
-                "deposit #{}: its Bitcoin refund lock (block {btc_locktime}) is too close to resume safely; the BTC returns to your refund key after the lock",
+                "deposit #{}: its Bitcoin refund lock (block {btc_locktime}) is too close to resume safely; Refund becomes available once it passes",
                 p.index
             ));
             continue;
@@ -4430,13 +4860,114 @@ fn resume_pending_deposits(state: &State<AppState>, notes: &mut Vec<String>) -> 
     Ok(resumed)
 }
 
+/// Resume every in-flight zBTC→BTC redeem from its persisted record (wallet M11): claim the
+/// operator's HTLC if it is funded, or expire the burn escrow (zBTC comes back) once the
+/// operator's window is over. Returns how many were completed.
+fn resume_pending_redeems(state: &State<AppState>, notes: &mut Vec<String>) -> Result<u32, String> {
+    let pending: Vec<PendingRedeemRec> = {
+        let g = state.wallet.lock().unwrap();
+        g.as_ref().ok_or("wallet locked")?.pending_redeems.clone()
+    };
+    if pending.is_empty() {
+        return Ok(0);
+    }
+    let (alice_bk, dest) = swap_backend(state, 0)?;
+    let zc = zc_client(state)?;
+    let zc_tip = zc.height()? as u64;
+    let mut done = 0u32;
+    for r in pending {
+        let drop_record = |state: &State<AppState>| {
+            let _ = with_wallet(state, |w| {
+                w.pending_redeems.retain(|x| x.index != r.index);
+                Ok(())
+            });
+        };
+        let Some(eid) = r.escrow_id_hex.as_deref().and_then(parse_hex32) else {
+            notes.push(format!(
+                "redeem #{}: no escrow was ever created (interrupted before the burn was accepted); record closed. If the inputs show as spent after a scan, the escrow refunds to you automatically at its timeout",
+                r.index
+            ));
+            drop_record(state);
+            continue;
+        };
+        let Some(preimage) = hex::decode(&r.preimage_hex).ok().filter(|v| v.len() == 32) else {
+            notes.push(format!("redeem #{}: corrupt preimage record", r.index));
+            continue;
+        };
+        let lock = zcrypt_core::nullifier::htlc_hashlock(&preimage);
+        let Some(info) = bswap::query_escrow(&zc, &eid)? else {
+            notes.push(format!("redeem #{}: consensus has no escrow {}; record closed", r.index, hex::encode(eid)));
+            drop_record(state);
+            continue;
+        };
+        match info.state.as_str() {
+            "claimed" => {
+                notes.push(format!("redeem #{}: settled (the operator finalized the burn); record closed", r.index));
+                drop_record(state);
+            }
+            "expired" => {
+                notes.push(format!("redeem #{}: the escrow expired; your zBTC is refunded (picked up by the next scan)", r.index));
+                drop_record(state);
+            }
+            _ => {
+                let reserve_pk = reserve_pk_for(&zc, r.asset_id, &r.reserve_pk_hex)?;
+                let alice_key = {
+                    let g = state.wallet.lock().unwrap();
+                    alice_key_at(&g.as_ref().ok_or("wallet locked")?.account, r.index)
+                };
+                match zcrypt_bridge::wallet_flows::find_operator_redeem_htlc(
+                    alice_bk.as_ref(), zc_tip, info.timeout_height, &lock, &alice_key.pk, &reserve_pk,
+                    bitcoin::Amount::from_sat(r.value_sats),
+                )? {
+                    Some((utxo, lt)) => {
+                        if alice_bk.height()? >= u64::from(lt) {
+                            notes.push(format!(
+                                "redeem #{}: the operator's BTC lock (block {lt}) has passed, so it may refund itself; the burn escrow expires at zcrypt block {} and your zBTC returns then",
+                                r.index, info.timeout_height
+                            ));
+                            continue;
+                        }
+                        match bswap::redeem_user_claim(alice_bk.as_ref(), &alice_key, &utxo, &preimage, &dest) {
+                            Ok(txid) => {
+                                notes.push(format!("redeem #{}: claimed the operator's BTC ({txid})", r.index));
+                                drop_record(state);
+                                done += 1;
+                            }
+                            Err(e) => notes.push(format!("redeem #{}: the operator funded BTC but the claim failed: {e}", r.index)),
+                        }
+                    }
+                    None => {
+                        if zc_tip >= info.timeout_height {
+                            match zc.broadcast(&bswap::expire_tx(&eid)) {
+                                Ok(_) => {
+                                    notes.push(format!(
+                                        "redeem #{}: the operator never funded; the escrow was expired and your zBTC returns as a refund coin on the next scan",
+                                        r.index
+                                    ));
+                                    drop_record(state);
+                                }
+                                Err(e) => notes.push(format!("redeem #{}: could not expire the escrow yet: {e}", r.index)),
+                            }
+                        } else {
+                            notes.push(format!(
+                                "redeem #{}: waiting for the operator to lock BTC (escrow open until zcrypt block {}; it refunds automatically after)",
+                                r.index, info.timeout_height
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(done)
+}
+
 #[tauri::command]
 fn bridge_recover(state: State<AppState>) -> R<RecoverResult> {
     let url = node_url(&state)?;
     let leaves = chain::fetch_leaves(&url)?;
     let zc = zc_client(&state)?;
     let asset = zbtc_asset(&zc).unwrap_or(0);
-    // First: pick up any deposit that died after its Bitcoin HTLC was funded.
     let mut notes: Vec<String> = Vec::new();
     let resumed = match resume_pending_deposits(&state, &mut notes) {
         Ok(n) => n,
@@ -4445,41 +4976,76 @@ fn bridge_recover(state: State<AppState>) -> R<RecoverResult> {
             0
         }
     };
-    with_wallet(&state, |w| {
-        let mut live = 0u64;
-        let mut dropped = 0usize;
-        for c in w.coins.iter_mut().filter(|c| !c.spent) {
-            if asset != 0 && c.coin.asset_id == asset {
-                if chain::find_index(&leaves, &c.coin.commitment()).is_some() {
-                    live += c.value;
-                } else {
-                    c.spent = true; // stale: not on-chain, so unspendable — clear it
-                    dropped += 1;
-                }
-            }
+    let redeems_done = match resume_pending_redeems(&state, &mut notes) {
+        Ok(n) => n,
+        Err(e) => {
+            notes.push(format!("could not check pending redeems: {e}"));
+            0
         }
-        let mut message = if resumed > 0 {
-            format!("Resumed {resumed} interrupted deposit(s) from their Bitcoin funding: the zBTC is now maturing. ")
-        } else {
-            String::new()
-        };
-        message.push_str(&if dropped > 0 {
-            format!(
-                "Cleared {dropped} stale zBTC coin(s) no longer on-chain (e.g. after a chain \
-                 reset). Your wallet now shows {} zBTC of live, redeemable balance.",
-                live as f64 / 100_000_000.0
-            )
-        } else {
-            format!(
-                "{} zBTC is live and redeemable. A half-finished Bitcoin HTLC that cannot be resumed \
-                 refunds itself to your refund key after its timeout.",
-                live as f64 / 100_000_000.0
-            )
-        });
+    };
+    // H3: a freshly claimed mint is deliberately NOT a tree leaf until it matures; the node
+    // lists those separately. Without that list "maturing" and "gone" are indistinguishable,
+    // so nothing is cleared at all.
+    let pending_set: Option<std::collections::HashSet<zcrypt_shield::Commitment>> =
+        chain::fetch_pending_coins(&url).ok().map(|v| v.into_iter().collect());
+    let tip = chain::node_height(&url).unwrap_or(0);
+    with_wallet(&state, |w| {
+        let tip = tip.max(w.scan_height);
+        let mut live = 0u64;
+        let mut maturing = 0u64;
+        let mut dropped = 0usize;
+        let mut unverified = 0usize;
+        for c in w.coins.iter_mut().filter(|c| !c.spent) {
+            if asset == 0 || c.coin.asset_id != asset {
+                continue;
+            }
+            let com = c.coin.commitment();
+            if chain::find_index(&leaves, &com).is_some() {
+                live += c.value;
+                continue;
+            }
+            match &pending_set {
+                Some(set) if set.contains(&com) => {
+                    maturing += c.value;
+                    continue;
+                }
+                None => {
+                    unverified += 1;
+                    continue;
+                }
+                _ => {}
+            }
+            if !stale_droppable(c, tip) {
+                unverified += 1;
+                continue;
+            }
+            // Same flag the scan uses, so a coin that reappears on-chain is revived.
+            c.spent = true;
+            c.dropped_stale = true;
+            dropped += 1;
+        }
+        let mut message = String::new();
+        if resumed > 0 {
+            message.push_str(&format!("Resumed {resumed} interrupted deposit(s) from their Bitcoin funding: the zBTC is now maturing. "));
+        }
+        if redeems_done > 0 {
+            message.push_str(&format!("Completed {redeems_done} pending redeem(s). "));
+        }
+        if dropped > 0 {
+            message.push_str(&format!(
+                "Cleared {dropped} stale zBTC coin(s) no longer on-chain (e.g. after a chain reset); they are revived automatically if they reappear. "
+            ));
+        }
+        if maturing > 0 {
+            message.push_str(&format!("{:.8} zBTC is still maturing and was left untouched. ", maturing as f64 / 1e8));
+        }
+        if unverified > 0 {
+            message.push_str(&format!("{unverified} coin(s) could not be verified against the node and were left untouched. "));
+        }
+        message.push_str(&format!("Live, redeemable balance: {:.8} zBTC.", live as f64 / 1e8));
         for n in &notes {
             message.push(' ');
             message.push_str(n);
-            message.push('.');
         }
         Ok(RecoverResult { live_zbtc: live, dropped_stale: dropped, resumed, message })
     })
@@ -4586,6 +5152,11 @@ fn main() {
             swap_shield_btc,
             swap_redeem_btc,
             bridge_recover,
+            bridge_refund_deposit,
+            list_pending_deposits,
+            list_pending_secrets,
+            dismiss_pending_secret,
+            wallet_health,
             held_assets,
             btc_wallet_info,
             withdraw_btc,
@@ -4598,4 +5169,297 @@ fn main() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running ZCrypt wallet");
+}
+
+
+/// Live end-to-end test of the WALLET BACKEND (the real `#[tauri::command]` functions, driven
+/// through a `tauri::test` mock app) against the running 3-node chain. Skipped unless
+/// `ZC_E2E_URL` is set; `chain/e2e/run-all.sh` runs it with `VALIDATOR_SEED_HEX` so the
+/// bond step signs with node0's real consensus key. Covers: create, fund (devnet faucet),
+/// scan, normal send/receive between two wallets, stealth send + out-of-band note receive,
+/// bearer create/claim, bond via the two-step host-signed flow, delegate, reward accrual,
+/// claim, undelegate, and restore-from-mnemonic recovering a second wallet's coins.
+#[cfg(test)]
+mod live_3node {
+    use super::*;
+
+    const ZC: u64 = 1_000_000; // 1 ZCRYPT in base units
+
+    /// Unwrap a command's `Api<T>` envelope the way the frontend does.
+    fn v<T: Serialize>(r: R<T>) -> Result<T, String> {
+        let api = r?;
+        if api.success {
+            api.data.ok_or_else(|| "success without data".to_string())
+        } else {
+            Err(api.error.unwrap_or_else(|| "command failed".to_string()))
+        }
+    }
+
+    struct W {
+        app: tauri::App<tauri::test::MockRuntime>,
+        _dir: std::path::PathBuf,
+    }
+    impl W {
+        fn new(url: &str, btc_url: &str) -> W {
+            let dir = std::env::temp_dir().join(format!("zcrypt-wallet-e2e-{}-{}", std::process::id(), rand::random::<u32>()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let app = tauri::test::mock_app();
+            app.manage(AppState::default());
+            let st = app.state::<AppState>();
+            *st.data_dir.lock().unwrap() = dir.to_string_lossy().to_string();
+            chain::set_pin_dir(dir.to_string_lossy().to_string());
+            let settings = Settings {
+                node_url: url.to_string(),
+                btc_url: btc_url.to_string(),
+                tor_enabled: false,
+                ..Default::default()
+            };
+            v(save_settings(settings, app.state())).expect("settings");
+            W { app, _dir: dir }
+        }
+        /// A wallet configured for the regtest bitcoind (the bridge flows).
+        fn new_bridge(url: &str, btc_url: &str) -> W {
+            let w = W::new(url, btc_url);
+            let mut settings = load_settings(&w._dir.to_string_lossy());
+            settings.btc_network = "regtest".into();
+            settings.btc_selfcustody = false;
+            v(save_settings(settings, w.app.state())).expect("bridge settings");
+            w
+        }
+        fn st(&self) -> State<'_, AppState> {
+            self.app.state::<AppState>()
+        }
+    }
+
+    fn dump(tag: &str, w: &W) {
+        let b = v(get_balance(w.st())).unwrap();
+        let coins: Vec<String> = {
+            let st = w.st();
+            let g = st.wallet.lock().unwrap();
+            g.as_ref().unwrap().coins.iter().map(|c| format!("{}{}", c.value, if c.spent { "(spent)" } else { "" })).collect()
+        };
+        println!("    [{tag}] total={} coins={} [{}]", b.total, b.coin_count, coins.join(", "));
+    }
+
+    fn wait_until<T>(what: &str, secs: u64, mut f: impl FnMut() -> Option<T>) -> T {
+        let start = std::time::Instant::now();
+        loop {
+            if let Some(x) = f() {
+                return x;
+            }
+            assert!(start.elapsed().as_secs() < secs, "timed out waiting for {what}");
+            std::thread::sleep(std::time::Duration::from_millis(1500));
+        }
+    }
+
+    #[test]
+    fn wallet_backend_against_live_3node() {
+        let Ok(url) = std::env::var("ZC_E2E_URL") else {
+            eprintln!("ZC_E2E_URL not set: skipping the live wallet test");
+            return;
+        };
+        let btc_url = std::env::var("BTC_URL").unwrap_or_else(|_| "http://localhost:28443".into());
+        let vseed = std::env::var("VALIDATOR_SEED_HEX").unwrap_or_default();
+        std::env::set_var("ZCRYPT_BROADCAST_JITTER", "0");
+        let pw = "correct horse battery".to_string();
+
+        // Alice: create, fund from the devnet faucet, scan.
+        let alice = W::new(&url, &btc_url);
+        let created = v(create_wallet(pw.clone(), alice.st())).expect("create");
+        assert!(created.address.starts_with("zc1"));
+        let fund = 30_000 * ZC;
+        assert_eq!(v(fund_onchain(fund, alice.st())).expect("fund"), 2);
+        v(scan_onchain(alice.st())).expect("scan");
+        let bal = v(get_balance(alice.st())).expect("balance");
+        assert_eq!(bal.total, fund, "funded balance visible");
+        println!("[wallet] Alice created + funded {} ZCRYPT, scanned", bal.total / ZC);
+
+        // Bob: create; Alice pays him on chain; Bob finds it by scanning.
+        let bob = W::new(&url, &btc_url);
+        let bob_created = v(create_wallet(pw.clone(), bob.st())).expect("create bob");
+        let bob_addr = v(get_address(bob.st())).expect("bob address");
+        assert_eq!(bob_addr, bob_created.address);
+        let sent = v(send_onchain(bob_addr.clone(), 2 * ZC, "0".into(), alice.st())).expect("send to bob");
+        assert!(sent.on_chain && sent.file.is_none());
+        let bob_bal = wait_until("bob's incoming coin", 60, || {
+            v(scan_onchain(bob.st())).ok()?;
+            let b = v(get_balance(bob.st())).ok()?;
+            (b.total >= 2 * ZC).then_some(b.total)
+        });
+        assert_eq!(bob_bal, 2 * ZC, "Bob received exactly the amount");
+        println!("[wallet] Alice -> Bob 2 ZCRYPT: received by scanning ({} ZCRYPT)", bob_bal / ZC);
+
+        // Bearer: Alice mints a bearer coin; Bob claims it (the sweep spends it into Bob's own
+        // key, paying gas from Bob's smallest coin), then refreshes.
+        let token = v(create_bearer(ZC, "0".into(), alice.st())).expect("bearer");
+        assert!(token.starts_with("zcb1"));
+        let claimed = wait_until("bearer claim", 60, || v(claim_bearer(token.clone(), bob.st())).ok());
+        assert_eq!(claimed.amount, ZC);
+        assert!(v(claim_bearer(token.clone(), bob.st())).is_err(), "a bearer coin claims once");
+        v(scan_onchain(bob.st())).expect("scan bob after the sweep");
+        let after_sweep = v(get_balance(bob.st())).unwrap().total;
+        assert_eq!(after_sweep, 3 * ZC - GAS_FEE, "2 received + 1 swept, minus the sweep's gas");
+        println!("[wallet] bearer coin created by Alice, claimed by Bob, double-claim rejected; Bob holds {} base units", after_sweep);
+
+        // Stealth: Bob makes a stealth address; Alice sends; the note travels out of band.
+        // Done AFTER the sweep so the stealth receipt stays unspent for the restore check.
+        let stealth = v(new_stealth_address(bob.st())).expect("stealth address");
+        assert_eq!(v(address_kind(stealth.address.clone())).unwrap(), "stealth");
+        let s = v(send_stealth(stealth.address.clone(), ZC, "0".into(), alice.st())).expect("stealth send");
+        let note = s.file.expect("stealth send returns the note");
+        assert!(note.starts_with("zct1"));
+        let got = wait_until("stealth note on chain", 60, || v(receive_coin(note.clone(), bob.st())).ok());
+        assert_eq!(got.amount, ZC);
+        v(scan_onchain(bob.st())).expect("scan");
+        assert_eq!(v(get_balance(bob.st())).unwrap().total, after_sweep + ZC);
+        println!("[wallet] Alice -> Bob stealth 1 ZCRYPT via out-of-band note: received");
+        let skip_staking = std::env::var("ZC_E2E_SKIP_STAKING").is_ok();
+
+        // Bond node0 through the two-step flow: the wallet prepares, the HOST signs.
+        if !skip_staking {
+        let seed: [u8; 32] = hex::decode(vseed.trim()).unwrap()[..32].try_into().unwrap();
+        let sk = ed25519_dalek::SigningKey::from_bytes(&seed);
+        let vpk = sk.verifying_key().to_bytes();
+        let vpk_hex = hex::encode(vpk);
+        let req = v(bond_request("10000".into(), "10".into(), alice.st())).expect("bond request");
+        let reward: [u8; 32] = hex::decode(&req.reward_address_hex).unwrap().try_into().unwrap();
+        let nonce: u64 = chain::query_str(&url, &format!("/staking/auth_nonce/{vpk_hex}")).unwrap().trim().parse().unwrap();
+        let (stake, commission_bps) = parse_bond_params("10000", "10").unwrap();
+        let msg = bond_message(req.chain_id.as_bytes(), &vpk, stake, &reward, commission_bps, nonce);
+        use ed25519_dalek::Signer as _;
+        let sig = hex::encode(sk.sign(&msg).to_bytes());
+        // A signature for the WRONG nonce is refused before anything is spent.
+        assert!(v(bond_validator_signed(req.reward_index, vpk_hex.clone(), (nonce + 1).to_string(), sig.clone(), "10000".into(), "10".into(), alice.st())).is_err());
+        let msg_ok = v(bond_validator_signed(req.reward_index, vpk_hex.clone(), nonce.to_string(), sig, "10000".into(), "10".into(), alice.st())).expect("bond");
+        println!("[wallet] {msg_ok}");
+        let listed = wait_until("validator listed", 30, || {
+            let vs = v(list_validators(alice.st())).ok()?;
+            vs.into_iter().find(|x| x.pubkey.eq_ignore_ascii_case(&vpk_hex))
+        });
+        assert!((listed.commission_pct - 10.0).abs() < 0.01);
+
+        // Delegate 5,000 to it, wait for an epoch, claim, undelegate.
+        let d = v(delegate_validator(vpk_hex.clone(), "5000".into(), alice.st())).expect("delegate");
+        println!("[wallet] {d}");
+        let claimable = wait_until("rewards to accrue", 240, || {
+            let c = v(get_claimable(alice.st())).ok()?;
+            (c > 0).then_some(c)
+        });
+        let claimed = v(claim_rewards(alice.st())).expect("claim");
+        assert!(claimed.claimed >= claimable && claimed.coins >= 1, "claimed {:?}", claimed.claimed);
+        v(scan_onchain(alice.st())).expect("scan");
+        println!("[wallet] rewards accrued ({claimable}) and claimed ({} base units, {} coins)", claimed.claimed, claimed.coins);
+        let u = v(undelegate_validator(vpk_hex.clone(), alice.st())).expect("undelegate");
+        println!("[wallet] {u}");
+        let unb = v(my_unbonding(alice.st())).expect("unbonding");
+        assert!(!unb.is_empty(), "the undelegated stake is in the unbonding queue");
+        }
+
+        // H2: the bearer token Alice created above was persisted as a pending secret BEFORE
+        // its coins were spent; it stays listed until dismissed, and no save ever failed.
+        {
+            let h = v(wallet_health(alice.st())).expect("health");
+            assert!(h.save_error.is_none(), "no save failure: {:?}", h.save_error);
+            let secrets = v(list_pending_secrets(alice.st())).expect("secrets");
+            let mine = secrets.iter().find(|x| x.secret == token).expect("the bearer token is a pending secret");
+            assert_eq!(mine.kind, "bearer");
+            assert!(v(dismiss_pending_secret(mine.id, alice.st())).unwrap());
+            assert!(!v(list_pending_secrets(alice.st())).unwrap().iter().any(|x| x.secret == token));
+            println!("[wallet] bearer token was persisted as a pending secret before the spend, then dismissed");
+        }
+
+        // BRIDGE (regtest bitcoind, the PUBLIC path against the chain's genesis reserve key).
+        if std::env::var("ZC_E2E_SKIP_BRIDGE").is_err() {
+            let carol = W::new_bridge(&url, &btc_url);
+            v(create_wallet(pw.clone(), carol.st())).expect("create carol");
+            let no_progress = |_: u8, _: &str| {};
+            // H1: the HTLC pays the chain's reserve key (not this wallet's own), so the SPV mint
+            // is accepted and the coin lands as MATURING.
+            let shielded = swap_shield_btc_impl(10_000_000, "0.1", &no_progress, &carol.st()).expect("shield 0.1 BTC");
+            assert_eq!(shielded, 10_000_000);
+            // The recipient coin is the deposit net of the 10 bps bridge fee (paid to stakers).
+            let net_mint = 10_000_000 - zcrypt_core::emission::bridge_fee(10_000_000);
+            let st0 = v(bridge_status(false, carol.st())).expect("status");
+            assert_eq!(st0.zbtc_maturing, net_mint, "the fresh mint is held maturing");
+            assert!(v(list_pending_deposits(carol.st())).unwrap().is_empty(), "no deposit left pending after a completed shield");
+            println!("[wallet] shielded 0.1 BTC via the chain reserve key; {} sats maturing", st0.zbtc_maturing);
+            // H3: recovery must NOT clear the maturing coin.
+            let rr = v(bridge_recover(carol.st())).expect("recover");
+            assert_eq!(rr.dropped_stale, 0, "maturing zBTC is never cleared: {}", rr.message);
+            let st1 = v(bridge_status(false, carol.st())).expect("status");
+            assert_eq!(st1.zbtc_maturing, net_mint, "still maturing after recover");
+            println!("[wallet] recover left the maturing coin untouched ({})", rr.message.trim());
+            // Mature it (mine + relay headers), then it is spendable.
+            let s = load_settings(&carol._dir.to_string_lossy());
+            let user_btc = Btc::connect(&s.btc_url, &s.btc_user, &s.btc_pass, &s.btc_wallet, bitcoin::Network::Regtest).unwrap();
+            let zc = Zcrypt::new(&url);
+            bswap::wait_for_maturity(&zc, &user_btc, Some(&|n| user_btc.mine(n)), 6).unwrap();
+            v(scan_onchain(carol.st())).expect("scan carol");
+            let st2 = v(bridge_status(false, carol.st())).expect("status");
+            assert_eq!(st2.zbtc_balance, net_mint, "matured into the spendable pool");
+            // M11: the operator-served redeem. A watcher thread plays the operator.
+            let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let op_thread = {
+                let stop = stop.clone();
+                let zc_url = url.clone();
+                let btc_url = btc_url.clone();
+                std::thread::spawn(move || {
+                    use zcrypt_bridge::watcher::{watcher_tick, WatcherState};
+                    let zc = Zcrypt::new(&zc_url);
+                    let reserve = BtcKey::from_bytes(&[0xB1; 32]);
+                    let _ = Btc::ensure_wallet(&btc_url, "zcrypt", "zcrypt", "operator");
+                    let op = Btc::connect(&btc_url, "zcrypt", "zcrypt", "operator", bitcoin::Network::Regtest).unwrap();
+                    if op.balance_btc().unwrap_or(0.0) < 1.0 {
+                        op.fund_self(120).unwrap();
+                    }
+                    let dest = op.new_address().unwrap();
+                    let asset = bswap::ensure_zbtc_registered(&zc).unwrap();
+                    let mut st = WatcherState::default();
+                    st.cursor = zc.height().unwrap();
+                    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        match watcher_tick(&mut st, &zc, &op, &bswap::ReserveKeys::single(&reserve), &dest, asset, 130_000, 1) {
+                            // Regtest has no miners: confirm what the operator just funded so the
+                            // user's confirmed-UTXO scan can see it (on a real network the next
+                            // block does this). Mine ONLY then, so the CLTV the user derives from
+                            // the tip stays within its search window.
+                            Ok(r) if r.locked > 0 => {
+                                let _ = op.mine(1);
+                            }
+                            Ok(_) => {}
+                            Err(e) => eprintln!("[operator] tick error: {e}"),
+                        }
+                        std::thread::sleep(std::time::Duration::from_secs(3));
+                    }
+                })
+            };
+            let redeemed = swap_redeem_btc_impl("0.05", &no_progress, &carol.st()).expect("redeem 0.05");
+            assert_eq!(redeemed, 5_000_000);
+            let h = v(wallet_health(carol.st())).expect("health");
+            assert_eq!(h.pending_redeems, 0, "the redeem record is closed after the claim");
+            assert!(h.save_error.is_none());
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            op_thread.join().unwrap();
+            v(scan_onchain(carol.st())).expect("scan after redeem");
+            let st3 = v(bridge_status(false, carol.st())).expect("status");
+            assert_eq!(st3.zbtc_balance, net_mint - 5_000_000 - zcrypt_core::emission::MIN_FEE, "change minus the in-asset fee stays spendable");
+            println!("[wallet] redeemed 0.05 zBTC through the operator watcher; BTC claimed; {} sats zBTC left", st3.zbtc_balance);
+        }
+
+        // Restore Bob from his phrase into a fresh wallet: same address, coins recovered.
+        let bob2 = W::new(&url, &btc_url);
+        let restored = v(restore_wallet(pw.clone(), bob_created.seed_phrase.clone(), bob2.st())).expect("restore");
+        assert_eq!(restored.address, bob_addr);
+        v(scan_onchain(bob2.st())).expect("scan restored");
+        dump("bob (live)", &bob);
+        dump("bob2 (restored)", &bob2);
+        let b2 = v(get_balance(bob2.st())).unwrap();
+        let b1 = v(get_balance(bob.st())).unwrap();
+        // The normal receipt, the swept bearer coin and the sweep's HD change are all found
+        // again by trial decryption; the stealth receipt used a RANDOM seed that a mnemonic
+        // cannot recover, which is the documented property of stealth addresses.
+        assert_eq!(b2.total, b1.total - ZC, "restore recovers everything except the stealth receipt");
+        println!("[wallet] Bob restored from his phrase: {} of {} ZCRYPT recovered (stealth receipt is by design not derivable)", b2.total / ZC, b1.total / ZC);
+
+        println!("\nWALLET BACKEND against the live 3-node chain: GREEN");
+    }
 }
