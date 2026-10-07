@@ -19,12 +19,12 @@ use zcrypt_bridge::swap;
 use zcrypt_bridge::zcrypt::Zcrypt;
 use zcrypt_bridge::Key;
 use zcrypt_core::bitcoin::block::Header;
-use zcrypt_core::bitcoin::consensus::{deserialize, serialize};
+use zcrypt_core::bitcoin::consensus::deserialize;
 use zcrypt_core::bitcoin::hashes::Hash as _;
 use zcrypt_core::htlc_shield;
 use zcrypt_core::keys::Account;
 use zcrypt_core::nullifier::htlc_hashlock;
-use zcrypt_core::spv::{testutil, MintProof, REGTEST_GENESIS};
+use zcrypt_core::spv::{testutil, REGTEST_GENESIS};
 
 fn header_hash(raw: &[u8; 80]) -> [u8; 32] {
     deserialize::<Header>(raw).unwrap().block_hash().to_byte_array()
@@ -104,20 +104,14 @@ fn main() {
     let value = 100_000u64;
     let btc_locktime = 100u32;
     let deposit = testutil::funding_tx(&lock, &reserve, &refund, btc_locktime, value, 1);
-    let a1 = testutil::mine_header(&REGTEST_GENESIS, &[deposit.clone()], 1_296_690_000);
+    let (a1, proof) = testutil::deposit_proof(
+        &REGTEST_GENESIS, &deposit, 1_296_690_000, reserve, refund, btc_locktime, 0, 1,
+    );
     let a2 = testutil::mine_header(&a1, &[], 1_296_690_600);
     nodes[0].broadcast(&swap::headers_tx(&cat(&[a1, a2]))).expect("relay A1,A2");
     println!("    relayed A1(deposit)+A2 → chain BTC tip = {}", q(&nodes, "/spv/tip"));
 
     let zc_timeout = nodes[0].height().unwrap() as u64 + 100_000;
-    let proof = MintProof {
-        reserve_pk: reserve,
-        refund_pk: refund,
-        btc_locktime,
-        vout: 0,
-        raw_tx: serialize(&deposit),
-        merkle_block: testutil::merkle_proof(&a1, &[deposit.clone()], &deposit),
-    };
     nodes[0]
         .broadcast(&swap::open_spv_tx(asset, value, &lock, zc_timeout, &alice.pubkey(), &proof, &refund_key))
         .expect("SPV mint escrow opens");
@@ -183,17 +177,11 @@ fn main() {
     let lock2 = htlc_hashlock(x2);
     let dep2 = testutil::funding_tx(&lock2, &reserve, &refund, btc_locktime, small, 2);
     // Only ONE confirmation of depth for the small deposit (mints AND matures at depth 1).
-    let d1 = testutil::mine_header(&prev, &[dep2.clone()], 1_296_695_000);
+    let (d1, proof2) = testutil::deposit_proof(
+        &prev, &dep2, 1_296_695_000, reserve, refund, btc_locktime, 0, 2,
+    );
     nodes[0].broadcast(&swap::headers_tx(&cat(&[d1]))).expect("relay small honest deposit");
     let zc_timeout2 = nodes[0].height().unwrap() as u64 + 100_000;
-    let proof2 = MintProof {
-        reserve_pk: reserve,
-        refund_pk: refund,
-        btc_locktime,
-        vout: 0,
-        raw_tx: serialize(&dep2),
-        merkle_block: testutil::merkle_proof(&d1, &[dep2.clone()], &dep2),
-    };
     nodes[0]
         .broadcast(&swap::open_spv_tx(asset, small, &lock2, zc_timeout2, &alice.pubkey(), &proof2, &refund_key))
         .expect("small SPV mint escrow");

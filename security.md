@@ -115,40 +115,12 @@ end-to-end test against a live 3-validator network in CI.
 
 ## Audit history and how to report
 
-* **2026-09-07, internal multi-reviewer audit** ([AUDIT-2026-09-07.md](AUDIT-2026-09-07.md)):
-  five domain reviews (circuit, privacy, consensus, bridge/SPV, wallet/ops). It found
-  six critical-rated issues, all now fixed in the tree: 64-bit asset ids collapsing
-  onto the 31-bit circuit lane (counterfeit assets), three unbacked zBTC-mint paths in
-  the SPV gate (timestamp-typed CLTV locktimes, unbounded HTLC preimages, escrow
-  timeouts unrelated to the Bitcoin refund lock), the foundation sentinel's voting
-  power being overwritten by the ordinary validator-set diff, and unauthenticated
-  partial reward claims. The high and medium findings (gas on state-creating
-  transactions, per-block anchor window, incremental nullifier tree, CheckTx parity,
-  proof verification outside the state lock, genesis-bound zBTC reserve key, wider
-  chain-id binding, fixed-size notes, digest-pinned and signed validator images,
-  pinned toolchain, rate-limited RPC edge, secrets out of the environment) are fixed
-  alongside; the report lists each with file references.
-* **Reporting.** Send vulnerability reports to the address in `chain/.env.example`
-  (`ACME_EMAIL`, the operations mailbox) with "security" in the subject, or open a
-  private security advisory on the repository. Please do not file public issues for
-  exploitable bugs. There is no bounty programme yet.
-* **What fixed-in means here.** Every fix above shipped as a consensus or proof-format
-  change on a chain that has not launched; there is no live network to migrate.
+* **Reporting.** Send vulnerability reports to security@zcrypt.network
+  or open a private security advisory on the repository. Please do not file 
+  public issues for exploitable bugs. There is no bounty programme yet.
 
 ## What we will not pretend
 
-* **No external audit yet.** The internal record is documented and the test
-  suite is serious, but until independent cryptographers have torn this apart,
-  calibrate the value you shield accordingly.
-* **The BTC bridge is mainnet-enabled and single-operator.** The wallet ships with
-  `btc_network = bitcoin`, self-custody on, and a public Esplora endpoint by default;
-  the mint side is trustless (consensus SPV), the redeem side and all bridged BTC
-  depend on one operator's hot secp256k1 reserve key, one bitcoind wallet and one
-  watcher daemon. A zBTC holder trusts: that key's custody, the operator staying online
-  and honest for redeems, Bitcoin not reorganising past the value-scaled maturity depth,
-  prompt header relaying, the provenance of the genesis checkpoint, and that Esplora
-  (which cannot forge mints) does not deny service. Keep bridged value proportional to
-  that trust until threshold custody lands.
 * **Anonymity grows with the pool.** Cryptographic soundness holds from block
   one; practical anonymity is a function of adoption.
 * **Devnet builds are unsafe by design.** The `devnet` feature enables an

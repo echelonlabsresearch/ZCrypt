@@ -10,6 +10,9 @@
                      field-level conservation an INTEGER conservation
                      (shield/src/tall.rs:243-262, 434-436). The audit's central
                      soundness argument, now a machine-checked theorem.
+    * Zcrypt.Binding — coin-layer binding as a collision reduction: equal openings of
+                     distinct coins, or a commitment equal to a nullifier, yield an
+                     explicit collision of the hash. Injectivity is not assumed.
 
   These formalize the MATHEMATICS of the constraints (the soundness argument). Linking
   this model to the actual Rust automatically is the separate Charon/Aeneas extraction

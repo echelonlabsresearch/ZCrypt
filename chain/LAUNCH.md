@@ -139,7 +139,7 @@ custody. The code-level money-critical items are now fixed (dynamic HTLC fee, ma
 Esplora default, network/endpoint mismatch guard, fail-closed SPV net + checkpoint).
 Two residual risks remain that are process, not code, and you accept them at launch
 (the 2026-09-07 audit's bridge findings, from timestamp-typed locktimes to the watcher's
-redeem margin, are fixed in code; see AUDIT-2026-09-07.md):
+redeem margin, are fixed in code; see the audit history in ../security.md):
 
 1. RESERVE KEY (single hot key). zBTC's mint authority is the consensus SPV gate over
    ONE Bitcoin key. Its PUBLIC key is fixed in the genesis `app_state`

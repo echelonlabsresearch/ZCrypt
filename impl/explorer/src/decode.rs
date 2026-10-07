@@ -38,6 +38,13 @@ fn rd_pk(b: &[u8], off: usize) -> Option<[u64; 8]> {
     Some(pk)
 }
 
+/// Swap-lock body after the 216-byte header is the same gas prefix a transfer uses,
+/// then the asset spend. Returns `(gas_tx, asset_tx)`.
+fn parse_swap_proofs(body: &[u8]) -> Option<(ShieldTx, ShieldTx)> {
+    const HEAD: usize = 216;
+    parse_transfer(body.get(HEAD..)?)
+}
+
 /// The 0x55 bundle body: `gas_blind(32) ‖ gas_len(4) ‖ gas_tx ‖ main_tx`.
 fn parse_transfer(body: &[u8]) -> Option<(ShieldTx, ShieldTx)> {
     if body.len() < 36 {
@@ -173,23 +180,36 @@ which hides among the whole pool", hex_at(0, 64)));
             r.push(row(format!("[33..{}]", 1 + body.len()), "preimage -> Ctx.preimage", hex_at(32, body.len().saturating_sub(32).min(64))));
         }
         0x5C => r.push(row("[1..33]".into(), "escrow id -> Ctx.escrow_open lookup", hex_at(0, 32))),
-        0x5D | 0x62 => {
-            let stx_off = if tag == 0x5D { 152 } else { 216 };
+        0x5D => {
             let aid = rd_u64(body, 40)?;
             r.push(row("[1..9]".into(), "locked value (u64 LE, in the asset's own atomic units)", asset_amt(rd_u64(body, 0)?, Some(aid), None, None)));
             r.push(row("[9..41]".into(), "lock blind (opens the burn output)", hex_at(8, 32)));
             r.push(row("[41..49]".into(), "asset id (u64 LE) -> Ctx.asset_registered lookup", format!("{aid}")));
             r.push(row("[49..81]".into(), "hashlock (SHA-256)", hex_at(48, 32)));
             r.push(row("[81..89]".into(), "timeout height (u64 LE)", format!("{}", rd_u64(body, 80)?)));
-            if tag == 0x62 {
-                r.push(row("[89..153]".into(), "counterparty shield pubkey", hex_at(88, 64)));
-                r.push(row("[153..217]".into(), "refund shield pubkey", hex_at(152, 64)));
-            } else {
-                r.push(row("[89..153]".into(), "refund shield pubkey", hex_at(88, 64)));
+            r.push(row("[89..153]".into(), "refund shield pubkey", hex_at(88, 64)));
+            if let Some(stx) = body.get(152..).and_then(shield_tx::from_bytes) {
+                shield_rows("[153..] lock", &stx, &mut r);
             }
-            if let Some(stx) = body.get(stx_off..).and_then(shield_tx::from_bytes) {
-                shield_rows(&format!("[{}..] lock", stx_off + 1), &stx, &mut r);
-            }
+        }
+        0x62 => {
+            let aid = rd_u64(body, 40)?;
+            r.push(row("".into(), "STRUCTURE", "a 0x62 swap lock keeps the 216-byte escrow header, then the \
+same ZCRYPT gas prefix a transfer uses (0.01 burned, the locked asset is not charged), then the asset spend \
+whose output[0] is the locked-value burn coin.".into()));
+            r.push(row("[1..9]".into(), "locked value (u64 LE, in the asset's own atomic units)", asset_amt(rd_u64(body, 0)?, Some(aid), None, None)));
+            r.push(row("[9..41]".into(), "lock blind (opens the burn output)", hex_at(8, 32)));
+            r.push(row("[41..49]".into(), "asset id (u64 LE) -> Ctx.asset_registered lookup", format!("{aid}")));
+            r.push(row("[49..81]".into(), "hashlock (SHA-256)", hex_at(48, 32)));
+            r.push(row("[81..89]".into(), "timeout height (u64 LE)", format!("{}", rd_u64(body, 80)?)));
+            r.push(row("[89..153]".into(), "counterparty shield pubkey", hex_at(88, 64)));
+            r.push(row("[153..217]".into(), "refund shield pubkey", hex_at(152, 64)));
+            let gas_len = rd_u32(body, 248)? as usize;
+            r.push(row("[217..249]".into(), "gas blind: the PUBLIC opening of the 0.01 ZCRYPT burn", hex_at(216, 32)));
+            r.push(row("[249..253]".into(), "gas tx length (u32 LE)", format!("{gas_len}")));
+            let (gas, asset_tx) = parse_swap_proofs(body)?;
+            shield_rows(&format!("[253..{}] gas", 253 + gas_len), &gas, &mut r);
+            shield_rows(&format!("[{}..] asset spend", 253 + gas_len), &asset_tx, &mut r);
         }
         0x5E => {
             // Wire: pubkey(32) ‖ nonce(8) ‖ sig(64) — nonce is signed for replay protection
@@ -372,7 +392,7 @@ pub fn describe_tx(b: &[u8], chain_id: &[u8], with_rules: bool, height: u64) -> 
             "hashlock": rd_hex(body, 48, 32),
             "timeout_height": rd_u64(body, 80),
             "hidden": ["which coins funded the lock"],
-            "explains": "One leg of a private asset-for-asset swap. The locked value and asset are public for the escrow; the funding coins are hidden. Two such legs under one hashlock settle atomically.",
+            "explains": "One leg of a private asset-for-asset swap. The locked value and asset are public for the escrow; the funding coins are hidden. Gas is 0.01 ZCRYPT in a separate proof, and the locked asset is not charged. Two such legs under one hashlock settle atomically.",
         }),
         Some(0x63) => json!({
             "type": "Bitcoin header relay", "tag": tag_hex,
@@ -566,12 +586,16 @@ fn gate_op_result(tag: u8, op: u8, body: &[u8], chain_id: &[u8], height: u64) ->
             Some(ran(ok, format!("explorer re-checked \"{ticker}\" against the format rule → {}", if ok { "valid" } else { "invalid" })))
         }
         0x1C => {
-            // CHECK_BURN_OUTPUT (swap-lock 0x62 / burn-lock 0x5D)
-            let stx_off = if tag == 0x5D { 152 } else { 216 };
+            // CHECK_BURN_OUTPUT (swap-lock 0x62 / burn-lock 0x5D). A swap lock's asset
+            // spend sits after the gas prefix, not immediately after the 216-byte header.
             let value = rd_u64(body, 0)?;
             let blind = rd_blind(body, 8)?;
             let asset = rd_u64(body, 40)?;
-            let stx = body.get(stx_off..).and_then(shield_tx::from_bytes)?;
+            let stx = if tag == 0x62 {
+                parse_swap_proofs(body)?.1
+            } else {
+                body.get(152..).and_then(shield_tx::from_bytes)?
+            };
             let expected = zcrypt_shield::commit_asset(value, &blind, &zcrypt_core::htlc_shield::BURN_PK, asset);
             let ok = stx.output_commitments.first() == Some(&expected);
             Some(ran(ok, format!("explorer recomputed commit_asset(value, blind, BURN_PK, asset) = {} and compared to output[0] → {}", short(&expected), if ok { "equal" } else { "MISMATCH" })))

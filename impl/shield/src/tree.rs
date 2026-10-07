@@ -4,7 +4,20 @@
 //! the ABCI app_hash and spends prove Merkle membership against it. Any
 //! divergence is caught by CometBFT's app_hash comparison.
 
+use std::collections::HashSet;
+
 use crate::{compress2, Commitment};
+
+/// Why an append was refused. A duplicate leaf is a consensus failure: the same
+/// commitment must not occupy two positions, because the nullifier does not bind
+/// the leaf index.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AppendError {
+    /// The tree already holds 2^DEPTH leaves.
+    Full,
+    /// `c` is already a leaf. Callers must not insert it again.
+    Duplicate,
+}
 
 /// Tree depth: 2^DEPTH leaf slots. Depth 32 gives ~4.29 billion slots, sized as a
 /// generous launch parameter (~1 billion transfers at ~4 output leaves each) so the
@@ -29,6 +42,9 @@ pub struct CommitmentTree {
     layers: Vec<Vec<Commitment>>,
     /// `empty[k]` = root of an all-empty subtree of height `k`.
     empty: Vec<Commitment>,
+    /// Every leaf currently in the tree. Not serialized: [`Self::restore`] rebuilds it
+    /// from the leaves and refuses a repeated one, so the root cannot change by skipping.
+    seen: HashSet<Commitment>,
 }
 
 impl Default for CommitmentTree {
@@ -48,6 +64,7 @@ impl CommitmentTree {
         CommitmentTree {
             layers: vec![Vec::new(); DEPTH + 1],
             empty,
+            seen: HashSet::new(),
         }
     }
 
@@ -70,25 +87,34 @@ impl CommitmentTree {
         self.layers[0].clone()
     }
 
-    /// Rebuild a tree from persisted leaves. `root()` depends only on the leaves +
-    /// the fixed empty hashes, so the restored root matches the saved one.
-    pub fn restore(leaves: Vec<Commitment>) -> Self {
-        let mut t = Self::new();
-        for c in leaves {
-            t.append(c);
-        }
-        t
+    /// Whether `c` is already a leaf.
+    pub fn contains(&self, c: &Commitment) -> bool {
+        self.seen.contains(c)
     }
 
-    /// Append a coin commitment; returns its leaf index. Fails only if the tree
-    /// is full (2^DEPTH leaves).
+    /// Rebuild a tree from persisted leaves. `root()` depends only on the leaves +
+    /// the fixed empty hashes, so the restored root matches the saved one. A repeated
+    /// leaf is an error: skipping it would change the root.
+    pub fn restore(leaves: Vec<Commitment>) -> Result<Self, AppendError> {
+        let mut t = Self::new();
+        for c in leaves {
+            t.append(c)?;
+        }
+        Ok(t)
+    }
+
+    /// Append a coin commitment; returns its leaf index. Fails if the tree is full
+    /// (2^DEPTH leaves) or `c` is already a leaf.
     ///
     /// Only the new leaf's ancestors change, so this rewrites one node per level. A node whose
     /// right child was previously absent was folded against `empty[k]`; recomputing it here is
     /// what folds in the newly arrived sibling.
-    pub fn append(&mut self, c: Commitment) -> Option<usize> {
+    pub fn append(&mut self, c: Commitment) -> Result<usize, AppendError> {
         if self.layers[0].len() >= (1usize << DEPTH) {
-            return None;
+            return Err(AppendError::Full);
+        }
+        if !self.seen.insert(c) {
+            return Err(AppendError::Duplicate);
         }
         let idx = self.layers[0].len();
         self.layers[0].push(c);
@@ -105,7 +131,7 @@ impl CommitmentTree {
                 self.layers[k + 1][j] = node;
             }
         }
-        Some(idx)
+        Ok(idx)
     }
 
     /// The tree root: the filled prefix folded up against empty subtrees.
@@ -241,7 +267,7 @@ mod tests {
         for &c in &leaves {
             built.append(c).unwrap();
         }
-        let restored = CommitmentTree::restore(leaves.clone());
+        let restored = CommitmentTree::restore(leaves.clone()).unwrap();
         assert_eq!(restored.root(), built.root());
         assert_eq!(restored.root(), restored.root_reference());
         assert_eq!(restored.leaf_entries(), leaves);
@@ -284,11 +310,28 @@ mod tests {
         let build = || {
             let mut t = CommitmentTree::new();
             for i in 0..5 {
-                t.append(commit(1000 + i, 7 * i + 1));
+                t.append(commit(1000 + i, 7 * i + 1)).unwrap();
             }
             t.root()
         };
         assert_eq!(build(), build());
+    }
+
+    #[test]
+    fn duplicate_leaf_is_rejected_and_restore_fails_closed() {
+        let mut t = CommitmentTree::new();
+        let c = commit(1, 1);
+        t.append(c).unwrap();
+        let root = t.root();
+        assert_eq!(t.append(c), Err(AppendError::Duplicate));
+        assert_eq!(t.len(), 1);
+        assert_eq!(t.root(), root, "a rejected duplicate must not move the root");
+        assert!(t.contains(&c));
+        assert_eq!(
+            CommitmentTree::restore(vec![c, c]).err(),
+            Some(AppendError::Duplicate),
+            "skipping a repeated leaf would change the root"
+        );
     }
 
     #[test]
@@ -301,11 +344,11 @@ mod tests {
     #[test]
     fn order_matters() {
         let mut t1 = CommitmentTree::new();
-        t1.append(commit(1, 1));
-        t1.append(commit(2, 2));
+        t1.append(commit(1, 1)).unwrap();
+        t1.append(commit(2, 2)).unwrap();
         let mut t2 = CommitmentTree::new();
-        t2.append(commit(2, 2));
-        t2.append(commit(1, 1));
+        t2.append(commit(2, 2)).unwrap();
+        t2.append(commit(1, 1)).unwrap();
         assert_ne!(t1.root(), t2.root(), "insertion order is part of the state");
     }
 }

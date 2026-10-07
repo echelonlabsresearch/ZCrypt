@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { call, toBaseAsset } from "../lib/api";
 import { CopyButton } from "./Share";
+import AssetSwap from "./AssetSwap";
 
 interface Status {
   btc_connected: boolean;
@@ -39,6 +40,7 @@ const ZBTC_BASE = 100_000_000;
 const zfmt = (base: number) => (base / ZBTC_BASE).toLocaleString(undefined, { maximumFractionDigits: 8 });
 
 type Tab = "shield" | "redeem";
+type Surface = "bitcoin" | "swap";
 
 export default function Bridge({
   active,
@@ -48,6 +50,7 @@ export default function Bridge({
   onSwapped: (msg: string) => void;
 }) {
   const [status, setStatus] = useState<Status | null>(null);
+  const [surface, setSurface] = useState<Surface>("bitcoin");
   const [tab, setTab] = useState<Tab>("shield");
   const [shieldAmt, setShieldAmt] = useState("0.05");
   const [redeemAmt, setRedeemAmt] = useState("0.05");
@@ -215,9 +218,32 @@ export default function Bridge({
 
   return (
     <div>
-      <h2 className="view-title">₿ ⇄ zBTC Bridge</h2>
+      <h2 className="view-title">Bridge</h2>
       <div className="card" style={{ maxWidth: 620, margin: "0 auto" }}>
-        <div className="bridge-stats">
+        <div className="seg">
+          <button
+            className={`seg-btn ${surface === "bitcoin" ? "active" : ""}`}
+            onClick={() => { setSurface("bitcoin"); setErr(""); }}
+            disabled={busy !== ""}
+          >
+            Bitcoin <span className="seg-sub">BTC ⇄ zBTC</span>
+          </button>
+          <button
+            className={`seg-btn ${surface === "swap" ? "active" : ""}`}
+            onClick={() => { setSurface("swap"); setErr(""); }}
+            disabled={busy !== ""}
+          >
+            Shielded swap <span className="seg-sub">asset ⇄ asset</span>
+          </button>
+        </div>
+
+        {surface === "swap" ? (
+          <div style={{ marginTop: "1.1rem" }}>
+            <AssetSwap active={active} />
+          </div>
+        ) : (
+        <>
+        <div className="bridge-stats" style={{ marginTop: "1.1rem" }}>
           <div className="bridge-stat">
             <span className="util">Bitcoin ({status?.btc_network ?? "…"})</span>
             <div className="reward-amount" style={{ fontSize: "1.5rem", color: "var(--color-cyan)" }}>
@@ -438,6 +464,8 @@ export default function Bridge({
           change. Each step updates the progress bar as it settles on-chain. Requires bitcoind (regtest)
           + a node (Settings).
         </div>
+        </>
+        )}
       </div>
     </div>
   );

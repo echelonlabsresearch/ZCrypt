@@ -189,6 +189,45 @@ impl Esplora {
         hex::decode(h.trim()).map_err(|e| e.to_string())
     }
 
+    /// Merkle proof of the coinbase and `txid` in the confirming block, plus the
+    /// raw coinbase. Built from `/block/:hash/txids` and the raw header, then
+    /// checked against that header's merkle root by consensus.
+    pub fn mint_inclusion(&self, txid: &str) -> Result<(Vec<u8>, Vec<u8>), String> {
+        use bitcoin::consensus::{deserialize, serialize};
+        use bitcoin::merkle_tree::PartialMerkleTree;
+        use bitcoin::{BlockHash, MerkleBlock, Txid};
+
+        let v = self.get_json(&format!("/tx/{txid}/status"))?;
+        if !v["confirmed"].as_bool().unwrap_or(false) {
+            return Err(format!("{txid} is unconfirmed"));
+        }
+        let hash = v["block_hash"].as_str().ok_or("status: confirmed but no block hash")?;
+        let txids_v = self.get_json(&format!("/block/{hash}/txids"))?;
+        let txid_strs: Vec<String> = serde_json::from_value(txids_v).map_err(|e| e.to_string())?;
+        if txid_strs.is_empty() {
+            return Err("block has no transactions".to_string());
+        }
+        let header_hex = self.get_text(&format!("/block/{hash}/header"))?;
+        let header_bytes = hex::decode(header_hex.trim()).map_err(|e| e.to_string())?;
+        let header: bitcoin::block::Header =
+            deserialize(&header_bytes).map_err(|e| format!("block header: {e}"))?;
+        let want = BlockHash::from_str(hash).map_err(|e| e.to_string())?;
+        if header.block_hash() != want {
+            return Err("block header does not match the reported block hash".to_string());
+        }
+        let parsed: Vec<Txid> = txid_strs
+            .iter()
+            .map(|s| Txid::from_str(s).map_err(|e| e.to_string()))
+            .collect::<Result<_, _>>()?;
+        let fund = Txid::from_str(txid).map_err(|e| e.to_string())?;
+        let cb_id = parsed[0];
+        let matches: Vec<bool> = parsed.iter().map(|t| *t == cb_id || *t == fund).collect();
+        let pmt = PartialMerkleTree::from_txids(&parsed, &matches);
+        let mb = MerkleBlock { header, txn: pmt };
+        let coinbase_raw = self.tx_raw(&txid_strs[0])?;
+        Ok((serialize(&mb), coinbase_raw))
+    }
+
     /// Confirmations of a transaction (0 if unconfirmed / in mempool).
     pub fn confirmations(&self, txid: &str) -> Result<u32, String> {
         let v = self.get_json(&format!("/tx/{txid}/status"))?;

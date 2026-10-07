@@ -60,6 +60,7 @@ and every flow in this README demonstrated live against real consensus (the vest
 schedule itself was watched executing block-by-block in an accelerated run). Proofs are
 about 1 MB at 244 conjectured bits of soundness and verify in tens of milliseconds.
 The BTC bridge is mainnet-enabled but single-operator (one hot reserve key). An internal
-multi-reviewer audit ran on 2026-09-07 ([AUDIT-2026-09-07.md](AUDIT-2026-09-07.md)) and
-its findings are fixed in the tree; no external audit has been performed yet. Read
-[security.md](security.md) before trusting it with value you care about.
+multi-reviewer audit ran on 2026-09-07 and its findings are fixed in the tree (the report
+itself is not published; [security.md](security.md) summarises what it found); no external
+audit has been performed yet. Read [security.md](security.md) before trusting it with value
+you care about.

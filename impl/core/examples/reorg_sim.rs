@@ -11,12 +11,12 @@
 //!   cargo run -p zcrypt-core --example reorg_sim
 
 use zcrypt_core::bitcoin::block::Header;
-use zcrypt_core::bitcoin::consensus::{deserialize, serialize};
+use zcrypt_core::bitcoin::consensus::deserialize;
 use zcrypt_core::bitcoin::hashes::Hash as _;
 use zcrypt_core::keys;
 use zcrypt_core::node::Node;
 use zcrypt_core::nullifier::htlc_hashlock;
-use zcrypt_core::spv::{self, testutil, MintProof, REGTEST_GENESIS};
+use zcrypt_core::spv::{self, testutil, REGTEST_GENESIS};
 
 fn header_hash(raw: &[u8; 80]) -> [u8; 32] {
     let h: Header = deserialize(raw).unwrap();
@@ -50,7 +50,9 @@ fn main() {
 
     // Bury the deposit just enough to mint (min_conf=1) but BELOW maturity_conf (3),
     // so the minted coin is still immature + reorg-voidable when the attack lands.
-    let a1 = testutil::mine_header(&REGTEST_GENESIS, &[deposit_tx.clone()], 1_296_690_000);
+    let (a1, proof) = testutil::deposit_proof(
+        &REGTEST_GENESIS, &deposit_tx, 1_296_690_000, reserve, refund, btc_locktime, 0, 1,
+    );
     let a2 = testutil::mine_header(&a1, &[], 1_296_690_600);
     for h in [&a1, &a2] {
         node.submit_btc_headers(h).unwrap();
@@ -62,14 +64,6 @@ fn main() {
         node.spv().confirmations(&a1_hash), node.spv().maturity_for(value));
 
     // ---- Attacker mints + claims zBTC against the (now 3-confirmed) deposit ----
-    let proof = MintProof {
-        reserve_pk: reserve,
-        refund_pk: refund,
-        btc_locktime,
-        vout: 0,
-        raw_tx: serialize(&deposit_tx),
-        merkle_block: testutil::merkle_proof(&a1, &[deposit_tx.clone()], &deposit_tx),
-    };
     const CHAIN: &[u8] = b"zcrypt-devnet";
     let auth = testutil::open_auth_for_proof(9, &proof, testutil::OpenTerms {
         chain_id: CHAIN, asset_id: asset, value, hashlock: &lock, timeout_height: 500, claim_pk: &attacker.pubkey(),

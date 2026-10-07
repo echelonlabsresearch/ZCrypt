@@ -24,9 +24,11 @@ pub const ATOMIC: u64 = 1_000_000;
 /// Minimum transaction fee: **0.01 ZCRYPT**. ZCRYPT is the universal gas asset: every
 /// action that moves value pays at least this, and the fee is **burned** (removed from
 /// supply). Enforced as a consensus rule (not in the circuit, which proves conservation
-/// for any fee): a shield spend must carry `fee >= MIN_FEE`, and state-creating actions
-/// (REGISTER, HTLC_OPEN, the escrow locks) carry a ZCRYPT gas note that burns exactly
-/// this. CLAIM / UNBOND / UNDELEGATE are gasless by design (a claim must take the FULL
+/// for any fee). A user transfer (`0x55`) and an in-pool swap lock (`0x62`) carry a
+/// separate ZCRYPT gas note that burns exactly this, and the asset spend itself has
+/// fee 0. A burn-lock (`0x5D` / `0x67`) still burns this amount of the locked asset
+/// inside that one proof. REGISTER and HTLC_OPEN carry a ZCRYPT gas note. CLAIM /
+/// UNBOND / UNDELEGATE are gasless by design (a claim must take the FULL
 /// claimable balance and is bounded by reward accrual; unbond/undelegate are signed and
 /// nonce-protected), so they do not debit the released value. A flat floor: a sender may
 /// always pay more.

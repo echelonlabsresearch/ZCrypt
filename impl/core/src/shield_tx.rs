@@ -138,6 +138,14 @@ pub fn enc_notes_digest(enc_notes: &[Vec<u8>]) -> [u64; 8] {
     aux_digest(enc_notes, &[])
 }
 
+/// Envelope that binds a ZCRYPT gas proof to the transaction it pays for.
+/// `payload` is the main proof's [`txbind`] for a shielded bundle, or the
+/// transparent body that follows the gas prefix for REGISTER and HTLC_OPEN.
+/// The digest is never empty, so a gas proof built with no envelope does not verify.
+pub fn gas_pay_envelope(payload: &[u8]) -> Vec<u8> {
+    h(b"ZC-GASPAY", &[payload]).to_vec()
+}
+
 /// Build a shielded-pool spend: prove whole-tree membership + openings + nullifiers +
 /// conservation. `spends` (1..=`N_IN`) carry each input's coin + authentication path;
 /// `outputs` are `(value, blind, recipient_pk, asset)` for the `N_OUT` new coins.
@@ -475,7 +483,7 @@ mod tests {
     fn path_in_pool(pool: &[Commitment], leaf_idx: usize) -> (Vec<Commitment>, Vec<bool>) {
         let mut t = zcrypt_shield::tree::CommitmentTree::new();
         for &c in pool {
-            t.append(c);
+            t.append(c).unwrap();
         }
         t.path(leaf_idx).unwrap()
     }

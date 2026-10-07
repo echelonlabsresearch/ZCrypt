@@ -856,15 +856,36 @@ impl HeaderChain {
                 return Err("SPV proof: claim key is not the asset's pinned reserve key".to_string());
             }
         }
+        let tx: Transaction =
+            deserialize(&proof.raw_tx).map_err(|e| format!("SPV proof: bad funding tx: {e}"))?;
+        let coinbase: Transaction =
+            deserialize(&proof.coinbase_raw).map_err(|e| format!("SPV proof: bad coinbase: {e}"))?;
+        // A 64-byte non-witness serialization is the same width as an inner merkle node.
+        // The coinbase, as the index-0 leaf of this same partial tree, fixes the height.
+        if tx.base_size() == 64 || coinbase.base_size() == 64 {
+            return Err(
+                "SPV proof: 64-byte transaction serialization is ambiguous with a merkle node"
+                    .to_string(),
+            );
+        }
+        if !coinbase.is_coinbase() {
+            return Err("SPV proof: coinbase transaction is not a coinbase".to_string());
+        }
         let mut matched = Vec::new();
         let mut indexes = Vec::new();
         mb.extract_matches(&mut matched, &mut indexes)
             .map_err(|e| format!("SPV proof: merkle proof invalid: {e:?}"))?;
-        let tx: Transaction =
-            deserialize(&proof.raw_tx).map_err(|e| format!("SPV proof: bad funding tx: {e}"))?;
         let txid = tx.compute_txid();
         if !matched.contains(&txid) {
             return Err("SPV proof: funding tx not proven in the block".to_string());
+        }
+        let cbid = coinbase.compute_txid();
+        let coinbase_at_zero = match matched.iter().position(|id| *id == cbid) {
+            Some(i) => indexes[i] == 0,
+            None => false,
+        };
+        if !coinbase_at_zero {
+            return Err("SPV proof: coinbase is not the index-0 leaf of this merkle proof".to_string());
         }
         let out = tx
             .output
@@ -1052,16 +1073,22 @@ pub struct MintProof {
     pub vout: u32,
     /// The raw funding transaction.
     pub raw_tx: Vec<u8>,
-    /// A `merkleblock` (header + partial merkle tree) proving the funding tx is
-    /// in a block — the exact format of bitcoind's `gettxoutproof` and Esplora's
-    /// `/tx/:txid/merkleblock-proof`.
+    /// A `merkleblock` (header + partial merkle tree) proving both the coinbase
+    /// and the funding tx into one block. bitcoind's `gettxoutproof` accepts both
+    /// txids; the partial tree's index-0 match is the coinbase.
     pub merkle_block: Vec<u8>,
+    /// Raw coinbase transaction of that same block. Its txid must be the index-0
+    /// leaf of `merkle_block`, which pins the tree height.
+    pub coinbase_raw: Vec<u8>,
 }
 
 impl MintProof {
-    /// Wire encoding: reserve33 ‖ refund33 ‖ locktime4 ‖ vout4 ‖ txlen4 ‖ tx ‖ mblen4 ‖ mb.
+    /// Wire encoding: reserve33 ‖ refund33 ‖ locktime4 ‖ vout4 ‖ txlen4 ‖ tx ‖
+    /// mblen4 ‖ mb ‖ cblen4 ‖ coinbase.
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut b = Vec::with_capacity(78 + self.raw_tx.len() + self.merkle_block.len());
+        let mut b = Vec::with_capacity(
+            82 + self.raw_tx.len() + self.merkle_block.len() + self.coinbase_raw.len(),
+        );
         b.extend_from_slice(&self.reserve_pk);
         b.extend_from_slice(&self.refund_pk);
         b.extend_from_slice(&self.btc_locktime.to_le_bytes());
@@ -1070,6 +1097,8 @@ impl MintProof {
         b.extend_from_slice(&self.raw_tx);
         b.extend_from_slice(&(self.merkle_block.len() as u32).to_le_bytes());
         b.extend_from_slice(&self.merkle_block);
+        b.extend_from_slice(&(self.coinbase_raw.len() as u32).to_le_bytes());
+        b.extend_from_slice(&self.coinbase_raw);
         b
     }
 
@@ -1105,11 +1134,25 @@ impl MintProof {
         let raw_tx = b[78..tx_end].to_vec();
         let mb_len = u32::from_le_bytes(b[tx_end..tx_end + 4].try_into().ok()?) as usize;
         let mb_end = (tx_end + 4).checked_add(mb_len)?;
-        if b.len() != mb_end {
+        if b.len() < mb_end + 4 {
             return None;
         }
         let merkle_block = b[tx_end + 4..mb_end].to_vec();
-        Some(MintProof { reserve_pk, refund_pk, btc_locktime, vout, raw_tx, merkle_block })
+        let cb_len = u32::from_le_bytes(b[mb_end..mb_end + 4].try_into().ok()?) as usize;
+        let cb_end = (mb_end + 4).checked_add(cb_len)?;
+        if b.len() != cb_end {
+            return None;
+        }
+        let coinbase_raw = b[mb_end + 4..cb_end].to_vec();
+        Some(MintProof {
+            reserve_pk,
+            refund_pk,
+            btc_locktime,
+            vout,
+            raw_tx,
+            merkle_block,
+            coinbase_raw,
+        })
     }
 }
 
@@ -1202,16 +1245,94 @@ pub mod testutil {
         }
     }
 
-    /// The `merkleblock` proof bytes for `tx` inside the block `header` + `txs`.
-    pub fn merkle_proof(raw_header: &[u8; 80], txs: &[Transaction], tx: &Transaction) -> Vec<u8> {
+    /// The `merkleblock` proof bytes for every txid in `want`, inside `header` + `txs`.
+    pub fn merkle_proof_matching(
+        raw_header: &[u8; 80],
+        txs: &[Transaction],
+        want: &[bitcoin::Txid],
+    ) -> Vec<u8> {
         use bitcoin::merkle_tree::PartialMerkleTree;
         let header: Header = deserialize(raw_header).unwrap();
         let txids: Vec<bitcoin::Txid> = txs.iter().map(|t| t.compute_txid()).collect();
-        let want = tx.compute_txid();
-        let matches: Vec<bool> = txids.iter().map(|t| *t == want).collect();
+        let matches: Vec<bool> = txids.iter().map(|t| want.contains(t)).collect();
         let pmt = PartialMerkleTree::from_txids(&txids, &matches);
         let mb = MerkleBlock { header, txn: pmt };
         serialize(&mb)
+    }
+
+    /// The `merkleblock` proof bytes for `tx` inside the block `header` + `txs`.
+    pub fn merkle_proof(raw_header: &[u8; 80], txs: &[Transaction], tx: &Transaction) -> Vec<u8> {
+        merkle_proof_matching(raw_header, txs, &[tx.compute_txid()])
+    }
+
+    /// Coinbase whose non-witness serialization is not 64 bytes: one null input,
+    /// an 8-byte scriptSig, and a P2PKH output. `tag` only varies the scriptSig.
+    pub fn coinbase_tx(tag: u32) -> Transaction {
+        let mut sig = tag.to_le_bytes().to_vec();
+        sig.extend_from_slice(&[0, 0, 0, 0]);
+        let mut spk = vec![0x76, 0xa9, 0x14];
+        spk.extend_from_slice(&[0x11; 20]);
+        spk.extend_from_slice(&[0x88, 0xac]);
+        let tx = Transaction {
+            version: bitcoin::transaction::Version::ONE,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: ScriptBuf::from(sig),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(50 * 100_000_000),
+                script_pubkey: ScriptBuf::from(spk),
+            }],
+        };
+        debug_assert!(tx.is_coinbase());
+        debug_assert_ne!(tx.base_size(), 64, "coinbase must not be merkle-node width");
+        tx
+    }
+
+    /// A transaction whose non-witness serialization is exactly 64 bytes.
+    pub fn ambiguous_64_tx() -> Transaction {
+        Transaction {
+            version: bitcoin::transaction::Version::ONE,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: ScriptBuf::from(vec![0x51, 0x51, 0x51, 0x51]),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut { value: Amount::ZERO, script_pubkey: ScriptBuf::new() }],
+        }
+    }
+
+    /// Mine `[coinbase, funding]` on `prev` and the mint proof for both leaves.
+    /// The returned header is the one the proof's merkle block commits to.
+    pub fn deposit_proof(
+        prev: &[u8; 80],
+        funding: &Transaction,
+        time: u32,
+        reserve_pk: [u8; 33],
+        refund_pk: [u8; 33],
+        btc_locktime: u32,
+        vout: u32,
+        tag: u32,
+    ) -> ([u8; 80], MintProof) {
+        let cb = coinbase_tx(tag);
+        let txs = [cb.clone(), funding.clone()];
+        let header = mine_header(prev, &txs, time);
+        let want = [cb.compute_txid(), funding.compute_txid()];
+        let proof = MintProof {
+            reserve_pk,
+            refund_pk,
+            btc_locktime,
+            vout,
+            raw_tx: serialize(funding),
+            merkle_block: merkle_proof_matching(&header, &txs, &want),
+            coinbase_raw: serialize(&cb),
+        };
+        (header, proof)
     }
 
     /// A deterministic valid compressed secp256k1 pubkey for tests.
@@ -1463,16 +1584,17 @@ mod tests {
         let refund = test_pk(9);
         let locktime = (c.tip_height() + 100) as u32;
         let tx = funding_tx(&hashlock, &reserve, &refund, locktime, value_sats, salt);
-        let block = mine_header(&c_last(c), &[tx.clone()], 1_296_688_602 + 600 * (salt + 1));
+        let (block, proof) = deposit_proof(
+            &c_last(c),
+            &tx,
+            1_296_688_602 + 600 * (salt + 1),
+            reserve,
+            refund,
+            locktime,
+            0,
+            salt,
+        );
         c.submit_headers(&block).unwrap();
-        let proof = MintProof {
-            reserve_pk: reserve,
-            refund_pk: refund,
-            btc_locktime: locktime,
-            vout: 0,
-            raw_tx: serialize(&tx),
-            merkle_block: merkle_proof(&block, &[tx.clone()], &tx),
-        };
         (spv_authority(&reserve), proof, hashlock)
     }
 
@@ -1545,16 +1667,8 @@ mod tests {
         // Locktime only 5 blocks out — inside the regtest margin of 20.
         let locktime = (c.tip_height() + 5) as u32;
         let tx = funding_tx(&hashlock, &reserve, &refund, locktime, 50_000, 42);
-        let block = mine_header(&c_last(&c), &[tx.clone()], 1_296_700_000);
+        let (block, proof) = deposit_proof(&c_last(&c), &tx, 1_296_700_000, reserve, refund, locktime, 0, 42);
         c.submit_headers(&block).unwrap();
-        let proof = MintProof {
-            reserve_pk: reserve,
-            refund_pk: refund,
-            btc_locktime: locktime,
-            vout: 0,
-            raw_tx: serialize(&tx),
-            merkle_block: merkle_proof(&block, &[tx.clone()], &tx),
-        };
         assert!(c
             .verify_mint_proof(&spv_authority(&reserve), 50_000, &hashlock, &proof)
             .unwrap_err()
@@ -1571,12 +1685,8 @@ mod tests {
         let (reserve, refund) = (test_pk(7), test_pk(9));
         let locktime = 600_000_000u32; // 1989 as a timestamp, "height 600M" to a naive check
         let tx = funding_tx(&hashlock, &reserve, &refund, locktime, 50_000, 77);
-        let block = mine_header(&c_last(&c), &[tx.clone()], 1_296_700_000);
+        let (block, proof) = deposit_proof(&c_last(&c), &tx, 1_296_700_000, reserve, refund, locktime, 0, 77);
         c.submit_headers(&block).unwrap();
-        let proof = MintProof {
-            reserve_pk: reserve, refund_pk: refund, btc_locktime: locktime, vout: 0,
-            raw_tx: serialize(&tx), merkle_block: merkle_proof(&block, &[tx.clone()], &tx),
-        };
         let err = c.verify_mint_proof(&spv_authority(&reserve), 50_000, &hashlock, &proof).unwrap_err();
         assert!(err.contains("timestamp"), "{err}");
         // Re-anchoring an already-claimed deposit is bound by the same type check.
@@ -1594,12 +1704,8 @@ mod tests {
         // past the bound measured now.
         let far = (c.tip_height() + max_locktime_ahead(BtcNet::Regtest) + 2) as u32;
         let tx = funding_tx(&hashlock, &reserve, &refund, far, 50_000, 78);
-        let block = mine_header(&c_last(&c), &[tx.clone()], 1_296_700_000);
+        let (block, proof) = deposit_proof(&c_last(&c), &tx, 1_296_700_000, reserve, refund, far, 0, 78);
         c.submit_headers(&block).unwrap();
-        let proof = MintProof {
-            reserve_pk: reserve, refund_pk: refund, btc_locktime: far, vout: 0,
-            raw_tx: serialize(&tx), merkle_block: merkle_proof(&block, &[tx.clone()], &tx),
-        };
         assert!(c.verify_mint_proof(&spv_authority(&reserve), 50_000, &hashlock, &proof).unwrap_err().contains("too far ahead"));
         // Dust: below the network minimum, unsweepable for the reserve.
         let (auth, proof2, lock2) = proven_deposit(&mut c, 500, 79);
@@ -1677,6 +1783,36 @@ mod tests {
         assert!(MintProof::from_bytes(&extra).is_none());
         assert!(MintProof::from_bytes(&bytes[..bytes.len() - 1]).is_none());
         assert!(MintProof::from_bytes(&[]).is_none());
+    }
+
+    #[test]
+    fn mint_proof_rejects_64_byte_txs_and_a_proof_that_omits_the_coinbase() {
+        let mut c = HeaderChain::new(BtcNet::Regtest);
+        let (authority, proof, hashlock) = proven_deposit(&mut c, 100_000, 11);
+        let ambiguous = ambiguous_64_tx();
+        assert_eq!(ambiguous.base_size(), 64, "fixture must be merkle-node width");
+        let mut wide = proof.clone();
+        wide.raw_tx = serialize(&ambiguous);
+        assert!(c
+            .verify_mint_proof(&authority, 100_000, &hashlock, &wide)
+            .unwrap_err()
+            .contains("64"));
+        let mut wide_cb = proof.clone();
+        wide_cb.coinbase_raw = serialize(&ambiguous);
+        assert!(c
+            .verify_mint_proof(&authority, 100_000, &hashlock, &wide_cb)
+            .unwrap_err()
+            .contains("64"));
+
+        // Same header and funding tx, but the partial tree matches only the funding leaf.
+        let tx: Transaction = deserialize(&proof.raw_tx).unwrap();
+        let cb: Transaction = deserialize(&proof.coinbase_raw).unwrap();
+        let mb: MerkleBlock = deserialize(&proof.merkle_block).unwrap();
+        let raw_header: [u8; 80] = serialize(&mb.header).try_into().unwrap();
+        let mut omitted = proof.clone();
+        omitted.merkle_block = merkle_proof(&raw_header, &[cb, tx.clone()], &tx);
+        let err = c.verify_mint_proof(&authority, 100_000, &hashlock, &omitted).unwrap_err();
+        assert!(err.contains("coinbase"), "{err}");
     }
 
     #[test]

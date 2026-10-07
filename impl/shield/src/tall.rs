@@ -118,8 +118,8 @@ impl BaseAir<BabyBear> for CoinsAirTall {
     }
 }
 
-/// Run one Poseidon2 compression block over a `BLK`-wide slice; return its 8 outputs.
-fn eval_block<AB: AirBuilder<F = BabyBear>>(builder: &mut AB, cols_slice: &[AB::Var]) -> [AB::Var; 8] {
+/// Run one Poseidon2 block over a `BLK`-wide slice and return `Trunc_8(P(x) + x)`.
+fn eval_block<AB: AirBuilder<F = BabyBear>>(builder: &mut AB, cols_slice: &[AB::Var]) -> [AB::Expr; 8] {
     let cols: &Poseidon2Cols<AB::Var, WIDTH, SD, SR, HFR, PR> = cols_slice.borrow();
     let mut state: [AB::Expr; WIDTH] = core::array::from_fn(|k| cols.inputs[k].into());
     LL::external_linear_layer(&mut state);
@@ -132,7 +132,9 @@ fn eval_block<AB: AirBuilder<F = BabyBear>>(builder: &mut AB, cols_slice: &[AB::
     for r in 0..HFR {
         eval_full::<AB>(&mut state, &cols.ending_full_rounds[r], &RC_EF[r], builder);
     }
-    core::array::from_fn(|k| cols.ending_full_rounds[HFR - 1].post[k])
+    core::array::from_fn(|k| {
+        feed_forward::<AB>(cols.ending_full_rounds[HFR - 1].post[k], cols.inputs[k])
+    })
 }
 
 impl<AB: AirBuilder<F = BabyBear>> Air<AB> for CoinsAirTall {
@@ -157,7 +159,7 @@ impl<AB: AirBuilder<F = BabyBear>> Air<AB> for CoinsAirTall {
         let p_p1last: AB::Expr = pre[P_P1LAST].into();
 
         // Every row: all CORE column groups are valid Poseidon2 compressions.
-        let outs: Vec<[AB::Var; 8]> = (0..CORE)
+        let outs: Vec<[AB::Expr; 8]> = (0..CORE)
             .map(|g| eval_block(builder, &local[g * BLK..(g + 1) * BLK]))
             .collect();
 
@@ -203,14 +205,12 @@ impl<AB: AirBuilder<F = BabyBear>> Air<AB> for CoinsAirTall {
                 let one_minus_act = AB::Expr::ONE - act.clone();
                 core_zero!(builder, one_minus_act.clone() * Into::<AB::Expr>::into(local[i * BLK]));
                 core_zero!(builder, one_minus_act * Into::<AB::Expr>::into(local[i * BLK + 1]));
-                // Role tag: the input commitment's lane [15] is TAG_COMMIT, mirroring the
-                // output-coin constraint below. Real leaves are always built with
-                // lane[15]=TAG_COMMIT (see `coin_input`), so this binds the last free
-                // preimage lane and denies a malleable second opening of a spent coin.
+                // Role tag: the input commitment's lane [15] is TAG_COMMIT, matching
+                // `coin_input` and the output-coin constraint below.
                 core_zero!(builder, Into::<AB::Expr>::into(local[i * BLK + 15]) - konst::<AB>(TAG_COMMIT));
-                // OWNERSHIP: pk in the commitment (input[6..14]) == Poseidon2(ss).
+                // OWNERSHIP: pk in the commitment (input[6..14]) equals the pk compression.
                 for t in 0..8 {
-                    core_zero!(builder, Into::<AB::Expr>::into(local[i * BLK + 6 + t]) - outs[pk_blk][t].into());
+                    core_zero!(builder, Into::<AB::Expr>::into(local[i * BLK + 6 + t]) - outs[pk_blk][t].clone());
                 }
                 for t in 8..WIDTH - 1 {
                     core_zero!(builder, Into::<AB::Expr>::into(local[pk_blk * BLK + t]));
@@ -229,12 +229,12 @@ impl<AB: AirBuilder<F = BabyBear>> Air<AB> for CoinsAirTall {
                 core_zero!(builder, Into::<AB::Expr>::into(local[nf_blk * BLK + 15]) - konst::<AB>(TAG_NF));
                 // Published nullifier for EVERY input (real or dummy) — arity-leak fix.
                 for k in 0..8 {
-                    core_zero!(builder, Into::<AB::Expr>::into(outs[nf_blk][k]) - pis[nf_off + i * 8 + k].clone());
+                    core_zero!(builder, outs[nf_blk][k].clone() - pis[nf_off + i * 8 + k].clone());
                 }
             } else {
                 core_zero!(builder, Into::<AB::Expr>::into(local[i * BLK + 15]) - konst::<AB>(TAG_COMMIT));
                 for j in 0..8 {
-                    core_zero!(builder, Into::<AB::Expr>::into(outs[i][j]) - pis[out_off + (i - N_IN) * 8 + j].clone());
+                    core_zero!(builder, outs[i][j].clone() - pis[out_off + (i - N_IN) * 8 + j].clone());
                 }
             }
         }
@@ -267,7 +267,7 @@ impl<AB: AirBuilder<F = BabyBear>> Air<AB> for CoinsAirTall {
         // Load carries on the core row: CLEAF := leaf of input 1 (commit block 1's
         // output); CACT[i] := active_i.
         for j in 0..8 {
-            core_zero!(builder, Into::<AB::Expr>::into(local[R_CLEAF + j]) - outs[1][j].into());
+            core_zero!(builder, Into::<AB::Expr>::into(local[R_CLEAF + j]) - outs[1][j].clone());
         }
         for i in 0..N_IN {
             core_zero!(builder, Into::<AB::Expr>::into(local[R_CACT + i]) - local[R_ACT + i].into());
@@ -307,7 +307,7 @@ impl<AB: AirBuilder<F = BabyBear>> Air<AB> for CoinsAirTall {
             let mut wt = builder.when_transition();
             let run_next = running(&next);
             for j in 0..8 {
-                wt.assert_zero(p_core.clone() * (run_next[j].clone() - outs[0][j].into()));
+                wt.assert_zero(p_core.clone() * (run_next[j].clone() - outs[0][j].clone()));
             }
         }
 
@@ -325,7 +325,7 @@ impl<AB: AirBuilder<F = BabyBear>> Air<AB> for CoinsAirTall {
             let mut wt = builder.when_transition();
             let run_next = running(&next);
             for j in 0..8 {
-                wt.assert_zero(p_chain.clone() * (run_next[j].clone() - outs[0][j].into()));
+                wt.assert_zero(p_chain.clone() * (run_next[j].clone() - outs[0][j].clone()));
             }
         }
 
@@ -335,8 +335,8 @@ impl<AB: AirBuilder<F = BabyBear>> Air<AB> for CoinsAirTall {
             let root_j = pis[root_off + j].clone();
             let cact0: AB::Expr = local[R_CACT].into();
             let cact1: AB::Expr = local[R_CACT + 1].into();
-            builder.assert_zero(p_p0last.clone() * cact0 * (Into::<AB::Expr>::into(outs[0][j]) - root_j.clone()));
-            builder.assert_zero(p_p1last.clone() * cact1 * (Into::<AB::Expr>::into(outs[0][j]) - root_j));
+            builder.assert_zero(p_p0last.clone() * cact0 * (outs[0][j].clone() - root_j.clone()));
+            builder.assert_zero(p_p1last.clone() * cact1 * (outs[0][j].clone() - root_j));
         }
     }
 }
@@ -896,8 +896,12 @@ mod tests {
         // guard must therefore never fire.
         assert!(crate::fri_num_queries() >= crate::MAINNET_MIN_QUERIES);
         assert!(crate::fri_pow_bits() >= crate::MAINNET_MIN_POW_BITS);
-        assert!(crate::conjectured_soundness_bits() >= crate::MAINNET_MIN_SOUNDNESS_BITS);
+        // The floor checks the Johnson bound, which still clears 100 and 128.
+        // SOUNDNESS_BITS remains the list-decoding conjecture, a separate claim.
+        assert!(crate::johnson_soundness_bits() >= 100);
+        assert!(crate::johnson_soundness_bits() >= crate::MAINNET_MIN_SOUNDNESS_BITS);
         assert_eq!(crate::conjectured_soundness_bits(), crate::SOUNDNESS_BITS);
+        assert!(crate::conjectured_soundness_bits() > crate::johnson_soundness_bits());
         assert!(crate::is_mainnet_grade(), "shipped FRI constants must be mainnet-grade");
         crate::assert_mainnet_grade(); // must NOT panic
     }

@@ -6,10 +6,9 @@
 use bitcoin::Amount;
 use zcrypt_bridge::swap;
 use zcrypt_bridge::zcrypt::Zcrypt;
-use zcrypt_bridge::{htlc_script, Btc, BtcBackend, Key};
+use zcrypt_bridge::{htlc_script, Btc, Key};
 use zcrypt_core::keys::Account;
 use zcrypt_core::nullifier::htlc_hashlock;
-use zcrypt_core::spv::MintProof;
 use zcrypt_shield::commit_asset;
 
 fn main() {
@@ -60,14 +59,15 @@ fn main() {
         let script = htlc_script(&lock, &wrong.pk, &user_btc_key.pk, locktime);
         let utxo = user_btc.fund_htlc(&script, btc_amt).unwrap();
         swap::relay_btc_headers(&zc, &user_btc).unwrap();
-        let proof = MintProof {
-            reserve_pk: wrong.pk.inner.serialize(),
-            refund_pk: user_btc_key.pk.inner.serialize(),
-            btc_locktime: locktime,
-            vout: utxo.outpoint.vout,
-            raw_tx: user_btc.raw_tx(&utxo.outpoint.txid).unwrap(),
-            merkle_block: user_btc.txout_proof(&utxo.outpoint.txid).unwrap(),
-        };
+        let proof = swap::mint_proof_for_txid(
+            &user_btc,
+            wrong.pk.inner.serialize(),
+            user_btc_key.pk.inner.serialize(),
+            locktime,
+            utxo.outpoint.vout,
+            &utxo.outpoint.txid,
+        )
+        .unwrap();
         let zc_timeout = zc.height().unwrap() as u64 + swap::ZC_HTLC_TIMEOUT_BLOCKS;
         let res = zc.broadcast(&swap::open_spv_tx(asset, btc_amt.to_sat(), &lock, zc_timeout, &user.pubkey(), &proof, &user_btc_key));
         assert!(res.is_err(), "ATTACK 1 FAILED: wrong-key mint was ACCEPTED (unbacked zBTC!)");

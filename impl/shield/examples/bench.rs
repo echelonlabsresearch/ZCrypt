@@ -9,6 +9,7 @@ use zcrypt_shield::{
     commit_asset, prove, spend_pubkey, tree, verify, zvm, Blind, OutCoin, SpendSecret,
     SpendWitness, ASSET_ZCRYPT, N_IN, SOUNDNESS_BITS,
 };
+use zcrypt_shield::johnson_soundness_bits;
 
 fn bl(b: u64) -> Blind { let b = zcrypt_shield::field_limb(b); [b, zcrypt_shield::field_limb(b.wrapping_add(0x9e37)), zcrypt_shield::field_limb(b.wrapping_add(1)), zcrypt_shield::field_limb(b.wrapping_add(2))] }
 fn ss(s: u64) -> SpendSecret { let s = zcrypt_shield::field_limb(s); core::array::from_fn(|i| zcrypt_shield::field_limb(s ^ ((i as u64 + 1) * 0x11))) }
@@ -85,7 +86,11 @@ fn bench(label: &str, ins: &[SpendWitness], outs: &[OutCoin], fee: u64) {
 
 fn main() {
     println!("ZCrypt shield proof benchmark — release build");
-    println!("field=BabyBear(31-bit)  Poseidon2(w=16)  shielded-pool (whole-tree)  N_IN(max)={N_IN}  soundness={SOUNDNESS_BITS} bits");
+    println!(
+        "field=BabyBear(31-bit)  Poseidon2 feed-forward  shielded-pool (whole-tree)  N_IN(max)={N_IN}  johnson={} bits  conjectured={} bits",
+        johnson_soundness_bits(),
+        SOUNDNESS_BITS
+    );
 
     bench(
         "2-input / 2-output spend",

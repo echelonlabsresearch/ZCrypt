@@ -740,9 +740,14 @@ pub trait BtcBackend {
     fn block_header(&self, height: u64) -> Result<[u8; 80], String>;
     /// The raw bytes of a confirmed transaction.
     fn raw_tx(&self, txid: &Txid) -> Result<Vec<u8>, String>;
-    /// A `merkleblock` inclusion proof for a confirmed transaction (bitcoind's
-    /// `gettxoutproof` / Esplora's `merkleblock-proof` — identical wire format).
+    /// A `merkleblock` inclusion proof for a confirmed transaction. The partial
+    /// tree matches the coinbase (index 0) and `txid`, so the mint check can pin
+    /// the tree height. bitcoind's `gettxoutproof` of both txids.
     fn txout_proof(&self, txid: &Txid) -> Result<Vec<u8>, String>;
+    /// Raw coinbase of the block that confirms `txid`.
+    fn coinbase_raw(&self, _txid: &Txid) -> Result<Vec<u8>, String> {
+        Err("coinbase_raw not supported by this backend".to_string())
+    }
 }
 
 impl BtcBackend for Btc {
@@ -840,11 +845,47 @@ impl BtcBackend for Btc {
         Ok(bitcoin::consensus::encode::serialize(&tx))
     }
     fn txout_proof(&self, txid: &Txid) -> Result<Vec<u8>, String> {
+        let (block_hash, txids) = self.block_txids(txid)?;
+        let mut ids = vec![txids[0].clone()];
+        let fund = txid.to_string();
+        if fund != txids[0] {
+            ids.push(fund);
+        }
         let hex_proof: String = self
             .rpc
-            .call("gettxoutproof", &[serde_json::json!([txid.to_string()])])
+            .call(
+                "gettxoutproof",
+                &[serde_json::json!(ids), serde_json::json!(block_hash.to_string())],
+            )
             .map_err(|e| e.to_string())?;
         hex::decode(hex_proof.trim()).map_err(|e| e.to_string())
+    }
+    fn coinbase_raw(&self, txid: &Txid) -> Result<Vec<u8>, String> {
+        let (_block, txids) = self.block_txids(txid)?;
+        let cb = Txid::from_str(&txids[0]).map_err(|e| e.to_string())?;
+        self.raw_tx(&cb)
+    }
+}
+
+impl Btc {
+    /// Txids of the block confirming `txid`, coinbase first.
+    fn block_txids(&self, txid: &Txid) -> Result<(bitcoin::BlockHash, Vec<String>), String> {
+        let info = self.rpc.get_raw_transaction_info(txid, None).map_err(|e| e.to_string())?;
+        let block_hash = info.blockhash.ok_or_else(|| format!("{txid} is unconfirmed"))?;
+        let block: serde_json::Value = self
+            .rpc
+            .call("getblock", &[serde_json::json!(block_hash.to_string()), serde_json::json!(1)])
+            .map_err(|e| e.to_string())?;
+        let txids = block["tx"]
+            .as_array()
+            .ok_or("block has no tx list")?
+            .iter()
+            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+            .collect::<Vec<_>>();
+        if txids.is_empty() {
+            return Err("block has no transactions".to_string());
+        }
+        Ok((block_hash, txids))
     }
 }
 

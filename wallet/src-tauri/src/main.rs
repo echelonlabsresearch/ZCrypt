@@ -256,6 +256,58 @@ struct PendingDeposit {
     refund_txid: Option<String>,
 }
 
+/// Change from a swap lock. The blind and spend secret are what let the wallet
+/// spend the coin again; they are saved with the pending swap before broadcast.
+#[derive(Clone, Serialize, Deserialize)]
+struct SwapChange {
+    value: u64,
+    blind: [u64; 4],
+    spend_secret: [u64; 8],
+    #[serde(default)]
+    asset_id: u64,
+}
+
+/// An in-pool shielded swap in flight. The preimage stays in this record (taker only) and
+/// is saved before the lock is broadcast. `their_escrow` is the other leg, derived from the
+/// same timeout rule both wallets use, so neither side has to scan the chain to find it.
+#[derive(Clone, Serialize, Deserialize)]
+struct PendingSwap {
+    /// "taker" locks first and reveals the preimage. "maker" locks second and claims after.
+    role: String,
+    #[serde(default)]
+    preimage_hex: String,
+    hashlock_hex: String,
+    #[serde(with = "u64_str")]
+    give_asset: u64,
+    #[serde(with = "u64_str")]
+    give_amount: u64,
+    #[serde(with = "u64_str")]
+    take_asset: u64,
+    #[serde(with = "u64_str")]
+    take_amount: u64,
+    /// The other party's spend pubkey, 64-byte hex.
+    counterparty_pk_hex: String,
+    my_escrow_hex: String,
+    their_escrow_hex: String,
+    my_timeout: u64,
+    /// Commitments of the coins this lock spent, including the ZCRYPT gas coin, so a
+    /// crash after broadcast can mark them.
+    #[serde(default)]
+    input_commitments: Vec<String>,
+    /// Change this lock creates. Kept here until the lock is visible, so a crash
+    /// after the node accepts it can still put the change back in the wallet.
+    #[serde(default)]
+    changes: Vec<SwapChange>,
+    started_height: i64,
+    /// How many blocks back the maker searches for the revealed preimage. Grows until
+    /// the search reaches the block where this lock was made.
+    #[serde(default)]
+    scanned_through: i64,
+    /// Offer text the taker hands to the maker. Empty for the maker.
+    #[serde(default)]
+    ticket: String,
+}
+
 /// A zBTC -> BTC redeem in flight (wallet M11). Written and SAVED before the burn escrow is
 /// broadcast, so a crash at any later point can resume: claim the operator's HTLC with the
 /// stored preimage, or expire the escrow to get the zBTC back.
@@ -334,6 +386,7 @@ struct Wallet {
     /// BTC to zBTC deposits started but not yet completed (resumable, see `bridge_recover`).
     pending_deposits: Vec<PendingDeposit>,
     pending_redeems: Vec<PendingRedeemRec>,
+    pending_swaps: Vec<PendingSwap>,
     pending_secrets: Vec<PendingSecret>,
     next_secret_id: u64,
 }
@@ -358,6 +411,7 @@ impl Wallet {
             escrows: vec![],
             pending_deposits: vec![],
             pending_redeems: vec![],
+            pending_swaps: vec![],
             pending_secrets: vec![],
             next_secret_id: 1,
         }
@@ -588,6 +642,8 @@ struct PersistState {
     #[serde(default)]
     pending_redeems: Vec<PendingRedeemRec>,
     #[serde(default)]
+    pending_swaps: Vec<PendingSwap>,
+    #[serde(default)]
     pending_secrets: Vec<PendingSecret>,
     #[serde(default)]
     next_secret_id: u64,
@@ -633,6 +689,7 @@ fn save_state(w: &Wallet, dir: &str) -> Result<(), String> {
         escrows: w.escrows.clone(),
         pending_deposits: w.pending_deposits.clone(),
         pending_redeems: w.pending_redeems.clone(),
+        pending_swaps: w.pending_swaps.clone(),
         pending_secrets: w.pending_secrets.clone(),
         next_secret_id: w.next_secret_id,
     };
@@ -702,6 +759,7 @@ fn load_state(w: &mut Wallet, dir: &str) {
     w.escrows = ps.escrows;
     w.pending_deposits = ps.pending_deposits;
     w.pending_redeems = ps.pending_redeems;
+    w.pending_swaps = ps.pending_swaps;
     w.pending_secrets = ps.pending_secrets;
     w.next_secret_id = ps.next_secret_id.max(w.pending_secrets.iter().map(|p| p.id + 1).max().unwrap_or(1));
     // Every logged action index must stay inside the scan window.
@@ -3993,6 +4051,768 @@ fn held_assets(state: State<AppState>) -> R<Vec<HeldAsset>> {
     ok(out)
 }
 
+/// How long the taker's offer stays open, in ZCrypt blocks. The maker's lock expires
+/// this many blocks before the taker's, which is the window the maker has to claim
+/// after the preimage is revealed.
+const SWAP_WINDOW_BLOCKS: u64 = 1_800;
+
+/// A shielded-asset offer. Both wallets derive the maker's escrow from the taker's
+/// timeout, so the text carries no secret. The preimage never leaves the taker.
+struct SwapTicket {
+    give_asset: u64,
+    give_amount: u64,
+    take_asset: u64,
+    take_amount: u64,
+    hashlock: [u8; 32],
+    taker_pk: zcrypt_shield::PubKey,
+    give_timeout: u64,
+    give_escrow: [u8; 32],
+    maker_pk: zcrypt_shield::PubKey,
+}
+
+fn encode_swap_ticket(t: &SwapTicket) -> String {
+    let mut b = Vec::with_capacity(1 + 8 * 4 + 32 + 64 + 8 + 32 + 64);
+    b.push(1u8);
+    for x in [t.give_asset, t.give_amount, t.take_asset, t.take_amount] {
+        b.extend_from_slice(&x.to_le_bytes());
+    }
+    b.extend_from_slice(&t.hashlock);
+    b.extend_from_slice(&pk64(&t.taker_pk));
+    b.extend_from_slice(&t.give_timeout.to_le_bytes());
+    b.extend_from_slice(&t.give_escrow);
+    b.extend_from_slice(&pk64(&t.maker_pk));
+    format!("zcswap1.{}", hex::encode(b))
+}
+
+fn decode_swap_ticket(s: &str) -> Result<SwapTicket, String> {
+    let hexpart = s.trim().strip_prefix("zcswap1.").ok_or("paste a swap offer (it starts with zcswap1.)")?;
+    let b = hex::decode(hexpart).map_err(|_| "that offer is not intact — copy it again".to_string())?;
+    // 1 + 32 + 32 + 64 + 8 + 32 + 64
+    if b.len() != 233 || b[0] != 1 {
+        return Err("that offer is not a version this wallet can read".to_string());
+    }
+    let u64_at = |off: usize| u64::from_le_bytes(b[off..off + 8].try_into().unwrap());
+    let pk_at = |off: usize| -> zcrypt_shield::PubKey {
+        let mut pk = [0u64; 8];
+        for i in 0..8 {
+            pk[i] = u64::from_le_bytes(b[off + i * 8..off + i * 8 + 8].try_into().unwrap());
+        }
+        pk
+    };
+    let mut hashlock = [0u8; 32];
+    hashlock.copy_from_slice(&b[33..65]);
+    let mut give_escrow = [0u8; 32];
+    give_escrow.copy_from_slice(&b[137..169]);
+    Ok(SwapTicket {
+        give_asset: u64_at(1),
+        give_amount: u64_at(9),
+        take_asset: u64_at(17),
+        take_amount: u64_at(25),
+        hashlock,
+        taker_pk: pk_at(65),
+        give_timeout: u64_at(129),
+        give_escrow,
+        maker_pk: pk_at(169),
+    })
+}
+
+fn commitment_hex(c: &zcrypt_shield::Commitment) -> String {
+    let mut b = [0u8; 64];
+    for (i, limb) in c.iter().enumerate() {
+        b[i * 8..i * 8 + 8].copy_from_slice(&limb.to_le_bytes());
+    }
+    hex::encode(b)
+}
+
+fn parse_id_hex(s: &str) -> Result<[u8; 32], String> {
+    let raw = hex::decode(s.trim()).map_err(|e| e.to_string())?;
+    raw.try_into().map_err(|_| "bad id".to_string())
+}
+
+/// The maker's lock expires `SWAP_MAKER_CLAIM_MARGIN_BLOCKS` before the taker's, and
+/// pays the taker. Both wallets compute this id, so the taker can claim it without
+/// searching blocks.
+fn maker_escrow_id(t: &SwapTicket) -> [u8; 32] {
+    let take_timeout = t.give_timeout.saturating_sub(bswap::SWAP_MAKER_CLAIM_MARGIN_BLOCKS);
+    zcrypt_core::htlc_shield::escrow_id(t.take_asset, t.take_amount, &t.hashlock, take_timeout, &t.taker_pk)
+}
+
+#[cfg(test)]
+mod swap_ticket_tests {
+    use super::*;
+
+    #[test]
+    fn offer_text_round_trips_and_both_sides_name_the_same_maker_lock() {
+        let (taker, _) = keys::new_account();
+        let (maker, _) = keys::new_account();
+        let hashlock = [9u8; 32];
+        let give_timeout = 50_000u64;
+        let give_escrow = zcrypt_core::htlc_shield::escrow_id(5, 100, &hashlock, give_timeout, &maker.pubkey());
+        let ticket = SwapTicket {
+            give_asset: 5,
+            give_amount: 100,
+            take_asset: 9,
+            take_amount: 50,
+            hashlock,
+            taker_pk: taker.pubkey(),
+            give_timeout,
+            give_escrow,
+            maker_pk: maker.pubkey(),
+        };
+        let back = decode_swap_ticket(&encode_swap_ticket(&ticket)).expect("offer decodes");
+        assert_eq!(back.give_asset, 5);
+        assert_eq!(back.take_amount, 50);
+        assert_eq!(back.taker_pk, taker.pubkey());
+        assert_eq!(back.maker_pk, maker.pubkey());
+        assert_eq!(back.give_escrow, give_escrow);
+        let take_timeout = bswap::maker_take_timeout_for(
+            &bswap::SwapLock {
+                escrow_id: give_escrow,
+                asset: 5,
+                value: 100,
+                hashlock,
+                timeout: give_timeout,
+                locker_pk: taker.pubkey(),
+                height: 0,
+            },
+            1,
+        )
+        .expect("timeout");
+        let named = zcrypt_core::htlc_shield::escrow_id(9, 50, &hashlock, take_timeout, &taker.pubkey());
+        assert_eq!(maker_escrow_id(&back), named);
+        assert!(decode_swap_ticket("not-an-offer").is_err());
+    }
+
+    #[test]
+    fn a_missing_lock_is_dropped_only_when_every_input_is_still_unspent() {
+        let (acct, phrase) = keys::new_account();
+        let mut w = Wallet::fresh(acct, Zeroizing::new(phrase));
+        assert!(!swap_inputs_still_unspent(&w, &[]));
+        let coin = w.account.own_coin(50, keys::random_blind());
+        let id = commitment_hex(&coin.commitment());
+        w.coins.push(CoinRec::new(coin, 0));
+        assert!(swap_inputs_still_unspent(&w, &[id.clone()]));
+        assert!(!swap_inputs_still_unspent(&w, &[id.clone(), "missing".into()]));
+        w.coins[0].spent = true;
+        assert!(!swap_inputs_still_unspent(&w, &[id]));
+    }
+}
+
+fn credit_htlc(w: &mut Wallet, url: &str, value: u64, asset: u64, escrow: &[u8; 32]) {
+    let coin = w.account.htlc_coin(value, asset, escrow);
+    if w.coins.iter().any(|c| c.coin.commitment() == coin.commitment()) {
+        return;
+    }
+    let born = tip_or(url, w);
+    w.coins.push(CoinRec::new(coin, born));
+}
+
+fn mark_swap_inputs_spent(w: &mut Wallet, commitments: &[String]) {
+    for c in w.coins.iter_mut() {
+        if commitments.iter().any(|h| h == &commitment_hex(&c.coin.commitment())) {
+            c.spent = true;
+        }
+    }
+}
+
+/// True only when every recorded input is still in the wallet and unspent. An empty
+/// list, a missing coin, or any spent coin stays unresolved: the lock may have landed
+/// and the escrow query may be stale.
+fn swap_inputs_still_unspent(w: &Wallet, commitments: &[String]) -> bool {
+    if commitments.is_empty() {
+        return false;
+    }
+    commitments.iter().all(|h| w.coins.iter().any(|c| !c.spent && commitment_hex(&c.coin.commitment()) == *h))
+}
+
+fn materialize_swap_changes(w: &mut Wallet, url: &str, changes: &[SwapChange]) {
+    let born = tip_or(url, w);
+    for ch in changes {
+        if ch.value == 0 {
+            continue;
+        }
+        let coin = Coin { value: ch.value, blind: ch.blind, spend_secret: ch.spend_secret, asset_id: ch.asset_id };
+        if w.coins.iter().any(|c| c.coin.commitment() == coin.commitment()) {
+            continue;
+        }
+        w.coins.push(CoinRec::new(coin, born));
+    }
+}
+
+/// A swap lock ready to broadcast. Building it spends no coins and contacts no node
+/// beyond the leaf snapshot the proof needs.
+struct PreparedSwapLock {
+    raw: Vec<u8>,
+    escrow: [u8; 32],
+    inputs: Vec<String>,
+    changes: Vec<SwapChange>,
+}
+
+/// Lock `value` of `asset` payable to `counterparty`, refunding to this wallet. Gas is a
+/// separate ZCRYPT coin. Does not broadcast and does not mark coins spent. `next_change`
+/// advances so the saved wallet already covers the change addresses.
+fn prepare_swap_lock(
+    w: &mut Wallet,
+    url: &str,
+    asset: u64,
+    value: u64,
+    hashlock: &[u8; 32],
+    timeout: u64,
+    counterparty: &zcrypt_shield::PubKey,
+) -> Result<PreparedSwapLock, String> {
+    if value == 0 || value > MAX_COIN {
+        return Err("enter an amount this coin can hold".to_string());
+    }
+    let chain_id = chain_id_for(url)?;
+    let leaves = chain::fetch_leaves(url)?;
+    let (gas_tx_draft_i, _) = {
+        let gas_i = w
+            .coins
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| {
+                !c.spent
+                    && c.coin.asset_id == zcrypt_shield::ASSET_ZCRYPT
+                    && c.value >= GAS_FEE
+                    && chain::find_index(&leaves, &c.coin.commitment()).is_some()
+            })
+            .min_by_key(|(_, c)| c.value)
+            .map(|(i, _)| i)
+            .ok_or(
+                "no ZCRYPT available to pay the 0.01 fee — a swap needs a little ZCRYPT \
+                 even when you are swapping something else",
+            )?;
+        (gas_i, ())
+    };
+    let gas_i = gas_tx_draft_i;
+    let mut sel: Vec<usize> = w
+        .coins
+        .iter()
+        .enumerate()
+        .filter(|(i, c)| {
+            *i != gas_i
+                && !c.spent
+                && c.coin.asset_id == asset
+                && c.value <= MAX_COIN
+                && chain::find_index(&leaves, &c.coin.commitment()).is_some()
+        })
+        .map(|(i, _)| i)
+        .collect();
+    sel.sort_by_key(|&i| std::cmp::Reverse(w.coins[i].value));
+    if sel.is_empty() {
+        return Err("none of that asset is spendable yet — it may still be maturing, or this wallet has none on this chain".to_string());
+    }
+    let need = value as u128;
+    let chosen: Vec<usize> = if w.coins[sel[0]].value as u128 >= need {
+        vec![sel[0]]
+    } else if sel.len() >= 2 && (w.coins[sel[0]].value as u128 + w.coins[sel[1]].value as u128) >= need {
+        vec![sel[0], sel[1]]
+    } else {
+        let total: u128 = sel.iter().map(|&i| w.coins[i].value as u128).sum();
+        return Err(format!(
+            "not enough spendable coins of that asset in one or two notes (have {total}, need {value})"
+        ));
+    };
+    let sum: u64 = chosen.iter().map(|&i| w.coins[i].value).sum();
+    let change = sum - value;
+    if change > MAX_COIN {
+        return Err("the change from this lock would be too large for one coin — lock a larger amount".to_string());
+    }
+    let mut spends = Vec::with_capacity(chosen.len());
+    for &i in &chosen {
+        let idx = chain::find_index(&leaves, &w.coins[i].coin.commitment()).ok_or("selected coin is not on this chain")?;
+        let (ps, pd) = chain::merkle_path(&leaves, idx as usize).ok_or("selected coin is not in the tree")?;
+        spends.push(shield_tx::Spend {
+            value: w.coins[i].value,
+            blind: w.coins[i].coin.blind,
+            spend_secret: w.coins[i].coin.spend_secret,
+            asset_id: w.coins[i].coin.asset_id,
+            path_siblings: ps,
+            path_dirs: pd,
+        });
+    }
+    let burn_blind = keys::random_blind();
+    let burn_out = (value, burn_blind, zcrypt_core::htlc_shield::BURN_PK, asset);
+    let change_blind = keys::random_blind();
+    let change_idx = w.next_change;
+    w.next_change = w.next_change.saturating_add(1);
+    let change_acct = w.account.stealth(change_idx);
+    let change_addr = change_acct.stealth_address();
+    let change_out = keys::out_asset_coin(&change_addr, change, change_blind, asset);
+    let change_note = kem::ciphertext_to_bytes(&keys::encrypt_note_asset(&change_addr, change, change_blind, asset));
+    let me = w.account.pubkey();
+    let envelope = zcrypt_core::htlc_shield::lock_envelope(
+        zcrypt_core::htlc_shield::ENV_SWAP_LOCK,
+        asset,
+        value,
+        hashlock,
+        timeout,
+        counterparty,
+        &me,
+        &[],
+    );
+    let main_tx = shield_tx::build_bound(&chain_id, &spends, &[burn_out, change_out], 0, vec![keys::cover_note_bytes(), change_note], &envelope)
+        .ok_or("could not prove the lock")?;
+    let gas_coin = w.coins[gas_i].coin;
+    let gidx = chain::find_index(&leaves, &gas_coin.commitment()).ok_or("gas coin is not on this chain")?;
+    let (gps, gpd) = chain::merkle_path(&leaves, gidx as usize).ok_or("gas coin is not in the tree")?;
+    let gas_spend = shield_tx::Spend {
+        value: gas_coin.value,
+        blind: gas_coin.blind,
+        spend_secret: gas_coin.spend_secret,
+        asset_id: zcrypt_shield::ASSET_ZCRYPT,
+        path_siblings: gps,
+        path_dirs: gpd,
+    };
+    let gas_blind = keys::random_blind();
+    let gas_burn = (GAS_FEE, gas_blind, zcrypt_core::htlc_shield::BURN_PK, zcrypt_shield::ASSET_ZCRYPT);
+    let gchg_val = gas_coin.value - GAS_FEE;
+    let gchg_blind = keys::random_blind();
+    let gchg_idx = w.next_change;
+    w.next_change = w.next_change.saturating_add(1);
+    let gchg_acct = w.account.stealth(gchg_idx);
+    let gchg_addr = gchg_acct.stealth_address();
+    let gas_change = keys::out_coin(&gchg_addr, gchg_val, gchg_blind);
+    let gchg_note = kem::ciphertext_to_bytes(&keys::encrypt_note(&gchg_addr, gchg_val, gchg_blind));
+    let gas_env = shield_tx::gas_pay_envelope(&shield_tx::txbind(&chain_id, &main_tx));
+    let gas_tx = shield_tx::build_bound(
+        &chain_id,
+        &[gas_spend],
+        &[gas_burn, gas_change],
+        0,
+        vec![keys::cover_note_bytes(), gchg_note],
+        &gas_env,
+    )
+    .ok_or("could not prove the fee")?;
+    let raw = bswap::swap_lock_tx(value, &burn_blind, asset, hashlock, timeout, counterparty, &me, &gas_blind, &gas_tx, &main_tx);
+    let escrow = zcrypt_core::htlc_shield::escrow_id(asset, value, hashlock, timeout, counterparty);
+    let mut inputs: Vec<String> = chosen.iter().map(|&i| commitment_hex(&w.coins[i].coin.commitment())).collect();
+    inputs.push(commitment_hex(&w.coins[gas_i].coin.commitment()));
+    let mut changes = Vec::new();
+    if change > 0 {
+        let coin = change_acct.own_asset_coin(change, change_blind, asset);
+        changes.push(SwapChange { value: coin.value, blind: coin.blind, spend_secret: coin.spend_secret, asset_id: coin.asset_id });
+    }
+    if gchg_val > 0 {
+        let coin = gchg_acct.own_coin(gchg_val, gchg_blind);
+        changes.push(SwapChange { value: coin.value, blind: coin.blind, spend_secret: coin.spend_secret, asset_id: coin.asset_id });
+    }
+    Ok(PreparedSwapLock { raw, escrow, inputs, changes })
+}
+
+/// Save `pending` (it holds the preimage), then broadcast. A rejected broadcast removes
+/// the record and saves again. Coins are marked spent only after the node accepts.
+fn commit_swap_lock(state: &State<AppState>, w: &mut Wallet, url: &str, prepared: &PreparedSwapLock, pending: PendingSwap) -> Result<(), String> {
+    let escrow_hex = pending.my_escrow_hex.clone();
+    w.pending_swaps.push(pending);
+    if let Err(e) = save_now(state, w, "lock a swap") {
+        w.pending_swaps.retain(|s| s.my_escrow_hex != escrow_hex);
+        return Err(e);
+    }
+    if let Err(e) = chain::broadcast(url, &prepared.raw) {
+        w.pending_swaps.retain(|s| s.my_escrow_hex != escrow_hex);
+        return match save_now(state, w, "drop a swap lock the node did not accept") {
+            Ok(()) => Err(e),
+            Err(save_e) => Err(format!("{e} ({save_e})")),
+        };
+    }
+    mark_swap_inputs_spent(w, &prepared.inputs);
+    materialize_swap_changes(w, url, &prepared.changes);
+    Ok(())
+}
+
+#[derive(Serialize)]
+struct RegisteredAsset {
+    #[serde(with = "u64_str")]
+    asset_id: u64,
+    ticker: String,
+    decimals: u8,
+}
+
+/// Every asset a swap can pay out: ZCRYPT, plus every ticker registered on this chain.
+#[tauri::command]
+fn registered_assets(state: State<AppState>) -> R<Vec<RegisteredAsset>> {
+    let url = node_url(&state)?;
+    let mut out = vec![RegisteredAsset { asset_id: zcrypt_shield::ASSET_ZCRYPT, ticker: "ZCRYPT".into(), decimals: 6 }];
+    for (ticker, id, _) in chain::asset_list(&url) {
+        if id == zcrypt_shield::ASSET_ZCRYPT {
+            continue;
+        }
+        let decimals = chain::asset_meta(&url, id).map(|(_, d)| d).unwrap_or(8);
+        out.push(RegisteredAsset { asset_id: id, ticker, decimals });
+    }
+    ok(out)
+}
+
+#[derive(Serialize)]
+struct SwapOffer {
+    ticket: String,
+    give_ticker: String,
+    take_ticker: String,
+    my_timeout: u64,
+}
+
+/// Lock `give_amount` of `give_asset` and hand back an offer the other wallet accepts.
+#[tauri::command]
+fn swap_asset_start(
+    give_asset: String,
+    give_amount: u64,
+    take_asset: String,
+    take_amount: u64,
+    maker_address: String,
+    state: State<AppState>,
+) -> R<SwapOffer> {
+    let give_asset: u64 = give_asset.parse().map_err(|_| "bad asset".to_string())?;
+    let take_asset: u64 = take_asset.parse().map_err(|_| "bad asset".to_string())?;
+    if give_amount == 0 || take_amount == 0 {
+        return Err("enter both amounts".to_string());
+    }
+    if give_asset == take_asset {
+        return Err("choose two different assets".to_string());
+    }
+    let maker_pk = Address::from_bech32(maker_address.trim()).ok_or("their address should start with zc1")?.pubkey();
+    let url = node_url(&state)?;
+    if take_asset != zcrypt_shield::ASSET_ZCRYPT && chain::asset_meta(&url, take_asset).is_none() {
+        return Err("that asset is not registered on this chain".to_string());
+    }
+    let (give_ticker, _) = asset_label(&url, give_asset);
+    let (take_ticker, _) = asset_label(&url, take_asset);
+    let zc = zc_client(&state)?;
+    let tip = zc.height()?;
+    let (give_timeout, _) = bswap::swap_timeouts(tip as u64, SWAP_WINDOW_BLOCKS);
+    let preimage = bswap::fresh_preimage();
+    let hashlock = zcrypt_core::nullifier::htlc_hashlock(&preimage);
+    with_wallet(&state, |w| {
+        if maker_pk == w.account.pubkey() {
+            return Err("that address is this wallet — the other side has to be someone else".to_string());
+        }
+        let prepared = prepare_swap_lock(w, &url, give_asset, give_amount, &hashlock, give_timeout, &maker_pk)?;
+        let ticket_body = SwapTicket {
+            give_asset,
+            give_amount,
+            take_asset,
+            take_amount,
+            hashlock,
+            taker_pk: w.account.pubkey(),
+            give_timeout,
+            give_escrow: prepared.escrow,
+            maker_pk,
+        };
+        let ticket = encode_swap_ticket(&ticket_body);
+        let their = maker_escrow_id(&ticket_body);
+        let pending = PendingSwap {
+            role: "taker".into(),
+            preimage_hex: hex::encode(preimage),
+            hashlock_hex: hex::encode(hashlock),
+            give_asset,
+            give_amount,
+            take_asset,
+            take_amount,
+            counterparty_pk_hex: hex::encode(pk64(&maker_pk)),
+            my_escrow_hex: hex::encode(prepared.escrow),
+            their_escrow_hex: hex::encode(their),
+            my_timeout: give_timeout,
+            input_commitments: prepared.inputs.clone(),
+            changes: prepared.changes.clone(),
+            started_height: tip,
+            scanned_through: 30,
+            ticket: ticket.clone(),
+        };
+        commit_swap_lock(&state, w, &url, &prepared, pending)?;
+        w.push_hist("swap", -(give_amount as i64), format!("locked for {take_ticker}"), give_asset);
+        Ok(SwapOffer { ticket, give_ticker, take_ticker, my_timeout: give_timeout })
+    })
+    .and_then(ok)
+}
+
+/// Lock the other side of an offer someone sent you.
+#[tauri::command]
+fn swap_asset_accept(ticket: String, state: State<AppState>) -> R<String> {
+    let t = decode_swap_ticket(&ticket)?;
+    let url = node_url(&state)?;
+    let zc = zc_client(&state)?;
+    let info = bswap::query_escrow(&zc, &t.give_escrow)?.ok_or("their lock is not on the chain yet")?;
+    if info.state != "open" {
+        return Err("their lock is no longer open".to_string());
+    }
+    if info.kind != "swap" || info.asset_id != t.give_asset || info.value != t.give_amount || info.hashlock != t.hashlock
+        || info.timeout_height != t.give_timeout
+    {
+        return Err("their lock does not match this offer".to_string());
+    }
+    if info.party_pk != pk64(&t.maker_pk).to_vec() || info.refund_pk != pk64(&t.taker_pk).to_vec() {
+        return Err("their lock pays someone else".to_string());
+    }
+    let expected = zcrypt_core::htlc_shield::escrow_id(t.give_asset, t.give_amount, &t.hashlock, t.give_timeout, &t.maker_pk);
+    if expected != t.give_escrow {
+        return Err("this offer does not match the lock it names".to_string());
+    }
+    let tip = zc.height()? as u64;
+    let taker_lock = bswap::SwapLock {
+        escrow_id: t.give_escrow,
+        asset: t.give_asset,
+        value: t.give_amount,
+        hashlock: t.hashlock,
+        timeout: t.give_timeout,
+        locker_pk: t.taker_pk,
+        height: zc.height()?,
+    };
+    let take_timeout = bswap::maker_take_timeout_for(&taker_lock, tip)?;
+    let their = maker_escrow_id(&t);
+    let mine = zcrypt_core::htlc_shield::escrow_id(t.take_asset, t.take_amount, &t.hashlock, take_timeout, &t.taker_pk);
+    if mine != their {
+        return Err("this offer's timing does not match the wallet's swap rule".to_string());
+    }
+    let (take_ticker, _) = asset_label(&url, t.take_asset);
+    let (give_ticker, _) = asset_label(&url, t.give_asset);
+    with_wallet(&state, |w| {
+        if w.account.pubkey() != t.maker_pk {
+            return Err("this offer is for a different wallet address".to_string());
+        }
+        if w.pending_swaps.iter().any(|p| p.my_escrow_hex == hex::encode(mine)) {
+            return Err("this wallet already accepted that offer".to_string());
+        }
+        let prepared = prepare_swap_lock(w, &url, t.take_asset, t.take_amount, &t.hashlock, take_timeout, &t.taker_pk)?;
+        if prepared.escrow != mine {
+            return Err("the lock this wallet would publish is not the one this offer asked for".to_string());
+        }
+        let pending = PendingSwap {
+            role: "maker".into(),
+            preimage_hex: String::new(),
+            hashlock_hex: hex::encode(t.hashlock),
+            give_asset: t.give_asset,
+            give_amount: t.give_amount,
+            take_asset: t.take_asset,
+            take_amount: t.take_amount,
+            counterparty_pk_hex: hex::encode(pk64(&t.taker_pk)),
+            my_escrow_hex: hex::encode(prepared.escrow),
+            their_escrow_hex: hex::encode(t.give_escrow),
+            my_timeout: take_timeout,
+            input_commitments: prepared.inputs.clone(),
+            changes: prepared.changes.clone(),
+            started_height: tip as i64,
+            scanned_through: 30,
+            ticket: String::new(),
+        };
+        commit_swap_lock(&state, w, &url, &prepared, pending)?;
+        w.push_hist("swap", -(t.take_amount as i64), format!("locked for {give_ticker}"), t.take_asset);
+        Ok(format!("Locked {take_ticker}. Their wallet claims it, then yours collects the {give_ticker}. Keep this wallet open."))
+    })
+    .and_then(ok)
+}
+
+#[derive(Serialize)]
+struct PendingSwapView {
+    role: String,
+    give_ticker: String,
+    take_ticker: String,
+    #[serde(with = "u64_str")]
+    give_amount: u64,
+    #[serde(with = "u64_str")]
+    take_amount: u64,
+    give_decimals: u8,
+    take_decimals: u8,
+    phase: String,
+    ticket: String,
+    my_escrow_hex: String,
+    my_timeout: u64,
+    can_refund: bool,
+}
+
+#[tauri::command]
+fn list_pending_swaps(state: State<AppState>) -> R<Vec<PendingSwapView>> {
+    let url = node_url(&state)?;
+    let tip = zc_client(&state).and_then(|z| z.height()).unwrap_or(0) as u64;
+    let g = state.wallet.lock().unwrap();
+    let w = g.as_ref().ok_or("wallet is locked")?;
+    let mut out = Vec::new();
+    for p in &w.pending_swaps {
+        let (give_ticker, give_decimals) = asset_label(&url, p.give_asset);
+        let (take_ticker, take_decimals) = asset_label(&url, p.take_asset);
+        let phase = if p.role == "taker" {
+            "Waiting for them to lock their side".to_string()
+        } else {
+            "Waiting for them to claim, then this wallet collects".to_string()
+        };
+        out.push(PendingSwapView {
+            role: p.role.clone(),
+            give_ticker,
+            take_ticker,
+            give_amount: p.give_amount,
+            take_amount: p.take_amount,
+            give_decimals,
+            take_decimals,
+            phase,
+            ticket: p.ticket.clone(),
+            my_escrow_hex: p.my_escrow_hex.clone(),
+            my_timeout: p.my_timeout,
+            can_refund: tip >= p.my_timeout,
+        });
+    }
+    ok(out)
+}
+
+/// Advance every open swap: claim when the other side has locked, or refund once the
+/// lock has expired. Returns one line per swap that moved.
+#[tauri::command]
+fn swap_asset_settle(state: State<AppState>) -> R<Vec<String>> {
+    let url = node_url(&state)?;
+    let zc = zc_client(&state)?;
+    let tip = zc.height()?;
+    let pending = {
+        let g = state.wallet.lock().unwrap();
+        g.as_ref().ok_or("wallet is locked")?.pending_swaps.clone()
+    };
+    let mut notes = Vec::new();
+    for p in pending {
+        let moved = settle_one_swap(&state, &url, &zc, tip, &p);
+        match moved {
+            Ok(Some(m)) => notes.push(m),
+            Ok(None) => {}
+            // A node blip or a claim that lost a race leaves the swap pending for the next pass.
+            Err(e) => eprintln!("[swap] {e}"),
+        }
+    }
+    ok(notes)
+}
+
+fn settle_one_swap(state: &State<AppState>, url: &str, zc: &Zcrypt, tip: i64, p: &PendingSwap) -> Result<Option<String>, String> {
+    let my_escrow = parse_id_hex(&p.my_escrow_hex)?;
+    let their_escrow = parse_id_hex(&p.their_escrow_hex)?;
+    let mine = bswap::query_escrow(zc, &my_escrow)?;
+    // A lock that reached the chain spends those coins even if the wallet crashed first.
+    if mine.is_some() {
+        let _ = with_wallet(state, |w| {
+            if let Some(slot) = w.pending_swaps.iter().position(|s| s.my_escrow_hex == p.my_escrow_hex) {
+                let commitments = w.pending_swaps[slot].input_commitments.clone();
+                let changes = w.pending_swaps[slot].changes.clone();
+                mark_swap_inputs_spent(w, &commitments);
+                materialize_swap_changes(w, url, &changes);
+            }
+            Ok(())
+        });
+    } else {
+        // The node has no escrow. Drop the record only when every input is still
+        // unspent — that is a lock that never landed. A query error never reaches
+        // here. Spent inputs stay pending: the query may be behind a lock that did.
+        let unspent = {
+            let g = state.wallet.lock().unwrap();
+            g.as_ref().is_some_and(|w| swap_inputs_still_unspent(w, &p.input_commitments))
+        };
+        if unspent {
+            let dropped = with_wallet(state, |w| {
+                let before = w.pending_swaps.len();
+                w.pending_swaps.retain(|s| s.my_escrow_hex != p.my_escrow_hex);
+                Ok(w.pending_swaps.len() != before)
+            })?;
+            if dropped {
+                return Ok(Some("That lock never landed, so nothing was spent.".to_string()));
+            }
+            return Ok(None);
+        }
+    }
+    if p.role == "taker" {
+        let preimage = hex::decode(&p.preimage_hex).map_err(|e| e.to_string())?;
+        let want_lock = parse_id_hex(&p.hashlock_hex)?;
+        if bswap::query_escrow(zc, &their_escrow)?.is_some_and(|e| e.state == "open" && e.asset_id == p.take_asset && e.value == p.take_amount && e.hashlock == want_lock) {
+            chain::broadcast(url, &bswap::claim_tx(&their_escrow, &preimage))?;
+            return with_wallet(state, |w| {
+                credit_htlc(w, url, p.take_amount, p.take_asset, &their_escrow);
+                let (ticker, _) = asset_label(url, p.take_asset);
+                w.push_hist("swap", p.take_amount as i64, "swap received".into(), p.take_asset);
+                w.pending_swaps.retain(|s| s.my_escrow_hex != p.my_escrow_hex);
+                Ok(Some(format!("Swap complete — {ticker} is in this wallet.")))
+            });
+        }
+        if tip as u64 >= p.my_timeout {
+            return refund_swap(state, url, zc, p, &my_escrow, p.give_amount, p.give_asset);
+        }
+        return Ok(None);
+    }
+    // Maker: once they claim our lock, the preimage is in that claim and we collect theirs.
+    if mine.as_ref().is_some_and(|e| e.state == "claimed") {
+        let hashlock = parse_id_hex(&p.hashlock_hex)?;
+        let lookback = p.scanned_through.max(30);
+        let mut from = tip.saturating_sub(lookback).max(p.started_height);
+        if from > tip {
+            from = tip;
+        }
+        if let Some((preimage, _)) = bswap::find_claim_preimage(zc, from, tip, &my_escrow, &hashlock)? {
+            chain::broadcast(url, &bswap::claim_tx(&their_escrow, &preimage))?;
+            return with_wallet(state, |w| {
+                credit_htlc(w, url, p.give_amount, p.give_asset, &their_escrow);
+                let (ticker, _) = asset_label(url, p.give_asset);
+                w.push_hist("swap", p.give_amount as i64, "swap received".into(), p.give_asset);
+                w.pending_swaps.retain(|s| s.my_escrow_hex != p.my_escrow_hex);
+                Ok(Some(format!("Swap complete — {ticker} is in this wallet.")))
+            });
+        }
+        let _ = with_wallet(state, |w| {
+            if let Some(s) = w.pending_swaps.iter_mut().find(|s| s.my_escrow_hex == p.my_escrow_hex) {
+                let span = tip.saturating_sub(s.started_height);
+                if s.scanned_through < span {
+                    s.scanned_through = (s.scanned_through + 40).min(span.max(30));
+                }
+            }
+            Ok(())
+        });
+    }
+    if tip as u64 >= p.my_timeout {
+        return refund_swap(state, url, zc, p, &my_escrow, p.take_amount, p.take_asset);
+    }
+    Ok(None)
+}
+
+fn refund_swap(
+    state: &State<AppState>,
+    url: &str,
+    zc: &Zcrypt,
+    p: &PendingSwap,
+    my_escrow: &[u8; 32],
+    value: u64,
+    asset: u64,
+) -> Result<Option<String>, String> {
+    let info = bswap::query_escrow(zc, my_escrow)?;
+    match info.as_ref().map(|e| e.state.as_str()) {
+        Some("open") => {
+            chain::broadcast(url, &bswap::expire_tx(my_escrow))?;
+        }
+        Some("expired") => {}
+        Some("claimed") => return Ok(None),
+        _ => return Ok(None),
+    }
+    with_wallet(state, |w| {
+        credit_htlc(w, url, value, asset, my_escrow);
+        let (ticker, _) = asset_label(url, asset);
+        w.push_hist("swap", value as i64, "swap refund".into(), asset);
+        w.pending_swaps.retain(|s| s.my_escrow_hex != p.my_escrow_hex);
+        Ok(Some(format!("The swap expired. {ticker} is back in this wallet.")))
+    })
+}
+
+#[tauri::command]
+fn swap_asset_refund(escrow_hex: String, state: State<AppState>) -> R<String> {
+    let url = node_url(&state)?;
+    let zc = zc_client(&state)?;
+    let tip = zc.height()?;
+    let p = {
+        let g = state.wallet.lock().unwrap();
+        g.as_ref()
+            .ok_or("wallet is locked")?
+            .pending_swaps
+            .iter()
+            .find(|s| s.my_escrow_hex == escrow_hex.trim())
+            .cloned()
+            .ok_or("no swap with that lock")?
+    };
+    if (tip as u64) < p.my_timeout {
+        return Err(format!("this lock refunds itself at block {} (the chain is at {tip})", p.my_timeout));
+    }
+    let my_escrow = parse_id_hex(&p.my_escrow_hex)?;
+    let (value, asset) = if p.role == "taker" { (p.give_amount, p.give_asset) } else { (p.take_amount, p.take_asset) };
+    refund_swap(&state, &url, &zc, &p, &my_escrow, value, asset)?.ok_or("that lock can no longer be refunded".to_string()).and_then(ok)
+}
+
 #[derive(Serialize)]
 struct BtcWallet {
     connected: bool,
@@ -5158,6 +5978,12 @@ fn main() {
             dismiss_pending_secret,
             wallet_health,
             held_assets,
+            registered_assets,
+            swap_asset_start,
+            swap_asset_accept,
+            swap_asset_settle,
+            swap_asset_refund,
+            list_pending_swaps,
             btc_wallet_info,
             withdraw_btc,
             mint_asset,

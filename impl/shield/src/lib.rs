@@ -4,16 +4,18 @@
 //!
 //! Per spend, over hidden amounts, one ZK proof (FRI + Poseidon2, transparent,
 //! no trusted setup) establishes:
-//!   * for EACH input, the spent coin's commitment `C=Poseidon2(value,blind,pk,asset)`
-//!     is a **real leaf under a public Merkle root** — proven by an in-circuit
-//!     authentication path — so the input coin never appears on-chain, and the
-//!     anonymity set is the whole tree (Zcash-Sapling-style), not a ring;
-//!   * for EACH output, `C=Poseidon2(value,blind)` is opened (the new coins);
-//!   * for EACH input, the nullifier `nf=Poseidon2(spend_secret,value,blind)` is
-//!     derived in-circuit (unlinkable to the leaf, canonical per coin);
+//!   * for EACH input, the spent coin's commitment is a **real leaf under a public
+//!     Merkle root** — proven by an in-circuit authentication path — so the input
+//!     coin never appears on-chain, and the anonymity set is the whole tree
+//!     (Zcash-Sapling-style), not a ring;
+//!   * for EACH output, the new coin's commitment is opened;
+//!   * for EACH input, the nullifier is derived in-circuit (unlinkable to the leaf,
+//!     canonical per coin);
 //!   * every amount is in range and `Σ inputs = Σ outputs + fee`.
 //!
-//! Ownership is bound by `pk = Poseidon2(spend_secret)` inside the commitment, so
+//! Commitments, nullifiers, spend keys, and Merkle nodes are the same Poseidon2
+//! compression: one width-16 permutation, then the feed-forward digest
+//! `Trunc_8(P(x) + x)`. Ownership is bound by `pk` inside the commitment, so
 //! membership + ownership together prove the prover knows the spend secret of a
 //! genuine tree coin — without revealing *which* leaf. Requires nightly (see
 //! rust-toolchain.toml).
@@ -119,7 +121,9 @@ fn os_rng() -> MaskRng {
 /// FRI query count. Fixed at the mainnet-grade value: there is deliberately NO
 /// lower-security build variant (the former `high-security` cargo feature is gone), so
 /// every binary (node, wallet, tools, tests) produces and verifies one proof format.
-/// 112 queries · log_blowup 2 + 20 pow bits → 244 conjectured (list-decoding) bits.
+/// 112 queries · log_blowup 2. The Johnson bound is `(2−1)·112 + 20 = 132` bits,
+/// and that is the figure the mainnet floor checks. The list-decoding conjecture
+/// is `2·112 + 20 = 244` bits ([`conjectured_soundness_bits`]).
 const FRI_NUM_QUERIES: usize = 112;
 
 /// Proof-of-work grinding bits, applied on both the commit and the query phase.
@@ -147,12 +151,22 @@ pub const fn conjectured_soundness_bits() -> usize {
     FRI_LOG_BLOWUP * FRI_NUM_QUERIES + FRI_POW_BITS
 }
 
-/// True iff the COMPILED FRI parameters meet the mainnet floor. Non-panicking twin of
-/// [`assert_mainnet_grade`]. Always `true` for the shipped constants.
+/// Johnson-bound FRI soundness of the compiled rate. At blowup 4 the Johnson
+/// radius gives about one bit per query: `(log_blowup − 1)·num_queries + query_pow`.
+/// [`is_mainnet_grade`] and the config assert check this figure. It is the standard
+/// estimate, not a tighter computation. [`conjectured_soundness_bits`] stays the
+/// list-decoding conjecture.
+pub const fn johnson_soundness_bits() -> usize {
+    FRI_LOG_BLOWUP.saturating_sub(1) * FRI_NUM_QUERIES + FRI_POW_BITS
+}
+
+/// True iff the COMPILED FRI parameters meet the mainnet floor, measured against
+/// the Johnson bound. Non-panicking twin of [`assert_mainnet_grade`]. Always
+/// `true` for the shipped constants (132 ≥ 128).
 pub fn is_mainnet_grade() -> bool {
     fri_num_queries() >= MAINNET_MIN_QUERIES
         && fri_pow_bits() >= MAINNET_MIN_POW_BITS
-        && conjectured_soundness_bits() >= MAINNET_MIN_SOUNDNESS_BITS
+        && johnson_soundness_bits() >= MAINNET_MIN_SOUNDNESS_BITS
 }
 
 /// Panic unless this binary was compiled with mainnet-grade FRI parameters. Called once
@@ -162,10 +176,16 @@ pub fn assert_mainnet_grade() {
     assert!(
         is_mainnet_grade(),
         "shield proofs are BELOW mainnet grade: compiled FRI = {} queries / pow {} / {} \
-         conjectured soundness bits; mainnet requires >= {} queries, >= {} pow bits, >= {} \
-         soundness bits: the FRI constants in zcrypt-shield were lowered; restore them",
-        fri_num_queries(), fri_pow_bits(), conjectured_soundness_bits(),
-        MAINNET_MIN_QUERIES, MAINNET_MIN_POW_BITS, MAINNET_MIN_SOUNDNESS_BITS,
+         Johnson-bound bits ({} conjectured list-decoding bits); mainnet requires >= {} \
+         queries, >= {} pow bits, >= {} soundness bits: the FRI constants in \
+         zcrypt-shield were lowered; restore them",
+        fri_num_queries(),
+        fri_pow_bits(),
+        johnson_soundness_bits(),
+        conjectured_soundness_bits(),
+        MAINNET_MIN_QUERIES,
+        MAINNET_MIN_POW_BITS,
+        MAINNET_MIN_SOUNDNESS_BITS,
     );
 }
 
@@ -187,12 +207,14 @@ fn make_config(rng_input: MaskRng, rng_challenge: MaskRng, rng_pcs: MaskRng) -> 
         query_proof_of_work_bits: FRI_POW_BITS,
         mmcs: challenge_mmcs,
     };
-    // Hard floor enforced in RELEASE builds too (was a debug_assert): a binary whose
-    // FRI parameters fall under the conjectured-soundness floor must never build a proof.
+    // Hard floor enforced in RELEASE builds too (was a debug_assert). The floor is
+    // the Johnson bound, about one bit per query at this rate, not the list-decoding
+    // conjecture. A binary under that floor must never build a proof.
+    let johnson_bits = fri_params.num_queries * fri_params.log_blowup.saturating_sub(1)
+        + fri_params.query_proof_of_work_bits;
     assert!(
-        fri_params.conjectured_soundness_bits() >= 100,
-        "FRI parameters below the 100-bit conjectured-soundness floor: {} bits",
-        fri_params.conjectured_soundness_bits(),
+        johnson_bits >= 100,
+        "FRI parameters below the 100-bit Johnson-bound floor: {johnson_bits} bits",
     );
     let pcs = HidingPcs::new(dft, val_mmcs, fri_params, 4, rng_pcs);
     ZkConfig::new(pcs, Challenger::from_hasher(vec![], byte_hash))
@@ -453,8 +475,9 @@ impl<AB: AirBuilder<F = BabyBear>> Air<AB> for CoinsAir {
         let root_off = nf_off + N_IN * 8; // public Merkle anchor root (8 limbs)
         let fee_pub = pis[fee_i].clone();
 
-        // run all Poseidon2 blocks, capture outputs
-        let mut outs: Vec<[AB::Var; 8]> = Vec::with_capacity(NBLK);
+        // Run every Poseidon2 block. The digest is the feed-forward compression
+        // Trunc_8(P(x) + x), the same function as `native_commit`.
+        let mut outs: Vec<[AB::Expr; 8]> = Vec::with_capacity(NBLK);
         for d in 0..NBLK {
             let base = d * BLK;
             let cols: &Poseidon2Cols<AB::Var, WIDTH, SD, SR, HFR, PR> = row[base..base + BLK].borrow();
@@ -463,14 +486,14 @@ impl<AB: AirBuilder<F = BabyBear>> Air<AB> for CoinsAir {
             for r in 0..HFR { eval_full::<AB>(&mut state, &cols.beginning_full_rounds[r], &RC_EI[r], builder); }
             for r in 0..PR { eval_partial::<AB>(&mut state, &cols.partial_rounds[r], &RC_I[r], builder); }
             for r in 0..HFR { eval_full::<AB>(&mut state, &cols.ending_full_rounds[r], &RC_EF[r], builder); }
-            outs.push(core::array::from_fn(|k| cols.ending_full_rounds[HFR - 1].post[k]));
+            outs.push(core::array::from_fn(|k| feed_forward::<AB>(cols.ending_full_rounds[HFR - 1].post[k], cols.inputs[k])));
         }
 
         // Commit-input layout (WIDTH=16):
-        //   [0]=value_lo, [1]=value_hi, [2..6]=blind(4), [6..14]=pk(8), [14]=asset, [15]=0
+        //   [0]=value_lo, [1]=value_hi, [2..6]=blind(4), [6..14]=pk(8), [14]=asset, [15]=TAG_COMMIT
         // Nullifier-input layout:
-        //   [0..8]=spend_secret(8), [8]=value_lo, [9]=value_hi, [10..14]=blind(4), [14]=asset, [15]=0
-        // Pk-input layout: [0..8]=spend_secret(8), rest 0.
+        //   [0..8]=spend_secret(8), [8]=value_lo, [9]=value_hi, [10..14]=blind(4), [14]=asset, [15]=TAG_NF
+        // Pk-input layout: [0..8]=spend_secret(8), [8..15)=0, [15]=TAG_PK.
         // Block indices: commit i -> i (0..S); nullifier j -> S+j; pk j -> S+N_IN+j.
 
         // SINGLE-ASSET: every coin (inputs + outputs) carries the same asset_id
@@ -511,7 +534,7 @@ impl<AB: AirBuilder<F = BabyBear>> Air<AB> for CoinsAir {
                 // spend secret of a genuine tree leaf `outs[i]` — no ring needed, the
                 // spent coin hides among the ENTIRE pool.
                 for t in 0..8 {
-                    builder.assert_eq(row[i * BLK + 6 + t], outs[pk_blk][t]);
+                    builder.assert_eq(row[i * BLK + 6 + t], outs[pk_blk][t].clone());
                 }
                 for t in 8..WIDTH - 1 {
                     builder.assert_zero(row[pk_blk * BLK + t].into());
@@ -538,7 +561,7 @@ impl<AB: AirBuilder<F = BabyBear>> Air<AB> for CoinsAir {
                 // its sibling are ordered by a boolean direction bit (a conditional
                 // swap), then compressed with one Poseidon2 block. Gated by `act`:
                 // an inactive padding input proves nothing (it spends no real coin).
-                let mut cur: [AB::Expr; 8] = core::array::from_fn(|j| outs[i][j].into());
+                let mut cur: [AB::Expr; 8] = core::array::from_fn(|j| outs[i][j].clone());
                 for lvl in 0..DEPTH {
                     let pblk = PATH_BASE + i * DEPTH + lvl;
                     let dir: AB::Expr = row[PATH_DIR_OFF + i * DEPTH + lvl].into();
@@ -554,7 +577,7 @@ impl<AB: AirBuilder<F = BabyBear>> Air<AB> for CoinsAir {
                         builder.assert_eq(row[pblk * BLK + j], left);
                         builder.assert_eq(row[pblk * BLK + 8 + j], right);
                     }
-                    cur = core::array::from_fn(|j| outs[pblk][j].into());
+                    cur = core::array::from_fn(|j| outs[pblk][j].clone());
                 }
                 // Active ⇒ the recomputed root equals the public anchor.
                 for j in 0..8 {
@@ -573,13 +596,13 @@ impl<AB: AirBuilder<F = BabyBear>> Air<AB> for CoinsAir {
                 // real coin (it corresponds to a value-0 phantom nobody else can name).
                 let mut wf = builder.when_first_row();
                 for k in 0..8 {
-                    wf.assert_eq(Into::<AB::Expr>::into(outs[nf_blk][k]), pis[nf_off + i * 8 + k].clone());
+                    wf.assert_eq(outs[nf_blk][k].clone(), pis[nf_off + i * 8 + k].clone());
                 }
             } else {
                 // output coin: [14]=asset, [15] the commit role tag.
                 builder.assert_eq(row[i * BLK + 15], konst::<AB>(TAG_COMMIT));
                 let mut wf = builder.when_first_row();
-                for j in 0..8 { wf.assert_eq(outs[i][j], pis[out_off + (i - N_IN) * 8 + j].clone()); }
+                for j in 0..8 { wf.assert_eq(outs[i][j].clone(), pis[out_off + (i - N_IN) * 8 + j].clone()); }
             }
         }
 
@@ -666,26 +689,35 @@ fn nf_input(spend_secret: &SpendSecret, value: u64, blind: &Blind, asset_id: u64
     s[15] = BabyBear::from_u64(TAG_NF);
     s
 }
-fn native_commit(input: &[BabyBear; WIDTH]) -> Commitment {
-    let perm = default_babybear_poseidon2_16();
-    let mut out = *input; perm.permute_mut(&mut out);
-    core::array::from_fn(|i| out[i].as_canonical_u64())
+/// Feed-forward digest lane: `P(x)[k] + x[k]`, field addition. Shared by every AIR
+/// so the circuit and [`native_commit`] name the same compression.
+fn feed_forward<AB: AirBuilder<F = BabyBear>>(post: AB::Var, input: AB::Var) -> AB::Expr {
+    let permuted: AB::Expr = post.into();
+    let preimage: AB::Expr = input.into();
+    permuted + preimage
 }
 
-/// The spend public key `pk = Poseidon2(spend_secret)` — one-way, so publishing it
+/// Poseidon2 compression: one width-16 permutation, then `Trunc_8(P(x) + x)`.
+fn native_commit(input: &[BabyBear; WIDTH]) -> Commitment {
+    let perm = default_babybear_poseidon2_16();
+    let mut out = *input;
+    perm.permute_mut(&mut out);
+    core::array::from_fn(|i| (out[i] + input[i]).as_canonical_u64())
+}
+
+/// The spend public key, the compression of the spend secret. Publishing it
 /// (in an address / coin commitment) does not reveal the spending secret.
 pub fn spend_pubkey(spend_secret: &SpendSecret) -> PubKey { native_commit(&pk_input(spend_secret)) }
-/// Coin commitment for native ZCRYPT `= Poseidon2(value, blind, pk, 0)`.
+/// Coin commitment for native ZCRYPT.
 pub fn commit(value: u64, blind: &Blind, pk: &PubKey) -> Commitment {
     commit_asset(value, blind, pk, ASSET_ZCRYPT)
 }
-/// Coin commitment for a shielded asset `= Poseidon2(value, blind, pk, asset_id)`
-/// — binds amount, owner, *and* asset, so a coin of one asset can never be opened
-/// or spent as another.
+/// Coin commitment for a shielded asset. Binds amount, owner, and asset, so a
+/// coin of one asset cannot be opened as another.
 pub fn commit_asset(value: u64, blind: &Blind, pk: &PubKey, asset_id: u64) -> Commitment {
     native_commit(&coin_input(value, blind, pk, asset_id))
 }
-/// Canonical nullifier for native ZCRYPT `= Poseidon2(spend_secret, value, blind, 0)`.
+/// Canonical nullifier for native ZCRYPT.
 pub fn nullifier(spend_secret: &SpendSecret, value: u64, blind: &Blind) -> Commitment {
     nullifier_asset(spend_secret, value, blind, ASSET_ZCRYPT)
 }
@@ -694,10 +726,9 @@ pub fn nullifier_asset(spend_secret: &SpendSecret, value: u64, blind: &Blind, as
     native_commit(&nf_input(spend_secret, value, blind, asset_id))
 }
 
-/// Domain tag for [`secret_coin_tag`], written into the nullifier block's one free
-/// lane. The canonical nullifier always leaves that lane zero, so a non-zero tag is a
-/// different permutation input: the tag and the coin's published nullifier are
-/// distinct values, and neither is computable from the other.
+/// Domain tag for [`secret_coin_tag`]. The nullifier pins lane 15 to [`TAG_NF`];
+/// the secret tag overwrites that lane, so the two compressions differ and neither
+/// digest is computable from the other.
 const COIN_TAG_DOMAIN: u64 = 0x00_C0_1A_67;
 
 /// A **secret** per-coin tag: the same binding tuple as the nullifier

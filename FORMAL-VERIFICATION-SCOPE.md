@@ -177,5 +177,6 @@ commitment, nullifier and spend-pubkey preimage domains disjoint by construction
 shipped Poseidon2 layouts overlapped (`pk_input(ss)` equalled `nf_input(ss, 0, zero-blind, 0)`).
 The code now realises the model's assumption: lane 15 of every core preimage carries a fixed
 role tag (`TAG_COMMIT = 1`, `TAG_NF = 2`, `TAG_PK = 3`, see `impl/shield/src/lib.rs`), and both
-AIRs constrain it. TODO for the formal model: state the injectivity hypothesis as a
-collision-resistance reduction rather than literal injectivity of the truncated permutation.
+AIRs constrain it. The Lean file does not assume injectivity. A theorem that used to conclude
+"the two openings are equal" now returns an explicit collision of the two hash inputs, so the
+statement is "breaking the property requires finding a collision."

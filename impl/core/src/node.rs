@@ -10,7 +10,7 @@
 use crate::hash::Hash;
 use crate::smt::{self, Smt};
 use crate::zvm;
-use zcrypt_shield::tree::CommitmentTree;
+use zcrypt_shield::tree::{AppendError, CommitmentTree};
 use zcrypt_shield::Commitment;
 
 pub use crate::reconcile::RECONCILE_BATCH_SIZE;
@@ -89,6 +89,14 @@ pub struct Node {
     /// from consensus-committed staking state, so it is NOT part of the app_hash — every
     /// node recomputes the identical sentinel power and CometBFT keeps the sets in lockstep.
     sentinel: Option<Sentinel>,
+    /// App hash of the weak-subjectivity checkpoint this process has verified.
+    /// Not part of [`Self::state_root`]. Persisted so a restart above the checkpoint
+    /// still carries the record. A snapshot above the checkpoint without it is refused.
+    ws_passed: Option<Hash>,
+    /// Client-local checkpoint override (tests, and a restore that names one).
+    /// Not persisted: a restart returns to the checkpoint compiled into the client
+    /// unless the caller passes another one to [`Self::restore_against`].
+    ws_checkpoint: Option<crate::ws::Checkpoint>,
 }
 
 /// The foundation liveness-guarantor validator (see [`Node::sentinel`]).
@@ -220,6 +228,9 @@ pub struct NodeSnapshot {
     pub sentinel: Option<Sentinel>,
     /// Block-boundary anchor roots (v10+).
     pub block_roots: Vec<Commitment>,
+    /// Weak-subjectivity record (v14+): the shipped checkpoint's app hash, once this
+    /// state has observed it. Absent on a snapshot that never passed the checkpoint.
+    pub ws_passed: Option<Hash>,
 }
 
 /// v2 added the Bitcoin SPV header chain; v3 added the immature-mint (maturity) queue;
@@ -233,7 +244,8 @@ pub struct NodeSnapshot {
 /// the sentinel's decay rule, and block-boundary anchor roots. Positional layout change,
 /// so older state refuses to load (the chain relaunches fresh with these consensus changes).
 /// v12: `AssetMeta::{reserve_pk, retired_reserves}` (SPV reserve-key rotation).
-const SNAPSHOT_VERSION: u32 = 13;
+/// v14: `ws_passed`, the weak-subjectivity record. Older state refuses to load.
+const SNAPSHOT_VERSION: u32 = 14;
 /// Public mirror of the postcard snapshot format version (for `state_db` restore).
 pub const SNAPSHOT_VERSION_PUB: u32 = SNAPSHOT_VERSION;
 
@@ -248,7 +260,7 @@ impl Node {
         let commitment_tree = CommitmentTree::new();
         let mut recent_roots = std::collections::VecDeque::new();
         recent_roots.push_back(commitment_tree.root()); // the empty-tree anchor
-        Node {
+        let mut node = Node {
             smt: Smt::new(),
             current_height: 0,
             current_block_time: 0,
@@ -261,7 +273,17 @@ impl Node {
             recent_roots,
             block_roots: std::collections::VecDeque::new(),
             sentinel: None,
+            ws_passed: None,
+            ws_checkpoint: None,
+        };
+        // The shipped checkpoint is the empty node at height 0, before InitChain mints.
+        // Stamp it now. `state_root` does not read `ws_passed`, so the stamp does not
+        // change the hash the checkpoint publishes.
+        if crate::ws::SHIPPED_HEIGHT == 0 {
+            let root = node.state_root();
+            node.ws_passed = Some(root);
         }
+        node
     }
 
     /// Append a coin commitment to the tree AND record the resulting root in the
@@ -269,10 +291,15 @@ impl Node {
     /// hard error: silently dropping an output would leave a spent input with no
     /// corresponding coin (I3).
     fn append_and_record(&mut self, c: Commitment) -> Result<usize, String> {
-        let idx = self
-            .commitment_tree
-            .append(c)
-            .ok_or_else(|| "commitment tree is full: no further coins can be created".to_string())?;
+        let idx = match self.commitment_tree.append(c) {
+            Ok(idx) => idx,
+            Err(AppendError::Full) => {
+                return Err("commitment tree is full: no further coins can be created".to_string());
+            }
+            Err(AppendError::Duplicate) => {
+                return Err("duplicate commitment: this opening is already in the tree".to_string());
+            }
+        };
         let root = self.commitment_tree.root();
         if self.recent_roots.back() != Some(&root) {
             self.recent_roots.push_back(root);
@@ -281,6 +308,19 @@ impl Node {
             }
         }
         Ok(idx)
+    }
+
+    /// Reject an output commitment that is already a leaf, or that appears twice in
+    /// `commitments`. Checked before any nullifier is inserted, so a repeated opening
+    /// cannot spend coins and then fail.
+    fn note_outputs_fresh(&self, commitments: impl IntoIterator<Item = Commitment>) -> Result<(), String> {
+        let mut batch = std::collections::HashSet::new();
+        for c in commitments {
+            if !batch.insert(c) || self.commitment_tree.contains(&c) {
+                return Err("duplicate commitment: this opening is already in the tree".into());
+            }
+        }
+        Ok(())
     }
 
     /// Whether `root` is a commitment-tree root the node produced: the live root, a
@@ -322,21 +362,39 @@ impl Node {
             immature: self.immature.clone(),
             sentinel: self.sentinel.clone(),
             block_roots: self.block_roots.iter().copied().collect(),
+            ws_passed: self.ws_passed,
         }
     }
 
-    /// Reconstruct a `Node` (and its block height) from a snapshot. Derived Merkle
-    /// state is rebuilt from the persisted leaves, so `state_root()` reproduces the
-    /// app_hash exactly.
-    pub fn restore(snap: NodeSnapshot) -> (Self, u64) {
-        let commitment_tree = CommitmentTree::restore(snap.commitment_leaves);
+    /// Reconstruct a `Node` (and its block height) from a snapshot, checked against
+    /// the checkpoint compiled into this client.
+    pub fn restore(snap: NodeSnapshot) -> Result<(Self, u64), String> {
+        let cp = crate::ws::shipped_checkpoint();
+        Self::restore_against(snap, &cp)
+    }
+
+    /// [`Self::restore`] against an explicit checkpoint. Tests use this to inject one
+    /// above genesis. The checkpoint is client configuration, not chain state.
+    pub fn restore_against(
+        snap: NodeSnapshot,
+        cp: &crate::ws::Checkpoint,
+    ) -> Result<(Self, u64), String> {
+        let commitment_tree = match CommitmentTree::restore(snap.commitment_leaves) {
+            Ok(t) => t,
+            Err(AppendError::Full) => {
+                return Err("commitment tree is full: no further coins can be created".to_string());
+            }
+            Err(AppendError::Duplicate) => {
+                return Err("duplicate commitment: snapshot leaves are not unique".to_string());
+            }
+        };
         let mut recent_roots: std::collections::VecDeque<Commitment> =
             snap.recent_roots.into_iter().collect();
         if recent_roots.is_empty() {
             recent_roots.push_back(commitment_tree.root());
         }
         let height = snap.height;
-        let node = Node {
+        let mut node = Node {
             smt: Smt::restore(snap.smt_leaves),
             current_height: height,
             current_block_time: 0, // re-set by the next finalize_block
@@ -349,8 +407,11 @@ impl Node {
             recent_roots,
             block_roots: snap.block_roots.into_iter().collect(),
             sentinel: snap.sentinel,
+            ws_passed: snap.ws_passed,
+            ws_checkpoint: Some(*cp),
         };
-        (node, height)
+        node.enforce_weak_subjectivity()?;
+        Ok((node, height))
     }
 
     /// Nullifiers inserted since the previous call (insertion order): what the durable
@@ -405,7 +466,7 @@ impl Node {
                 ))
             }
         };
-        Ok(Node::restore(snap))
+        Node::restore(snap)
     }
 
     /// The nullifier registry (SMT) root — what reconciliation proofs verify
@@ -981,16 +1042,18 @@ impl Node {
     /// Lock existing coins of `asset_id` into a **swap** escrow (in-pool asset↔asset). Like
     /// [`Self::htlc_burn_lock`], `shield_tx` must spend the locker's coins with its first
     /// output the burn coin `commit_asset(value, blind, BURN_PK, asset_id)` (the locked
-    /// value, taken out of circulation). On **claim** (with the preimage, before timeout)
-    /// the value re-materializes to `counterparty_pk`; on **expire** it refunds to
-    /// `refund_pk` (the locker). Two of these across two assets, sharing one hashlock, make
-    /// a private atomic swap — reuses the same gate as a burn-lock (registered asset +
-    /// output[0] is the declared locked coin).
+    /// value, taken out of circulation). Its fee is 0: gas is `gas_tx`, a separate ZCRYPT
+    /// spend whose first output burns exactly 0.01 ZCRYPT. On **claim** (with the preimage,
+    /// before timeout) the value re-materializes to `counterparty_pk`; on **expire** it
+    /// refunds to `refund_pk` (the locker). Two of these across two assets, sharing one
+    /// hashlock, make a private atomic swap.
     #[allow(clippy::too_many_arguments)]
     pub fn swap_lock(
         &mut self,
         chain_id: &[u8],
         shield_tx: &crate::shield_tx::ShieldTx,
+        gas_tx: &crate::shield_tx::ShieldTx,
+        gas_blind: zcrypt_shield::Blind,
         value: u64,
         blind: zcrypt_shield::Blind,
         asset_id: u64,
@@ -1015,14 +1078,17 @@ impl Node {
             return Err("escrow value must be positive".to_string());
         }
         lock_value_ok(value)?;
-        // Anti-bypass: the lock spend must burn ≥ MIN_FEE gas (in-asset), so a swap lock cannot
-        // move value through output[1..] for free (see `bond_with_stake`).
-        if shield_tx.fee < crate::emission::MIN_FEE {
+        // Gas is 0.01 ZCRYPT in a separate proof, the same bundle a transfer uses. The asset
+        // spend itself burns nothing, so a swap cannot be used to move the swapped asset for
+        // free and the asset being locked is not the fee.
+        if shield_tx.fee != 0 {
             return Err(format!(
-                "swap-lock: spend must burn ≥ MIN_FEE ({}) gas; got {}",
-                crate::emission::MIN_FEE,
+                "swap-lock: asset spend must have fee 0 (gas is the ZCRYPT note); got {}",
                 shield_tx.fee
             ));
+        }
+        if gas_tx.output_commitments.first() != Some(&Self::gas_burn_coin(&gas_blind)) {
+            return Err("swap-lock: gas note output[0] is not the 0.01 ZCRYPT burn coin".to_string());
         }
         // Escrow id is keyed by counterparty (party_pk); pre-check before burning.
         let eid =
@@ -1036,7 +1102,46 @@ impl Node {
             crate::htlc_shield::ENV_SWAP_LOCK,
             asset_id, value, &hashlock, timeout_height, &counterparty_pk, &refund_pk, &[],
         );
-        self.submit_shield_bound(chain_id, shield_tx, &envelope)?;
+        if !self.root_is_known(&gas_tx.root) {
+            return Err("swap-lock: gas note anchors on an unknown/expired root".to_string());
+        }
+        if !self.root_is_known(&shield_tx.root) {
+            return Err("swap-lock: asset spend anchors on an unknown/expired root".to_string());
+        }
+        // Verify both proofs before either mutates state, so a bad lock does not burn the gas.
+        let gas_env = crate::shield_tx::gas_pay_envelope(&crate::shield_tx::txbind(chain_id, shield_tx));
+        let gas_nfs = crate::shield_tx::verify_bound(chain_id, gas_tx, &gas_env)?;
+        let main_nfs = crate::shield_tx::verify_bound(chain_id, shield_tx, &envelope)?;
+        self.note_outputs_fresh(
+            gas_tx
+                .output_commitments
+                .iter()
+                .chain(shield_tx.output_commitments.iter())
+                .copied(),
+        )?;
+        let mut seen = std::collections::HashSet::new();
+        for nf in gas_nfs.iter().chain(main_nfs.iter()) {
+            if self.smt.contains(nf) {
+                return Err(format!("double-spend: nullifier {} already spent", hex8(nf)));
+            }
+            if !seen.insert(*nf) {
+                return Err("swap-lock: gas note and asset spend reuse a coin".to_string());
+            }
+        }
+        let gas_txbind = crate::shield_tx::txbind(chain_id, gas_tx);
+        let main_txbind = crate::shield_tx::txbind(chain_id, shield_tx);
+        for nf in &gas_nfs {
+            self.smt.insert(*nf, gas_txbind);
+        }
+        for nf in &main_nfs {
+            self.smt.insert(*nf, main_txbind);
+        }
+        for oc in &gas_tx.output_commitments {
+            self.append_and_record(*oc)?;
+        }
+        for oc in &shield_tx.output_commitments {
+            self.append_and_record(*oc)?;
+        }
         self.htlc.lock_swap(asset_id, value, hashlock, timeout_height, counterparty_pk, refund_pk)
     }
 
@@ -1830,6 +1935,63 @@ impl Node {
         self.current_height = height;
     }
 
+    /// The checkpoint this node enforces. The shipped one, unless a test or
+    /// [`Self::restore_against`] installed another.
+    fn checkpoint(&self) -> crate::ws::Checkpoint {
+        self.ws_checkpoint
+            .unwrap_or_else(crate::ws::shipped_checkpoint)
+    }
+
+    /// Install a checkpoint other than the one compiled into the client.
+    pub fn install_checkpoint(&mut self, cp: crate::ws::Checkpoint) {
+        self.ws_checkpoint = Some(cp);
+    }
+
+    pub fn ws_passed(&self) -> Option<Hash> {
+        self.ws_passed
+    }
+
+    /// Hash of the bonded validator set, in the same order CometBFT is told.
+    pub fn validator_set_hash(&self) -> Hash {
+        crate::ws::validator_set_hash(&self.staking.validator_set())
+    }
+
+    /// Halt unless this state is consistent with the weak-subjectivity checkpoint.
+    ///
+    /// At the checkpoint height the state root and the validator-set hash must
+    /// match, and the match is recorded. Above it, the record must already be
+    /// present. The height-0 checkpoint is the empty node from before InitChain;
+    /// once it has been recorded, later genesis mints at height 0 are not a mismatch.
+    /// `state_root` does not cover this record.
+    pub fn enforce_weak_subjectivity(&mut self) -> Result<(), String> {
+        let cp = self.checkpoint();
+        if self.current_height < cp.height {
+            return Ok(());
+        }
+        let matches = self.state_root() == cp.app_hash
+            && self.validator_set_hash() == cp.validator_set_hash;
+        if self.current_height == cp.height {
+            if matches {
+                self.ws_passed = Some(cp.app_hash);
+                return Ok(());
+            }
+            if cp.height == 0 && self.ws_passed == Some(cp.app_hash) {
+                return Ok(());
+            }
+            return Err(format!(
+                "weak-subjectivity checkpoint mismatch at height {}",
+                cp.height
+            ));
+        }
+        if self.ws_passed != Some(cp.app_hash) {
+            return Err(format!(
+                "height {} is above the weak-subjectivity checkpoint at height {} without a record of passing it",
+                self.current_height, cp.height
+            ));
+        }
+        Ok(())
+    }
+
     /// Set the current BFT block time in unix seconds (consensus layer calls this in
     /// `finalize_block`, from the agreed block timestamp). Drives the unbonding period.
     pub fn set_block_time(&mut self, unix_secs: u64) {
@@ -1870,6 +2032,8 @@ impl Node {
         if !self.root_is_known(&tx.root) {
             return Err("shield-tx: unknown/expired commitment-tree anchor root".to_string());
         }
+        // Before the proof, and before any nullifier is recorded.
+        self.note_outputs_fresh(tx.output_commitments.iter().copied())?;
         // Fee-agnostic raw apply: conservation (`Σin = Σout + fee`) is proven by the
         // circuit for whatever `fee` the tx declares. The universal-gas minimum is NOT
         // enforced here — it lives on the transfer path ([`Self::submit_transfer`], which
@@ -1911,6 +2075,7 @@ impl Node {
                 return Err(format!("double-spend: nullifier {} already spent", hex8(&nf)));
             }
         }
+        self.note_outputs_fresh(tx.output_commitments.iter().copied())?;
         Ok(())
     }
 
@@ -1944,6 +2109,13 @@ impl Node {
                 return Err("transfer: gas note and main tx reuse a coin".to_string());
             }
         }
+        self.note_outputs_fresh(
+            gas_tx
+                .output_commitments
+                .iter()
+                .chain(main_tx.output_commitments.iter())
+                .copied(),
+        )?;
         Ok(())
     }
 
@@ -1968,25 +2140,28 @@ impl Node {
         chain_id: &[u8],
         gas_tx: &crate::shield_tx::ShieldTx,
         gas_blind: zcrypt_shield::Blind,
+        body: &[u8],
     ) -> Result<(), String> {
         if gas_tx.output_commitments.first() != Some(&Self::gas_burn_coin(&gas_blind)) {
             return Err("gas note output[0] is not the 0.01 ZCRYPT gas burn coin".to_string());
         }
-        self.check_shield(chain_id, gas_tx)
+        self.check_shield_bound(chain_id, gas_tx, &crate::shield_tx::gas_pay_envelope(body))
     }
 
     /// Apply a standalone gas note (see [`Self::check_gas_note`]): burns the gas and
-    /// records the spend. Call before the action it pays for.
+    /// records the spend. `body` is the transparent payload the note pays for.
+    /// Call before the action it pays for.
     pub fn submit_gas_note(
         &mut self,
         chain_id: &[u8],
         gas_tx: &crate::shield_tx::ShieldTx,
         gas_blind: zcrypt_shield::Blind,
+        body: &[u8],
     ) -> Result<Receipt, String> {
         if gas_tx.output_commitments.first() != Some(&Self::gas_burn_coin(&gas_blind)) {
             return Err("gas note output[0] is not the 0.01 ZCRYPT gas burn coin".to_string());
         }
-        self.submit_shield(chain_id, gas_tx)
+        self.submit_shield_bound(chain_id, gas_tx, &crate::shield_tx::gas_pay_envelope(body))
     }
 
     /// Current commitment-tree root — a spend anchor. Wallets prove membership
@@ -2042,6 +2217,7 @@ impl Node {
         if !self.root_is_known(&tx.root) {
             return Err("shield-tx: unknown/expired commitment-tree anchor root".to_string());
         }
+        self.note_outputs_fresh(tx.output_commitments.iter().copied())?;
         let nullifiers = crate::shield_tx::verify_bound(chain_id, tx, envelope)?;
         for nf in &nullifiers {
             if self.smt.contains(nf) {
@@ -2092,7 +2268,8 @@ impl Node {
         if !self.root_is_known(&main_tx.root) {
             return Err("transfer: main tx anchors on an unknown/expired root".to_string());
         }
-        let gas_nfs = crate::shield_tx::verify(chain_id, gas_tx)?;
+        let gas_env = crate::shield_tx::gas_pay_envelope(&crate::shield_tx::txbind(chain_id, main_tx));
+        let gas_nfs = crate::shield_tx::verify_bound(chain_id, gas_tx, &gas_env)?;
         let main_nfs = crate::shield_tx::verify(chain_id, main_tx)?;
         // No nullifier may already be spent, and gas + main must not reuse a coin.
         let mut seen = std::collections::HashSet::new();
@@ -2104,6 +2281,13 @@ impl Node {
                 return Err("transfer: gas note and main tx reuse a coin".to_string());
             }
         }
+        self.note_outputs_fresh(
+            gas_tx
+                .output_commitments
+                .iter()
+                .chain(main_tx.output_commitments.iter())
+                .copied(),
+        )?;
         Ok((main_nfs, gas_nfs))
     }
 
@@ -2356,5 +2540,88 @@ mod tests {
     fn snapshot_version_mismatch_is_rejected() {
         // A corrupt / wrong-version snapshot must fail loudly, never silently reset.
         assert!(Node::from_snapshot_bytes(b"not a snapshot").is_err());
+    }
+
+    #[test]
+    fn duplicate_commitment_is_rejected_and_does_not_spend_a_nullifier() {
+        let mut node = Node::new();
+        let c = [7u64; 8];
+        node.seed_coin(c);
+        let nf = h(b"NF", &[b"keep"]);
+        node.smt.insert(nf, h(b"TX", &[b"1"]));
+        let root = node.state_root();
+        let err = node.note_outputs_fresh([c, [8u64; 8]]).unwrap_err();
+        assert!(err.contains("duplicate commitment"), "{err}");
+        let err = node.note_outputs_fresh([[1u64; 8], [1u64; 8]]).unwrap_err();
+        assert!(err.contains("duplicate commitment"), "{err}");
+        let err = node.append_and_record(c).unwrap_err();
+        assert!(err.contains("duplicate commitment"), "{err}");
+        assert_eq!(node.commitment_count(), 1);
+        assert_eq!(node.smt_len(), 1);
+        assert!(node.smt.contains(&nf));
+        assert_eq!(node.state_root(), root);
+
+        let mut snap = node.snapshot(1);
+        snap.commitment_leaves.push(c);
+        let err = match Node::restore(snap) {
+            Err(e) => e,
+            Ok(_) => panic!("a snapshot with a repeated leaf was accepted"),
+        };
+        assert!(err.contains("duplicate commitment"), "{err}");
+    }
+
+    #[test]
+    fn weak_subjectivity_record_is_not_part_of_the_state_root() {
+        let a = Node::new();
+        let mut b = Node::new();
+        b.ws_passed = None;
+        assert_eq!(a.state_root(), b.state_root());
+        assert_eq!(a.ws_passed(), Some(a.state_root()));
+    }
+
+    #[test]
+    fn weak_subjectivity_checkpoint_halts_on_mismatch_and_gates_snapshots() {
+        let mut good = Node::new();
+        good.set_height(5);
+        good.seed_coin([1u64; 8]);
+        let cp = crate::ws::Checkpoint {
+            height: 5,
+            app_hash: good.state_root(),
+            validator_set_hash: good.validator_set_hash(),
+        };
+
+        let mut bad = Node::new();
+        bad.install_checkpoint(cp);
+        bad.set_height(5);
+        bad.seed_coin([2u64; 8]);
+        let err = bad.enforce_weak_subjectivity().unwrap_err();
+        assert!(err.contains("checkpoint mismatch"), "{err}");
+
+        good.install_checkpoint(cp);
+        good.enforce_weak_subjectivity().unwrap();
+        assert_eq!(good.ws_passed(), Some(cp.app_hash));
+        let (restored, h) = Node::restore_against(good.snapshot(8), &cp).unwrap();
+        assert_eq!(h, 8);
+        assert_eq!(restored.state_root(), good.state_root());
+        assert_eq!(restored.ws_passed(), Some(cp.app_hash));
+
+        // Above the checkpoint, a snapshot that never recorded passing it is refused.
+        let mut unanchored = Node::new();
+        unanchored.install_checkpoint(cp);
+        unanchored.set_height(6);
+        unanchored.seed_coin([1u64; 8]);
+        let err = match Node::restore_against(unanchored.snapshot(6), &cp) {
+            Err(e) => e,
+            Ok(_) => panic!("a snapshot above the checkpoint with no record was accepted"),
+        };
+        assert!(err.contains("without a record"), "{err}");
+
+        // The shipped genesis checkpoint still accepts a node that started empty.
+        let mut later = Node::new();
+        later.seed_coin([3u64; 8]);
+        later.set_height(4);
+        let (round, height) = Node::restore(later.snapshot(4)).unwrap();
+        assert_eq!(height, 4);
+        assert_eq!(round.state_root(), later.state_root());
     }
 }

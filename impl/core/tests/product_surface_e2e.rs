@@ -282,11 +282,11 @@ fn shielded_swap_end_to_end() {
     let timeout = 100u64;
 
     // Lock `value` of `asset` from `locker`'s `coin` into a swap escrow claimable by
-    // `counterparty` (refund to the locker). The fee is paid in the moved asset.
+    // `counterparty` (refund to the locker). The asset spend has fee 0; gas is 0.01 ZCRYPT.
     let lock_leg = |node: &mut Node, locker: &Account, asset: u64, coin: &Coin, value: u64, counterparty: &Account| -> [u8; 32] {
         let burn_blind = keys::random_blind();
         let chg_blind = keys::random_blind();
-        let chg = coin.value - value - FEE;
+        let chg = coin.value - value;
         let burn_out: OutCoin = (value, burn_blind, BURN_PK, asset);
         let chg_out: OutCoin = (chg, chg_blind, locker.pubkey(), asset);
         let note = kem::ciphertext_to_bytes(&keys::encrypt_note_asset(&locker.normal_address(), chg, chg_blind, asset));
@@ -296,8 +296,22 @@ fn shielded_swap_end_to_end() {
             zcrypt_core::htlc_shield::ENV_SWAP_LOCK,
             asset, value, &lock, timeout, &counterparty.pubkey(), &locker.pubkey(), &[],
         );
-        let stx = build_shield_bound(node, &[coin.clone()], [burn_out, chg_out], FEE, vec![keys::cover_note_bytes(), note], &env).unwrap();
-        node.swap_lock(CHAIN, &stx, value, burn_blind, asset, lock, timeout, counterparty.pubkey(), locker.pubkey()).unwrap()
+        let stx = build_shield_bound(node, &[coin.clone()], [burn_out, chg_out], 0, vec![keys::cover_note_bytes(), note], &env).unwrap();
+        let gas_coin = locker.own_coin(FEE + 1_000, keys::random_blind());
+        node.seed_coin(gas_coin.commitment());
+        let gas_blind = keys::random_blind();
+        let gas_burn: OutCoin = (FEE, gas_blind, BURN_PK, 0);
+        let gas_chg = keys::out_coin(&locker.normal_address(), 1_000, keys::random_blind());
+        let gas_tx = build_shield_bound(
+            node,
+            &[gas_coin],
+            [gas_burn, gas_chg],
+            0,
+            notes(),
+            &shield_tx::gas_pay_envelope(&shield_tx::txbind(CHAIN, &stx)),
+        )
+        .unwrap();
+        node.swap_lock(CHAIN, &stx, &gas_tx, gas_blind, value, burn_blind, asset, lock, timeout, counterparty.pubkey(), locker.pubkey()).unwrap()
     };
 
     // Alice locks A → Bob; Bob locks B → Alice (same hashlock).
@@ -679,7 +693,21 @@ fn transfer_of_a_shielded_asset_pays_zcrypt_gas() {
     let gas_blind = keys::random_blind();
     let gas_burn: OutCoin = (FEE, gas_blind, BURN_PK, 0);
     let gas_chg = keys::out_coin(&alice.normal_address(), 1_000, keys::random_blind());
-    let gas_tx = build_shield(&node, &[gas_coin], [gas_burn, gas_chg], 0, notes()).unwrap();
+    let gas_tx = build_shield_bound(
+        &node,
+        &[gas_coin],
+        [gas_burn, gas_chg],
+        0,
+        notes(),
+        &shield_tx::gas_pay_envelope(&shield_tx::txbind(CHAIN, &main_tx)),
+    )
+    .unwrap();
+    // The gas proof is bound to this main transaction. A different envelope, including
+    // an empty one, does not verify.
+    let bound = shield_tx::gas_pay_envelope(&shield_tx::txbind(CHAIN, &main_tx));
+    assert!(shield_tx::verify_bound(CHAIN, &gas_tx, &bound).is_ok());
+    assert!(shield_tx::verify_bound(CHAIN, &gas_tx, &[]).is_err());
+    assert!(shield_tx::verify_bound(CHAIN, &gas_tx, &shield_tx::gas_pay_envelope(b"other-main")).is_err());
 
     // The bundled transfer is accepted: a GOLD transfer, gas paid in ZCRYPT.
     node.submit_transfer(CHAIN, &main_tx, &gas_tx, gas_blind).expect("GOLD transfer with ZCRYPT gas");
@@ -702,12 +730,13 @@ fn transfer_of_a_shielded_asset_pays_zcrypt_gas() {
     let underpay = carol.own_coin(FEE + 1_000, keys::random_blind());
     node.seed_coin(underpay.commitment());
     let ub = keys::random_blind();
-    let under_gas = build_shield(
+    let under_gas = build_shield_bound(
         &node,
         &[underpay],
         [(FEE - 1, ub, BURN_PK, 0), keys::out_coin(&carol.normal_address(), 1_001, keys::random_blind())],
         0,
         notes(),
+        &shield_tx::gas_pay_envelope(&shield_tx::txbind(CHAIN, &good_main)),
     ).unwrap();
     assert!(
         node.submit_transfer(CHAIN, &good_main, &under_gas, ub).is_err(),
@@ -729,12 +758,13 @@ fn transfer_of_a_shielded_asset_pays_zcrypt_gas() {
     let gas_coin2 = carol.own_coin(FEE + 1_000, keys::random_blind());
     node.seed_coin(gas_coin2.commitment());
     let gb2 = keys::random_blind();
-    let good_gas = build_shield(
+    let good_gas = build_shield_bound(
         &node,
         &[gas_coin2],
         [(FEE, gb2, BURN_PK, 0), keys::out_coin(&carol.normal_address(), 1_000, keys::random_blind())],
         0,
         notes(),
+        &shield_tx::gas_pay_envelope(&shield_tx::txbind(CHAIN, &main_with_fee)),
     ).unwrap();
     assert!(
         node.submit_transfer(CHAIN, &main_with_fee, &good_gas, gb2).is_err(),

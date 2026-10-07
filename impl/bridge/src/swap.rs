@@ -364,9 +364,14 @@ fn pk_bytes(pk: &PubKey) -> Vec<u8> {
 /// Build the GAS PREFIX state-creating txs (REGISTER 0x59, HTLC_OPEN 0x5A) must carry:
 /// `gas_blind(32) ‖ gas_len(u32 LE) ‖ gas_tx`, where `gas_tx` is a ZCRYPT shield spend of
 /// `gas_coin` (owned by `gas_owner`) whose output[0] burns exactly MIN_FEE ZCRYPT and whose
-/// change returns to `gas_owner`. Exactly the gas note a 0x55 transfer bundles. Consensus
-/// rejects these tags without it (they used to be free: consensus H1).
-pub fn build_gas_prefix(zc: &Zcrypt, gas_owner: &Account, gas_coin: &Coin) -> Result<Vec<u8>, String> {
+/// change returns to `gas_owner`. `payload` is the transparent body that follows this
+/// prefix; the gas proof is bound to it.
+pub fn build_gas_prefix(
+    zc: &Zcrypt,
+    gas_owner: &Account,
+    gas_coin: &Coin,
+    payload: &[u8],
+) -> Result<Vec<u8>, String> {
     let min_fee = zcrypt_core::emission::MIN_FEE;
     if gas_coin.value < min_fee {
         return Err("gas coin is below the minimum fee".to_string());
@@ -381,12 +386,13 @@ pub fn build_gas_prefix(zc: &Zcrypt, gas_owner: &Account, gas_coin: &Coin) -> Re
         chg_val,
         chg_blind,
     ));
-    let gas_tx = build_shield_spend(
+    let gas_tx = build_shield_spend_bound(
         zc,
         &[gas_coin.clone()],
         &[burn, chg],
         0,
         vec![zcrypt_core::keys::cover_note_bytes(), chg_note],
+        &shield_tx::gas_pay_envelope(payload),
     )?;
     let gas_bytes = shield_tx::to_bytes(&gas_tx);
     let mut out = Vec::with_capacity(36 + gas_bytes.len());
@@ -398,15 +404,53 @@ pub fn build_gas_prefix(zc: &Zcrypt, gas_owner: &Account, gas_coin: &Coin) -> Re
     Ok(out)
 }
 
-/// Build a REGISTER tx (0x59). `gas` is the encoded gas prefix from [`build_gas_prefix`].
-pub fn register_tx(ticker: &str, decimals: u8, authority: &[u8; 32], max_supply: u64, gas: &[u8]) -> Vec<u8> {
-    let mut t = vec![0x59u8];
-    t.extend_from_slice(gas);
+/// Transparent body of a REGISTER tx: the bytes that follow the gas prefix.
+pub fn register_body(decimals: u8, ticker: &str, max_supply: u64, authority: &[u8; 32]) -> Vec<u8> {
+    let mut t = Vec::with_capacity(2 + ticker.len() + 8 + 32);
     t.push(decimals);
     t.push(ticker.len() as u8);
     t.extend_from_slice(ticker.as_bytes());
     t.extend_from_slice(&max_supply.to_le_bytes());
     t.extend_from_slice(authority);
+    t
+}
+
+/// Transparent body of an SPV REGISTER tx (33-byte reserve key in place of the authority).
+pub fn register_spv_body(decimals: u8, ticker: &str, max_supply: u64, reserve_pk: &[u8; 33]) -> Vec<u8> {
+    let mut t = Vec::with_capacity(2 + ticker.len() + 8 + 33);
+    t.push(decimals);
+    t.push(ticker.len() as u8);
+    t.extend_from_slice(ticker.as_bytes());
+    t.extend_from_slice(&max_supply.to_le_bytes());
+    t.extend_from_slice(reserve_pk);
+    t
+}
+
+/// Transparent body of an HTLC_OPEN tx: the bytes that follow the gas prefix.
+pub fn open_body(
+    asset: u64,
+    value: u64,
+    lock: &[u8; 32],
+    timeout: u64,
+    claim_pk: &PubKey,
+    auth: &[u8],
+) -> Vec<u8> {
+    let mut t = Vec::with_capacity(8 + 8 + 32 + 8 + 64 + auth.len());
+    t.extend_from_slice(&asset.to_le_bytes());
+    t.extend_from_slice(&value.to_le_bytes());
+    t.extend_from_slice(lock);
+    t.extend_from_slice(&timeout.to_le_bytes());
+    t.extend_from_slice(&pk_bytes(claim_pk));
+    t.extend_from_slice(auth);
+    t
+}
+
+/// Build a REGISTER tx (0x59). `gas` is the encoded gas prefix from [`build_gas_prefix`],
+/// bound to [`register_body`] of these same fields.
+pub fn register_tx(ticker: &str, decimals: u8, authority: &[u8; 32], max_supply: u64, gas: &[u8]) -> Vec<u8> {
+    let mut t = vec![0x59u8];
+    t.extend_from_slice(gas);
+    t.extend_from_slice(&register_body(decimals, ticker, max_supply, authority));
     t
 }
 
@@ -422,11 +466,7 @@ pub fn register_tx(ticker: &str, decimals: u8, authority: &[u8; 32], max_supply:
 pub fn register_spv_tx(ticker: &str, decimals: u8, reserve_pk: &[u8; 33], max_supply: u64, gas: &[u8]) -> Vec<u8> {
     let mut t = vec![0x59u8];
     t.extend_from_slice(gas);
-    t.push(decimals);
-    t.push(ticker.len() as u8);
-    t.extend_from_slice(ticker.as_bytes());
-    t.extend_from_slice(&max_supply.to_le_bytes());
-    t.extend_from_slice(reserve_pk);
+    t.extend_from_slice(&register_spv_body(decimals, ticker, max_supply, reserve_pk));
     t
 }
 
@@ -676,12 +716,7 @@ pub fn relay_btc_headers(zc: &dyn ZcNode, btc: &dyn crate::BtcBackend) -> Result
 pub fn open_tx(asset: u64, value: u64, lock: &[u8; 32], timeout: u64, claim_pk: &PubKey, auth: &[u8], gas: &[u8]) -> Vec<u8> {
     let mut t = vec![0x5Au8];
     t.extend_from_slice(gas);
-    t.extend_from_slice(&asset.to_le_bytes());
-    t.extend_from_slice(&value.to_le_bytes());
-    t.extend_from_slice(lock);
-    t.extend_from_slice(&timeout.to_le_bytes());
-    t.extend_from_slice(&pk_bytes(claim_pk));
-    t.extend_from_slice(auth);
+    t.extend_from_slice(&open_body(asset, value, lock, timeout, claim_pk, auth));
     t
 }
 
@@ -806,7 +841,9 @@ pub fn parse_burn_lock_btc(payload: &[u8]) -> Option<([u8; 33], u64, u64, [u8; 3
 /// Build a swap-lock tx (0x62): lock existing coins into a swap escrow. Like a burn-lock
 /// but with TWO keys — `counterparty_pk` (claims with the preimage) and `refund_pk` (the
 /// locker, refunded on timeout). Two of these across two assets, one hashlock, = an atomic
-/// in-pool swap. `stx`'s output[0] must be `commit_asset(value, blind, BURN_PK, asset)`.
+/// in-pool swap. `stx`'s output[0] must be `commit_asset(value, blind, BURN_PK, asset)` and
+/// its fee is 0. Gas is `gas_tx`, appended after the 216-byte header as the same prefix a
+/// transfer uses (`gas_blind ‖ gas_len ‖ gas_tx`), and its output[0] burns 0.01 ZCRYPT.
 #[allow(clippy::too_many_arguments)]
 pub fn swap_lock_tx(
     value: u64,
@@ -816,6 +853,8 @@ pub fn swap_lock_tx(
     timeout: u64,
     counterparty_pk: &PubKey,
     refund_pk: &PubKey,
+    gas_blind: &[u64; 4],
+    gas_tx: &shield_tx::ShieldTx,
     stx: &shield_tx::ShieldTx,
 ) -> Vec<u8> {
     let mut t = vec![0x62u8];
@@ -828,14 +867,21 @@ pub fn swap_lock_tx(
     t.extend_from_slice(&timeout.to_le_bytes());
     t.extend_from_slice(&pk_bytes(counterparty_pk));
     t.extend_from_slice(&pk_bytes(refund_pk));
+    let gas_bytes = shield_tx::to_bytes(gas_tx);
+    for limb in gas_blind {
+        t.extend_from_slice(&limb.to_le_bytes());
+    }
+    t.extend_from_slice(&(gas_bytes.len() as u32).to_le_bytes());
+    t.extend_from_slice(&gas_bytes);
     t.extend_from_slice(&shield_tx::to_bytes(stx));
     t
 }
 
-/// Parse a SWAP_LOCK (`0x62`) payload (the bytes after the tag):
+/// Parse the 216-byte header of a SWAP_LOCK (`0x62`) payload (the bytes after the tag):
 /// `value(8) ‖ blind(32) ‖ asset(8) ‖ hashlock(32) ‖ timeout(8) ‖ counterparty_pk(64) ‖
-/// refund_pk(64) ‖ shield_tx`. Returns `(value, blind, asset, hashlock, timeout,
-/// counterparty_pk, refund_pk)`; the shield tx is left to consensus.
+/// refund_pk(64)`. A ZCRYPT gas prefix and the asset spend follow that header; both are
+/// left to consensus. Returns `(value, blind, asset, hashlock, timeout, counterparty_pk,
+/// refund_pk)`.
 #[allow(clippy::type_complexity)]
 pub fn parse_swap_lock(payload: &[u8]) -> Option<(u64, [u64; 4], u64, [u8; 32], u64, PubKey, PubKey)> {
     const HEAD: usize = 8 + 32 + 8 + 32 + 8 + 64 + 64;
@@ -880,6 +926,27 @@ pub struct PreparedDeposit {
     pub sats: u64,
 }
 
+/// Mint proof for a confirmed funding tx: raw tx, coinbase, and a merkle block that
+/// matches both. The coinbase is the index-0 leaf, which pins the tree height.
+pub fn mint_proof_for_txid(
+    backend: &dyn BtcBackend,
+    reserve_pk: [u8; 33],
+    refund_pk: [u8; 33],
+    btc_locktime: u32,
+    vout: u32,
+    txid: &bitcoin::Txid,
+) -> Result<MintProof, String> {
+    Ok(MintProof {
+        reserve_pk,
+        refund_pk,
+        btc_locktime,
+        vout,
+        raw_tx: backend.raw_tx(txid)?,
+        merkle_block: backend.txout_proof(txid)?,
+        coinbase_raw: backend.coinbase_raw(txid)?,
+    })
+}
+
 /// Fund a Bitcoin HTLC to `reserve_pk` for `preimage`, confirm it, relay the headers, and
 /// build the SPV mint proof. Returns everything an `open_spv_tx` needs, without opening.
 #[allow(clippy::too_many_arguments)]
@@ -898,14 +965,14 @@ pub fn prepare_spv_deposit(
     let utxo = user_btc.fund_htlc(&script, btc_amount)?;
     user_btc.confirm(&utxo.outpoint.txid)?;
     relay_btc_headers(zc, user_btc)?;
-    let proof = MintProof {
-        reserve_pk: reserve_pk.inner.serialize(),
-        refund_pk: user_refund.pk.inner.serialize(),
+    let proof = mint_proof_for_txid(
+        user_btc,
+        reserve_pk.inner.serialize(),
+        user_refund.pk.inner.serialize(),
         btc_locktime,
-        vout: utxo.outpoint.vout,
-        raw_tx: user_btc.raw_tx(&utxo.outpoint.txid)?,
-        merkle_block: user_btc.txout_proof(&utxo.outpoint.txid)?,
-    };
+        utxo.outpoint.vout,
+        &utxo.outpoint.txid,
+    )?;
     Ok(PreparedDeposit { proof, lock, zc_timeout, btc_locktime, utxo, sats: btc_amount.to_sat() })
 }
 
@@ -956,7 +1023,7 @@ pub fn build_shield_spend_bound(
     // current root, so the proof anchors on an anchor the node will recognize.
     let mut tree = zcrypt_shield::tree::CommitmentTree::new();
     for &c in &leaves {
-        tree.append(c);
+        tree.append(c).unwrap();
     }
     let mut spends = Vec::new();
     for coin in coins {
@@ -993,8 +1060,9 @@ pub fn build_transfer(
     if gas_coin.value < min_fee {
         return Err("gas coin is below the minimum fee".to_string());
     }
-    // Main transfer: no in-tx fee.
+    // Main transfer: no in-tx fee. The gas proof is bound to this tx's binding hash.
     let main_tx = build_shield_spend(zc, main_inputs, main_outs, 0, main_notes)?;
+    let gas_env = shield_tx::gas_pay_envelope(&shield_tx::txbind(&chain_id(), &main_tx));
     // ZCRYPT gas note: output[0] burns MIN_FEE, output[1] is change back to gas_owner.
     let gas_blind = zcrypt_core::keys::random_blind();
     let burn: OutCoin = (
@@ -1011,12 +1079,13 @@ pub fn build_transfer(
         chg_val,
         chg_blind,
     ));
-    let gas_tx = build_shield_spend(
+    let gas_tx = build_shield_spend_bound(
         zc,
         &[gas_coin.clone()],
         &[burn, chg],
         0,
         vec![zcrypt_core::keys::cover_note_bytes(), chg_note],
+        &gas_env,
     )?;
     // Bundle: 0x55 ‖ gas_blind(32) ‖ gas_len(4) ‖ gas_tx ‖ main_tx.
     let gas_bytes = shield_tx::to_bytes(&gas_tx);
@@ -1119,14 +1188,14 @@ pub fn btc_to_zbtc_progress(
     // reserve-key binding before a single base unit mints.
     progress(35, "Proving your BTC deposit to the chain (SPV)…");
     relay_btc_headers(zc, b.alice)?;
-    let proof = zcrypt_core::spv::MintProof {
-        reserve_pk: b.bridge_key.pk.inner.serialize(),
-        refund_pk: b.alice_key.pk.inner.serialize(),
+    let proof = mint_proof_for_txid(
+        b.alice,
+        b.bridge_key.pk.inner.serialize(),
+        b.alice_key.pk.inner.serialize(),
         btc_locktime,
-        vout: utxo.outpoint.vout,
-        raw_tx: b.alice.raw_tx(&utxo.outpoint.txid)?,
-        merkle_block: b.alice.txout_proof(&utxo.outpoint.txid)?,
-    };
+        utxo.outpoint.vout,
+        &utxo.outpoint.txid,
+    )?;
     let data =
         zc.broadcast(&open_spv_tx(asset, zbtc_value, &lock, zc_timeout, &alice.pubkey(), &proof, b.alice_key))?;
     let escrow_id = escrow_id_from(&data)?;
@@ -1292,14 +1361,14 @@ pub fn resume_public_shield(
     //    everything; nobody signs the mint.
     progress(40, "Proving your BTC deposit to the chain (SPV)…");
     relay_btc_headers(zc, user_btc)?;
-    let proof = MintProof {
-        reserve_pk: reserve_pk.inner.serialize(),
-        refund_pk: user_refund.pk.inner.serialize(),
+    let proof = mint_proof_for_txid(
+        user_btc,
+        reserve_pk.inner.serialize(),
+        user_refund.pk.inner.serialize(),
         btc_locktime,
-        vout: utxo.outpoint.vout,
-        raw_tx: user_btc.raw_tx(&utxo.outpoint.txid)?,
-        merkle_block: user_btc.txout_proof(&utxo.outpoint.txid)?,
-    };
+        utxo.outpoint.vout,
+        &utxo.outpoint.txid,
+    )?;
     let data =
         zc.broadcast(&open_spv_tx(asset, zbtc_value, &lock, zc_timeout, &user.pubkey(), &proof, user_refund))?;
     let escrow_id = escrow_id_from(&data)?;
@@ -1578,7 +1647,8 @@ pub fn reanchor_reorged_deposits(
                 // Re-mined into a different block: re-anchor with a fresh merkle proof.
                 let outcome = (|| -> Result<(), String> {
                     let merkle_block = backend.txout_proof(&txid)?;
-                    let fresh = MintProof { merkle_block, ..proof.clone() };
+                    let coinbase_raw = backend.coinbase_raw(&txid)?;
+                    let fresh = MintProof { merkle_block, coinbase_raw, ..proof.clone() };
                     if fresh.deposit_block_hash() != Some(h) {
                         return Err("fresh merkle proof is not for the block the backend reports".to_string());
                     }
@@ -2610,8 +2680,10 @@ pub fn maker_take_timeout_for(taker_lock: &SwapLock, zc_tip: u64) -> Result<u64,
     Ok(take_timeout)
 }
 
-/// TAKER side, step 1: lock `quote.give` for `maker_pk` under `hashlock`. Returns the escrow
-/// id, the taker's change coin, and the lock's timeout (which the maker's lock must undercut).
+/// TAKER side, step 1: lock `quote.give` for `maker_pk` under `hashlock`. `gas_coin` is
+/// ZCRYPT the taker owns; the lock burns 0.01 of it and does not charge the locked asset.
+/// Returns the escrow id, the taker's change coin, and the lock's timeout (which the
+/// maker's lock must undercut).
 pub fn taker_lock_give(
     zc: &Zcrypt,
     taker: &Account,
@@ -2619,10 +2691,13 @@ pub fn taker_lock_give(
     quote: &SwapQuote,
     maker_pk: &PubKey,
     hashlock: &[u8; 32],
+    gas_coin: &Coin,
 ) -> Result<([u8; 32], Coin, u64), String> {
     let base = zc.height()? as u64;
     let (give_timeout, _take_timeout) = swap_timeouts(base, quote.timeout_blocks);
-    let (eid, change) = send_swap_lock(zc, taker, quote.give_asset, quote.give_amount, coins, hashlock, give_timeout, maker_pk)?;
+    let (eid, change) = send_swap_lock(
+        zc, taker, quote.give_asset, quote.give_amount, coins, hashlock, give_timeout, maker_pk, gas_coin,
+    )?;
     Ok((eid, change, give_timeout))
 }
 
@@ -2636,6 +2711,7 @@ pub fn maker_lock_take(
     coins: &[Coin],
     quote: &SwapQuote,
     taker_lock: &SwapLock,
+    gas_coin: &Coin,
 ) -> Result<([u8; 32], Coin), String> {
     if taker_lock.asset != quote.give_asset || taker_lock.value != quote.give_amount {
         return Err(format!(
@@ -2648,7 +2724,10 @@ pub fn maker_lock_take(
     if !maker_lock_is_safe(taker_lock.timeout, take_timeout) {
         return Err("swap: maker lock would not expire safely before the taker's lock; refusing".to_string());
     }
-    send_swap_lock(zc, maker, quote.take_asset, quote.take_amount, coins, &taker_lock.hashlock, take_timeout, &taker_lock.locker_pk)
+    send_swap_lock(
+        zc, maker, quote.take_asset, quote.take_amount, coins, &taker_lock.hashlock, take_timeout,
+        &taker_lock.locker_pk, gas_coin,
+    )
 }
 
 /// Scan ZC blocks `from..=to` for an HTLC_CLAIM (`0x5B`) of `escrow_id` whose preimage opens
@@ -2685,7 +2764,8 @@ pub struct SwapResult {
 
 /// Lock `value` of `asset` from `locker`'s `coins` into a **swap escrow** claimable by
 /// `counterparty_pk` (refund to the locker on timeout). Broadcasts the lock and returns
-/// `(escrow_id, change_coin)`. Fee is paid in the moved asset (the pool hides asset_id).
+/// `(escrow_id, change_coin)`. The asset spend has fee 0, so change is `inputs − value`.
+/// Gas is `gas_coin` (ZCRYPT owned by the locker): a separate proof burns 0.01 ZCRYPT.
 #[allow(clippy::too_many_arguments)]
 fn send_swap_lock(
     zc: &Zcrypt,
@@ -2696,14 +2776,22 @@ fn send_swap_lock(
     hashlock: &[u8; 32],
     timeout: u64,
     counterparty_pk: &PubKey,
+    gas_coin: &Coin,
 ) -> Result<([u8; 32], Coin), String> {
     let in_total: u64 = coins.iter().map(|c| c.value).sum();
-    if value + zcrypt_core::emission::MIN_FEE > in_total {
-        return Err("lock value + fee exceeds the locker's coins".to_string());
+    if value > in_total {
+        return Err("lock value exceeds the locker's coins".to_string());
+    }
+    let min_fee = zcrypt_core::emission::MIN_FEE;
+    if gas_coin.asset_id != zcrypt_shield::ASSET_ZCRYPT {
+        return Err("swap gas coin must be ZCRYPT".to_string());
+    }
+    if gas_coin.value < min_fee {
+        return Err("gas coin is below the minimum fee".to_string());
     }
     let burn_blind = zcrypt_core::keys::random_blind();
     let change_blind = zcrypt_core::keys::random_blind();
-    let change_value = in_total - value - zcrypt_core::emission::MIN_FEE;
+    let change_value = in_total - value;
     let burn_out: OutCoin = (value, burn_blind, zcrypt_core::htlc_shield::BURN_PK, asset);
     let change_out: OutCoin = (change_value, change_blind, locker.pubkey(), asset);
     let change_note = zcrypt_core::kem::ciphertext_to_bytes(&zcrypt_core::keys::encrypt_note_asset(
@@ -2726,9 +2814,36 @@ fn send_swap_lock(
         zc,
         coins,
         &[burn_out, change_out],
-        zcrypt_core::emission::MIN_FEE,
+        0,
         vec![zcrypt_core::keys::cover_note_bytes(), change_note],
         &envelope,
+    )?;
+    // ZCRYPT gas note: output[0] burns MIN_FEE, output[1] is change back to the locker.
+    let gas_blind = zcrypt_core::keys::random_blind();
+    let gas_burn: OutCoin = (
+        min_fee,
+        gas_blind,
+        zcrypt_core::htlc_shield::BURN_PK,
+        zcrypt_shield::ASSET_ZCRYPT,
+    );
+    let gas_change_value = gas_coin.value - min_fee;
+    let gas_change_blind = zcrypt_core::keys::random_blind();
+    let gas_change = zcrypt_core::keys::out_coin(&locker.normal_address(), gas_change_value, gas_change_blind);
+    let gas_change_note = zcrypt_core::kem::ciphertext_to_bytes(&zcrypt_core::keys::encrypt_note(
+        &locker.normal_address(),
+        gas_change_value,
+        gas_change_blind,
+    ));
+    let gas_env = zcrypt_core::shield_tx::gas_pay_envelope(
+        &zcrypt_core::shield_tx::txbind(&chain_id(), &stx),
+    );
+    let gas_tx = build_shield_spend_bound(
+        zc,
+        &[gas_coin.clone()],
+        &[gas_burn, gas_change],
+        0,
+        vec![zcrypt_core::keys::cover_note_bytes(), gas_change_note],
+        &gas_env,
     )?;
     let data = zc.broadcast(&swap_lock_tx(
         value,
@@ -2738,6 +2853,8 @@ fn send_swap_lock(
         timeout,
         counterparty_pk,
         &locker.pubkey(),
+        &gas_blind,
+        &gas_tx,
         &stx,
     ))?;
     let escrow = escrow_id_from(&data)?;
@@ -2757,6 +2874,8 @@ pub fn swap_in_pool_progress(
     maker: &Account,
     taker_give_coins: &[Coin],
     maker_take_coins: &[Coin],
+    taker_gas: &Coin,
+    maker_gas: &Coin,
     quote: &SwapQuote,
     preimage: &[u8],
     progress: &dyn Fn(u8, &str),
@@ -2774,16 +2893,20 @@ pub fn swap_in_pool_progress(
     debug_assert!(maker_lock_is_safe(give_timeout, take_timeout));
 
     progress(15, "Locking your side of the swap…");
-    let (give_escrow, give_change) =
-        send_swap_lock(zc, taker, quote.give_asset, quote.give_amount, taker_give_coins, &lock, give_timeout, &maker.pubkey())?;
+    let (give_escrow, give_change) = send_swap_lock(
+        zc, taker, quote.give_asset, quote.give_amount, taker_give_coins, &lock, give_timeout, &maker.pubkey(),
+        taker_gas,
+    )?;
 
     progress(40, "Maker locking their side…");
     // What a maker wallet must check against the taker's on-chain lock before committing.
     if !maker_lock_is_safe(give_timeout, take_timeout) {
         return Err("swap: maker lock would not expire safely before the taker's lock; refusing".to_string());
     }
-    let (take_escrow, _maker_change) =
-        send_swap_lock(zc, maker, quote.take_asset, quote.take_amount, maker_take_coins, &lock, take_timeout, &taker.pubkey())?;
+    let (take_escrow, _maker_change) = send_swap_lock(
+        zc, maker, quote.take_asset, quote.take_amount, maker_take_coins, &lock, take_timeout, &taker.pubkey(),
+        maker_gas,
+    )?;
 
     progress(65, "Claiming what you receive (revealing the preimage)…");
     zc.broadcast(&claim_tx(&take_escrow, preimage))?;
@@ -2837,6 +2960,7 @@ mod public_shield_tests {
             vout: 1,
             raw_tx: bitcoin::consensus::serialize(&tx),
             merkle_block: vec![],
+            coinbase_raw: vec![],
         };
 
         let utxo = htlc_utxo_from_proof(&proof, &lock).expect("reconstruct");
@@ -2878,6 +3002,7 @@ mod public_shield_tests {
             vout: 1,
             raw_tx: bitcoin::consensus::serialize(&tx),
             merkle_block: vec![0x01, 0x02, 0x03],
+            coinbase_raw: vec![],
         };
         let claim_pk: PubKey = [1, 2, 3, 4, 5, 6, 7, 8];
         let payload = open_spv_tx(0xABCD, 555_000, &lock, 42, &claim_pk, &proof, &refund);

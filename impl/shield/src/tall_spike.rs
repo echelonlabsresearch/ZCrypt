@@ -26,16 +26,15 @@ use p3_uni_stark::{prove as p3_prove, verify as p3_verify, Proof};
 // Items DEFINED in lib.rs (accessible to this child module even though private);
 // `use`-imports in the parent (BabyBear, RC_*) are NOT, so they come from the crate.
 use super::{
-    compress2, eval_full, eval_partial, prover_config, verifier_config, Commitment, BLK, HFR, PR,
-    SD, SR, WIDTH, ZkConfig, LL,
+    compress2, eval_full, eval_partial, feed_forward, prover_config, verifier_config, Commitment,
+    BLK, HFR, PR, SD, SR, WIDTH, ZkConfig, LL,
 };
 
 /// Membership depth for the spike (power of two so the tall trace needs no padding).
 const D: usize = 16;
 
-/// Run one Poseidon2 compression block's in-circuit constraints over `cols`
-/// (a `BLK`-wide slice) and return its 8-limb output lanes.
-fn eval_block<AB: AirBuilder<F = BabyBear>>(builder: &mut AB, cols_slice: &[AB::Var]) -> [AB::Var; 8] {
+/// Run one Poseidon2 block's constraints over `cols` and return `Trunc_8(P(x) + x)`.
+fn eval_block<AB: AirBuilder<F = BabyBear>>(builder: &mut AB, cols_slice: &[AB::Var]) -> [AB::Expr; 8] {
     let cols: &Poseidon2Cols<AB::Var, WIDTH, SD, SR, HFR, PR> = cols_slice.borrow();
     let mut state: [AB::Expr; WIDTH] = core::array::from_fn(|k| cols.inputs[k].into());
     LL::external_linear_layer(&mut state);
@@ -48,7 +47,9 @@ fn eval_block<AB: AirBuilder<F = BabyBear>>(builder: &mut AB, cols_slice: &[AB::
     for r in 0..HFR {
         eval_full::<AB>(&mut state, &cols.ending_full_rounds[r], &RC_EF[r], builder);
     }
-    core::array::from_fn(|k| cols.ending_full_rounds[HFR - 1].post[k])
+    core::array::from_fn(|k| {
+        feed_forward::<AB>(cols.ending_full_rounds[HFR - 1].post[k], cols.inputs[k])
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -109,7 +110,7 @@ impl<AB: AirBuilder<F = BabyBear>> Air<AB> for TallMemAir {
         // Last row: the compression output equals the public root.
         let mut wl = builder.when_last_row();
         for j in 0..8 {
-            wl.assert_eq(out[j], pis[8 + j].clone());
+            wl.assert_eq(out[j].clone(), pis[8 + j].clone());
         }
 
         // Transition: the NEXT row's running node equals THIS row's output.
@@ -117,7 +118,7 @@ impl<AB: AirBuilder<F = BabyBear>> Air<AB> for TallMemAir {
         let run_next = running(&next, dir_n);
         let mut wt = builder.when_transition();
         for j in 0..8 {
-            wt.assert_eq(run_next[j].clone(), out[j]);
+            wt.assert_eq(run_next[j].clone(), out[j].clone());
         }
     }
 }
@@ -181,7 +182,7 @@ impl<AB: AirBuilder<F = BabyBear>> Air<AB> for WideMemAir {
         let pis: Vec<AB::Expr> = builder.public_values().iter().map(|x| (*x).into()).collect();
 
         // Every block is a valid compression (applies to every row).
-        let outs: Vec<[AB::Var; 8]> = (0..D)
+        let outs: Vec<[AB::Expr; 8]> = (0..D)
             .map(|k| eval_block(builder, &row[k * BLK..(k + 1) * BLK]))
             .collect();
 
@@ -202,13 +203,13 @@ impl<AB: AirBuilder<F = BabyBear>> Air<AB> for WideMemAir {
                 let l: AB::Expr = row[base + j].into();
                 let r: AB::Expr = row[base + 8 + j].into();
                 let running = (AB::Expr::ONE - dir.clone()) * l + dir.clone() * r;
-                let expected = if k == 0 { pis[j].clone() } else { outs[k - 1][j].into() };
+                let expected = if k == 0 { pis[j].clone() } else { outs[k - 1][j].clone() };
                 wf.assert_eq(running, expected);
             }
         }
         // Final output equals the public root.
         for j in 0..8 {
-            wf.assert_eq(outs[D - 1][j], pis[8 + j].clone());
+            wf.assert_eq(outs[D - 1][j].clone(), pis[8 + j].clone());
         }
     }
 }

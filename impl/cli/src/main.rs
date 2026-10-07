@@ -120,7 +120,7 @@ fn demo_shield() {
     // (the node seeds the same pool in the same order, so the anchor root matches).
     let mut tree = zcrypt_shield::tree::CommitmentTree::new();
     for &c in &pool {
-        tree.append(c);
+        tree.append(c).unwrap();
     }
     let (sib_a, dir_a) = tree.path(0).unwrap();
     let (sib_b, dir_b) = tree.path(1).unwrap();

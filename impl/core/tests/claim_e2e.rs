@@ -117,7 +117,7 @@ fn claimed_reward_coins_are_spendable() {
     let mk_spend = |coin: &zcrypt_core::keys::Coin, leaf_idx: usize| {
         let mut t = zcrypt_shield::tree::CommitmentTree::new();
         for &x in &pool {
-            t.append(x);
+            t.append(x).unwrap();
         }
         let (path_siblings, path_dirs) = t.path(leaf_idx).unwrap();
         Spend {

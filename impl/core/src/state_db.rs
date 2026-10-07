@@ -19,7 +19,7 @@ use crate::node::{ImmatureMint, Node, NodeSnapshot, Sentinel};
 /// On-disk schema for this module. Bump when key layout changes; older DBs
 /// refuse to open (re-migrate from postcard backup or relaunch) rather than
 /// silently misparse.
-pub const STATE_DB_SCHEMA: u32 = 3;
+pub const STATE_DB_SCHEMA: u32 = 4;
 
 // ---- key layout (default column family) ------------------------------------
 // meta/schema        -> u32 LE
@@ -56,6 +56,7 @@ const K_IMMATURE: &[u8] = b"blob/immature";
 const K_RECENT_ROOTS: &[u8] = b"blob/recent_roots";
 const K_SENTINEL: &[u8] = b"blob/sentinel";
 const K_BLOCK_ROOTS: &[u8] = b"blob/block_roots";
+const K_WS_PASSED: &[u8] = b"meta/ws_passed";
 
 /// Stats from one successful `commit` (phase-2 observability).
 #[derive(Clone, Debug, Default)]
@@ -309,6 +310,11 @@ impl StateDb {
             None => Vec::new(),
             Some(b) => postcard::from_bytes(&b).map_err(|e| format!("decode block_roots: {e}"))?,
         };
+        let ws_passed: Option<crate::hash::Hash> = match self.db.get(K_WS_PASSED).map_err(|e| e.to_string())? {
+            None => None,
+            Some(b) if b.is_empty() => None,
+            Some(b) => postcard::from_bytes(&b).map_err(|e| format!("decode ws_passed: {e}"))?,
+        };
 
         let snap = NodeSnapshot {
             version: crate::node::SNAPSHOT_VERSION_PUB,
@@ -323,8 +329,9 @@ impl StateDb {
             immature,
             sentinel,
             block_roots,
+            ws_passed,
         };
-        let (node, h) = Node::restore(snap);
+        let (node, h) = Node::restore(snap)?;
         Ok(Some((node, h)))
     }
 
@@ -444,6 +451,11 @@ impl StateDb {
             puts += 1;
         }
         batch.put(K_SPV_HDR_COUNT, (spv_log.len() as u64).to_le_bytes());
+        puts += 1;
+
+        let ws_bytes = postcard::to_allocvec(&node.ws_passed())
+            .map_err(|e| format!("encode ws_passed: {e}"))?;
+        batch.put(K_WS_PASSED, ws_bytes);
         puts += 1;
 
         let mut wopts = WriteOptions::default();

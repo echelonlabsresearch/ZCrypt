@@ -260,7 +260,6 @@ chain/                    Docker consensus stacks
   docker/                       Dockerfile(s) + CometBFT entrypoints + Caddyfile
   e2e/run-all.sh                full live end-to-end
 deny.toml                 cargo-deny policy (advisories, licenses, sources)
-AUDIT-2026-09-07.md       internal security + privacy audit and fix list
 wallet/                   Tauri + React desktop wallet
 protocol.md                 Protocol tour
 security.md               Security & threat model
@@ -295,7 +294,7 @@ transactions in which even the input count is unobservable.
   claimable balance, provable equivocation is **slashed** (5% burned, the validator
   tombstoned), and **delegation** lets anyone back a validator with coin-backed stake to
   earn a reward share and share its slashing risk. An internal multi-reviewer audit
-  ([AUDIT-2026-09-07.md](AUDIT-2026-09-07.md)) found and fixed six critical-rated issues;
+  (2026-09-07, summarised in [security.md](security.md)) found and fixed six critical-rated issues;
   the remaining gap is the **missing external audit**, which is what keeps this a testnet
   rather than something for securing large stake.
 

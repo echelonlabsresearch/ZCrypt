@@ -356,7 +356,10 @@ impl crate::BtcBackend for SelfCustodyBtc {
         self.esplora.tx_raw(&txid.to_string())
     }
     fn txout_proof(&self, txid: &Txid) -> Result<Vec<u8>, String> {
-        self.esplora.merkleblock_proof(&txid.to_string())
+        Ok(self.esplora.mint_inclusion(&txid.to_string())?.0)
+    }
+    fn coinbase_raw(&self, txid: &Txid) -> Result<Vec<u8>, String> {
+        Ok(self.esplora.mint_inclusion(&txid.to_string())?.1)
     }
 }
 

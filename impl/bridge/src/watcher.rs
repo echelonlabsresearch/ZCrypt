@@ -1110,6 +1110,9 @@ mod tests {
         fn txout_proof(&self, txid: &Txid) -> Result<Vec<u8>, String> {
             self.proof_for.borrow().get(txid).cloned().ok_or("sim: no proof".into())
         }
+        fn coinbase_raw(&self, _txid: &Txid) -> Result<Vec<u8>, String> {
+            Ok(vec![0])
+        }
     }
 
     /// One reserve deposit: keys, preimage, funding tx in a mined block, the 0x64 open tx
@@ -1134,15 +1137,16 @@ mod tests {
         let preimage = [0x30u8 + salt as u8; 32];
         let lock = htlc_hashlock(&preimage);
         let tx = testutil::funding_tx(&lock, &reserve.pk.inner.serialize(), &refund.pk.inner.serialize(), LOCKTIME, VALUE, salt);
-        let header = testutil::mine_header(&REGTEST_GENESIS, &[tx.clone()], 1_296_689_000 + salt);
-        let proof = MintProof {
-            reserve_pk: reserve.pk.inner.serialize(),
-            refund_pk: refund.pk.inner.serialize(),
-            btc_locktime: LOCKTIME,
-            vout: 0,
-            raw_tx: bitcoin::consensus::serialize(&tx),
-            merkle_block: testutil::merkle_proof(&header, &[tx.clone()], &tx),
-        };
+        let (header, proof) = testutil::deposit_proof(
+            &REGTEST_GENESIS,
+            &tx,
+            1_296_689_000 + salt,
+            reserve.pk.inner.serialize(),
+            refund.pk.inner.serialize(),
+            LOCKTIME,
+            0,
+            salt,
+        );
         let claim_pk: zcrypt_shield::PubKey = [salt as u64 + 1; 8];
         let timeout = 100_000u64;
         let eid = zcrypt_core::htlc_shield::escrow_id(ASSET, VALUE, &lock, timeout, &claim_pk);

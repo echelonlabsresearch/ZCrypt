@@ -37,7 +37,7 @@ fn main() {
     // Merkle paths for the two real coins (leaf indices 0 and 1) from the pool tree.
     let mut tree = zcrypt_shield::tree::CommitmentTree::new();
     for &c in &pool {
-        tree.append(c);
+        tree.append(c).unwrap();
     }
     let (sib_a, dir_a) = tree.path(0).unwrap();
     let (sib_b, dir_b) = tree.path(1).unwrap();

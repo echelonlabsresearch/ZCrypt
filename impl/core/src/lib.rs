@@ -37,4 +37,5 @@ pub mod smt;
 pub mod spv;
 pub mod staking;
 pub mod state_db;
+pub mod ws;
 pub mod zvm;

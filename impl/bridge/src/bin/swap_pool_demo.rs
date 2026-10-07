@@ -29,7 +29,8 @@ fn main() {
     for (t, auth) in [("AAAA", [0x09u8; 32]), ("BBBB", [0x0Au8; 32])] {
         let gas = gas_owner.own_coin(1_000_000, keys::random_blind());
         zc.broadcast(&swap::seed_tx(&gas.commitment())).expect("seed gas coin");
-        let prefix = swap::build_gas_prefix(&zc, &gas_owner, &gas).expect("gas prefix");
+        let body = swap::register_body(8, t, 21_000_000 * 100_000_000, &auth);
+        let prefix = swap::build_gas_prefix(&zc, &gas_owner, &gas, &body).expect("gas prefix");
         let _ = zc.broadcast(&swap::register_tx(t, 8, &auth, 21_000_000 * 100_000_000, &prefix));
     }
     let asset_a: u64 = zc.query("/asset/by_ticker/AAAA").unwrap().trim().parse().unwrap();
@@ -45,8 +46,13 @@ fn main() {
     }
     let alice_a = alice.own_asset_coin(500_000, keys::random_blind(), asset_a);
     let bob_b = bob.own_asset_coin(500_000, keys::random_blind(), asset_b);
+    // Each lock burns 0.01 ZCRYPT. The swapped asset is not charged.
+    let alice_gas = alice.own_coin(zcrypt_core::emission::MIN_FEE, keys::random_blind());
+    let bob_gas = bob.own_coin(zcrypt_core::emission::MIN_FEE, keys::random_blind());
     zc.broadcast(&swap::seed_tx(&alice_a.commitment())).unwrap();
     zc.broadcast(&swap::seed_tx(&bob_b.commitment())).unwrap();
+    zc.broadcast(&swap::seed_tx(&alice_gas.commitment())).unwrap();
+    zc.broadcast(&swap::seed_tx(&bob_gas.commitment())).unwrap();
 
     // RFQ terms (agreed off-chain): Alice gives 100_000 A, receives 120_000 B.
     let quote = SwapQuote {
@@ -65,7 +71,8 @@ fn main() {
 
     // TAKER: lock A for the maker.
     let (give_escrow, give_change, give_timeout) =
-        swap::taker_lock_give(&zc, &alice, &[alice_a], &quote, &bob.pubkey(), &lock).expect("taker lock");
+        swap::taker_lock_give(&zc, &alice, &[alice_a], &quote, &bob.pubkey(), &lock, &alice_gas).expect("taker lock");
+    assert_eq!(give_change.value, 400_000, "taker change is the unspent asset; gas is ZCRYPT");
     println!("  [taker] locked {} AAAA, escrow {}, expires at {give_timeout}", quote.give_amount, hex::encode(give_escrow));
 
     // MAKER: find the taker's lock on chain (claimant = maker), verify it, lock B with a
@@ -74,7 +81,8 @@ fn main() {
         .expect("scan")
         .expect("maker finds the taker's confirmed lock");
     assert_eq!(taker_lock.escrow_id, give_escrow);
-    let (take_escrow, _maker_change) = swap::maker_lock_take(&zc, &bob, &[bob_b], &quote, &taker_lock).expect("maker lock");
+    let (take_escrow, maker_change) = swap::maker_lock_take(&zc, &bob, &[bob_b], &quote, &taker_lock, &bob_gas).expect("maker lock");
+    assert_eq!(maker_change.value, 380_000, "maker change is the unspent asset; gas is ZCRYPT");
     let take_info = swap::query_escrow(&zc, &take_escrow).unwrap().expect("maker escrow open");
     assert!(swap::maker_lock_is_safe(taker_lock.timeout, take_info.timeout_height));
     println!("  [maker] locked {} BBBB, escrow {}, expires at {}", quote.take_amount, hex::encode(take_escrow), take_info.timeout_height);
@@ -100,8 +108,8 @@ fn main() {
     assert_eq!(received.asset_id, asset_b);
     assert_eq!(received.value, 120_000);
     println!(
-        "Alice received {} BBBB; {} AAAA change back. Bob received {} AAAA.",
-        received.value, give_change.value, bob_got.value
+        "Alice received {} BBBB; {} AAAA change back. Bob received {} AAAA (change {}). Each lock burned 0.01 ZCRYPT.",
+        received.value, give_change.value, bob_got.value, maker_change.value
     );
 
     println!("\nIn-pool private swap (both legs, one hashlock): GREEN");

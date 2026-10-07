@@ -264,12 +264,13 @@ fn main() {
     let (gold_ks, gold_signers) = zcrypt_core::mint_auth::derive_keyset(b"gold-cap-3node", 1, 1);
     // Registration and mint-open are state-creating txs: each carries a ZCRYPT gas note.
     let rg1 = gas_for(&zc, &alice);
-    let rg1p = swap::build_gas_prefix(&zc, &alice, &rg1).expect("register gas");
+    let gold_body = swap::register_body(2, "GOLD", 1_000_000, &gold_ks.commitment());
+    let rg1p = swap::build_gas_prefix(&zc, &alice, &rg1, &gold_body).expect("register gas");
     let _ = zc.broadcast(&swap::register_tx("GOLD", 2, &gold_ks.commitment(), 1_000_000, &rg1p));
     let gold: u64 = zc.query("/asset/by_ticker/GOLD").unwrap().trim().parse().unwrap();
     // ABUSE: registering GOLD again must be rejected (first-mint-wins).
     let rg2 = gas_for(&zc, &alice);
-    let rg2p = swap::build_gas_prefix(&zc, &alice, &rg2).expect("register gas");
+    let rg2p = swap::build_gas_prefix(&zc, &alice, &rg2, &gold_body).expect("register gas");
     assert!(
         zc.broadcast(&swap::register_tx("GOLD", 2, &gold_ks.commitment(), 1_000_000, &rg2p)).is_err(),
         "duplicate ticker rejected"
@@ -284,7 +285,8 @@ fn main() {
         &zcrypt_core::mint_auth::authorize(&gold_ks, &gold_signers, &gold_msg),
     );
     let og = gas_for(&zc, &alice);
-    let ogp = swap::build_gas_prefix(&zc, &alice, &og).expect("open gas");
+    let open_body = swap::open_body(gold, 500_000, &lock, timeout, &alice.pubkey(), &gold_auth);
+    let ogp = swap::build_gas_prefix(&zc, &alice, &og, &open_body).expect("open gas");
     zc.broadcast(&swap::open_tx(gold, 500_000, &lock, timeout, &alice.pubkey(), &gold_auth, &ogp)).expect("htlc open");
     zc.broadcast(&swap::claim_tx(&escrow, preimage)).expect("htlc claim mints GOLD");
     let gold_coin = alice.htlc_coin(500_000, gold, &escrow);
@@ -465,6 +467,58 @@ fn main() {
         }
         Err(_) => println!("[6] SKIPPED bond/reward/unbond (set VALIDATOR_SEED_HEX to enable)"),
     }
+
+    // ---- 7. In-pool swap: each lock burns 0.01 ZCRYPT; the swapped asset is not charged ----
+    for (ticker, auth) in [("AAAA", [0x09u8; 32]), ("BBBB", [0x0Au8; 32])] {
+        let g = gas_for(&zc, &alice);
+        let body = swap::register_body(8, ticker, 21_000_000 * 100_000_000, &auth);
+        let prefix = swap::build_gas_prefix(&zc, &alice, &g, &body).expect("swap register gas");
+        let _ = zc.broadcast(&swap::register_tx(ticker, 8, &auth, 21_000_000 * 100_000_000, &prefix));
+    }
+    let asset_a: u64 = zc.query("/asset/by_ticker/AAAA").unwrap().trim().parse().unwrap();
+    let asset_b: u64 = zc.query("/asset/by_ticker/BBBB").unwrap().trim().parse().unwrap();
+    let alice_a = alice.own_asset_coin(500_000, keys::random_blind(), asset_a);
+    let bob_b = bob.own_asset_coin(500_000, keys::random_blind(), asset_b);
+    seed(&zc, &alice_a.commitment(), "alice AAAA");
+    seed(&zc, &bob_b.commitment(), "bob BBBB");
+    let quote = swap::SwapQuote {
+        give_asset: asset_a,
+        give_amount: 100_000,
+        take_asset: asset_b,
+        take_amount: 120_000,
+        timeout_blocks: 500,
+    };
+    let scan_from = zc.height().unwrap();
+    let preimage = swap::fresh_preimage();
+    let lock = zcrypt_core::nullifier::htlc_hashlock(&preimage);
+    let alice_gas = gas_for(&zc, &alice);
+    let (give_escrow, give_change, _give_timeout) =
+        swap::taker_lock_give(&zc, &alice, &[alice_a], &quote, &bob.pubkey(), &lock, &alice_gas)
+            .expect("taker lock");
+    assert_eq!(give_change.value, 400_000, "taker change is the unspent asset; gas is ZCRYPT");
+    let taker_lock = swap::find_swap_lock(
+        &zc, scan_from, zc.height().unwrap(), &lock, &bob.pubkey(), asset_a, quote.give_amount,
+    )
+    .expect("scan")
+    .expect("maker finds the taker's confirmed lock");
+    assert_eq!(taker_lock.escrow_id, give_escrow);
+    let bob_gas = gas_for(&zc, &bob);
+    let (take_escrow, maker_change) =
+        swap::maker_lock_take(&zc, &bob, &[bob_b], &quote, &taker_lock, &bob_gas).expect("maker lock");
+    assert_eq!(maker_change.value, 380_000, "maker change is the unspent asset; gas is ZCRYPT");
+    zc.broadcast(&swap::claim_tx(&take_escrow, &preimage)).expect("taker claim");
+    let received = alice.htlc_coin(quote.take_amount, asset_b, &take_escrow);
+    let (revealed, _) = swap::find_claim_preimage(&zc, scan_from, zc.height().unwrap(), &take_escrow, &lock)
+        .expect("scan")
+        .expect("maker sees the preimage");
+    assert_eq!(revealed, preimage);
+    zc.broadcast(&swap::claim_tx(&give_escrow, &revealed)).expect("maker claim");
+    assert_eq!(received.value, 120_000);
+    assert_eq!(bob.htlc_coin(quote.give_amount, asset_a, &give_escrow).value, 100_000);
+    println!(
+        "[7] in-pool swap settled: each lock burned 0.01 ZCRYPT; Alice change {} AAAA, received {} BBBB; Bob change {} BBBB",
+        give_change.value, received.value, maker_change.value
+    );
 
     let count: usize = zc.query("/commit/count").unwrap().trim().parse().unwrap_or(0);
     println!("\nALL FLOWS GREEN on the live chain. Commitment tree now has {count} leaves.");
