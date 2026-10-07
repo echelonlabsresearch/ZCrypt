@@ -1,0 +1,365 @@
+# Cut a wallet release.
+#
+# A tag vX.Y.Z (or a manual run that names an existing tag) builds the desktop
+# wallet and uploads installers to a DRAFT prerelease:
+#   * macOS Apple-silicon DMG, Developer ID signed and notarized
+#   * Linux .deb and AppImage (built on Ubuntu 22.04 so the AppImage's glibc
+#     stays old enough for current desktop distros)
+#   * SHA256SUMS for those files
+# Publish the draft by hand after looking at the assets. There is no updater.
+#
+# The tag version must match wallet/package.json, wallet/src-tauri/Cargo.toml,
+# and wallet/src-tauri/tauri.conf.json. The same v* tag also publishes the ABCI
+# image (.github/workflows/image.yml); tag a commit only when both should ship,
+# and only a commit that already contains this workflow.
+#
+#   # bump the three version fields, commit, then:
+#   git tag v0.1.0 && git push origin v0.1.0
+#
+# Apple signing (macOS job; the job fails if any of these is missing, so a
+# release cannot ship an ad-hoc DMG). Same Developer ID used for rootmode:
+#   APPLE_CERTIFICATE            base64 of the Developer ID Application .p12
+#   APPLE_CERTIFICATE_PASSWORD   .p12 export password
+#   APPLE_SIGNING_IDENTITY       "Developer ID Application: Name (TEAMID)"
+#   APPLE_ID                     Apple ID email
+#   APPLE_PASSWORD               app-specific password
+#   APPLE_TEAM_ID                10-character team id
+#
+# The wallet links zcrypt-shield, so the release link is memory-heavy. Debug
+# info stays off and the macOS job links one crate at a time. Repo Actions
+# permission default stays read; this workflow opts in to contents: write.
+name: Wallet release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to build (vX.Y.Z). Leave empty when this run is already on a tag."
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_RELEASE_DEBUG: "0"
+  CARGO_PROFILE_RELEASE_INCREMENTAL: "0"
+
+jobs:
+  prepare:
+    name: Draft release
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+      release_id: ${{ steps.release.outputs.release_id }}
+    steps:
+      - id: meta
+        shell: bash
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+          REF_NAME: ${{ github.ref_name }}
+          REF_TYPE: ${{ github.ref_type }}
+        run: |
+          set -euo pipefail
+          tag="${INPUT_TAG}"
+          if [ -z "$tag" ]; then
+            if [ "$REF_TYPE" = "tag" ]; then
+              tag="$REF_NAME"
+            fi
+          fi
+          if ! printf '%s' "$tag" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "need a tag vX.Y.Z (got '${tag:-<empty>}')" >&2
+            exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ steps.meta.outputs.tag }}
+
+      - name: Tag matches the wallet version
+        shell: bash
+        env:
+          TAG: ${{ steps.meta.outputs.tag }}
+        run: |
+          set -euo pipefail
+          want="${TAG#v}"
+          conf=$(jq -r .version wallet/src-tauri/tauri.conf.json)
+          pkg=$(jq -r .version wallet/package.json)
+          cargo=$(awk -F'"' '/^version = /{print $2; exit}' wallet/src-tauri/Cargo.toml)
+          echo "tag=$want tauri.conf=$conf package.json=$pkg Cargo.toml=$cargo"
+          if [ "$conf" != "$want" ] || [ "$pkg" != "$want" ] || [ "$cargo" != "$want" ]; then
+            echo "bump package.json, src-tauri/Cargo.toml, and tauri.conf.json to $want before tagging" >&2
+            exit 1
+          fi
+
+      - id: release
+        name: Create the draft prerelease
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.meta.outputs.tag }}
+        run: |
+          set -euo pipefail
+          notes=$(cat <<EOF
+          ZCrypt Wallet ${TAG}
+
+          Desktop installers built from this tag. The macOS DMG is Developer ID signed and notarized. Linux ships a .deb and an AppImage. Verify every file against SHA256SUMS before opening it.
+
+          This tag also publishes the ABCI image. The wallet build does not enable the devnet feature.
+
+          This release is a draft. Check the assets, then publish it.
+          EOF
+          )
+          # Strip the indentation the workflow source adds.
+          notes=$(printf '%s\n' "$notes" | sed 's/^          //')
+          jq -n \
+            --arg tag "$TAG" \
+            --arg body "$notes" \
+            '{tag_name:$tag, name:("ZCrypt Wallet "+$tag), body:$body, draft:true, prerelease:true, target_commitish:$tag}' \
+            > "$RUNNER_TEMP/release.json"
+          set +e
+          id=$(gh api --method POST "repos/${GITHUB_REPOSITORY}/releases" --input "$RUNNER_TEMP/release.json" --jq .id 2>"$RUNNER_TEMP/release.err")
+          status=$?
+          set -e
+          if [ "$status" -ne 0 ]; then
+            if grep -q 'already_exists' "$RUNNER_TEMP/release.err"; then
+              id=$(gh api "repos/${GITHUB_REPOSITORY}/releases?per_page=100" --jq "[.[] | select(.tag_name==\"${TAG}\") | .id][0]")
+            else
+              cat "$RUNNER_TEMP/release.err" >&2
+              exit "$status"
+            fi
+          fi
+          if [ -z "$id" ]; then
+            echo "no release id for $TAG" >&2
+            exit 1
+          fi
+          echo "release_id=$id" >> "$GITHUB_OUTPUT"
+          echo "draft release $TAG id=$id"
+
+  build:
+    name: Build (${{ matrix.id }})
+    needs: prepare
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - id: macos
+            runner: macos-latest
+            bundles: dmg
+            cargo_jobs: "1"
+          - id: linux
+            runner: ubuntu-22.04
+            bundles: appimage,deb
+            cargo_jobs: "2"
+    env:
+      CARGO_BUILD_JOBS: ${{ matrix.cargo_jobs }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
+
+      - name: Free disk space
+        shell: bash
+        run: |
+          set -euo pipefail
+          df -h /
+          if [ "$(uname -s)" = "Linux" ]; then
+            sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+            sudo docker image prune --all --force >/dev/null 2>&1 || true
+          else
+            rm -rf "$HOME/Library/Developer/Xcode/DerivedData" || true
+            sudo rm -rf /Library/Developer/CoreSimulator/Caches || true
+          fi
+          df -h /
+
+      - name: Linux build dependencies
+        if: matrix.id == 'linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential curl wget file patchelf pkg-config cmake clang libclang-dev \
+            libssl-dev libxdo-dev \
+            libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev libayatana-appindicator3-dev libfuse2
+
+      - name: Pinned nightly
+        working-directory: wallet
+        shell: bash
+        run: rustup show
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: wallet/src-tauri
+          shared-key: wallet-release-${{ matrix.id }}
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: wallet/package-lock.json
+
+      - name: Frontend dependencies
+        working-directory: wallet
+        shell: bash
+        run: npm ci
+
+      - name: Apple signing secrets are present
+        if: matrix.id == 'macos'
+        shell: bash
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          missing=0
+          for name in APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID; do
+            case "$name" in
+              APPLE_CERTIFICATE) val="$APPLE_CERTIFICATE" ;;
+              APPLE_CERTIFICATE_PASSWORD) val="$APPLE_CERTIFICATE_PASSWORD" ;;
+              APPLE_SIGNING_IDENTITY) val="$APPLE_SIGNING_IDENTITY" ;;
+              APPLE_ID) val="$APPLE_ID" ;;
+              APPLE_PASSWORD) val="$APPLE_PASSWORD" ;;
+              APPLE_TEAM_ID) val="$APPLE_TEAM_ID" ;;
+            esac
+            if [ -z "$val" ]; then
+              echo "missing secret $name" >&2
+              missing=1
+            fi
+          done
+          if [ "$missing" -ne 0 ]; then
+            exit "$missing"
+          fi
+          echo "Apple signing secrets are set"
+
+      - name: Build, sign, notarize, upload
+        uses: tauri-apps/tauri-action@84b9d35b5fc46c1e45415bdb6144030364f7ebc5 # v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          APPLE_CERTIFICATE: ${{ matrix.id == 'macos' && secrets.APPLE_CERTIFICATE || '' }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ matrix.id == 'macos' && secrets.APPLE_CERTIFICATE_PASSWORD || '' }}
+          APPLE_SIGNING_IDENTITY: ${{ matrix.id == 'macos' && secrets.APPLE_SIGNING_IDENTITY || '' }}
+          APPLE_ID: ${{ matrix.id == 'macos' && secrets.APPLE_ID || '' }}
+          APPLE_PASSWORD: ${{ matrix.id == 'macos' && secrets.APPLE_PASSWORD || '' }}
+          APPLE_TEAM_ID: ${{ matrix.id == 'macos' && secrets.APPLE_TEAM_ID || '' }}
+        with:
+          projectPath: wallet
+          releaseId: ${{ needs.prepare.outputs.release_id }}
+          includeUpdaterJson: false
+          uploadPlainBinary: false
+          args: --bundles ${{ matrix.bundles }} -- --locked
+
+      - name: Drop the raw .app archive
+        if: matrix.id == 'macos'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          set -euo pipefail
+          # tauri-action tars the .app so it can upload a directory. The DMG is
+          # the installer; the tarball does not belong on the release.
+          gh release view "$TAG" --json assets --jq '.assets[].name' | while IFS= read -r name; do
+            case "$name" in
+              *.app.tar.gz|*.app.tar.gz.sig)
+                gh release delete-asset "$TAG" "$name" --yes
+                ;;
+            esac
+          done
+
+      - name: SHA-256 of the installers
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib
+          import pathlib
+          import sys
+
+          root = pathlib.Path("wallet/src-tauri/target")
+          files = []
+          for path in root.rglob("*"):
+              if not path.is_file():
+                  continue
+              name = path.name
+              if name.endswith(".dmg") or name.endswith(".deb") or name.endswith(".AppImage"):
+                  files.append(path)
+          if not files:
+              sys.exit("no installer under wallet/src-tauri/target")
+          lines = []
+          for path in sorted(files, key=lambda item: item.name):
+              digest = hashlib.sha256(path.read_bytes()).hexdigest()
+              lines.append(f"{digest}  {path.name}")
+          pathlib.Path("SHA256SUMS.fragment").write_text("\n".join(lines) + "\n")
+          print("\n".join(lines))
+          PY
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: sha256-${{ matrix.id }}
+          path: SHA256SUMS.fragment
+          if-no-files-found: error
+
+  checksums:
+    name: SHA256SUMS
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: sha256-*
+          path: sums
+
+      - name: Publish SHA256SUMS
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import pathlib
+          import sys
+
+          seen = {}
+          fragments = list(pathlib.Path("sums").rglob("SHA256SUMS.fragment"))
+          if len(fragments) != 2:
+              sys.exit(f"expected 2 checksum fragments, found {len(fragments)}")
+          for fragment in fragments:
+              for line in fragment.read_text().splitlines():
+                  if not line.strip():
+                      continue
+                  digest, name = line.split("  ", 1)
+                  if len(digest) != 64:
+                      sys.exit(f"bad digest line: {line}")
+                  previous = seen.get(name)
+                  if previous is not None and previous != digest:
+                      sys.exit(f"hash mismatch for {name}")
+                  seen[name] = digest
+          names = sorted(seen)
+          if not any(name.endswith(".dmg") for name in names):
+              sys.exit("SHA256SUMS has no .dmg")
+          if not any(name.endswith(".deb") for name in names):
+              sys.exit("SHA256SUMS has no .deb")
+          if not any(name.endswith(".AppImage") for name in names):
+              sys.exit("SHA256SUMS has no .AppImage")
+          pathlib.Path("SHA256SUMS").write_text(
+              "".join(f"{seen[name]}  {name}\n" for name in names)
+          )
+          print(pathlib.Path("SHA256SUMS").read_text())
+          PY
+          gh release upload "$TAG" SHA256SUMS --clobber
