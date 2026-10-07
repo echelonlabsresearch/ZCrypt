@@ -1062,7 +1062,7 @@ pub fn build_transfer(
     }
     // Main transfer: no in-tx fee. The gas proof is bound to this tx's binding hash.
     let main_tx = build_shield_spend(zc, main_inputs, main_outs, 0, main_notes)?;
-    let gas_env = shield_tx::gas_pay_envelope(&shield_tx::txbind(&chain_id(), &main_tx));
+    let gas_env = shield_tx::gas_pay_envelope(&shield_tx::txbind(chain_id(), &main_tx));
     // ZCRYPT gas note: output[0] burns MIN_FEE, output[1] is change back to gas_owner.
     let gas_blind = zcrypt_core::keys::random_blind();
     let burn: OutCoin = (
@@ -2835,7 +2835,7 @@ fn send_swap_lock(
         gas_change_blind,
     ));
     let gas_env = zcrypt_core::shield_tx::gas_pay_envelope(
-        &zcrypt_core::shield_tx::txbind(&chain_id(), &stx),
+        &zcrypt_core::shield_tx::txbind(chain_id(), &stx),
     );
     let gas_tx = build_shield_spend_bound(
         zc,

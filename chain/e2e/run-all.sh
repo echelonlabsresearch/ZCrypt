@@ -38,7 +38,7 @@ say "0/7  Build the RPC test drivers (release)"
     --bin audit_fixes_3node )
 WALLET_DIR="$(cd "$CHAIN_DIR/../wallet/src-tauri" && pwd)"
 say "0b/7 Build the WALLET backend test (release, tauri mock app)"
-( cd "$WALLET_DIR" && cargo test --release --locked --no-run 2>&1 | tail -1 )
+( cd "$WALLET_DIR" && cargo test --release --locked --no-run )
 BIN="$IMPL_DIR/target/release"
 # zBTC is bound to its reserve pubkey in GENESIS: derive it from the dev reserve key every
 # regtest driver uses (Key::from_bytes([0xB1; 32])) BEFORE the chain is created.

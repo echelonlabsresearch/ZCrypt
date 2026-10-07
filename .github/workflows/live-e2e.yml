@@ -34,14 +34,19 @@ jobs:
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
           df -h /
-      - name: Native build deps (drivers build the prover locally)
+      - name: Native build deps (drivers build the prover locally, wallet test links Tauri)
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends clang libclang-dev cmake pkg-config
+          sudo apt-get install -y --no-install-recommends \
+            clang libclang-dev cmake pkg-config \
+            libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev \
+            libayatana-appindicator3-dev
       - name: Cache cargo build
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          workspaces: impl
+          workspaces: |
+            impl
+            wallet/src-tauri
           shared-key: live-e2e
       - name: Show toolchain
         working-directory: impl
