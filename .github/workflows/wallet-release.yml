@@ -3,6 +3,8 @@
 # A tag vX.Y.Z (or a manual run that names an existing tag) builds the desktop
 # wallet and uploads installers to a DRAFT prerelease:
 #   * macOS Apple-silicon DMG, Developer ID signed and notarized
+#   * Windows x64 NSIS setup.exe. No Authenticode certificate is configured,
+#     so SmartScreen warns on first install.
 #   * Linux .deb and AppImage (built on Ubuntu 22.04 so the AppImage's glibc
 #     stays old enough for current desktop distros)
 #   * SHA256SUMS for those files
@@ -109,7 +111,7 @@ jobs:
           notes=$(cat <<EOF
           ZCrypt Wallet ${TAG}
 
-          Desktop installers built from this tag. The macOS DMG is Developer ID signed and notarized. Linux ships a .deb and an AppImage. Verify every file against SHA256SUMS before opening it.
+          Desktop installers built from this tag. The macOS DMG is Developer ID signed and notarized. Windows ships an NSIS setup.exe (not Authenticode-signed). Linux ships a .deb and an AppImage. Verify every file against SHA256SUMS before opening it.
 
           This tag also publishes the ABCI image. The wallet build does not enable the devnet feature.
 
@@ -159,6 +161,10 @@ jobs:
             runner: ubuntu-22.04
             bundles: appimage,deb
             cargo_jobs: "2"
+          - id: windows
+            runner: windows-latest
+            bundles: nsis
+            cargo_jobs: "2"
     env:
       CARGO_BUILD_JOBS: ${{ matrix.cargo_jobs }}
     steps:
@@ -170,15 +176,56 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          df -h /
-          if [ "$(uname -s)" = "Linux" ]; then
-            sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
-            sudo docker image prune --all --force >/dev/null 2>&1 || true
-          else
-            rm -rf "$HOME/Library/Developer/Xcode/DerivedData" || true
-            sudo rm -rf /Library/Developer/CoreSimulator/Caches || true
-          fi
-          df -h /
+          df -h / || true
+          case "$(uname -s)" in
+            Linux)
+              sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+              sudo docker image prune --all --force >/dev/null 2>&1 || true
+              ;;
+            Darwin)
+              rm -rf "$HOME/Library/Developer/Xcode/DerivedData" || true
+              sudo rm -rf /Library/Developer/CoreSimulator/Caches || true
+              ;;
+          esac
+          df -h / || true
+
+      - name: Free Windows disk space
+        if: matrix.id == 'windows'
+        shell: pwsh
+        run: |
+          Write-Host "Before:"
+          Get-PSDrive C | Format-List Used,Free
+          foreach ($path in @(
+            "$env:LOCALAPPDATA\Android",
+            "C:\Android",
+            "C:\Program Files (x86)\Android",
+            "C:\Program Files\Microsoft SQL Server",
+            "C:\Program Files (x86)\Microsoft SQL Server"
+          )) {
+            if (Test-Path -LiteralPath $path) {
+              Write-Host "Removing $path"
+              Remove-Item -LiteralPath $path -Recurse -Force -ErrorAction SilentlyContinue
+            }
+          }
+          $cache = "C:\hostedtoolcache\windows"
+          foreach ($name in @("Java*","Ruby*","go*","PyPy*","CodeQL*","Boost*","Android*")) {
+            Get-ChildItem -Path $cache -Filter $name -ErrorAction SilentlyContinue |
+              Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+          }
+          Write-Host "After:"
+          Get-PSDrive C | Format-List Used,Free
+
+      - name: Windows libclang (RocksDB bindgen)
+        if: matrix.id == 'windows'
+        shell: pwsh
+        run: |
+          $llvm = "C:\Program Files\LLVM\bin"
+          if (-not (Test-Path "$llvm\clang.exe")) {
+            Write-Error "LLVM is not installed; RocksDB's bindgen needs libclang"
+            exit 1
+          }
+          Add-Content -Path $env:GITHUB_PATH -Value $llvm
+          & "$llvm\clang.exe" --version
 
       - name: Linux build dependencies
         if: matrix.id == 'linux'
@@ -284,7 +331,12 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          python3 - <<'PY'
+          if command -v python3 >/dev/null 2>&1 && python3 -c 'import sys' >/dev/null 2>&1; then
+            PYTHON=python3
+          else
+            PYTHON=python
+          fi
+          "$PYTHON" - <<'PY'
           import hashlib
           import pathlib
           import sys
@@ -295,7 +347,9 @@ jobs:
               if not path.is_file():
                   continue
               name = path.name
-              if name.endswith(".dmg") or name.endswith(".deb") or name.endswith(".AppImage"):
+              # NSIS names the installer "<product>_<version>_x64-setup.exe".
+              # Do not hash every .exe under target/; the raw wallet binary is not a release asset.
+              if name.endswith((".dmg", ".deb", ".AppImage")) or name.endswith("-setup.exe"):
                   files.append(path)
           if not files:
               sys.exit("no installer under wallet/src-tauri/target")
@@ -337,8 +391,8 @@ jobs:
 
           seen = {}
           fragments = list(pathlib.Path("sums").rglob("SHA256SUMS.fragment"))
-          if len(fragments) != 2:
-              sys.exit(f"expected 2 checksum fragments, found {len(fragments)}")
+          if len(fragments) != 3:
+              sys.exit(f"expected 3 checksum fragments, found {len(fragments)}")
           for fragment in fragments:
               for line in fragment.read_text().splitlines():
                   if not line.strip():
@@ -357,6 +411,8 @@ jobs:
               sys.exit("SHA256SUMS has no .deb")
           if not any(name.endswith(".AppImage") for name in names):
               sys.exit("SHA256SUMS has no .AppImage")
+          if not any(name.endswith("-setup.exe") for name in names):
+              sys.exit("SHA256SUMS has no Windows setup.exe")
           pathlib.Path("SHA256SUMS").write_text(
               "".join(f"{seen[name]}  {name}\n" for name in names)
           )

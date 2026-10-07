@@ -126,8 +126,9 @@ npm run tauri:build
 Tauri signs with the identity and notarizes when the `APPLE_*` variables are present.
 A tag `vX.Y.Z` that matches the version in `package.json`, `src-tauri/Cargo.toml`,
 and `tauri.conf.json` runs `.github/workflows/wallet-release.yml`. That builds a
-signed, notarized macOS DMG and a Linux `.deb` and AppImage, uploads them to a
-draft prerelease, and adds `SHA256SUMS`. Publish the draft after checking the
+signed, notarized macOS DMG, a Windows NSIS `setup.exe`, and a Linux `.deb` and
+AppImage, uploads them to a draft prerelease, and adds `SHA256SUMS`. The Windows
+installer is not Authenticode-signed. Publish the draft after checking the
 assets. There is no auto-update channel.
 
 ## Tracked dependency advisories
