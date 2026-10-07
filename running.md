@@ -236,11 +236,12 @@ VM≡circuit differential tests) is:
 cd impl && cargo test --workspace
 ```
 
-CI runs the fast suite on every push (`.github/workflows/ci.yml`: three test shards,
-a clippy ratchet, cargo audit + cargo deny + npm audit) and the live e2e on `main` and
-nightly (`live-e2e.yml`). Release images are built, digest-pinned and cosign-signed by
-`image.yml`. Every cargo call runs `--locked` on the date-pinned nightly in
-`impl/rust-toolchain.toml`.
+CI is one workflow (`.github/workflows/ci.yml`). Every push runs the three test
+shards, the clippy ratchet, cargo audit + cargo deny + npm audit, and the wallet
+build. The live 3-node run is a job in that same workflow, and it runs on `main`,
+nightly, or when the workflow is started by hand. Release images are built,
+digest-pinned and cosign-signed by `image.yml`. Every cargo call runs `--locked`
+on the date-pinned nightly in `impl/rust-toolchain.toml`.
 
 ---
 
