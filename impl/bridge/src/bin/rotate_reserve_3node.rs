@@ -138,13 +138,11 @@ fn main() {
     user_btc.mine(need + 2).unwrap();
     swap::relay_btc_headers(&zc, &user_btc).expect("relay");
     let margin = 130_000u64;
-    let mut only_new = WatcherState::default();
-    only_new.cursor = watch_from;
+    let mut only_new = WatcherState { cursor: watch_from, ..Default::default() };
     let r = watcher_tick(&mut only_new, &zc, &operator_btc, &swap::ReserveKeys::single(&new), &sweep_dest, asset, margin, 1).expect("tick");
     assert_eq!(r.swept, 0, "a watcher without the retired key cannot sweep the old-key deposit");
     let prev = [Key::from_bytes(&[0xB1; 32])];
-    let mut both = WatcherState::default();
-    both.cursor = watch_from;
+    let mut both = WatcherState { cursor: watch_from, ..Default::default() };
     let r = watcher_tick(&mut both, &zc, &operator_btc, &swap::ReserveKeys { current: &new, previous: &prev }, &sweep_dest, asset, margin, 1).expect("tick");
     assert_eq!(r.swept, 1, "with the retired key loaded the pre-rotation deposit is swept: {:?}", r.errors);
     println!("[6] pre-rotation deposit: not swept with the new key alone, SWEPT once the retired key is loaded");

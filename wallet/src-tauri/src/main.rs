@@ -1181,11 +1181,13 @@ fn claim_bearer(token: String, state: State<AppState>) -> R<Received> {
         // No "is it spent?" query: asking the node about a specific nullifier would tell
         // the operator which coin this session is about to sweep. The sweep itself is the
         // check: a double-spend is rejected atomically (nothing of ours is spent).
-        // The sweep is a transfer, so it pays ZCRYPT gas via a bundled gas note (built
-        // first — it reserves a spare ZCRYPT coin). You get the FULL bearer value; the
-        // 0.01 ZCRYPT gas comes from a separate ZCRYPT coin you hold.
+        // The sweep is a transfer, so it pays ZCRYPT gas from a separate ZCRYPT coin.
+        // Reserve that coin first. The gas proof is built after the sweep proof:
+        // consensus binds it to gas_pay_envelope(txbind(main)), which covers the
+        // sweep's proof bytes. You get the FULL bearer value; the 0.01 ZCRYPT gas
+        // comes from the reserved coin.
         let cid = chain_id_for(&url)?;
-        let (gas_tx, gas_blind, gas_i, gchg_rec) = build_gas_note(w, &leaves, &[], &cid)?;
+        let gas_i = pick_gas_coin(w, &leaves, &[])?;
         // Sweep: single-input spend of the bearer coin → a fresh coin we own (new
         // secret), plus a 0-value change output (2-output topology). No in-tx fee.
         // Membership proof against the whole shielded pool — no ring selection.
@@ -1209,6 +1211,8 @@ fn claim_bearer(token: String, state: State<AppState>) -> R<Received> {
         let note1 = kem::ciphertext_to_bytes(&keys::encrypt_note_asset(&self_addr, 0, blind_b, bcoin.asset_id));
         let main_tx = shield_tx::build(&cid, &[spend], &[out0, out1], 0, vec![note0, note1])
             .ok_or("failed to build the claim proof")?;
+        let gas_env = shield_tx::gas_pay_envelope(&shield_tx::txbind(&cid, &main_tx));
+        let (gas_tx, gas_blind, gchg_rec) = build_gas_note(w, &leaves, gas_i, &cid, &gas_env)?;
         let raw = bundle_transfer(&gas_blind, &gas_tx, &main_tx);
         chain::broadcast(&url, &raw).map_err(|e| {
             if e.contains("spent") || e.contains("nullifier") {
@@ -1842,19 +1846,14 @@ struct SendResult {
     file: Option<String>,
 }
 
-/// Build the ZCRYPT **gas note** for a transfer: reserve a spare ZCRYPT coin (≥ `GAS_FEE`,
-/// not in `exclude`) and spend it into `[burn(GAS_FEE ZCRYPT), change]`. The revealed
-/// burn coin proves the gas is exactly 0.01 ZCRYPT. Returns the gas tx, its blind, the
-/// gas coin's wallet index (mark it spent after broadcast), and the change coin to record.
-/// Allocates an HD stealth-change index, but does NOT otherwise mutate coins.
-fn build_gas_note(
-    w: &mut Wallet,
+/// Index of the smallest on-chain ZCRYPT coin that can pay `GAS_FEE`, skipping `exclude`.
+/// Does not mutate the wallet. Callers prove the spend later, once the envelope exists.
+fn pick_gas_coin(
+    w: &Wallet,
     leaves: &[zcrypt_shield::Commitment],
     exclude: &[usize],
-    chain_id: &[u8],
-) -> Result<(shield_tx::ShieldTx, [u64; 4], usize, Option<CoinRec>), String> {
-    let gas_i = w
-        .coins
+) -> Result<usize, String> {
+    w.coins
         .iter()
         .enumerate()
         .filter(|(i, c)| {
@@ -1868,9 +1867,26 @@ fn build_gas_note(
         .map(|(i, _)| i)
         .ok_or(
             "no ZCRYPT available to pay the 0.01 gas fee — keep a little ZCRYPT on hand \
-             (mint some on devnet) to pay for transfers, including moving zBTC and assets",
-        )?;
-    let gas_coin = w.coins[gas_i].coin;
+             (mint some on devnet) to pay for transfers, including moving zBTC and assets"
+                .to_string(),
+        )
+}
+
+/// Prove the ZCRYPT **gas note** that spends coin `gas_i` into `[burn(GAS_FEE ZCRYPT), change]`.
+/// The revealed burn coin proves the gas is exactly 0.01 ZCRYPT. `envelope` is what consensus
+/// rebuilds: `gas_pay_envelope(txbind(main))` for a transfer (so the main proof must already
+/// exist — its bytes are inside the binding), or `gas_pay_envelope(body)` for REGISTER /
+/// HTLC_OPEN. A proof built with an empty envelope does not verify.
+/// Returns the gas tx, its blind, and the change coin to record. Allocates an HD
+/// stealth-change index, but does not otherwise mutate coins.
+fn build_gas_note(
+    w: &mut Wallet,
+    leaves: &[zcrypt_shield::Commitment],
+    gas_i: usize,
+    chain_id: &[u8],
+    envelope: &[u8],
+) -> Result<(shield_tx::ShieldTx, [u64; 4], Option<CoinRec>), String> {
+    let gas_coin = w.coins.get(gas_i).ok_or("gas coin is missing")?.coin;
     let gidx = chain::find_index(leaves, &gas_coin.commitment()).ok_or("gas coin not on chain")?;
     let (gps, gpd) = chain::merkle_path(leaves, gidx as usize).ok_or("gas coin not in the tree")?;
     let gas_spend = shield_tx::Spend {
@@ -1896,12 +1912,13 @@ fn build_gas_note(
     let gchg_addr = gchg_acct.stealth_address();
     let gas_change = keys::out_coin(&gchg_addr, gchg_val, gchg_blind);
     let gchg_note = kem::ciphertext_to_bytes(&keys::encrypt_note(&gchg_addr, gchg_val, gchg_blind));
-    let gas_tx = shield_tx::build(
+    let gas_tx = shield_tx::build_bound(
         chain_id,
         &[gas_spend],
         &[gas_burn, gas_change],
         0,
         vec![keys::cover_note_bytes(), gchg_note],
+        envelope,
     )
     .ok_or("failed to build the gas note proof")?;
     let gchg_rec = if gchg_val > 0 {
@@ -1910,17 +1927,24 @@ fn build_gas_note(
     } else {
         None
     };
-    Ok((gas_tx, gas_blind, gas_i, gchg_rec))
+    Ok((gas_tx, gas_blind, gchg_rec))
 }
 
 /// The encoded GAS PREFIX (`gas_blind(32) ‖ gas_len(4) ‖ gas_tx`) a state-creating tx
-/// (REGISTER / HTLC_OPEN) must carry, built from this wallet's ZCRYPT coins exactly like a
-/// transfer's gas note. Returns the prefix, the index of the spent gas coin, and the change
-/// coin record (if any) to add once the tx is accepted.
-fn mint_gas_prefix(w: &mut Wallet, url: &str) -> Result<(Vec<u8>, usize, Option<CoinRec>), String> {
+/// (REGISTER / HTLC_OPEN) must carry. `payload` is the transparent body that follows the
+/// prefix; the gas proof is bound to `gas_pay_envelope(payload)`, which is what consensus
+/// verifies. Returns the prefix, the index of the spent gas coin, and the change coin
+/// record (if any) to add once the tx is accepted.
+fn mint_gas_prefix(
+    w: &mut Wallet,
+    url: &str,
+    payload: &[u8],
+) -> Result<(Vec<u8>, usize, Option<CoinRec>), String> {
     let chain_id = chain_id_for(url)?;
     let leaves = chain::fetch_leaves(url)?;
-    let (gas_tx, gas_blind, gas_i, gchg_rec) = build_gas_note(w, &leaves, &[], &chain_id)?;
+    let gas_i = pick_gas_coin(w, &leaves, &[])?;
+    let (gas_tx, gas_blind, gchg_rec) =
+        build_gas_note(w, &leaves, gas_i, &chain_id, &shield_tx::gas_pay_envelope(payload))?;
     let gas_bytes = shield_tx::to_bytes(&gas_tx);
     let mut out = Vec::with_capacity(36 + gas_bytes.len());
     for limb in gas_blind {
@@ -1968,9 +1992,10 @@ fn shield_pay(
     if amount > MAX_COIN {
         return Err(format!("amount too large — must be ≤ {MAX_COIN} base units"));
     }
-    // ---- Universal gas: build a ZCRYPT gas note first (reserves a spare ZCRYPT coin,
-    //      even for a ZCRYPT send — the node can't tell ZCRYPT from a hidden asset). ----
-    let (gas_tx, gas_blind, gas_i, gchg_rec) = build_gas_note(w, leaves, &[], &chain_id)?;
+    // Reserve a spare ZCRYPT coin for gas before choosing payment inputs (even for a
+    // ZCRYPT send — the node can't tell ZCRYPT from a hidden asset). The proof is
+    // built after the main tx, bound to that tx.
+    let gas_i = pick_gas_coin(w, leaves, &[])?;
 
     // ---- Main transfer inputs: fewest coins of `asset_id` covering `amount`, EXCLUDING
     //      the gas coin. No in-tx fee (the moved asset is never burned for gas). ----
@@ -2086,6 +2111,11 @@ fn shield_pay(
         vec![onchain_note, change_note],
     )
     .ok_or("failed to build the shield proof")?;
+
+    // Gas is bound to the finished main tx (its proof bytes are inside txbind). An
+    // empty envelope does not verify against gas_pay_envelope(txbind(main)).
+    let gas_env = shield_tx::gas_pay_envelope(&shield_tx::txbind(&chain_id, &main_tx));
+    let (gas_tx, gas_blind, gchg_rec) = build_gas_note(w, leaves, gas_i, &chain_id, &gas_env)?;
 
     // Bundle the gas note + main transfer and broadcast.
     let raw = bundle_transfer(&gas_blind, &gas_tx, &main_tx);
@@ -4985,7 +5015,8 @@ fn mint_asset(
             None => {
                 // Free → register it (first-mint-wins) with your authority. Registration is
                 // a state-creating tx and carries a ZCRYPT gas note (0.01 ZCRYPT burned).
-                let (gas, gas_i, gchg) = mint_gas_prefix(w, &url)?;
+                let body = bswap::register_body(decimals, &t, max_supply, &my_authority);
+                let (gas, gas_i, gchg) = mint_gas_prefix(w, &url, &body)?;
                 chain::broadcast(&url, &bswap::register_tx(&t, decimals, &my_authority, max_supply, &gas))?;
                 w.coins[gas_i].spent = true;
                 if let Some(rec) = gchg {
@@ -5016,7 +5047,8 @@ fn mint_asset(
         // on-chain. The open is a state-creating tx and carries a ZCRYPT gas note.
         let cid = chain_id_for(&url)?;
         let auth = sign_mint(&zcrypt_core::mint_auth::mint_message(&cid, asset_id, amount, &lock, timeout, &pk));
-        let (gas, gas_i, gchg) = mint_gas_prefix(w, &url)?;
+        let body = bswap::open_body(asset_id, amount, &lock, timeout, &pk, &auth);
+        let (gas, gas_i, gchg) = mint_gas_prefix(w, &url, &body)?;
         chain::broadcast(&url, &bswap::open_tx(asset_id, amount, &lock, timeout, &pk, &auth, &gas))?;
         w.coins[gas_i].spent = true;
         if let Some(rec) = gchg {
@@ -5063,9 +5095,6 @@ fn parse_decimal_units(s: &str, decimals: u32) -> Result<u64, String> {
     let scale = 10u64.pow(decimals);
     whole_n.checked_mul(scale).and_then(|w| w.checked_add(frac_n)).ok_or_else(|| "amount overflow".into())
 }
-
-/// BTC → zBTC: lock BTC, receive shielded zBTC (atomic, hashlocked).
-/// `btc` is a decimal BTC string (or whole sats if you pass integer base via zbtc_amount 1:1).
 
 /// How long a redeem waits for the operator to fund the BTC HTLC before handing back to the
 /// user (the record stays pending; "Diagnose & fix" resumes it), and how often it polls.
@@ -6240,8 +6269,10 @@ mod live_3node {
                     }
                     let dest = op.new_address().unwrap();
                     let asset = bswap::ensure_zbtc_registered(&zc).unwrap();
-                    let mut st = WatcherState::default();
-                    st.cursor = zc.height().unwrap();
+                    let mut st = WatcherState {
+                        cursor: zc.height().unwrap(),
+                        ..Default::default()
+                    };
                     while !stop.load(std::sync::atomic::Ordering::Relaxed) {
                         match watcher_tick(&mut st, &zc, &op, &bswap::ReserveKeys::single(&reserve), &dest, asset, 130_000, 1) {
                             // Regtest has no miners: confirm what the operator just funded so the

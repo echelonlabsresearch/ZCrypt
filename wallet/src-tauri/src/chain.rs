@@ -649,7 +649,7 @@ pub fn scan_blocks(url: &str, from: i64, to: i64) -> ScanFetch {
 pub fn merkle_path(leaves: &[Commitment], leaf_idx: usize) -> Option<(Vec<Commitment>, Vec<bool>)> {
     let mut tree = zcrypt_shield::tree::CommitmentTree::new();
     for &c in leaves {
-        tree.append(c);
+        tree.append(c).ok()?;
     }
     tree.path(leaf_idx)
 }
