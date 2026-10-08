@@ -425,6 +425,8 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # This job does not check the repo out. gh looks for .git unless the repo is named.
+          GH_REPO: ${{ github.repository }}
           TAG: ${{ needs.prepare.outputs.tag }}
         run: |
           set -euo pipefail
@@ -443,6 +445,9 @@ jobs:
                   digest, name = line.split("  ", 1)
                   if len(digest) != 64:
                       sys.exit(f"bad digest line: {line}")
+                  # GitHub stores "ZCrypt Wallet_….dmg" as "ZCrypt.Wallet_….dmg".
+                  # The download uses that name, so the checksum line has to as well.
+                  name = name.replace(" ", ".")
                   previous = seen.get(name)
                   if previous is not None and previous != digest:
                       sys.exit(f"hash mismatch for {name}")
@@ -461,4 +466,12 @@ jobs:
           )
           print(pathlib.Path("SHA256SUMS").read_text())
           PY
+          assets=$(gh release view "$TAG" --json assets --jq '.assets[].name')
+          while IFS= read -r line; do
+            name=${line#*  }
+            if ! printf '%s\n' "$assets" | grep -Fxq -- "$name"; then
+              echo "SHA256SUMS names ${name}, which is not an asset on ${TAG}" >&2
+              exit 1
+            fi
+          done < SHA256SUMS
           gh release upload "$TAG" SHA256SUMS --clobber
