@@ -61,7 +61,8 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
   CARGO_PROFILE_RELEASE_DEBUG: "0"
-  CARGO_PROFILE_RELEASE_INCREMENTAL: "0"
+  # nightly-2025-10-12 rejects 0/1 for this boolean. 0 is what failed the macOS build.
+  CARGO_PROFILE_RELEASE_INCREMENTAL: "false"
 
 jobs:
   # A browser-downloaded disk image is checked on its own. A notarized app
