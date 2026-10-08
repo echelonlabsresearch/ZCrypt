@@ -123,13 +123,35 @@ APPLE_ID=<apple id> APPLE_PASSWORD=<app-specific password> APPLE_TEAM_ID=<team i
 npm run tauri:build
 ```
 
-Tauri signs with the identity and notarizes when the `APPLE_*` variables are present.
-A tag `vX.Y.Z` that matches the version in `package.json`, `src-tauri/Cargo.toml`,
-and `tauri.conf.json` runs `.github/workflows/wallet-release.yml`. That builds a
-signed, notarized macOS DMG, a Windows NSIS `setup.exe`, and a Linux `.deb` and
-AppImage, uploads them to a draft prerelease, and adds `SHA256SUMS`. The Windows
-installer is not Authenticode-signed. Publish the draft after checking the
-assets. There is no auto-update channel.
+Tauri signs the `.app` and notarizes that bundle when the `APPLE_*` variables are
+present. It then wraps the app in a Developer ID signed disk image and does not
+notarize the image. Gatekeeper checks the file a browser saved. A notarized app
+inside an image with no ticket of its own is rejected, and the app never opens.
+
+The release workflow submits that image to the notary service, staples the ticket,
+and replaces the draft asset before `SHA256SUMS` is written. A tag `vX.Y.Z` that
+matches the version in `package.json`, `src-tauri/Cargo.toml`, and `tauri.conf.json`
+runs `.github/workflows/wallet-release.yml`. That builds a signed, notarized macOS
+DMG, a Windows NSIS `setup.exe`, and a Linux `.deb` and AppImage, uploads them to a
+draft prerelease, and adds `SHA256SUMS`. The Windows installer is not
+Authenticode-signed. Publish the draft after checking the assets. There is no
+auto-update channel.
+
+A release that already went out with an unstapled image can be repaired without a
+rebuild. Stapling changes the file, so the repair rewrites the DMG lines in
+`SHA256SUMS`:
+
+```bash
+gh workflow run wallet-release.yml -f repair_tag=v0.1.0
+```
+
+A DMG built on a machine, rather than by that workflow, needs the same staple
+before anyone else opens it. This leaves the file in place and does not upload it:
+
+```bash
+APPLE_ID=<apple id> APPLE_PASSWORD=<app-specific password> APPLE_TEAM_ID=<team id> \
+  bash .github/workflows/staple-dmg.sh --built '*.dmg'
+```
 
 ## Tracked dependency advisories
 

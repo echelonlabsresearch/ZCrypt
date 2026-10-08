@@ -2,7 +2,7 @@
 #
 # A tag vX.Y.Z (or a manual run that names an existing tag) builds the desktop
 # wallet and uploads installers to a DRAFT prerelease:
-#   * macOS Apple-silicon DMG, Developer ID signed and notarized
+#   * macOS Apple-silicon DMG, Developer ID signed, notarized, and stapled
 #   * Windows x64 NSIS setup.exe. No Authenticode certificate is configured,
 #     so SmartScreen warns on first install.
 #   * Linux .deb and AppImage (built on Ubuntu 22.04 so the AppImage's glibc
@@ -27,6 +27,14 @@
 #   APPLE_PASSWORD               app-specific password
 #   APPLE_TEAM_ID                10-character team id
 #
+# tauri-action notarizes the .app. Gatekeeper checks the .dmg a browser
+# saved. A notarized app inside an image with no ticket of its own is
+# rejected, and the app never opens. The macOS job submits that image,
+# staples the ticket, and replaces the asset the action already uploaded.
+# The checksum step runs after that, so SHA256SUMS matches the stapled file.
+# Repair a release that is already out, without rebuilding:
+#   gh workflow run wallet-release.yml -f repair_tag=v0.1.0
+#
 # The wallet links zcrypt-shield, so the release link is memory-heavy. Debug
 # info stays off and the macOS job links one crate at a time. Repo Actions
 # permission default stays read; this workflow opts in to contents: write.
@@ -38,7 +46,11 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Existing tag to build (vX.Y.Z). Leave empty when this run is already on a tag."
+        description: "Existing tag to build (vX.Y.Z). Leave empty when this run is already on a tag. Ignored when repair_tag is set."
+        required: false
+        type: string
+      repair_tag:
+        description: "Release whose disk images should be notarized and re-uploaded, e.g. v0.1.0. Leave empty to build. Setting this skips the build."
         required: false
         type: string
 
@@ -52,8 +64,28 @@ env:
   CARGO_PROFILE_RELEASE_INCREMENTAL: "0"
 
 jobs:
+  # A browser-downloaded disk image is checked on its own. A notarized app
+  # inside an unnotarized image does not open. Submit the image, staple the
+  # ticket to it, and replace the asset only after the ticket validates.
+  repair-dmg:
+    if: github.event_name == 'workflow_dispatch' && inputs.repair_tag != ''
+    runs-on: macos-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Notarize the disk images already on the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          REPAIR_TAG: ${{ inputs.repair_tag }}
+        run: bash .github/workflows/staple-dmg.sh --tag "$REPAIR_TAG"
+
   prepare:
     name: Draft release
+    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.repair_tag == '')
     runs-on: ubuntu-latest
     timeout-minutes: 10
     outputs:
@@ -111,7 +143,7 @@ jobs:
           notes=$(cat <<EOF
           ZCrypt Wallet ${TAG}
 
-          Desktop installers built from this tag. The macOS DMG is Developer ID signed and notarized. Windows ships an NSIS setup.exe (not Authenticode-signed). Linux ships a .deb and an AppImage. Verify every file against SHA256SUMS before opening it.
+          Desktop installers built from this tag. The macOS DMG is Developer ID signed, notarized, and stapled. Windows ships an NSIS setup.exe (not Authenticode-signed). Linux ships a .deb and an AppImage. Verify every file against SHA256SUMS before opening it.
 
           This tag also publishes the ABCI image. The wallet build does not enable the devnet feature.
 
@@ -308,6 +340,17 @@ jobs:
           includeUpdaterJson: false
           uploadPlainBinary: false
           args: --bundles ${{ matrix.bundles }} -- --locked
+
+      - name: Notarize the disk image
+        if: matrix.id == 'macos'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: bash .github/workflows/staple-dmg.sh --built '*.dmg' "$TAG"
 
       - name: Drop the raw .app archive
         if: matrix.id == 'macos'
