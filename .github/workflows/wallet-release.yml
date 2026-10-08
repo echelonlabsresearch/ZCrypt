@@ -152,22 +152,21 @@ jobs:
           )
           # Strip the indentation the workflow source adds.
           notes=$(printf '%s\n' "$notes" | sed 's/^          //')
-          jq -n \
-            --arg tag "$TAG" \
-            --arg body "$notes" \
-            '{tag_name:$tag, name:("ZCrypt Wallet "+$tag), body:$body, draft:true, prerelease:true, target_commitish:$tag}' \
-            > "$RUNNER_TEMP/release.json"
-          set +e
-          id=$(gh api --method POST "repos/${GITHUB_REPOSITORY}/releases" --input "$RUNNER_TEMP/release.json" --jq .id 2>"$RUNNER_TEMP/release.err")
-          status=$?
-          set -e
-          if [ "$status" -ne 0 ]; then
-            if grep -q 'already_exists' "$RUNNER_TEMP/release.err"; then
-              id=$(gh api "repos/${GITHUB_REPOSITORY}/releases?per_page=100" --jq "[.[] | select(.tag_name==\"${TAG}\") | .id][0]")
-            else
-              cat "$RUNNER_TEMP/release.err" >&2
-              exit "$status"
-            fi
+          # A draft is invisible to the by-tag endpoint, and creating again
+          # makes a second draft with the same tag. Reuse the one that exists.
+          id=$(gh api "repos/${GITHUB_REPOSITORY}/releases?per_page=100" --jq "[.[] | select(.tag_name==\"${TAG}\") | .id] | if length==1 then .[0] elif length==0 then empty else error(\"more than one release for ${TAG}\") end")
+          if [ -z "$id" ]; then
+            # An annotated tag name is not a valid target_commitish. The API
+            # wants the commit the tag peels to.
+            sha=$(git rev-parse HEAD)
+            jq -n \
+              --arg tag "$TAG" \
+              --arg body "$notes" \
+              --arg sha "$sha" \
+              '{tag_name:$tag, name:("ZCrypt Wallet "+$tag), body:$body, draft:true, prerelease:true, target_commitish:$sha}' \
+              > "$RUNNER_TEMP/release.json"
+            gh api --method POST "repos/${GITHUB_REPOSITORY}/releases" --input "$RUNNER_TEMP/release.json" >"$RUNNER_TEMP/release.out"
+            id=$(jq -r .id "$RUNNER_TEMP/release.out")
           fi
           if [ -z "$id" ]; then
             echo "no release id for $TAG" >&2
