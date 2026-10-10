@@ -7,6 +7,7 @@
 //!   * commit          -> RocksDB StateDb (incremental leaves + fsync WriteBatch)
 //!   * query           -> /registry/root, /registry/minted, /prove/<nf_hex>
 
+use zcrypt_shield::Blind;
 use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -34,7 +35,7 @@ const DEFAULT_CHAIN_ID: &[u8] = b"zcrypt-1";
 /// Magic first byte marking a SHIELD **transfer** (hidden-amount, post-quantum
 /// zero-knowledge value proof via Plonky3). A transfer bundles two proofs so that gas
 /// is always paid in ZCRYPT even for a hidden non-ZCRYPT asset. Payload:
-///   gas_blind(4×u64 = 32) ‖ gas_tx_len(u32 LE = 4) ‖ gas_tx_bytes ‖ main_tx_bytes
+///   gas_blind(8×u64 = 64) ‖ gas_tx_len(u32 LE = 4) ‖ gas_tx_bytes ‖ main_tx_bytes
 /// where `gas_tx.output[0]` burns exactly `MIN_FEE` ZCRYPT and `main_tx.fee == 0`.
 /// Native ZVM bytecode always starts with `OP_PUSH` (0x01), so there is no collision.
 const SHIELD_TAG: u8 = 0x55;
@@ -61,7 +62,7 @@ const BOND_TAG: u8 = 0x57;
 const CLAIM_TAG: u8 = 0x58;
 
 /// Register a shielded-asset ticker (first-mint-wins). Payload:
-///   GAS PREFIX: gas_blind(4×u64 = 32) ‖ gas_tx_len(u32 LE) ‖ gas_tx_bytes (a ZCRYPT shield
+///   GAS PREFIX: gas_blind(8×u64 = 64) ‖ gas_tx_len(u32 LE) ‖ gas_tx_bytes (a ZCRYPT shield
 ///   spend whose output[0] burns exactly MIN_FEE ZCRYPT, exactly as a 0x55 transfer bundles),
 ///   then:
 ///   [0]      decimals
@@ -95,7 +96,7 @@ const UNBOND_TAG: u8 = 0x5E;
 /// key). The pledged stake boosts the validator's voting power and earns the delegator
 /// a share of its rewards (net of commission). Payload:
 ///   delegator_pubkey(32) ‖ target_addr(20) ‖ stake_le(8) ‖ reward(32) ‖ sig(64)
-///   ‖ stake_blind(32) ‖ shield_tx (the burn-coin pledge).
+///   ‖ stake_blind(64) ‖ shield_tx (the burn-coin pledge).
 const DELEGATE_TAG: u8 = 0x5F;
 
 /// Undelegate a delegator's stake from a validator (signed by the delegator's key). The
@@ -353,23 +354,32 @@ fn build_spv_chain(net_str: &str, cp_str: &str) -> Option<zcrypt_core::spv::Head
     })
 }
 
-/// Parse the GAS PREFIX that state-creating txs carry: `gas_blind(32) ‖ gas_len(u32 LE) ‖
+/// Parse the GAS PREFIX that state-creating txs carry: `gas_blind(64) ‖ gas_len(u32 LE) ‖
 /// gas_tx`. Returns `(gas_blind, gas_tx, rest)`.
-fn parse_gas_prefix(b: &[u8]) -> Option<([u64; 4], ShieldTx, &[u8])> {
-    if b.len() < 36 {
+fn parse_gas_prefix(b: &[u8]) -> Option<(Blind, ShieldTx, &[u8])> {
+    if b.len() < BB + 4 {
         return None;
     }
-    let mut gas_blind = [0u64; 4];
-    for (i, limb) in gas_blind.iter_mut().enumerate() {
-        *limb = u64::from_le_bytes(b[i * 8..i * 8 + 8].try_into().ok()?);
-    }
-    let gas_len = u32::from_le_bytes(b[32..36].try_into().ok()?) as usize;
-    let gas_end = 36usize.checked_add(gas_len)?;
+    let gas_blind = rd_blind(b, 0)?;
+    let gas_len = u32::from_le_bytes(b[BB..BB + 4].try_into().ok()?) as usize;
+    let gas_end = (BB + 4).checked_add(gas_len)?;
     if b.len() < gas_end {
         return None;
     }
-    let gas_tx = zcrypt_core::shield_tx::from_bytes(&b[36..gas_end])?;
+    let gas_tx = zcrypt_core::shield_tx::from_bytes(&b[BB + 4..gas_end])?;
     Some((gas_blind, gas_tx, &b[gas_end..]))
+}
+
+/// Serialized blind size on every wire: `BLIND_LIMBS` × 8 little-endian bytes (64).
+const BB: usize = zcrypt_shield::BLIND_BYTES;
+
+/// Read a blind (`BLIND_LIMBS` u64 LE limbs) at `off`.
+fn rd_blind(b: &[u8], off: usize) -> Option<Blind> {
+    let mut blind: Blind = [0u64; zcrypt_shield::BLIND_LIMBS];
+    for (i, limb) in blind.iter_mut().enumerate() {
+        *limb = u64::from_le_bytes(b.get(off + i * 8..off + i * 8 + 8)?.try_into().ok()?);
+    }
+    Some(blind)
 }
 
 /// Parse an HTLC-open payload into (asset_id, value, hashlock, timeout, claim_pk, capability).
@@ -437,24 +447,24 @@ fn parse_escrow_id(b: &[u8]) -> Option<[u8; 32]> {
 #[allow(clippy::type_complexity)]
 fn parse_burn_lock(
     b: &[u8],
-) -> Option<(u64, [u64; 4], u64, [u8; 32], u64, [u64; 8], zcrypt_core::shield_tx::ShieldTx)> {
-    // value(8) + blind(32) + asset(8) + hashlock(32) + timeout(8) + refund_pk(64) = 152
-    if b.len() < 152 {
+) -> Option<(u64, Blind, u64, [u8; 32], u64, [u64; 8], zcrypt_core::shield_tx::ShieldTx)> {
+    // value(8) + blind(64) + asset(8) + hashlock(32) + timeout(8) + refund_pk(64) = 184
+    const A: usize = 8 + BB; // asset
+    const H: usize = A + 8; // hashlock
+    const T: usize = H + 32; // timeout
+    const R: usize = T + 8; // refund_pk
+    const END: usize = R + 64;
+    if b.len() < END {
         return None;
     }
     let value = u64::from_le_bytes(b[0..8].try_into().ok()?);
-    let blind = [
-        u64::from_le_bytes(b[8..16].try_into().ok()?),
-        u64::from_le_bytes(b[16..24].try_into().ok()?),
-        u64::from_le_bytes(b[24..32].try_into().ok()?),
-        u64::from_le_bytes(b[32..40].try_into().ok()?),
-    ];
-    let asset_id = u64::from_le_bytes(b[40..48].try_into().ok()?);
+    let blind = rd_blind(b, 8)?;
+    let asset_id = u64::from_le_bytes(b[A..A + 8].try_into().ok()?);
     let mut hashlock = [0u8; 32];
-    hashlock.copy_from_slice(&b[48..80]);
-    let timeout = u64::from_le_bytes(b[80..88].try_into().ok()?);
-    let refund_pk = parse_pubkey(&b[88..152])?;
-    let tx = zcrypt_core::shield_tx::from_bytes(&b[152..])?;
+    hashlock.copy_from_slice(&b[H..H + 32]);
+    let timeout = u64::from_le_bytes(b[T..T + 8].try_into().ok()?);
+    let refund_pk = parse_pubkey(&b[R..END])?;
+    let tx = zcrypt_core::shield_tx::from_bytes(&b[END..])?;
     Some((value, blind, asset_id, hashlock, timeout, refund_pk, tx))
 }
 
@@ -467,34 +477,35 @@ fn parse_swap_lock(
     b: &[u8],
 ) -> Option<(
     u64,
-    [u64; 4],
+    Blind,
     u64,
     [u8; 32],
     u64,
     [u64; 8],
     [u64; 8],
-    [u64; 4],
+    Blind,
     zcrypt_core::shield_tx::ShieldTx,
     zcrypt_core::shield_tx::ShieldTx,
 )> {
-    // value(8)+blind(32)+asset(8)+hashlock(32)+timeout(8)+counterparty_pk(64)+refund_pk(64) = 216
-    if b.len() < 216 {
+    // value(8)+blind(64)+asset(8)+hashlock(32)+timeout(8)+counterparty_pk(64)+refund_pk(64) = 248
+    const A: usize = 8 + BB;
+    const H: usize = A + 8;
+    const T: usize = H + 32;
+    const C: usize = T + 8;
+    const R: usize = C + 64;
+    const END: usize = R + 64;
+    if b.len() < END {
         return None;
     }
     let value = u64::from_le_bytes(b[0..8].try_into().ok()?);
-    let blind = [
-        u64::from_le_bytes(b[8..16].try_into().ok()?),
-        u64::from_le_bytes(b[16..24].try_into().ok()?),
-        u64::from_le_bytes(b[24..32].try_into().ok()?),
-        u64::from_le_bytes(b[32..40].try_into().ok()?),
-    ];
-    let asset_id = u64::from_le_bytes(b[40..48].try_into().ok()?);
+    let blind = rd_blind(b, 8)?;
+    let asset_id = u64::from_le_bytes(b[A..A + 8].try_into().ok()?);
     let mut hashlock = [0u8; 32];
-    hashlock.copy_from_slice(&b[48..80]);
-    let timeout = u64::from_le_bytes(b[80..88].try_into().ok()?);
-    let counterparty_pk = parse_pubkey(&b[88..152])?;
-    let refund_pk = parse_pubkey(&b[152..216])?;
-    let (gas_blind, gas_tx, rest) = parse_gas_prefix(&b[216..])?;
+    hashlock.copy_from_slice(&b[H..H + 32]);
+    let timeout = u64::from_le_bytes(b[T..T + 8].try_into().ok()?);
+    let counterparty_pk = parse_pubkey(&b[C..R])?;
+    let refund_pk = parse_pubkey(&b[R..END])?;
+    let (gas_blind, gas_tx, rest) = parse_gas_prefix(&b[END..])?;
     let tx = zcrypt_core::shield_tx::from_bytes(rest)?;
     Some((
         value,
@@ -662,7 +673,7 @@ fn verify_bond(b: &[u8], chain_id: &[u8]) -> Option<(Vec<u8>, Vec<u8>, u64, [u8;
 }
 
 /// Parse a **coin-backed** BOND payload:
-///   verify_bond header (138) ‖ stake_blind (4×u64 = 32) ‖ shield_tx_bytes.
+///   verify_bond header (138) ‖ stake_blind (8×u64 = 64) ‖ shield_tx_bytes.
 /// The header authenticates the validator + stake + reward + commission (as [`verify_bond`]);
 /// the stake_blind + shield_tx are the pledge — the node checks the shield tx's `output[0]`
 /// is the burn coin `commit(stake, stake_blind, BURN_PK, ZCRYPT)` and applies the spend.
@@ -670,17 +681,14 @@ fn verify_bond(b: &[u8], chain_id: &[u8]) -> Option<(Vec<u8>, Vec<u8>, u64, [u8;
 fn parse_bond_coin(
     b: &[u8],
     chain_id: &[u8],
-) -> Option<(Vec<u8>, Vec<u8>, u64, [u8; 32], u16, u64, [u64; 4], zcrypt_core::shield_tx::ShieldTx)> {
-    // 146-byte authenticated header ‖ stake_blind(32) ‖ shield_tx.
-    if b.len() < 178 {
+) -> Option<(Vec<u8>, Vec<u8>, u64, [u8; 32], u16, u64, Blind, zcrypt_core::shield_tx::ShieldTx)> {
+    // 146-byte authenticated header ‖ stake_blind(64) ‖ shield_tx.
+    if b.len() < 146 + BB {
         return None;
     }
     let (addr, pubkey, stake, reward, commission, nonce) = verify_bond(&b[..146], chain_id)?;
-    let mut stake_blind = [0u64; 4];
-    for (i, limb) in stake_blind.iter_mut().enumerate() {
-        *limb = u64::from_le_bytes(b[146 + i * 8..154 + i * 8].try_into().ok()?);
-    }
-    let stx = zcrypt_core::shield_tx::from_bytes(&b[178..])?;
+    let stake_blind = rd_blind(b, 146)?;
+    let stx = zcrypt_core::shield_tx::from_bytes(&b[146 + BB..])?;
     Some((addr, pubkey, stake, reward, commission, nonce, stake_blind, stx))
 }
 
@@ -711,27 +719,15 @@ fn verify_unbond(b: &[u8], chain_id: &[u8]) -> Option<(Vec<u8>, [u8; 32], u64)> 
 }
 
 /// Parse a bundled SHIELD **transfer** payload:
-///   gas_blind(4×u64 = 32) ‖ gas_tx_len(u32 LE) ‖ gas_tx_bytes ‖ main_tx_bytes.
+///   gas_blind(8×u64 = 64) ‖ gas_tx_len(u32 LE) ‖ gas_tx_bytes ‖ main_tx_bytes.
 /// Returns `(gas_blind, gas_tx, main_tx)`. The node checks `gas_tx.output[0]` burns
 /// exactly `MIN_FEE` ZCRYPT (so gas is ZCRYPT even when `main_tx` moves a hidden asset).
 #[allow(clippy::type_complexity)]
 fn parse_transfer(
     b: &[u8],
-) -> Option<([u64; 4], zcrypt_core::shield_tx::ShieldTx, zcrypt_core::shield_tx::ShieldTx)> {
-    if b.len() < 36 {
-        return None;
-    }
-    let mut gas_blind = [0u64; 4];
-    for (i, limb) in gas_blind.iter_mut().enumerate() {
-        *limb = u64::from_le_bytes(b[i * 8..i * 8 + 8].try_into().ok()?);
-    }
-    let gas_len = u32::from_le_bytes(b[32..36].try_into().ok()?) as usize;
-    let gas_end = 36usize.checked_add(gas_len)?;
-    if b.len() < gas_end {
-        return None;
-    }
-    let gas_tx = zcrypt_core::shield_tx::from_bytes(&b[36..gas_end])?;
-    let main_tx = zcrypt_core::shield_tx::from_bytes(&b[gas_end..])?;
+) -> Option<(Blind, zcrypt_core::shield_tx::ShieldTx, zcrypt_core::shield_tx::ShieldTx)> {
+    let (gas_blind, gas_tx, rest) = parse_gas_prefix(b)?;
+    let main_tx = zcrypt_core::shield_tx::from_bytes(rest)?;
     Some((gas_blind, gas_tx, main_tx))
 }
 
@@ -773,23 +769,20 @@ fn verify_delegate(b: &[u8], chain_id: &[u8]) -> Option<(Vec<u8>, Vec<u8>, u64, 
 }
 
 /// Parse a **coin-backed** DELEGATE payload:
-///   verify_delegate header (156) ‖ stake_blind (4×u64 = 32) ‖ shield_tx_bytes.
+///   verify_delegate header (156) ‖ stake_blind (8×u64 = 64) ‖ shield_tx_bytes.
 /// The header authenticates the delegator + target + stake + reward; the stake_blind +
 /// shield_tx are the pledge (checked against the burn coin exactly like a bond).
 #[allow(clippy::type_complexity)]
 fn parse_delegate_coin(
     b: &[u8],
     chain_id: &[u8],
-) -> Option<(Vec<u8>, Vec<u8>, u64, [u8; 32], [u64; 4], zcrypt_core::shield_tx::ShieldTx)> {
-    if b.len() < 188 {
+) -> Option<(Vec<u8>, Vec<u8>, u64, [u8; 32], Blind, zcrypt_core::shield_tx::ShieldTx)> {
+    if b.len() < 156 + BB {
         return None;
     }
     let (target, delegator_id, stake, reward) = verify_delegate(&b[..156], chain_id)?;
-    let mut stake_blind = [0u64; 4];
-    for (i, limb) in stake_blind.iter_mut().enumerate() {
-        *limb = u64::from_le_bytes(b[156 + i * 8..164 + i * 8].try_into().ok()?);
-    }
-    let stx = zcrypt_core::shield_tx::from_bytes(&b[188..])?;
+    let stake_blind = rd_blind(b, 156)?;
+    let stx = zcrypt_core::shield_tx::from_bytes(&b[156 + BB..])?;
     Some((target, delegator_id, stake, reward, stake_blind, stx))
 }
 

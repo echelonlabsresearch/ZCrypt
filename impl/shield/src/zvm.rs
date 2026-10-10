@@ -178,7 +178,7 @@ pub fn run_shield_transfer(inputs: &[SpendWitness], outputs: &[OutCoin], fee: u6
 }
 
 // Stable helpers so callers can construct blinds/secrets without field internals.
-pub fn blind(limbs: [u64; 4]) -> Blind {
+pub fn blind(limbs: [u64; crate::BLIND_LIMBS]) -> Blind {
     core::array::from_fn(|i| crate::field_limb(limbs[i]))
 }
 pub fn secret(limbs: [u64; 8]) -> SpendSecret {
@@ -193,8 +193,7 @@ mod tests {
     const TEST_CHAIN: &[u8] = b"zcrypt-test";
 
     fn bl(b: u64) -> Blind {
-        let b = field_limb(b);
-        [b, field_limb(b.wrapping_add(0x9e37)), field_limb(b.wrapping_add(1)), field_limb(b.wrapping_add(2))]
+        core::array::from_fn(|i| field_limb(b.wrapping_add(0x9e37u64.wrapping_mul(i as u64 + 1))))
     }
     fn ss(s: u64) -> SpendSecret {
         let s = field_limb(s);

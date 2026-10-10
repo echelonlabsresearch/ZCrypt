@@ -39,8 +39,9 @@ arity is invisible.
 ## Coins, nullifiers, and why spends are unlinkable
 
 A coin is `(value, blind, spend_secret)` with public commitment
-`C = Poseidon2(value, blind, pk, asset_id)` where `pk = Poseidon2(spend_secret)`.
-Spending reveals the canonical nullifier `nf = Poseidon2(spend_secret, value, blind)`:
+`C = Poseidon2(value, Poseidon2(pk, blind), asset_id)` where `pk = Poseidon2(spend_secret)` and
+the blind is eight field limbs (~248 bits, ~124-bit against Grover).
+Spending reveals the canonical nullifier `nf = Poseidon2(Poseidon2(spend_secret, blind), value, asset_id)`:
 
 * deterministic per coin, so a double-spend collides and is rejected;
 * keyed on the private `spend_secret`, so nobody can precompute a coin's

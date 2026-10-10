@@ -4,6 +4,7 @@
 //! escrow. The bridge reads the preimage *from whichever chain reveals it first*
 //! and uses it to settle the other, so neither side can take without giving.
 
+use zcrypt_shield::Blind;
 use bitcoin::{Address, Amount, OutPoint, PublicKey, ScriptBuf};
 use zcrypt_core::keys::{Account, Coin};
 use zcrypt_core::nullifier::htlc_hashlock;
@@ -362,7 +363,7 @@ fn pk_bytes(pk: &PubKey) -> Vec<u8> {
 }
 
 /// Build the GAS PREFIX state-creating txs (REGISTER 0x59, HTLC_OPEN 0x5A) must carry:
-/// `gas_blind(32) ‖ gas_len(u32 LE) ‖ gas_tx`, where `gas_tx` is a ZCRYPT shield spend of
+/// `gas_blind(64) ‖ gas_len(u32 LE) ‖ gas_tx`, where `gas_tx` is a ZCRYPT shield spend of
 /// `gas_coin` (owned by `gas_owner`) whose output[0] burns exactly MIN_FEE ZCRYPT and whose
 /// change returns to `gas_owner`. `payload` is the transparent body that follows this
 /// prefix; the gas proof is bound to it.
@@ -766,7 +767,7 @@ pub fn fresh_preimage() -> [u8; 32] {
 
 pub fn burn_lock_tx(
     value: u64,
-    blind: &[u64; 4],
+    blind: &Blind,
     asset: u64,
     lock: &[u8; 32],
     timeout: u64,
@@ -794,7 +795,7 @@ pub fn burn_lock_tx(
 pub fn burn_lock_btc_tx(
     btc_claim_pk: &PublicKey,
     value: u64,
-    blind: &[u64; 4],
+    blind: &Blind,
     asset: u64,
     lock: &[u8; 32],
     timeout: u64,
@@ -820,20 +821,25 @@ pub fn burn_lock_btc_tx(
 /// watcher needs: the user's BTC claim pubkey (33B), asset, value, hashlock, timeout, refund_pk.
 /// (The trailing shield_tx isn't needed operator-side.) Fail-closed on malformed input.
 pub fn parse_burn_lock_btc(payload: &[u8]) -> Option<([u8; 33], u64, u64, [u8; 32], u64, PubKey)> {
-    // btc_claim_pk(33) ‖ value(8) ‖ blind(32) ‖ asset(8) ‖ hashlock(32) ‖ timeout(8) ‖ refund_pk(64) ‖ stx
-    const HEAD: usize = 33 + 8 + 32 + 8 + 32 + 8 + 64;
+    // btc_claim_pk(33) ‖ value(8) ‖ blind(BLIND_BYTES) ‖ asset(8) ‖ hashlock(32) ‖ timeout(8) ‖ refund_pk(64) ‖ stx
+    const BB: usize = zcrypt_shield::BLIND_BYTES;
+    const V: usize = 33;
+    const A: usize = V + 8 + BB; // the blind is not needed operator-side
+    const H: usize = A + 8;
+    const T: usize = H + 32;
+    const R: usize = T + 8;
+    const HEAD: usize = R + 64;
     if payload.len() < HEAD {
         return None;
     }
-    let btc_claim_pk: [u8; 33] = payload[0..33].try_into().ok()?;
-    let value = u64::from_le_bytes(payload[33..41].try_into().ok()?);
-    // payload[41..73] is the blind — not needed operator-side.
-    let asset = u64::from_le_bytes(payload[73..81].try_into().ok()?);
-    let hashlock: [u8; 32] = payload[81..113].try_into().ok()?;
-    let timeout = u64::from_le_bytes(payload[113..121].try_into().ok()?);
+    let btc_claim_pk: [u8; 33] = payload[0..V].try_into().ok()?;
+    let value = u64::from_le_bytes(payload[V..V + 8].try_into().ok()?);
+    let asset = u64::from_le_bytes(payload[A..A + 8].try_into().ok()?);
+    let hashlock: [u8; 32] = payload[H..T].try_into().ok()?;
+    let timeout = u64::from_le_bytes(payload[T..R].try_into().ok()?);
     let mut refund_pk: PubKey = [0u64; 8];
     for (i, limb) in refund_pk.iter_mut().enumerate() {
-        *limb = u64::from_le_bytes(payload[121 + i * 8..129 + i * 8].try_into().ok()?);
+        *limb = u64::from_le_bytes(payload[R + i * 8..R + 8 + i * 8].try_into().ok()?);
     }
     Some((btc_claim_pk, asset, value, hashlock, timeout, refund_pk))
 }
@@ -847,13 +853,13 @@ pub fn parse_burn_lock_btc(payload: &[u8]) -> Option<([u8; 33], u64, u64, [u8; 3
 #[allow(clippy::too_many_arguments)]
 pub fn swap_lock_tx(
     value: u64,
-    blind: &[u64; 4],
+    blind: &Blind,
     asset: u64,
     lock: &[u8; 32],
     timeout: u64,
     counterparty_pk: &PubKey,
     refund_pk: &PubKey,
-    gas_blind: &[u64; 4],
+    gas_blind: &Blind,
     gas_tx: &shield_tx::ShieldTx,
     stx: &shield_tx::ShieldTx,
 ) -> Vec<u8> {
@@ -883,20 +889,26 @@ pub fn swap_lock_tx(
 /// left to consensus. Returns `(value, blind, asset, hashlock, timeout, counterparty_pk,
 /// refund_pk)`.
 #[allow(clippy::type_complexity)]
-pub fn parse_swap_lock(payload: &[u8]) -> Option<(u64, [u64; 4], u64, [u8; 32], u64, PubKey, PubKey)> {
-    const HEAD: usize = 8 + 32 + 8 + 32 + 8 + 64 + 64;
+pub fn parse_swap_lock(payload: &[u8]) -> Option<(u64, Blind, u64, [u8; 32], u64, PubKey, PubKey)> {
+    const BB: usize = zcrypt_shield::BLIND_BYTES;
+    const A: usize = 8 + BB;
+    const H: usize = A + 8;
+    const T: usize = H + 32;
+    const C: usize = T + 8;
+    const R: usize = C + 64;
+    const HEAD: usize = R + 64;
     if payload.len() < HEAD {
         return None;
     }
     let value = u64::from_le_bytes(payload[0..8].try_into().ok()?);
-    let mut blind = [0u64; 4];
+    let mut blind: Blind = [0u64; zcrypt_shield::BLIND_LIMBS];
     for (i, limb) in blind.iter_mut().enumerate() {
         *limb = u64::from_le_bytes(payload[8 + i * 8..16 + i * 8].try_into().ok()?);
     }
-    let asset = u64::from_le_bytes(payload[40..48].try_into().ok()?);
+    let asset = u64::from_le_bytes(payload[A..A + 8].try_into().ok()?);
     let mut hashlock = [0u8; 32];
-    hashlock.copy_from_slice(&payload[48..80]);
-    let timeout = u64::from_le_bytes(payload[80..88].try_into().ok()?);
+    hashlock.copy_from_slice(&payload[H..H + 32]);
+    let timeout = u64::from_le_bytes(payload[T..T + 8].try_into().ok()?);
     let pk = |off: usize| -> Option<PubKey> {
         let mut k = [0u64; 8];
         for (i, limb) in k.iter_mut().enumerate() {
@@ -904,7 +916,7 @@ pub fn parse_swap_lock(payload: &[u8]) -> Option<(u64, [u64; 4], u64, [u8; 32], 
         }
         Some(k)
     };
-    Some((value, blind, asset, hashlock, timeout, pk(88)?, pk(152)?))
+    Some((value, blind, asset, hashlock, timeout, pk(C)?, pk(R)?))
 }
 
 pub fn seed_tx(c: &Commitment) -> Vec<u8> {
@@ -1087,7 +1099,7 @@ pub fn build_transfer(
         vec![zcrypt_core::keys::cover_note_bytes(), chg_note],
         &gas_env,
     )?;
-    // Bundle: 0x55 ‖ gas_blind(32) ‖ gas_len(4) ‖ gas_tx ‖ main_tx.
+    // Bundle: 0x55 ‖ gas_blind(64) ‖ gas_len(4) ‖ gas_tx ‖ main_tx.
     let gas_bytes = shield_tx::to_bytes(&gas_tx);
     let main_bytes = shield_tx::to_bytes(&main_tx);
     let mut out = vec![0x55u8];
@@ -1103,15 +1115,16 @@ pub fn build_transfer(
 /// Parse a bundled transfer payload (the bytes AFTER the `0x55` tag) into
 /// `(gas_tx, main_tx)`, for scanning received coins. Mirrors the node's parser.
 pub fn parse_transfer_payload(b: &[u8]) -> Option<(shield_tx::ShieldTx, shield_tx::ShieldTx)> {
-    if b.len() < 36 {
+    const BB: usize = zcrypt_shield::BLIND_BYTES;
+    if b.len() < BB + 4 {
         return None;
     }
-    let gas_len = u32::from_le_bytes(b[32..36].try_into().ok()?) as usize;
-    let gas_end = 36usize.checked_add(gas_len)?;
+    let gas_len = u32::from_le_bytes(b[BB..BB + 4].try_into().ok()?) as usize;
+    let gas_end = (BB + 4).checked_add(gas_len)?;
     if b.len() < gas_end {
         return None;
     }
-    let gas_tx = shield_tx::from_bytes(&b[36..gas_end])?;
+    let gas_tx = shield_tx::from_bytes(&b[BB + 4..gas_end])?;
     let main_tx = shield_tx::from_bytes(&b[gas_end..])?;
     Some((gas_tx, main_tx))
 }
@@ -2032,7 +2045,7 @@ pub fn redeem_user_burn(
     hashlock: &[u8; 32],
     zbtc_value: u64,
     btc_claim_pk: &PublicKey,
-) -> Result<([u8; 32], u64, [u64; 4]), String> {
+) -> Result<([u8; 32], u64, Blind), String> {
     if coins.is_empty() {
         return Err("no zBTC coins to redeem".to_string());
     }
@@ -2456,7 +2469,7 @@ pub fn zbtc_to_btc_progress(
     zbtc_value: u64,
     btc_amount: Amount,
     progress: &dyn Fn(u8, &str),
-) -> Result<(u64, [u64; 4]), String> {
+) -> Result<(u64, Blind), String> {
     if preimage.len() != PREIMAGE_LEN {
         return Err(format!("HTLC preimage must be exactly {PREIMAGE_LEN} bytes (got {})", preimage.len()));
     }
@@ -3278,7 +3291,7 @@ mod public_shield_tests {
     fn raw_swap_lock(value: u64, asset: u64, lock: &[u8; 32], timeout: u64, claimant: &PubKey, locker: &PubKey) -> Vec<u8> {
         let mut t = vec![0x62u8];
         t.extend_from_slice(&value.to_le_bytes());
-        t.extend_from_slice(&[0u8; 32]);
+        t.extend_from_slice(&[0u8; zcrypt_shield::BLIND_BYTES]);
         t.extend_from_slice(&asset.to_le_bytes());
         t.extend_from_slice(lock);
         t.extend_from_slice(&timeout.to_le_bytes());
@@ -3355,7 +3368,7 @@ mod public_shield_tests {
         let mut t = vec![0x67u8];
         t.extend_from_slice(btc_pk);
         t.extend_from_slice(&value.to_le_bytes());
-        t.extend_from_slice(&[0u8; 32]);
+        t.extend_from_slice(&[0u8; zcrypt_shield::BLIND_BYTES]);
         t.extend_from_slice(&asset.to_le_bytes());
         t.extend_from_slice(lock);
         t.extend_from_slice(&timeout.to_le_bytes());
@@ -3454,6 +3467,29 @@ mod public_shield_tests {
         let (v, _b, a, l, t, c, r) = parse_swap_lock(&raw[1..]).unwrap();
         assert_eq!((v, a, l, t, c, r), (42, 7, lock, 999, claimant, locker));
         assert!(parse_swap_lock(&raw[1..100]).is_none());
+    }
+
+    /// The 0x67 parser must agree with the real builder (not just the test fixture): a stale
+    /// blind width here silently makes the redeem watcher skip every burn.
+    #[test]
+    fn burn_lock_btc_payload_round_trips_through_the_real_builder() {
+        let btc_pk = Key::from_bytes(&[5u8; 32]).pk;
+        let refund: PubKey = [4; 8];
+        let lock = [6u8; 32];
+        let blind: Blind = std::array::from_fn(|i| i as u64 + 1);
+        let stx = shield_tx::ShieldTx {
+            inputs: vec![],
+            output_commitments: vec![],
+            enc_notes: vec![],
+            fee: 0,
+            root: [0u64; 8],
+            proof: vec![],
+        };
+        let raw = burn_lock_btc_tx(&btc_pk, 42, &blind, 7, &lock, 999, &refund, &stx);
+        let (pk, a, v, l, t, r) = parse_burn_lock_btc(&raw[1..]).expect("parses");
+        assert_eq!(pk, btc_pk.inner.serialize());
+        assert_eq!((a, v, l, t, r), (7, 42, lock, 999, refund));
+        assert!(parse_burn_lock_btc(&raw[1..100]).is_none());
     }
 
     #[test]

@@ -38,7 +38,7 @@ fn main() {
         }
     };
     for k in 0..POOL_DECOYS {
-        let d = Account::from_seed([(0x50 + k) as u8; 32]).own_coin(1_000 + k, [k + 3, k + 7, (k + 3).wrapping_add(1), (k + 7).wrapping_add(1)]);
+        let d = Account::from_seed([(0x50 + k) as u8; 32]).own_coin(1_000 + k, zcrypt_shield::widen_blind([k + 3, k + 7, (k + 3).wrapping_add(1), (k + 7).wrapping_add(1)]));
         seed(&d.commitment(), "decoy");
     }
     let alice_coin = alice.own_coin(1_000_000, keys::random_blind());

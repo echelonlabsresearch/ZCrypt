@@ -52,7 +52,7 @@ const FEE: u64 = emission::MIN_FEE;
 fn seed_decoys(node: &mut Node, n: u64) {
     for k in 0..n {
         let a = Account::from_seed([(0x40 + k) as u8; 32]);
-        let c = a.own_coin(1_000 + k, [k + 3, k + 7, (k + 3).wrapping_add(1), (k + 7).wrapping_add(1)]);
+        let c = a.own_coin(1_000 + k, zcrypt_shield::widen_blind([k + 3, k + 7, (k + 3).wrapping_add(1), (k + 7).wrapping_add(1)]));
         node.seed_coin(c.commitment());
     }
 }
@@ -204,8 +204,8 @@ fn full_product_surface_happy_path() {
     let bearer = BearerCoin::create(50_000);
     node.seed_coin(bearer.coin.commitment());
     let sweep = |node: &Node, b: u64, s: u64| -> ShieldTx {
-        let out0 = keys::out_coin(&Account::from_seed([s as u8; 32]).normal_address(), bearer.coin.value - FEE, [b, b + 1, (b).wrapping_add(1), (b + 1).wrapping_add(1)]);
-        let out1 = keys::out_coin(&Account::from_seed([(s + 1) as u8; 32]).normal_address(), 0, [b + 2, b + 3, (b + 2).wrapping_add(1), (b + 3).wrapping_add(1)]);
+        let out0 = keys::out_coin(&Account::from_seed([s as u8; 32]).normal_address(), bearer.coin.value - FEE, zcrypt_shield::widen_blind([b, b + 1, (b).wrapping_add(1), (b + 1).wrapping_add(1)]));
+        let out1 = keys::out_coin(&Account::from_seed([(s + 1) as u8; 32]).normal_address(), 0, zcrypt_shield::widen_blind([b + 2, b + 3, (b + 2).wrapping_add(1), (b + 3).wrapping_add(1)]));
         build_shield(node, &[bearer.coin.clone()], [out0, out1], FEE, notes()).unwrap()
     };
     node.submit_shield(CHAIN, &sweep(&node, 11, 0x71)).expect("bearer coin swept by holder");
@@ -426,8 +426,8 @@ fn product_surface_abuse_cases() {
     // --- (e) Cross-asset spend is unprovable (single-asset conservation) ---
     let coin = alice.own_asset_coin(100, keys::random_blind(), id);
     node.seed_coin(coin.commitment());
-    let out_native = keys::out_coin(&alice.normal_address(), 95, [1, 2, 2, 3]); // native ZCRYPT output
-    let out_asset = keys::out_asset_coin(&alice.normal_address(), 0, [3, 4, 4, 5], id);
+    let out_native = keys::out_coin(&alice.normal_address(), 95, zcrypt_shield::widen_blind([1, 2, 2, 3])); // native ZCRYPT output
+    let out_asset = keys::out_asset_coin(&alice.normal_address(), 0, zcrypt_shield::widen_blind([3, 4, 4, 5]), id);
     // Mixing the input asset with a native output must fail to prove.
     let mix = build_shield(&node, &[coin.clone()], [out_native, out_asset], 5, notes());
     assert!(mix.is_err(), "cross-asset spend must be unprovable");
@@ -436,8 +436,8 @@ fn product_surface_abuse_cases() {
     let spendable = alice.own_coin(100_000, keys::random_blind());
     node.seed_coin(spendable.commitment());
     let mk = |node: &Node, o: u64| {
-        let o0 = keys::out_coin(&alice.normal_address(), o, [7, 8, 8, 9]);
-        let o1 = keys::out_coin(&alice.normal_address(), 100_000 - o - FEE, [9, 10, 10, 11]);
+        let o0 = keys::out_coin(&alice.normal_address(), o, zcrypt_shield::widen_blind([7, 8, 8, 9]));
+        let o1 = keys::out_coin(&alice.normal_address(), 100_000 - o - FEE, zcrypt_shield::widen_blind([9, 10, 10, 11]));
         build_shield(node, &[spendable.clone()], [o0, o1], FEE, notes()).unwrap()
     };
     node.submit_shield(CHAIN, &mk(&node, 80_000)).expect("first spend");
@@ -457,8 +457,8 @@ fn product_surface_abuse_cases() {
 
 /// Build a single-input self-spend of `coin` (helper for the anchor-tamper case).
 fn mk_single(node: &Node, coin: &Coin, owner: &Account) -> ShieldTx {
-    let o0 = keys::out_coin(&owner.normal_address(), coin.value - 5, [5, 6, 6, 7]);
-    let o1 = keys::out_coin(&owner.normal_address(), 0, [7, 8, 8, 9]);
+    let o0 = keys::out_coin(&owner.normal_address(), coin.value - 5, zcrypt_shield::widen_blind([5, 6, 6, 7]));
+    let o1 = keys::out_coin(&owner.normal_address(), 0, zcrypt_shield::widen_blind([7, 8, 8, 9]));
     build_shield(node, &[coin.clone()], [o0, o1], 5, notes()).unwrap()
 }
 

@@ -193,6 +193,23 @@ mod tests {
     }
 
     #[test]
+    fn scheduled_issuance_is_exactly_20_999_640_zcrypt() {
+        // Integer halving: sum_{i=0}^{17} (140_000 >> i) · 60_000_000 blocks.
+        // 140_000 >> 18 == 0, so eras 18+ mint nothing. The 360 ZCRYPT shortfall
+        // against the 16.8M reward budget is never minted. Published in the paper;
+        // this test fails if the schedule or the numbers drift.
+        let eras: u128 = (0..64).map(|i| (INITIAL_REWARD >> i) as u128).sum();
+        let rewards = eras * HALVING_INTERVAL as u128;
+        assert_eq!(rewards, 16_799_640 * ATOMIC as u128);
+        assert_eq!(cumulative_emission(u64::MAX) as u128, rewards);
+        assert_eq!(MINEABLE as u128 - rewards, 360 * ATOMIC as u128);
+        assert_eq!(FOUNDATION as u128 + rewards, 20_999_640 * ATOMIC as u128);
+        assert_eq!(TOTAL_SUPPLY as u128 - (FOUNDATION as u128 + rewards), 360 * ATOMIC as u128);
+        assert_eq!(block_reward(18 * HALVING_INTERVAL), 0);
+        assert_ne!(block_reward(17 * HALVING_INTERVAL), 0);
+    }
+
+    #[test]
     fn total_emission_matches_mineable_budget() {
         // Summing the whole schedule to exhaustion lands on the 16.8M budget
         // (a hair under, from integer-halving truncation) and never over.

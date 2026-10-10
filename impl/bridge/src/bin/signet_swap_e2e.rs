@@ -127,7 +127,7 @@ fn main() {
     for k in 0..16u64 {
         let c = zcrypt_shield::commit_asset(
             1_000 + k,
-            &[k + 7, k + 9, k + 11, k + 13],
+            &zcrypt_shield::widen_blind([k + 7, k + 9, k + 11, k + 13]),
             &zcrypt_core::htlc_shield::BURN_PK,
             asset,
         );

@@ -41,7 +41,7 @@ fn main() {
     // Seed a decoy pool so the shield spend hides in a non-trivial shielded set.
     for k in 0..24u64 {
         let pk = zcrypt_shield::spend_pubkey(&[k + 1, k + 2, k + 3, k + 4, k + 5, k + 6, k + 7, k + 8]);
-        let c = commit_asset(1_000 + k, &[k + 7, k + 9, k + 11, k + 13], &pk, asset);
+        let c = commit_asset(1_000 + k, &zcrypt_shield::widen_blind([k + 7, k + 9, k + 11, k + 13]), &pk, asset);
         let _ = zc.broadcast(&swap::seed_tx(&c));
     }
     // Operator's Bitcoin wallet — where swept deposits land.

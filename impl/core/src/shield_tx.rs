@@ -449,7 +449,7 @@ mod tests {
     const FEE: u64 = crate::emission::MIN_FEE;
 
     // Deterministic wide secrets / commitments from a scalar (test convenience).
-    fn bl(b: u64) -> Blind { let b = zcrypt_shield::field_limb(b); [b, zcrypt_shield::field_limb(b.wrapping_add(0x9e37)), zcrypt_shield::field_limb(b.wrapping_add(1)), zcrypt_shield::field_limb(b.wrapping_add(2))] }
+    fn bl(b: u64) -> Blind { core::array::from_fn(|i| zcrypt_shield::field_limb(b.wrapping_add(0x9e37u64.wrapping_mul(i as u64 + 1)))) }
     fn ss(s: u64) -> SpendSecret { let s = zcrypt_shield::field_limb(s); core::array::from_fn(|i| zcrypt_shield::field_limb(s ^ ((i as u64 + 1) * 0x11))) }
     fn pkof(s: u64) -> PubKey { spend_pubkey(&ss(s)) }
     fn tc(value: u64, b: u64, s: u64) -> Commitment { commit(value, &bl(b), &pkof(s)) }

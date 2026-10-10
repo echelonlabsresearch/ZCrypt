@@ -115,7 +115,7 @@ fn main() {
     // A few decoys so the proofs have company in the tree.
     for k in 0..8u64 {
         let pk = zcrypt_shield::spend_pubkey(&[k + 31, k + 32, k + 33, k + 34, k + 35, k + 36, k + 37, k + 38]);
-        seed(&zc, &zcrypt_shield::commit(1_000 + k, &[k + 7, k + 9, k + 11, k + 13], &pk));
+        seed(&zc, &zcrypt_shield::commit(1_000 + k, &zcrypt_shield::widen_blind([k + 7, k + 9, k + 11, k + 13]), &pk));
     }
     wait_blocks(&zc, 2);
     let value = 100 * ZC;
@@ -128,8 +128,8 @@ fn main() {
         // later claim would have driven the asset's minted counter to zero.
         let aliased = value + FIELD_ORDER * (1u64 << 26);
         assert_eq!(
-            zcrypt_shield::commit(value, &[1, 2, 3, 4], &BURN_PK),
-            zcrypt_shield::commit(aliased, &[1, 2, 3, 4], &BURN_PK),
+            zcrypt_shield::commit(value, &zcrypt_shield::widen_blind([1, 2, 3, 4]), &BURN_PK),
+            zcrypt_shield::commit(aliased, &zcrypt_shield::widen_blind([1, 2, 3, 4]), &BURN_PK),
             "setup: the aliased value really shares the commitment"
         );
         let err = burn_lock_zcrypt(&zc, &user, c1, value, aliased, &lock_a, timeout).expect_err("aliased value must be refused");

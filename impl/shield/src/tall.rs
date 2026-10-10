@@ -6,10 +6,15 @@
 //! trace WIDTH but only log in height, so this shrinks it substantially.
 //!
 //! **Design (hybrid, chosen for safety):**
-//!   * ROW 0 holds the 8 "core" Poseidon2 blocks (commit×S, nf×N_IN, pk×N_IN) side by
-//!     side, and its constraints are copied BYTE-FOR-BYTE from the audited wide AIR
-//!     (ownership, nullifier construction, conservation, range, active/dummy,
-//!     single-asset, published nullifiers/outputs). Only the row gating changes.
+//!   * ROW 1 (the CORE row) holds the 8 outer Poseidon2 blocks (commit×S, nf×N_IN,
+//!     pk×N_IN) side by side, and its constraints mirror the audited wide AIR
+//!     (nullifier construction, conservation, range, active/dummy, single-asset,
+//!     published nullifiers/outputs). Only the row gating changes.
+//!   * ROW 0 (the INNER row) holds the S + N_IN inner blocks of the two-block commitment
+//!     and nullifier hashes: inner commit i = [pk ‖ blind], inner nullifier j =
+//!     [spend_secret ‖ blind]. It is adjacent to the core row, so the inner→outer wiring
+//!     (digest feeds, shared pk / spend secret / blind lanes) is a plain local/next
+//!     window constraint; no extra columns, no extra carries, height unchanged.
 //!   * The N_IN·DEPTH Merkle-path blocks — the dominant cost — go TALL: one compression
 //!     per ROW, chained with adjacent-row transition constraints (the shape proven in
 //!     `tall_spike`). Cross-row wiring uses preprocessed role selectors + two small
@@ -40,29 +45,41 @@ use std::sync::OnceLock;
 use super::*;
 
 // ---- layout -------------------------------------------------------------------
-// Core blocks in row 0's column groups 0..CORE, in the SAME order as the wide AIR:
+// Core blocks in the core row's column groups 0..CORE, in the SAME order as the wide AIR:
 //   [commit_0..commit_S) ‖ [nf_0..nf_N_IN) ‖ [pk_0..pk_N_IN)  (S + 2·N_IN = 8 groups).
 const CORE: usize = S + 2 * N_IN;
-// Path rows: input i occupies rows [1 + i·DEPTH .. 1 + (i+1)·DEPTH); its path blocks
-// live in column group 0. Groups 1..CORE on path/padding rows are dummy permutations.
+// Inner blocks in the inner row's column groups 0..INNER, in the wide AIR's order:
+//   [inner_commit_0..inner_commit_S) ‖ [inner_nf_0..inner_nf_N_IN)  (S + N_IN = 6 groups).
+const INNER: usize = S + N_IN;
+const _: () = assert!(INNER <= CORE, "inner blocks must fit the core row's column groups");
+/// Row holding the inner (pk ‖ blind / spend_secret ‖ blind) blocks.
+const ROW_INNER: usize = 0;
+/// Row holding the outer core blocks and all value semantics.
+const ROW_CORE: usize = 1;
+/// First Merkle-path row. Input i occupies rows [PATH_FIRST + i·DEPTH ..
+/// PATH_FIRST + (i+1)·DEPTH); its path blocks live in column group 0. Groups 1..CORE on
+/// path/padding rows (and groups INNER..CORE on the inner row) are dummy permutations.
+const PATH_FIRST: usize = 2;
 const PATH_ROWS: usize = N_IN * DEPTH;
-/// Trace height: 1 core row + all path rows, padded up to a power of two.
-/// DEPTH 32: 1 + N_IN*32 = 1 + 64 = 65 -> 128.
+/// Trace height: 1 inner row + 1 core row + all path rows, padded up to a power of two.
+/// DEPTH 32: 2 + N_IN*32 = 2 + 64 = 66 -> 128.
 const HEIGHT: usize = 128;
 const DEGREE_BITS: usize = 7; // log2(HEIGHT)
 // Geometry guards: if DEPTH changes, these fail at compile time until HEIGHT/DEGREE_BITS
-// are retuned (HEIGHT must cover the core row + every path row, be a power of two, and
-// equal 2^DEGREE_BITS).
-const _: () = assert!(HEIGHT >= 1 + PATH_ROWS, "HEIGHT too small for 1 core row + PATH_ROWS");
+// are retuned (HEIGHT must cover the inner + core rows + every path row, be a power of
+// two, and equal 2^DEGREE_BITS).
+const _: () = assert!(ROW_CORE == ROW_INNER + 1, "the core row must directly follow the inner row");
+const _: () = assert!(PATH_FIRST == ROW_CORE + 1, "the first path row must directly follow the core row");
+const _: () = assert!(HEIGHT >= PATH_FIRST + PATH_ROWS, "HEIGHT too small for inner + core rows + PATH_ROWS");
 const _: () = assert!(HEIGHT.is_power_of_two(), "HEIGHT must be a power of two");
 const _: () = assert!(1usize << DEGREE_BITS == HEIGHT, "DEGREE_BITS must equal log2(HEIGHT)");
 
 // Aux column offsets (after the CORE·BLK block columns).
 const AUX: usize = CORE * BLK;
-const R_RANGE: usize = AUX; // S·2·BITS value-limb bits (row 0)
-const R_FEE: usize = R_RANGE + S * 2 * BITS; // BITS fee bits (row 0)
-const R_CARRY: usize = R_FEE + BITS; // CARRY_BITS carry bits (row 0)
-const R_ACT: usize = R_CARRY + CARRY_BITS; // N_IN active flags (row 0)
+const R_RANGE: usize = AUX; // S·2·BITS value-limb bits (core row)
+const R_FEE: usize = R_RANGE + S * 2 * BITS; // BITS fee bits (core row)
+const R_CARRY: usize = R_FEE + BITS; // CARRY_BITS carry bits (core row)
+const R_ACT: usize = R_CARRY + CARRY_BITS; // N_IN active flags (core row)
 const R_PSIB: usize = R_ACT + N_IN; // 8 sibling limbs (path rows)
 const R_PDIR: usize = R_PSIB + 8; // 1 direction bit (path rows)
 const R_CLEAF: usize = R_PDIR + 1; // 8-limb carried leaf of input 1 (all rows)
@@ -70,13 +87,14 @@ const R_CACT: usize = R_CLEAF + 8; // N_IN carried active flags (all rows)
 const TALL_W: usize = R_CACT + N_IN;
 
 // Preprocessed selector columns (fixed per row).
-const P_CORE: usize = 0; // row 0
-const P_PATH: usize = 1; // rows 1..=PATH_ROWS
+const P_CORE: usize = 0; // the core row
+const P_PATH: usize = 1; // rows PATH_FIRST..PATH_FIRST+PATH_ROWS
 const P_CHAIN: usize = 2; // rows whose NEXT row continues the same chain
 const P_P1FIRST: usize = 3; // first path row of input 1
 const P_P0LAST: usize = 4; // last path row of input 0
 const P_P1LAST: usize = 5; // last path row of input 1
-const NUM_SEL: usize = 6;
+const P_INNER: usize = 6; // the inner row
+const NUM_SEL: usize = 7;
 
 pub struct CoinsAirTall;
 
@@ -94,14 +112,15 @@ impl BaseAir<BabyBear> for CoinsAirTall {
     fn preprocessed_trace(&self) -> Option<RowMajorMatrix<BabyBear>> {
         let mut v = vec![BabyBear::ZERO; HEIGHT * NUM_SEL];
         let mut set = |row: usize, col: usize| v[row * NUM_SEL + col] = BabyBear::ONE;
-        set(0, P_CORE);
-        for r in 1..=PATH_ROWS {
+        set(ROW_INNER, P_INNER);
+        set(ROW_CORE, P_CORE);
+        for r in PATH_FIRST..PATH_FIRST + PATH_ROWS {
             set(r, P_PATH);
         }
-        // input 0 path: rows 1..=DEPTH ; input 1 path: rows DEPTH+1..=2·DEPTH.
+        // input 0 path: rows PATH_FIRST..PATH_FIRST+DEPTH ; input 1: the next DEPTH rows.
         for i in 0..N_IN {
-            let first = 1 + i * DEPTH;
-            let last = i * DEPTH + DEPTH; // = first + DEPTH - 1
+            let first = PATH_FIRST + i * DEPTH;
+            let last = first + DEPTH - 1;
             // chain links: every path row of this input EXCEPT its last one.
             for r in first..last {
                 set(r, P_CHAIN);
@@ -116,6 +135,17 @@ impl BaseAir<BabyBear> for CoinsAirTall {
         }
         Some(RowMajorMatrix::new(v, NUM_SEL))
     }
+}
+
+/// The feed-forward digest `Trunc_8(P(x) + x)` of a block WITHOUT asserting its round
+/// constraints. Used to read a NEXT-row block's output: that row's permutation is
+/// constrained when it is the local row (every row runs [`eval_block`] on every group),
+/// so re-asserting it here would only double the constraint count.
+fn block_output<AB: AirBuilder<F = BabyBear>>(cols_slice: &[AB::Var]) -> [AB::Expr; 8] {
+    let cols: &Poseidon2Cols<AB::Var, WIDTH, SD, SR, HFR, PR> = cols_slice.borrow();
+    core::array::from_fn(|k| {
+        feed_forward::<AB>(cols.ending_full_rounds[HFR - 1].post[k], cols.inputs[k])
+    })
 }
 
 /// Run one Poseidon2 block over a `BLK`-wide slice and return `Trunc_8(P(x) + x)`.
@@ -157,11 +187,46 @@ impl<AB: AirBuilder<F = BabyBear>> Air<AB> for CoinsAirTall {
         let p_p1first: AB::Expr = pre[P_P1FIRST].into();
         let p_p0last: AB::Expr = pre[P_P0LAST].into();
         let p_p1last: AB::Expr = pre[P_P1LAST].into();
+        let p_inner: AB::Expr = pre[P_INNER].into();
 
         // Every row: all CORE column groups are valid Poseidon2 compressions.
         let outs: Vec<[AB::Expr; 8]> = (0..CORE)
             .map(|g| eval_block(builder, &local[g * BLK..(g + 1) * BLK]))
             .collect();
+
+        // ============================================================
+        // INNER ROW (gated by P_INNER == ROW_INNER; `next` is the core row). Group i
+        // (i < S) is inner commit i = [pk(8) ‖ blind(8)]; group S+j is inner nullifier
+        // j = [spend_secret(8) ‖ blind(8)]. Their digests feed the core row's outer
+        // blocks, and the lanes they absorb are tied to the core row's pk blocks.
+        // ============================================================
+        {
+            let mut wt = builder.when_transition();
+            for i in 0..S {
+                // Outer commit lanes [2..10] == inner commit digest.
+                for t in 0..8 {
+                    wt.assert_zero(p_inner.clone() * (Into::<AB::Expr>::into(next[i * BLK + 2 + t]) - outs[i][t].clone()));
+                }
+            }
+            for i in 0..N_IN {
+                let pk_blk = S + N_IN + i; // core-row pk block of input i
+                let nf_blk = S + i; // core-row outer nullifier block of input i
+                let inf = S + i; // inner-row inner nullifier group of input i
+                // OWNERSHIP: the pk the inner commit absorbs == Poseidon2(spend_secret),
+                // the pk block's digest on the core row. With the Merkle path this proves
+                // knowledge of the spend secret of a genuine tree leaf.
+                let pk_out = block_output::<AB>(&next[pk_blk * BLK..(pk_blk + 1) * BLK]);
+                for t in 0..8 {
+                    wt.assert_zero(p_inner.clone() * (Into::<AB::Expr>::into(local[i * BLK + t]) - pk_out[t].clone()));
+                    // Inner nullifier absorbs the SAME spend secret the pk block hashes...
+                    wt.assert_zero(p_inner.clone() * (Into::<AB::Expr>::into(local[inf * BLK + t]) - next[pk_blk * BLK + t].into()));
+                    // ...and the SAME blind the inner commit absorbs.
+                    wt.assert_zero(p_inner.clone() * (Into::<AB::Expr>::into(local[inf * BLK + 8 + t]) - local[i * BLK + 8 + t].into()));
+                    // Outer nullifier lanes [0..8] == inner nullifier digest.
+                    wt.assert_zero(p_inner.clone() * (Into::<AB::Expr>::into(next[nf_blk * BLK + t]) - outs[inf][t].clone()));
+                }
+            }
+        }
 
         // ---- carry propagation (every transition): CLEAF and CACT stay constant ----
         {
@@ -175,8 +240,8 @@ impl<AB: AirBuilder<F = BabyBear>> Air<AB> for CoinsAirTall {
         }
 
         // ============================================================
-        // CORE ROW (gated by P_CORE == row 0). Copied from the wide AIR.
-        // Column group g in row 0 == wide block g, so all indexing matches.
+        // CORE ROW (gated by P_CORE == ROW_CORE). Mirrors the wide AIR.
+        // Column group g in the core row == wide block g, so all indexing matches.
         // ============================================================
         // helper: assert `expr == 0` only on the core row.
         macro_rules! core_zero {
@@ -196,6 +261,12 @@ impl<AB: AirBuilder<F = BabyBear>> Air<AB> for CoinsAirTall {
             let hi = recompose::<AB>(builder, &local, R_RANGE + i * 2 * BITS + BITS, BITS);
             core_zero!(builder, lo - local[i * BLK].into());
             core_zero!(builder, hi - Into::<AB::Expr>::into(local[i * BLK + 1]));
+            // Outer commit lanes [10..14] are zero (lanes [2..10] are tied to the inner
+            // digest on the inner row above); lane [15] is the commit role tag.
+            for t in 10..14 {
+                core_zero!(builder, Into::<AB::Expr>::into(local[i * BLK + t]));
+            }
+            core_zero!(builder, Into::<AB::Expr>::into(local[i * BLK + 15]) - konst::<AB>(TAG_COMMIT));
 
             if i < N_IN {
                 let pk_blk = S + N_IN + i;
@@ -205,25 +276,18 @@ impl<AB: AirBuilder<F = BabyBear>> Air<AB> for CoinsAirTall {
                 let one_minus_act = AB::Expr::ONE - act.clone();
                 core_zero!(builder, one_minus_act.clone() * Into::<AB::Expr>::into(local[i * BLK]));
                 core_zero!(builder, one_minus_act * Into::<AB::Expr>::into(local[i * BLK + 1]));
-                // Role tag: the input commitment's lane [15] is TAG_COMMIT, matching
-                // `coin_input` and the output-coin constraint below.
-                core_zero!(builder, Into::<AB::Expr>::into(local[i * BLK + 15]) - konst::<AB>(TAG_COMMIT));
-                // OWNERSHIP: pk in the commitment (input[6..14]) equals the pk compression.
-                for t in 0..8 {
-                    core_zero!(builder, Into::<AB::Expr>::into(local[i * BLK + 6 + t]) - outs[pk_blk][t].clone());
-                }
+                // pk block: [spend_secret(8), 0×7, TAG_PK]. (Ownership, the pk the inner
+                // commit absorbs == this block's digest, is constrained on the inner row.)
                 for t in 8..WIDTH - 1 {
                     core_zero!(builder, Into::<AB::Expr>::into(local[pk_blk * BLK + t]));
                 }
                 core_zero!(builder, Into::<AB::Expr>::into(local[pk_blk * BLK + WIDTH - 1]) - konst::<AB>(TAG_PK));
-                // CANONICAL nullifier input: [ss(8), vlo, vhi, blind(4), asset].
-                for t in 0..8 {
-                    core_zero!(builder, Into::<AB::Expr>::into(local[nf_blk * BLK + t]) - local[pk_blk * BLK + t].into());
-                }
+                // CANONICAL outer nullifier: [inner_nf(8), vlo, vhi, 0×4, asset, TAG_NF].
+                // Lanes [0..8] are tied to the inner nullifier digest on the inner row.
                 core_zero!(builder, Into::<AB::Expr>::into(local[nf_blk * BLK + 8]) - local[i * BLK].into());
                 core_zero!(builder, Into::<AB::Expr>::into(local[nf_blk * BLK + 9]) - local[i * BLK + 1].into());
-                for t in 0..4 {
-                    core_zero!(builder, Into::<AB::Expr>::into(local[nf_blk * BLK + 10 + t]) - local[i * BLK + 2 + t].into());
+                for t in 10..14 {
+                    core_zero!(builder, Into::<AB::Expr>::into(local[nf_blk * BLK + t]));
                 }
                 core_zero!(builder, Into::<AB::Expr>::into(local[nf_blk * BLK + 14]) - local[i * BLK + 14].into());
                 core_zero!(builder, Into::<AB::Expr>::into(local[nf_blk * BLK + 15]) - konst::<AB>(TAG_NF));
@@ -232,7 +296,6 @@ impl<AB: AirBuilder<F = BabyBear>> Air<AB> for CoinsAirTall {
                     core_zero!(builder, outs[nf_blk][k].clone() - pis[nf_off + i * 8 + k].clone());
                 }
             } else {
-                core_zero!(builder, Into::<AB::Expr>::into(local[i * BLK + 15]) - konst::<AB>(TAG_COMMIT));
                 for j in 0..8 {
                     core_zero!(builder, outs[i][j].clone() - pis[out_off + (i - N_IN) * 8 + j].clone());
                 }
@@ -274,8 +337,8 @@ impl<AB: AirBuilder<F = BabyBear>> Air<AB> for CoinsAirTall {
         }
 
         // ============================================================
-        // TALL PATH (group 0 blocks on rows 1..=PATH_ROWS). `outs[0]` is this row's
-        // compression output. `running(row)` is the leaf/previous-node fed in.
+        // TALL PATH (group 0 blocks on rows PATH_FIRST..PATH_FIRST+PATH_ROWS). `outs[0]`
+        // is this row's compression output. `running(row)` is the leaf/previous-node fed in.
         // ============================================================
         let running = |row: &[AB::Var]| -> [AB::Expr; 8] {
             let dir: AB::Expr = row[R_PDIR].into();
@@ -301,8 +364,8 @@ impl<AB: AirBuilder<F = BabyBear>> Air<AB> for CoinsAirTall {
             }
         }
 
-        // Leaf feed, input 0: on the (row 0 -> row 1) transition, the next row's
-        // running node equals commit block 0's output (input 0's leaf).
+        // Leaf feed, input 0: on the (core row -> first path row) transition, the next
+        // row's running node equals commit block 0's output (input 0's leaf).
         {
             let mut wt = builder.when_transition();
             let run_next = running(&next);
@@ -375,15 +438,15 @@ fn tall_trace(
         .map(|i| i.value)
         .chain(outputs.iter().map(|&(v, _, _, _)| v))
         .collect();
-    let commit_states: Vec<[BabyBear; WIDTH]> = inputs
+    let (inner_c_states, commit_states): (Vec<[BabyBear; WIDTH]>, Vec<[BabyBear; WIDTH]>) = inputs
         .iter()
         .enumerate()
-        .map(|(i, inp)| coin_input(inp.value, &inp.blind, &in_pks[i], inp.asset_id))
-        .chain(outputs.iter().map(|(v, b, pk, a)| coin_input(*v, b, pk, *a)))
-        .collect();
+        .map(|(i, inp)| coin_blocks(inp.value, &inp.blind, &in_pks[i], inp.asset_id))
+        .chain(outputs.iter().map(|(v, b, pk, a)| coin_blocks(*v, b, pk, *a)))
+        .unzip();
     let out_commits: Vec<Commitment> = commit_states[N_IN..].iter().map(native_commit).collect();
-    let nf_states: Vec<[BabyBear; WIDTH]> =
-        inputs.iter().map(|i| nf_input(&i.spend_secret, i.value, &i.blind, i.asset_id)).collect();
+    let (inner_nf_states, nf_states): (Vec<[BabyBear; WIDTH]>, Vec<[BabyBear; WIDTH]>) =
+        inputs.iter().map(|i| nf_blocks(&i.spend_secret, i.value, &i.blind, i.asset_id)).unzip();
     let nullifiers: Vec<Commitment> = nf_states.iter().map(native_commit).collect();
     let pk_states: Vec<[BabyBear; WIDTH]> = inputs.iter().map(|i| pk_input(&i.spend_secret)).collect();
     let leaf_commits: Vec<Commitment> = commit_states[..N_IN].iter().map(native_commit).collect();
@@ -406,7 +469,7 @@ fn tall_trace(
         }
     }
 
-    // Core blocks in row 0's column groups (commit S ‖ nf N_IN ‖ pk N_IN).
+    // Core blocks in the core row's column groups (commit S ‖ nf N_IN ‖ pk N_IN).
     let core_states: Vec<[BabyBear; WIDTH]> = commit_states
         .iter()
         .chain(&nf_states)
@@ -414,16 +477,23 @@ fn tall_trace(
         .copied()
         .collect();
     debug_assert_eq!(core_states.len(), CORE);
+    // Inner blocks in the inner row's column groups (inner commit S ‖ inner nf N_IN).
+    let inner_states: Vec<[BabyBear; WIDTH]> =
+        inner_c_states.iter().chain(&inner_nf_states).copied().collect();
+    debug_assert_eq!(inner_states.len(), INNER);
 
     // For each column group g, the state occupying (row, g).
     let dummy = [BabyBear::ZERO; WIDTH];
     let mut group_states: Vec<Vec<[BabyBear; WIDTH]>> = vec![vec![dummy; HEIGHT]; CORE];
-    for g in 0..CORE {
-        group_states[g][0] = core_states[g]; // row 0: the core block
+    for g in 0..INNER {
+        group_states[g][ROW_INNER] = inner_states[g];
     }
-    // Group 0's path rows: input 0 -> rows 1..=DEPTH, input 1 -> rows DEPTH+1..=2·DEPTH.
+    for g in 0..CORE {
+        group_states[g][ROW_CORE] = core_states[g];
+    }
+    // Group 0's path rows: input 0 -> the first DEPTH path rows, input 1 -> the next DEPTH.
     for (idx, st) in path_states.iter().enumerate() {
-        group_states[0][1 + idx] = *st;
+        group_states[0][PATH_FIRST + idx] = *st;
     }
 
     let constants = RoundConstants::<BabyBear, WIDTH, HFR, PR>::new(RC_EI, RC_I, RC_EF);
@@ -448,31 +518,32 @@ fn tall_trace(
                 vals.push(group_traces[g].values[r * BLK + c]);
             }
         }
-        // aux — only row 0 carries the core aux; path rows carry sibling/dir.
-        // R_RANGE: value-limb bits (row 0 only)
+        // aux — only the core row carries the core aux; path rows carry sibling/dir.
+        let core = r == ROW_CORE;
+        // R_RANGE: value-limb bits (core row only)
         for (_i, &v) in coin_values.iter().enumerate() {
             let (vlo, vhi) = (v & LIMB_MASK, v >> SHIFT);
             for j in 0..BITS {
-                vals.push(BabyBear::from_u64(if r == 0 { (vlo >> j) & 1 } else { 0 }));
+                vals.push(BabyBear::from_u64(if core { (vlo >> j) & 1 } else { 0 }));
             }
             for j in 0..BITS {
-                vals.push(BabyBear::from_u64(if r == 0 { (vhi >> j) & 1 } else { 0 }));
+                vals.push(BabyBear::from_u64(if core { (vhi >> j) & 1 } else { 0 }));
             }
         }
         // R_FEE
         for j in 0..BITS {
-            vals.push(BabyBear::from_u64(if r == 0 { (fee >> j) & 1 } else { 0 }));
+            vals.push(BabyBear::from_u64(if core { (fee >> j) & 1 } else { 0 }));
         }
         // R_CARRY
         for j in 0..CARRY_BITS {
-            vals.push(BabyBear::from_u64(if r == 0 { (ecarry >> j) & 1 } else { 0 }));
+            vals.push(BabyBear::from_u64(if core { (ecarry >> j) & 1 } else { 0 }));
         }
         // R_ACT
         for i in 0..N_IN {
-            vals.push(BabyBear::from_u64(if r == 0 && active[i] { 1 } else { 0 }));
+            vals.push(BabyBear::from_u64(if core && active[i] { 1 } else { 0 }));
         }
         // R_PSIB / R_PDIR: sibling + dir for this path row (else zero).
-        let path_idx = if (1..=PATH_ROWS).contains(&r) { Some(r - 1) } else { None };
+        let path_idx = if (PATH_FIRST..PATH_FIRST + PATH_ROWS).contains(&r) { Some(r - PATH_FIRST) } else { None };
         let (sib, dir) = match path_idx {
             Some(idx) => {
                 let i = idx / DEPTH;
@@ -625,7 +696,7 @@ mod tests {
     const CHAIN: &[u8] = b"zcrypt-devnet";
     /// Hex of `postcard(preprocessed vk commitment)`; update ONLY with a deliberate,
     /// coordinated circuit change (it is a proof-format change).
-    const PINNED_PREPROCESSED_COMMITMENT: &str = "01bd939debe7cda8c67cb88da48a9ef3d492b501b8a4919992edccb4db01b79a8cedddbdb0977f";
+    const PINNED_PREPROCESSED_COMMITMENT: &str = "0187ec94e4dbb685d8c501fdb989e3e38a8cf5f101f5f3eaadcff3e9c202b6a2d9e1ffcfcde2e001";
 
     fn bl(b: u64) -> Blind {
         core::array::from_fn(|i| field_limb(b.wrapping_add(0x9e37u64.wrapping_mul(i as u64 + 1))))
@@ -884,8 +955,8 @@ mod tests {
     fn hash_role_tags_separate_domains() {
         // Circuit L11: before the role tags, pk_input(ss) == nf_input(ss, 0, zero-blind, 0).
         let s = ss(7);
-        assert_ne!(spend_pubkey(&s), nullifier_asset(&s, 0, &[0u64; 4], ASSET_ZCRYPT));
-        assert_ne!(spend_pubkey(&s), commit_asset(0, &[0u64; 4], &[0u64; 8], ASSET_ZCRYPT));
+        assert_ne!(spend_pubkey(&s), nullifier_asset(&s, 0, &[0u64; BLIND_LIMBS], ASSET_ZCRYPT));
+        assert_ne!(spend_pubkey(&s), commit_asset(0, &[0u64; BLIND_LIMBS], &[0u64; 8], ASSET_ZCRYPT));
         assert!(TAG_COMMIT != TAG_NF && TAG_NF != TAG_PK && TAG_COMMIT != TAG_PK);
     }
 

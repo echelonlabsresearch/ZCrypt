@@ -95,7 +95,7 @@ type Val = BabyBear;
 // Degree-5 challenge extension (BabyBear^5 ≈ 2^154.6). A degree-4 extension
 // (≈2^123.7) caps the DEEP/out-of-domain soundness terms below 128 bits; degree 5
 // lifts that ceiling so the FRI query phase (below) is the only binding term.
-type Challenge = BinomialExtensionField<Val, 5>;
+type Challenge = BinomialExtensionField<Val, CHALLENGE_EXT_DEGREE>;
 type ByteHash = Keccak256Hash;
 type U64Hash = PaddingFreeSponge<KeccakF, 25, 17, 4>;
 type FieldHash = SerializingHasher<U64Hash>;
@@ -201,7 +201,9 @@ fn make_config(rng_input: MaskRng, rng_challenge: MaskRng, rng_pcs: MaskRng) -> 
     let challenge_mmcs = ChallengeHidingMmcs::new(mk_mmcs(rng_challenge));
     let dft = Dft::default();
     let fri_params = FriParameters {
-        log_blowup: FRI_LOG_BLOWUP, log_final_poly_len: 1, max_log_arity: 2,
+        log_blowup: FRI_LOG_BLOWUP,
+        log_final_poly_len: FRI_LOG_FINAL_POLY_LEN,
+        max_log_arity: FRI_MAX_LOG_ARITY,
         num_queries: FRI_NUM_QUERIES,
         commit_proof_of_work_bits: FRI_POW_BITS,
         query_proof_of_work_bits: FRI_POW_BITS,
@@ -216,7 +218,7 @@ fn make_config(rng_input: MaskRng, rng_challenge: MaskRng, rng_pcs: MaskRng) -> 
         johnson_bits >= 100,
         "FRI parameters below the 100-bit Johnson-bound floor: {johnson_bits} bits",
     );
-    let pcs = HidingPcs::new(dft, val_mmcs, fri_params, 4, rng_pcs);
+    let pcs = HidingPcs::new(dft, val_mmcs, fri_params, HIDING_QUOTIENT_RANDOM_COLS, rng_pcs);
     ZkConfig::new(pcs, Challenger::from_hasher(vec![], byte_hash))
 }
 
@@ -264,7 +266,13 @@ pub const DEPTH: usize = tree::DEPTH;
 // input commitment so ownership is enforced and the nullifier is canonical), then
 // N_IN·DEPTH Merkle-path compression blocks (one Poseidon2 per tree level per
 // input) that prove the spent coin is a real leaf under the public root.
-const PATH_BASE: usize = S + 2 * N_IN;
+// Inner hash blocks: the commitment and the nullifier are each TWO Poseidon2
+// compressions (the 8-limb blind no longer fits beside pk/value/asset in one block).
+// Inner commit i = [pk(8) ‖ blind(8)]; inner nullifier j = [spend_secret(8) ‖ blind(8)].
+// Their 8-limb digests feed the outer (tagged) commit / nullifier blocks.
+const INNER_C_BASE: usize = S + 2 * N_IN;
+const INNER_NF_BASE: usize = INNER_C_BASE + S;
+const PATH_BASE: usize = INNER_NF_BASE + N_IN;
 const NBLK: usize = PATH_BASE + N_IN * DEPTH;
 // Range-check columns: 2 limbs per coin, one limb for the fee, plus the carry.
 const CARRY_BITS: usize = 4; // carry E, offset so E+8 ∈ [0,16) ⇒ E ∈ [-8,7]
@@ -288,6 +296,111 @@ type LL = GenericPoseidon2LinearLayersBabyBear;
 /// queries=112 · log_blowup=2 + pow=20 → 244 (conjectured list-decoding).
 pub const SOUNDNESS_BITS: usize = conjectured_soundness_bits();
 pub type Commitment = [u64; 8];
+
+/// FRI final-polynomial length exponent (final poly has `2^this` coefficients).
+const FRI_LOG_FINAL_POLY_LEN: usize = 1;
+/// FRI maximum folding arity exponent (folds by up to `2^this` per round).
+const FRI_MAX_LOG_ARITY: usize = 2;
+/// Degree of the Fiat–Shamir challenge extension field over BabyBear.
+const CHALLENGE_EXT_DEGREE: usize = 5;
+/// Number of random codewords blinding the quotient in the hiding PCS.
+const HIDING_QUOTIENT_RANDOM_COLS: usize = 4;
+/// Exact Plonky3 release every consensus proof is produced and verified with. A
+/// test checks this string against `Cargo.lock` so it cannot drift silently.
+pub const PLONKY3_VERSION: &str = "0.6.1";
+
+/// The consensus proof configuration and the generic-attack security figures it
+/// implies, as one machine-readable record (`zcrypt --proof-params` prints it as
+/// JSON). Every number here is derived from the compiled constants, not typed in.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct ProofParams {
+    pub plonky3_version: &'static str,
+    pub field: &'static str,
+    pub field_order: u64,
+    pub field_bits: f64,
+    pub challenge_extension_degree: usize,
+    pub challenge_field_bits: f64,
+    pub fri_log_blowup: usize,
+    pub fri_num_queries: usize,
+    pub fri_log_final_poly_len: usize,
+    pub fri_max_log_arity: usize,
+    pub fri_commit_pow_bits: usize,
+    pub fri_query_pow_bits: usize,
+    pub merkle_compress_arity: usize,
+    pub merkle_digest_u64s: usize,
+    pub hiding_pcs: bool,
+    pub hiding_quotient_random_cols: usize,
+    /// Johnson-bound FRI figure: `(log_blowup − 1)·queries + query_pow`. The floor
+    /// the node checks. Degree and batching losses are not subtracted.
+    pub fri_johnson_bits: usize,
+    /// List-decoding-conjecture figure: `log_blowup·queries + query_pow`. Reported
+    /// for comparison only; never used as a floor.
+    pub fri_conjectured_bits: usize,
+    pub mainnet_min_soundness_bits: usize,
+    pub digest_limbs: usize,
+    /// Range entropy of a digest: `limbs·log2(p)`.
+    pub digest_bits: f64,
+    /// Generic classical collision search: `digest_bits / 2`.
+    pub digest_collision_classical_bits: f64,
+    /// Generic quantum collision search (Brassard–Høyer–Tapp): `digest_bits / 3`.
+    /// Needs quantum memory of the same order; the classical figure is the
+    /// realistic bound under most cost models, but this is the generic lower one.
+    pub digest_collision_quantum_bits: f64,
+    /// Generic classical preimage search: `digest_bits`.
+    pub digest_preimage_classical_bits: f64,
+    /// Generic quantum (Grover) preimage search: `digest_bits / 2`.
+    pub digest_preimage_quantum_bits: f64,
+    pub blind_limbs: usize,
+    pub blind_bits: f64,
+    pub spend_secret_limbs: usize,
+    pub coin_value_bits: usize,
+    pub asset_id_bits: f64,
+    pub tree_depth: usize,
+}
+
+/// log2 of the BabyBear order.
+fn field_bits() -> f64 {
+    (FIELD_ORDER as f64).log2()
+}
+
+/// The compiled consensus proof parameters (see [`ProofParams`]).
+pub fn proof_params() -> ProofParams {
+    let fb = field_bits();
+    let digest_bits = 8.0 * fb;
+    ProofParams {
+        plonky3_version: PLONKY3_VERSION,
+        field: "BabyBear (15·2^27 + 1)",
+        field_order: FIELD_ORDER,
+        field_bits: fb,
+        challenge_extension_degree: CHALLENGE_EXT_DEGREE,
+        challenge_field_bits: CHALLENGE_EXT_DEGREE as f64 * fb,
+        fri_log_blowup: FRI_LOG_BLOWUP,
+        fri_num_queries: FRI_NUM_QUERIES,
+        fri_log_final_poly_len: FRI_LOG_FINAL_POLY_LEN,
+        fri_max_log_arity: FRI_MAX_LOG_ARITY,
+        fri_commit_pow_bits: FRI_POW_BITS,
+        fri_query_pow_bits: FRI_POW_BITS,
+        merkle_compress_arity: 2,
+        merkle_digest_u64s: 4,
+        hiding_pcs: true,
+        hiding_quotient_random_cols: HIDING_QUOTIENT_RANDOM_COLS,
+        fri_johnson_bits: johnson_soundness_bits(),
+        fri_conjectured_bits: conjectured_soundness_bits(),
+        mainnet_min_soundness_bits: MAINNET_MIN_SOUNDNESS_BITS,
+        digest_limbs: 8,
+        digest_bits,
+        digest_collision_classical_bits: digest_bits / 2.0,
+        digest_collision_quantum_bits: digest_bits / 3.0,
+        digest_preimage_classical_bits: digest_bits,
+        digest_preimage_quantum_bits: digest_bits / 2.0,
+        blind_limbs: BLIND_LIMBS,
+        blind_bits: BLIND_LIMBS as f64 * fb,
+        spend_secret_limbs: SPEND_SECRET_LIMBS,
+        coin_value_bits: 2 * BITS,
+        asset_id_bits: fb,
+        tree_depth: DEPTH,
+    }
+}
 
 /// BabyBear field modulus (`15·2^27 + 1`). A commitment / nullifier limb is a field
 /// element, so a *canonical* on-chain encoding requires every limb to be `< P`.
@@ -329,14 +442,21 @@ pub fn field_limb(x: u64) -> u64 {
 /// node's raw-`u64` accounting from the proven value — reject it on the wire.
 pub const MAX_FEE: u64 = 1u64 << BITS;
 
-/// Number of field limbs in a blinding factor (~31 bits each).
-pub const BLIND_LIMBS: usize = 4;
+/// Number of field limbs in a blinding factor (~31 bits each): 8 limbs, about 248
+/// bits, so a Grover search over the blind of a guessed amount is about 2^124.
+pub const BLIND_LIMBS: usize = 8;
+/// Canonical serialized size of a blind: 8 little-endian bytes per limb.
+pub const BLIND_BYTES: usize = BLIND_LIMBS * 8;
+// The inner commit / nullifier blocks absorb [8 lanes ‖ blind]; the blind must fill
+// exactly the upper half of the permutation width.
+const _: () = assert!(8 + BLIND_LIMBS == WIDTH, "blind must fill lanes 8..16 of the inner block");
 /// Number of field limbs in a spend secret.
 pub const SPEND_SECRET_LIMBS: usize = 8;
 
-/// Blinding factor: 4 field elements (~124-bit hiding). Two limbs (~62-bit) was
-/// brute-forceable against a guessed amount; four limbs puts amount privacy past
-/// practical offline search.
+/// Blinding factor: 8 field elements (~248-bit hiding, ~124-bit against Grover).
+/// Four limbs (~124-bit classical, ~62-bit quantum) was the previous width; eight
+/// matches the ~252-bit blinds of Sapling/Orchard and keeps amount privacy at the
+/// same post-quantum level as the spend secret.
 pub type Blind = [u64; BLIND_LIMBS];
 /// Spend secret: 8 field elements (~248-bit) so `pk = Poseidon2(spend_secret)`
 /// cannot be inverted by brute force.
@@ -347,6 +467,13 @@ pub type PubKey = [u64; 8];
 /// Fresh uniform blind (each limb rejection-sampled in the field).
 pub fn random_blind() -> Blind {
     core::array::from_fn(|_| rand_field_limb())
+}
+
+/// Deterministically widen four limbs into a full 8-limb [`Blind`] (test / demo
+/// convenience: fixtures written as four scalars keep working). Each extra limb is
+/// the matching base limb plus a constant, reduced into the field.
+pub fn widen_blind(limbs: [u64; 4]) -> Blind {
+    core::array::from_fn(|i| field_limb(limbs[i % 4].wrapping_add((i / 4) as u64 * 0x9e37_79b9)))
 }
 
 /// Fresh uniform spend secret.
@@ -489,12 +616,14 @@ impl<AB: AirBuilder<F = BabyBear>> Air<AB> for CoinsAir {
             outs.push(core::array::from_fn(|k| feed_forward::<AB>(cols.ending_full_rounds[HFR - 1].post[k], cols.inputs[k])));
         }
 
-        // Commit-input layout (WIDTH=16):
-        //   [0]=value_lo, [1]=value_hi, [2..6]=blind(4), [6..14]=pk(8), [14]=asset, [15]=TAG_COMMIT
-        // Nullifier-input layout:
-        //   [0..8]=spend_secret(8), [8]=value_lo, [9]=value_hi, [10..14]=blind(4), [14]=asset, [15]=TAG_NF
-        // Pk-input layout: [0..8]=spend_secret(8), [8..15)=0, [15]=TAG_PK.
-        // Block indices: commit i -> i (0..S); nullifier j -> S+j; pk j -> S+N_IN+j.
+        // Layouts (WIDTH=16):
+        //   inner commit  [0..8]=pk(8)  [8..16]=blind(8)                       (tagless)
+        //   outer commit  [0]=value_lo [1]=value_hi [2..10]=inner_c(8) [10..14]=0 [14]=asset [15]=TAG_COMMIT
+        //   inner nf      [0..8]=spend_secret(8)  [8..16]=blind(8)             (tagless)
+        //   outer nf      [0..8]=inner_nf(8) [8]=value_lo [9]=value_hi [10..14]=0 [14]=asset [15]=TAG_NF
+        //   pk            [0..8]=spend_secret(8), [8..15)=0, [15]=TAG_PK
+        // Block indices: commit i -> i (0..S); nullifier j -> S+j; pk j -> S+N_IN+j;
+        // inner commit i -> INNER_C_BASE+i; inner nullifier j -> INNER_NF_BASE+j.
 
         // SINGLE-ASSET: every coin (inputs + outputs) carries the same asset_id
         // (commit input[14]); with the per-asset conservation below you cannot turn
@@ -510,6 +639,14 @@ impl<AB: AirBuilder<F = BabyBear>> Air<AB> for CoinsAir {
             let hi = recompose::<AB>(builder, row, BITS_OFF + i * 2 * BITS + BITS, BITS);
             builder.assert_eq(lo, row[i * BLK].into()); // value_lo = commit input[0]
             builder.assert_eq(hi, row[i * BLK + 1].into()); // value_hi = commit input[1]
+            // Outer commit lanes [2..10] carry the inner block's digest of (pk ‖ blind);
+            // lanes [10..14] are zero, so the commitment has one canonical preimage layout.
+            for t in 0..8 {
+                builder.assert_eq(row[i * BLK + 2 + t], outs[INNER_C_BASE + i][t].clone());
+            }
+            for t in 10..14 {
+                builder.assert_zero(row[i * BLK + t].into());
+            }
 
             if i < N_IN {
                 let pk_blk = S + N_IN + i; // pk_i = Poseidon2(spend_secret_i)
@@ -528,26 +665,34 @@ impl<AB: AirBuilder<F = BabyBear>> Air<AB> for CoinsAir {
                 // the output-coin constraint below (kept in parity with the tall production
                 // AIR). Real leaves are always built with lane[15]=TAG_COMMIT.
                 builder.assert_eq(row[i * BLK + 15], konst::<AB>(TAG_COMMIT));
-                // OWNERSHIP: pk bound in the commitment (input[6..14]) == Poseidon2(ss).
-                // Kept unconditional (a pad still binds pk = Poseidon2(ss=0), trivially).
+                let ic_blk = INNER_C_BASE + i;
+                let inf_blk = INNER_NF_BASE + i;
+                // OWNERSHIP: the pk absorbed by the inner commit block == Poseidon2(ss).
+                // Kept unconditional (a pad still binds pk = Poseidon2(ss), trivially).
                 // Together with the Merkle path below, this proves the prover knows the
                 // spend secret of a genuine tree leaf `outs[i]` — no ring needed, the
                 // spent coin hides among the ENTIRE pool.
                 for t in 0..8 {
-                    builder.assert_eq(row[i * BLK + 6 + t], outs[pk_blk][t].clone());
+                    builder.assert_eq(row[ic_blk * BLK + t], outs[pk_blk][t].clone());
                 }
                 for t in 8..WIDTH - 1 {
                     builder.assert_zero(row[pk_blk * BLK + t].into());
                 }
                 builder.assert_eq(row[pk_blk * BLK + WIDTH - 1], konst::<AB>(TAG_PK));
-                // CANONICAL nullifier: nf block hashes [ss(8), value_lo, value_hi, blind(4), asset].
+                // CANONICAL nullifier, two blocks. Inner: [ss(8) ‖ blind(8)], the same
+                // spend secret as the pk block and the same blind as the inner commit block.
                 for t in 0..8 {
-                    builder.assert_eq(row[nf_blk * BLK + t], row[pk_blk * BLK + t]); // same spend_secret
+                    builder.assert_eq(row[inf_blk * BLK + t], row[pk_blk * BLK + t]);
+                    builder.assert_eq(row[inf_blk * BLK + 8 + t], row[ic_blk * BLK + 8 + t]);
+                }
+                // Outer: [inner_nf(8), value_lo, value_hi, 0×4, asset, TAG_NF].
+                for t in 0..8 {
+                    builder.assert_eq(row[nf_blk * BLK + t], outs[inf_blk][t].clone());
                 }
                 builder.assert_eq(row[nf_blk * BLK + 8], row[i * BLK]);       // value_lo
                 builder.assert_eq(row[nf_blk * BLK + 9], row[i * BLK + 1]);   // value_hi
-                for t in 0..4 {
-                    builder.assert_eq(row[nf_blk * BLK + 10 + t], row[i * BLK + 2 + t]); // blind
+                for t in 10..14 {
+                    builder.assert_zero(row[nf_blk * BLK + t].into());
                 }
                 builder.assert_eq(row[nf_blk * BLK + 14], row[i * BLK + 14]); // asset_id
                 builder.assert_eq(row[nf_blk * BLK + 15], konst::<AB>(TAG_NF));
@@ -655,8 +800,16 @@ fn konst<AB: AirBuilder<F = BabyBear>>(x: u64) -> AB::Expr {
     AB::Expr::from(BabyBear::from_u64(x))
 }
 
-// Commit: [0]=vlo [1]=vhi [2..6]=blind(4) [6..14]=pk(8) [14]=asset [15]=TAG_COMMIT
-fn coin_input(value: u64, blind: &Blind, pk: &PubKey, asset_id: u64) -> [BabyBear; WIDTH] {
+// Inner commit block: [0..8]=pk(8) ‖ [8..16]=blind(8). Tagless: the role tag lives in
+// the outer block, and a collision in an inner block is a Poseidon2 collision outright.
+fn inner_coin_input(pk: &PubKey, blind: &Blind) -> [BabyBear; WIDTH] {
+    let mut s = [BabyBear::ZERO; WIDTH];
+    for i in 0..8 { s[i] = BabyBear::from_u64(pk[i]); }
+    for i in 0..BLIND_LIMBS { s[8 + i] = BabyBear::from_u64(blind[i]); }
+    s
+}
+// Outer commit block: [0]=vlo [1]=vhi [2..10]=inner(8) [10..14]=0 [14]=asset [15]=TAG_COMMIT
+fn coin_input(value: u64, inner: &Commitment, asset_id: u64) -> [BabyBear; WIDTH] {
     // The asset lane is a field element: an id at or above the field order would alias
     // another id inside the circuit. Consensus rejects such ids on every wire; this guard
     // catches any caller that bypasses it in debug builds.
@@ -664,11 +817,17 @@ fn coin_input(value: u64, blind: &Blind, pk: &PubKey, asset_id: u64) -> [BabyBea
     let mut s = [BabyBear::ZERO; WIDTH];
     s[0] = BabyBear::from_u64(value & LIMB_MASK);
     s[1] = BabyBear::from_u64(value >> SHIFT);
-    for i in 0..BLIND_LIMBS { s[2 + i] = BabyBear::from_u64(blind[i]); }
-    for i in 0..8 { s[6 + i] = BabyBear::from_u64(pk[i]); }
+    for i in 0..8 { s[2 + i] = BabyBear::from_u64(inner[i]); }
     s[14] = BabyBear::from_u64(asset_id);
     s[15] = BabyBear::from_u64(TAG_COMMIT);
     s
+}
+/// Both Poseidon2 blocks of a coin commitment: `(inner, outer)`, where
+/// `commitment = native_commit(outer)` and `outer` absorbs `native_commit(inner)`.
+fn coin_blocks(value: u64, blind: &Blind, pk: &PubKey, asset_id: u64) -> ([BabyBear; WIDTH], [BabyBear; WIDTH]) {
+    let inner = inner_coin_input(pk, blind);
+    let outer = coin_input(value, &native_commit(&inner), asset_id);
+    (inner, outer)
 }
 // Pk: [0..8]=spend_secret, [8..15]=0, [15]=TAG_PK.
 fn pk_input(spend_secret: &SpendSecret) -> [BabyBear; WIDTH] {
@@ -677,17 +836,29 @@ fn pk_input(spend_secret: &SpendSecret) -> [BabyBear; WIDTH] {
     s[15] = BabyBear::from_u64(TAG_PK);
     s
 }
-// Nullifier: [0..8]=ss [8]=vlo [9]=vhi [10..14]=blind [14]=asset [15]=TAG_NF
-fn nf_input(spend_secret: &SpendSecret, value: u64, blind: &Blind, asset_id: u64) -> [BabyBear; WIDTH] {
-    debug_assert!(asset_id < FIELD_ORDER, "asset_id {asset_id} is not a canonical field element");
+// Inner nullifier block: [0..8]=spend_secret(8) ‖ [8..16]=blind(8). Tagless (see above).
+fn inner_nf_input(spend_secret: &SpendSecret, blind: &Blind) -> [BabyBear; WIDTH] {
     let mut s = [BabyBear::ZERO; WIDTH];
     for i in 0..SPEND_SECRET_LIMBS { s[i] = BabyBear::from_u64(spend_secret[i]); }
+    for i in 0..BLIND_LIMBS { s[8 + i] = BabyBear::from_u64(blind[i]); }
+    s
+}
+// Outer nullifier block: [0..8]=inner_nf [8]=vlo [9]=vhi [10..14]=0 [14]=asset [15]=TAG_NF
+fn nf_input(inner: &Commitment, value: u64, asset_id: u64) -> [BabyBear; WIDTH] {
+    debug_assert!(asset_id < FIELD_ORDER, "asset_id {asset_id} is not a canonical field element");
+    let mut s = [BabyBear::ZERO; WIDTH];
+    for i in 0..8 { s[i] = BabyBear::from_u64(inner[i]); }
     s[8] = BabyBear::from_u64(value & LIMB_MASK);
     s[9] = BabyBear::from_u64(value >> SHIFT);
-    for i in 0..BLIND_LIMBS { s[10 + i] = BabyBear::from_u64(blind[i]); }
     s[14] = BabyBear::from_u64(asset_id);
     s[15] = BabyBear::from_u64(TAG_NF);
     s
+}
+/// Both Poseidon2 blocks of a nullifier: `(inner, outer)`; `nf = native_commit(outer)`.
+fn nf_blocks(spend_secret: &SpendSecret, value: u64, blind: &Blind, asset_id: u64) -> ([BabyBear; WIDTH], [BabyBear; WIDTH]) {
+    let inner = inner_nf_input(spend_secret, blind);
+    let outer = nf_input(&native_commit(&inner), value, asset_id);
+    (inner, outer)
 }
 /// Feed-forward digest lane: `P(x)[k] + x[k]`, field addition. Shared by every AIR
 /// so the circuit and [`native_commit`] name the same compression.
@@ -715,7 +886,7 @@ pub fn commit(value: u64, blind: &Blind, pk: &PubKey) -> Commitment {
 /// Coin commitment for a shielded asset. Binds amount, owner, and asset, so a
 /// coin of one asset cannot be opened as another.
 pub fn commit_asset(value: u64, blind: &Blind, pk: &PubKey, asset_id: u64) -> Commitment {
-    native_commit(&coin_input(value, blind, pk, asset_id))
+    native_commit(&coin_blocks(value, blind, pk, asset_id).1)
 }
 /// Canonical nullifier for native ZCRYPT.
 pub fn nullifier(spend_secret: &SpendSecret, value: u64, blind: &Blind) -> Commitment {
@@ -723,7 +894,7 @@ pub fn nullifier(spend_secret: &SpendSecret, value: u64, blind: &Blind) -> Commi
 }
 /// Canonical nullifier for a shielded-asset coin.
 pub fn nullifier_asset(spend_secret: &SpendSecret, value: u64, blind: &Blind, asset_id: u64) -> Commitment {
-    native_commit(&nf_input(spend_secret, value, blind, asset_id))
+    native_commit(&nf_blocks(spend_secret, value, blind, asset_id).1)
 }
 
 /// Domain tag for [`secret_coin_tag`]. The nullifier pins lane 15 to [`TAG_NF`];
@@ -738,7 +909,7 @@ const COIN_TAG_DOMAIN: u64 = 0x00_C0_1A_67;
 /// per-coin uniqueness. Recovering it needs the coin's spend secret and blind, so it
 /// is not computable from anything the chain reveals.
 fn secret_coin_tag(spend_secret: &SpendSecret, value: u64, blind: &Blind, asset_id: u64) -> Commitment {
-    let mut s = nf_input(spend_secret, value, blind, asset_id);
+    let (_, mut s) = nf_blocks(spend_secret, value, blind, asset_id);
     s[WIDTH - 1] = BabyBear::from_u64(COIN_TAG_DOMAIN);
     native_commit(&s)
 }
@@ -902,12 +1073,13 @@ pub fn prove_wide(
     let in_pks: Vec<PubKey> = inputs.iter().map(|i| spend_pubkey(&i.spend_secret)).collect();
     let coin_values: Vec<u64> = inputs.iter().map(|i| i.value)
         .chain(outputs.iter().map(|&(v, _, _, _)| v)).collect();
-    let commit_states: Vec<[BabyBear; WIDTH]> = inputs.iter().enumerate()
-        .map(|(i, inp)| coin_input(inp.value, &inp.blind, &in_pks[i], inp.asset_id))
-        .chain(outputs.iter().map(|(v, b, pk, a)| coin_input(*v, b, pk, *a)))
-        .collect();
+    let (inner_c_states, commit_states): (Vec<[BabyBear; WIDTH]>, Vec<[BabyBear; WIDTH]>) = inputs.iter().enumerate()
+        .map(|(i, inp)| coin_blocks(inp.value, &inp.blind, &in_pks[i], inp.asset_id))
+        .chain(outputs.iter().map(|(v, b, pk, a)| coin_blocks(*v, b, pk, *a)))
+        .unzip();
     let out_commits: Vec<Commitment> = commit_states[N_IN..].iter().map(native_commit).collect();
-    let nf_states: Vec<[BabyBear; WIDTH]> = inputs.iter().map(|i| nf_input(&i.spend_secret, i.value, &i.blind, i.asset_id)).collect();
+    let (inner_nf_states, nf_states): (Vec<[BabyBear; WIDTH]>, Vec<[BabyBear; WIDTH]>) =
+        inputs.iter().map(|i| nf_blocks(&i.spend_secret, i.value, &i.blind, i.asset_id)).unzip();
     // Every slot — real or dummy — publishes its genuine Poseidon2 nullifier (matching
     // the unconditional `nf == pis` constraint in the AIR), so the input count is not
     // revealed by an all-zero sentinel.
@@ -937,9 +1109,9 @@ pub fn prove_wide(
     }
 
     // block order must match the AIR: commits (S) ‖ nullifiers (N_IN) ‖ pk (N_IN)
-    // ‖ path (N_IN·DEPTH).
-    let block_inputs: Vec<[BabyBear; WIDTH]> =
-        commit_states.iter().chain(&nf_states).chain(&pk_states).chain(&path_states).copied().collect();
+    // ‖ inner commits (S) ‖ inner nullifiers (N_IN) ‖ path (N_IN·DEPTH).
+    let block_inputs: Vec<[BabyBear; WIDTH]> = commit_states.iter().chain(&nf_states).chain(&pk_states)
+        .chain(&inner_c_states).chain(&inner_nf_states).chain(&path_states).copied().collect();
     let constants = RoundConstants::<BabyBear, WIDTH, HFR, PR>::new(RC_EI, RC_I, RC_EF);
     let n = 32usize;
     let blocks: Vec<RowMajorMatrix<BabyBear>> = block_inputs.iter()
@@ -1077,10 +1249,77 @@ pub fn verify(
 mod tests {
     use super::*;
 
+    #[test]
+    fn proof_params_report_matches_compiled_configuration() {
+        // The report is what the whitepaper and `zcrypt --proof-params` cite. Every
+        // field must be the compiled value; this pins the published numbers.
+        let p = proof_params();
+        assert_eq!(p.fri_num_queries, 112);
+        assert_eq!(p.fri_log_blowup, 2);
+        assert_eq!(p.fri_commit_pow_bits, 20);
+        assert_eq!(p.fri_query_pow_bits, 20);
+        assert_eq!(p.fri_log_final_poly_len, 1);
+        assert_eq!(p.fri_max_log_arity, 2);
+        assert_eq!(p.challenge_extension_degree, 5);
+        assert_eq!(p.fri_johnson_bits, 132);
+        assert_eq!(p.fri_conjectured_bits, 244);
+        assert!(p.fri_johnson_bits >= p.mainnet_min_soundness_bits);
+        assert!(is_mainnet_grade());
+        // Generic-attack figures for the 8-limb BabyBear digest. These are what the
+        // paper may claim, and they are NOT 128-bit post-quantum collision security.
+        assert!((p.digest_bits - 247.255).abs() < 0.01, "{}", p.digest_bits);
+        assert!((p.digest_collision_classical_bits - 123.63).abs() < 0.01);
+        assert!((p.digest_collision_quantum_bits - 82.42).abs() < 0.01);
+        assert!((p.digest_preimage_quantum_bits - 123.63).abs() < 0.01);
+        assert!(p.digest_collision_quantum_bits < 128.0);
+        assert!((p.challenge_field_bits - 154.53).abs() < 0.01);
+        assert!((p.asset_id_bits - 30.907).abs() < 0.001);
+        assert_eq!(p.coin_value_bits, 52);
+        // Amount privacy: the blind is 8 limbs (~247 bits), so a Grover search over the
+        // blind of a guessed amount is ~124 bits, the same level as the spend secret.
+        assert_eq!(p.blind_limbs, 8);
+        assert!((p.blind_bits - 247.255).abs() < 0.01);
+        assert!(p.blind_bits / 2.0 > 120.0);
+        let json = serde_json::to_string(&p).unwrap();
+        assert!(json.contains("\"fri_num_queries\":112"));
+    }
+
+    #[test]
+    fn plonky3_version_matches_lockfile() {
+        // The whitepaper cites PLONKY3_VERSION; the lockfile is the truth.
+        let lock = include_str!("../../Cargo.lock");
+        let needle = format!("name = \"p3-fri\"\nversion = \"{PLONKY3_VERSION}\"");
+        assert!(lock.contains(&needle), "p3-fri {PLONKY3_VERSION} not in Cargo.lock");
+        let needle = format!("name = \"p3-uni-stark\"\nversion = \"{PLONKY3_VERSION}\"");
+        assert!(lock.contains(&needle), "p3-uni-stark {PLONKY3_VERSION} not in Cargo.lock");
+    }
+
+    #[test]
+    fn phantom_depends_on_slot_and_on_every_coin_field() {
+        // Same coin, same slot: same phantom. Same coin, other slot: different. And
+        // changing any one field of the real coin (secret, value, blind, asset) changes
+        // the phantom, because the secret coin tag binds the whole opening. Distinct
+        // openings collide only with the collision probability of Poseidon2; the real
+        // nullifier registry is what rejects a repeated spend of the same coin.
+        let real = inp(100, 11, 7, 0);
+        let a = dummy_witness(&[real.clone()], 1, ASSET_ZCRYPT);
+        let b = dummy_witness(&[real.clone()], 1, ASSET_ZCRYPT);
+        assert_eq!(a.spend_secret, b.spend_secret);
+        assert_eq!(a.blind, b.blind);
+        assert_eq!(a.value, 0, "phantom carries no value");
+        let other_slot = dummy_witness(&[real.clone()], 0, ASSET_ZCRYPT);
+        assert_ne!(a.spend_secret, other_slot.spend_secret);
+        for variant in [inp(101, 11, 7, 0), inp(100, 12, 7, 0), inp(100, 11, 8, 0), inpa(100, 11, 7, 0, 5)] {
+            let d = dummy_witness(&[variant], 1, ASSET_ZCRYPT);
+            assert_ne!(a.spend_secret, d.spend_secret);
+        }
+        let nf_a = nullifier_asset(&a.spend_secret, 0, &a.blind, ASSET_ZCRYPT);
+        assert_ne!(nf_a, [0u64; 8], "phantom never lands on the reserved all-zero nullifier");
+    }
+
     // Deterministic wide secrets from a scalar (test convenience).
     fn bl(b: u64) -> Blind {
-        let b = field_limb(b);
-        [b, field_limb(b.wrapping_add(0x9e37)), field_limb(b.wrapping_add(1)), field_limb(b.wrapping_add(2))]
+        core::array::from_fn(|i| field_limb(b.wrapping_add(0x9e37u64.wrapping_mul(i as u64 + 1))))
     }
     fn ss(s: u64) -> SpendSecret {
         let s = field_limb(s);

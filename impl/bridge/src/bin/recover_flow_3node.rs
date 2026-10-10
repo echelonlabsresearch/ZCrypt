@@ -17,7 +17,7 @@ fn seed(zc: &Zcrypt, c: &[u64; 8]) {
         }
     }
 }
-fn note(addr: &keys::Address, v: u64, b: [u64; 4]) -> Vec<u8> {
+fn note(addr: &keys::Address, v: u64, b: zcrypt_shield::Blind) -> Vec<u8> {
     kem::ciphertext_to_bytes(&keys::encrypt_note(addr, v, b))
 }
 /// Scan live blocks [from,to] and trial-decrypt shield notes to recover a coin. A 0x55
@@ -57,7 +57,7 @@ fn main() {
     println!("[bob] 24-word recovery phrase generated ({} words)", phrase.split_whitespace().count());
 
     for k in 0..24u64 {
-        let d = Account::from_seed([(0x60 + k) as u8; 32]).own_coin(2_000 + k, [k + 1, k + 5, (k + 1).wrapping_add(1), (k + 5).wrapping_add(1)]);
+        let d = Account::from_seed([(0x60 + k) as u8; 32]).own_coin(2_000 + k, zcrypt_shield::widen_blind([k + 1, k + 5, (k + 1).wrapping_add(1), (k + 5).wrapping_add(1)]));
         seed(&zc, &d.commitment());
     }
     let a = alice.own_coin(500_000, keys::random_blind());

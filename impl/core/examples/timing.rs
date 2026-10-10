@@ -20,14 +20,14 @@ fn main() {
     // --- shield transfer: hidden-amount, 2-input shielded-pool spend ---
     let ss_a: SpendSecret = [7, 8, 9, 10, 11, 12, 13, 14];
     let ss_b: SpendSecret = [15, 16, 17, 18, 19, 20, 21, 22];
-    let bl_a: Blind = [1, 2, 3, 4];
-    let bl_b: Blind = [5, 6, 7, 8];
+    let bl_a: Blind = [1, 2, 3, 4, 5, 6, 7, 8];
+    let bl_b: Blind = [5, 6, 7, 8, 9, 10, 11, 12];
     let mut pool: Vec<Commitment> = vec![
         commit(100, &bl_a, &spend_pubkey(&ss_a)),
         commit(101, &bl_b, &spend_pubkey(&ss_b)),
     ];
     for k in 2..24u64 {
-        pool.push(commit(100 + k, &[k, k.wrapping_add(1), k.wrapping_add(2), k.wrapping_add(3)], &spend_pubkey(&[k, k.wrapping_add(1), k.wrapping_add(2), k.wrapping_add(3), k.wrapping_add(4), k.wrapping_add(5), k.wrapping_add(6), k.wrapping_add(7)])));
+        pool.push(commit(100 + k, &core::array::from_fn(|i| k.wrapping_add(i as u64)), &spend_pubkey(&[k, k.wrapping_add(1), k.wrapping_add(2), k.wrapping_add(3), k.wrapping_add(4), k.wrapping_add(5), k.wrapping_add(6), k.wrapping_add(7)])));
     }
     let pool_size = pool.len();
     let mut node = Node::new();
@@ -62,7 +62,7 @@ fn main() {
     let tx = shield_tx::build(
         CHAIN.as_bytes(),
         &[a, b],
-        &[(90, [3, 4, 5, 6], out_pk, 0), (106, [7, 8, 9, 10], out_pk, 0)],
+        &[(90, [3, 4, 5, 6, 7, 8, 9, 10], out_pk, 0), (106, [7, 8, 9, 10, 11, 12, 13, 14], out_pk, 0)],
         5,
         vec![zcrypt_core::keys::cover_note_bytes(), zcrypt_core::keys::cover_note_bytes()],
     )

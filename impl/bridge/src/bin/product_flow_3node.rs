@@ -30,10 +30,10 @@ fn seed(zc: &Zcrypt, c: &[u64; 8], what: &str) {
 
 
 /// (OutCoin, encrypted-note bytes) for a native-ZCRYPT payment to `addr`.
-fn pay(addr: &keys::Address, value: u64, blind: [u64; 4]) -> (OutCoin, Vec<u8>) {
+fn pay(addr: &keys::Address, value: u64, blind: zcrypt_shield::Blind) -> (OutCoin, Vec<u8>) {
     (keys::out_coin(addr, value, blind), kem::ciphertext_to_bytes(&keys::encrypt_note(addr, value, blind)))
 }
-fn pay_asset(addr: &keys::Address, value: u64, blind: [u64; 4], asset: u64) -> (OutCoin, Vec<u8>) {
+fn pay_asset(addr: &keys::Address, value: u64, blind: zcrypt_shield::Blind, asset: u64) -> (OutCoin, Vec<u8>) {
     (
         keys::out_asset_coin(addr, value, blind, asset),
         kem::ciphertext_to_bytes(&keys::encrypt_note_asset(addr, value, blind, asset)),
@@ -203,7 +203,7 @@ fn main() {
     // Seed a pool so shield spends hide among a non-trivial shielded pool.
     const POOL_DECOYS: u64 = 24;
     for k in 0..POOL_DECOYS {
-        let d = Account::from_seed([(0x50 + k) as u8; 32]).own_coin(1_000 + k, [k + 3, k + 7, (k + 3).wrapping_add(1), (k + 7).wrapping_add(1)]);
+        let d = Account::from_seed([(0x50 + k) as u8; 32]).own_coin(1_000 + k, zcrypt_shield::widen_blind([k + 3, k + 7, (k + 3).wrapping_add(1), (k + 7).wrapping_add(1)]));
         seed(&zc, &d.commitment(), "decoy");
     }
     println!("[setup] seeded {POOL_DECOYS} pool coins");
@@ -249,8 +249,8 @@ fn main() {
     seed(&zc, &bearer.coin.commitment(), "bearer");
     let mk_sweep = |b: u64, s: u64, gas: &Coin| {
         let dst = Account::from_seed([s as u8; 32]);
-        let (o0, m0) = pay(&dst.normal_address(), bearer.coin.value, [b, b + 1, (b).wrapping_add(1), (b + 1).wrapping_add(1)]);
-        let (o1, m1) = pay(&dst.normal_address(), 0, [b + 2, b + 3, (b + 2).wrapping_add(1), (b + 3).wrapping_add(1)]);
+        let (o0, m0) = pay(&dst.normal_address(), bearer.coin.value, zcrypt_shield::widen_blind([b, b + 1, (b).wrapping_add(1), (b + 1).wrapping_add(1)]));
+        let (o1, m1) = pay(&dst.normal_address(), 0, zcrypt_shield::widen_blind([b + 2, b + 3, (b + 2).wrapping_add(1), (b + 3).wrapping_add(1)]));
         // Alice pays the ZCRYPT gas for the sweep.
         swap::build_transfer(&zc, &[bearer.coin], &[o0, o1], vec![m0, m1], &alice, gas).unwrap()
     };

@@ -227,7 +227,7 @@ mod tests {
 
     // A tree leaf is just an opaque commitment; ownership/pk is irrelevant here.
     fn commit(v: u64, b: u64) -> Commitment {
-        crate::commit(v, &[b, b.wrapping_add(1), b.wrapping_add(2), b.wrapping_add(3)], &[0u64; 8])
+        crate::commit(v, &core::array::from_fn(|i| b.wrapping_add(i as u64)), &[0u64; 8])
     }
 
     /// After EVERY append the cached layers must equal a full rebuild, and every leaf's

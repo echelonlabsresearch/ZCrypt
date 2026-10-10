@@ -39,7 +39,7 @@ one of these live):
 
 ### The 0x55 bundle
 
-`tag ‖ gas_blind(32) ‖ gas_len(4) ‖ gas_tx ‖ main_tx`. The gas note is a small
+`tag ‖ gas_blind(64) ‖ gas_len(4) ‖ gas_tx ‖ main_tx`. The gas note is a small
 ZCRYPT shield tx whose `output[0]` is a burn of exactly 0.01 ZCRYPT to an
 unspendable key; publishing `gas_blind` makes that single output publicly
 checkable (every node recomputes the commitment) while everything else stays

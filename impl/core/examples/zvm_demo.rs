@@ -4,7 +4,7 @@
 use zcrypt_shield::zvm::{self, SHIELD_TRANSFER};
 use zcrypt_shield::{commit_asset, prove, spend_pubkey, tree, verify, Blind, Commitment, OutCoin, SpendSecret, SpendWitness, ASSET_ZCRYPT};
 
-fn bl(b: u64) -> Blind { let b = zcrypt_shield::field_limb(b); [b, zcrypt_shield::field_limb(b.wrapping_add(0x9e37)), zcrypt_shield::field_limb(b.wrapping_add(1)), zcrypt_shield::field_limb(b.wrapping_add(2))] }
+fn bl(b: u64) -> Blind { core::array::from_fn(|i| zcrypt_shield::field_limb(b.wrapping_add(0x9e37u64.wrapping_mul(i as u64 + 1)))) }
 fn ss(s: u64) -> SpendSecret { let s = zcrypt_shield::field_limb(s); core::array::from_fn(|i| zcrypt_shield::field_limb(s ^ ((i as u64 + 1) * 0x11))) }
 fn inp(v: u64, b: u64, s: u64) -> SpendWitness {
     SpendWitness {

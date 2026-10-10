@@ -27,8 +27,14 @@ fn rd_u32(b: &[u8], off: usize) -> Option<u32> {
 fn rd_hex(b: &[u8], off: usize, len: usize) -> Option<String> {
     Some(hex::encode(b.get(off..off + len)?))
 }
-fn rd_blind(b: &[u8], off: usize) -> Option<[u64; 4]> {
-    Some([rd_u64(b, off)?, rd_u64(b, off + 8)?, rd_u64(b, off + 16)?, rd_u64(b, off + 24)?])
+/// Serialized blind size on every wire: 8 limbs × 8 bytes.
+const BB: usize = zcrypt_shield::BLIND_BYTES;
+fn rd_blind(b: &[u8], off: usize) -> Option<zcrypt_shield::Blind> {
+    let mut blind = [0u64; zcrypt_shield::BLIND_LIMBS];
+    for (i, x) in blind.iter_mut().enumerate() {
+        *x = rd_u64(b, off + i * 8)?;
+    }
+    Some(blind)
 }
 fn rd_pk(b: &[u8], off: usize) -> Option<[u64; 8]> {
     let mut pk = [0u64; 8];
@@ -41,18 +47,18 @@ fn rd_pk(b: &[u8], off: usize) -> Option<[u64; 8]> {
 /// Swap-lock body after the 216-byte header is the same gas prefix a transfer uses,
 /// then the asset spend. Returns `(gas_tx, asset_tx)`.
 fn parse_swap_proofs(body: &[u8]) -> Option<(ShieldTx, ShieldTx)> {
-    const HEAD: usize = 216;
+    const HEAD: usize = 8 + BB + 8 + 32 + 8 + 64 + 64; // swap-lock header (248)
     parse_transfer(body.get(HEAD..)?)
 }
 
-/// The 0x55 bundle body: `gas_blind(32) ‖ gas_len(4) ‖ gas_tx ‖ main_tx`.
+/// The 0x55 bundle body: `gas_blind(64) ‖ gas_len(4) ‖ gas_tx ‖ main_tx`.
 fn parse_transfer(body: &[u8]) -> Option<(ShieldTx, ShieldTx)> {
-    if body.len() < 36 {
+    if body.len() < BB + 4 {
         return None;
     }
-    let gas_len = rd_u32(body, 32)? as usize;
-    let gas_end = 36usize.checked_add(gas_len)?;
-    let gas = shield_tx::from_bytes(body.get(36..gas_end)?)?;
+    let gas_len = rd_u32(body, BB)? as usize;
+    let gas_end = (BB + 4).checked_add(gas_len)?;
+    let gas = shield_tx::from_bytes(body.get(BB + 4..gas_end)?)?;
     let main = shield_tx::from_bytes(body.get(gas_end..)?)?;
     Some((gas, main))
 }
@@ -124,26 +130,26 @@ fn payload_layout(tag: u8, body: &[u8]) -> Option<Vec<Value>> {
             r.push(row("".into(), "STRUCTURE", "a 0x55 transfer bundles TWO shield txs: a small ZCRYPT \
 GAS note that provably burns the 0.01 fee, and the MAIN transfer that moves the (hidden) value. \
 Both carry their own STARK proof; consensus accepts or rejects them atomically.".into()));
-            r.push(row("[1..33]".into(), "gas blind: the PUBLIC opening of the gas burn. Every node recomputes \
+            r.push(row("[1..65]".into(), "gas blind: the PUBLIC opening of the gas burn. Every node recomputes \
 commit(0.01 ZCRYPT, this blind, BURN_PK) and requires it to equal gas.outputs[0] — proving exactly 0.01 was \
-burned, while every other output stays hidden", hex_at(0, 32)));
-            let gas_len = rd_u32(body, 32)? as usize;
-            r.push(row("[33..37]".into(), "gas tx length (u32 LE)", format!("{gas_len}")));
+burned, while every other output stays hidden", hex_at(0, BB)));
+            let gas_len = rd_u32(body, BB)? as usize;
+            r.push(row("[65..69]".into(), "gas tx length (u32 LE)", format!("{gas_len}")));
             let (gas, main) = parse_transfer(body)?;
-            shield_rows(&format!("[37..{}] gas", 37 + gas_len), &gas, &mut r);
-            shield_rows(&format!("[{}..] main", 37 + gas_len), &main, &mut r);
+            shield_rows(&format!("[69..{}] gas", 69 + gas_len), &gas, &mut r);
+            shield_rows(&format!("[{}..] main", 69 + gas_len), &main, &mut r);
         }
         0x57 => {
-            // Wire: ed25519_pk(32) ‖ stake(8) ‖ reward(32) ‖ commission_bps(2) ‖ nonce(8) ‖ sig(64) ‖ stake_blind(32) ‖ shield_tx
+            // Wire: ed25519_pk(32) ‖ stake(8) ‖ reward(32) ‖ commission_bps(2) ‖ nonce(8) ‖ sig(64) ‖ stake_blind(64) ‖ shield_tx
             r.push(row("[1..33]".into(), "consensus pubkey (ed25519) -> validator id", hex_at(0, 32)));
             r.push(row("[33..41]".into(), "stake (u64 LE) -> Ctx.stake", rd_u64(body, 32).map(zcry)?));
             r.push(row("[41..73]".into(), "reward address", hex_at(40, 32)));
             r.push(row("[73..75]".into(), "commission_bps (u16 LE)", format!("{}", u16::from_le_bytes(body.get(72..74)?.try_into().ok()?))));
             r.push(row("[75..83]".into(), "auth nonce (u64 LE, replay protection)", format!("{}", rd_u64(body, 74)?)));
             r.push(row("[83..147]".into(), "ed25519 signature over ZCRYPT-BOND-v1 ‖ chain ‖ pk ‖ stake ‖ reward ‖ commission ‖ nonce", hex_at(82, 64)));
-            r.push(row("[147..179]".into(), "stake blind (opens the pledge burn output)", hex_at(146, 32)));
-            if let Some(stx) = body.get(178..).and_then(shield_tx::from_bytes) {
-                shield_rows("[179..] pledge", &stx, &mut r);
+            r.push(row("[147..211]".into(), "stake blind (opens the pledge burn output)", hex_at(146, BB)));
+            if let Some(stx) = body.get(146 + BB..).and_then(shield_tx::from_bytes) {
+                shield_rows("[211..] pledge", &stx, &mut r);
             }
         }
         0x58 => {
@@ -181,32 +187,33 @@ which hides among the whole pool", hex_at(0, 64)));
         }
         0x5C => r.push(row("[1..33]".into(), "escrow id -> Ctx.escrow_open lookup", hex_at(0, 32))),
         0x5D => {
-            let aid = rd_u64(body, 40)?;
+            let aid = rd_u64(body, 8 + BB)?;
             r.push(row("[1..9]".into(), "locked value (u64 LE, in the asset's own atomic units)", asset_amt(rd_u64(body, 0)?, Some(aid), None, None)));
-            r.push(row("[9..41]".into(), "lock blind (opens the burn output)", hex_at(8, 32)));
-            r.push(row("[41..49]".into(), "asset id (u64 LE) -> Ctx.asset_registered lookup", format!("{aid}")));
-            r.push(row("[49..81]".into(), "hashlock (SHA-256)", hex_at(48, 32)));
-            r.push(row("[81..89]".into(), "timeout height (u64 LE)", format!("{}", rd_u64(body, 80)?)));
-            r.push(row("[89..153]".into(), "refund shield pubkey", hex_at(88, 64)));
-            if let Some(stx) = body.get(152..).and_then(shield_tx::from_bytes) {
-                shield_rows("[153..] lock", &stx, &mut r);
+            r.push(row("[9..73]".into(), "lock blind (opens the burn output)", hex_at(8, BB)));
+            r.push(row("[73..81]".into(), "asset id (u64 LE) -> Ctx.asset_registered lookup", format!("{aid}")));
+            r.push(row("[81..113]".into(), "hashlock (SHA-256)", hex_at(16 + BB, 32)));
+            r.push(row("[113..121]".into(), "timeout height (u64 LE)", format!("{}", rd_u64(body, 48 + BB)?)));
+            r.push(row("[121..185]".into(), "refund shield pubkey", hex_at(56 + BB, 64)));
+            if let Some(stx) = body.get(120 + BB..).and_then(shield_tx::from_bytes) {
+                shield_rows("[185..] lock", &stx, &mut r);
             }
         }
         0x62 => {
-            let aid = rd_u64(body, 40)?;
-            r.push(row("".into(), "STRUCTURE", "a 0x62 swap lock keeps the 216-byte escrow header, then the \
+            let aid = rd_u64(body, 8 + BB)?;
+            r.push(row("".into(), "STRUCTURE", "a 0x62 swap lock keeps the 248-byte escrow header, then the \
 same ZCRYPT gas prefix a transfer uses (0.01 burned, the locked asset is not charged), then the asset spend \
 whose output[0] is the locked-value burn coin.".into()));
             r.push(row("[1..9]".into(), "locked value (u64 LE, in the asset's own atomic units)", asset_amt(rd_u64(body, 0)?, Some(aid), None, None)));
-            r.push(row("[9..41]".into(), "lock blind (opens the burn output)", hex_at(8, 32)));
-            r.push(row("[41..49]".into(), "asset id (u64 LE) -> Ctx.asset_registered lookup", format!("{aid}")));
-            r.push(row("[49..81]".into(), "hashlock (SHA-256)", hex_at(48, 32)));
-            r.push(row("[81..89]".into(), "timeout height (u64 LE)", format!("{}", rd_u64(body, 80)?)));
-            r.push(row("[89..153]".into(), "counterparty shield pubkey", hex_at(88, 64)));
-            r.push(row("[153..217]".into(), "refund shield pubkey", hex_at(152, 64)));
-            let gas_len = rd_u32(body, 248)? as usize;
-            r.push(row("[217..249]".into(), "gas blind: the PUBLIC opening of the 0.01 ZCRYPT burn", hex_at(216, 32)));
-            r.push(row("[249..253]".into(), "gas tx length (u32 LE)", format!("{gas_len}")));
+            r.push(row("[9..73]".into(), "lock blind (opens the burn output)", hex_at(8, BB)));
+            r.push(row("[73..81]".into(), "asset id (u64 LE) -> Ctx.asset_registered lookup", format!("{aid}")));
+            r.push(row("[81..113]".into(), "hashlock (SHA-256)", hex_at(16 + BB, 32)));
+            r.push(row("[113..121]".into(), "timeout height (u64 LE)", format!("{}", rd_u64(body, 48 + BB)?)));
+            r.push(row("[121..185]".into(), "counterparty shield pubkey", hex_at(56 + BB, 64)));
+            r.push(row("[185..249]".into(), "refund shield pubkey", hex_at(120 + BB, 64)));
+            let head = 184 + BB; // 248-byte escrow header
+            let gas_len = rd_u32(body, head + BB)? as usize;
+            r.push(row("[249..313]".into(), "gas blind: the PUBLIC opening of the 0.01 ZCRYPT burn", hex_at(head, BB)));
+            r.push(row("[313..317]".into(), "gas tx length (u32 LE)", format!("{gas_len}")));
             let (gas, asset_tx) = parse_swap_proofs(body)?;
             shield_rows(&format!("[253..{}] gas", 253 + gas_len), &gas, &mut r);
             shield_rows(&format!("[{}..] asset spend", 253 + gas_len), &asset_tx, &mut r);
@@ -218,15 +225,15 @@ whose output[0] is the locked-value burn coin.".into()));
             r.push(row("[41..105]".into(), "ed25519 signature over ZCRYPT-UNBOND-v1 ‖ chain ‖ pk ‖ nonce", hex_at(40, 64)));
         }
         0x5F => {
-            // Wire: delegator_pk(32) ‖ target_addr(20) ‖ stake(8) ‖ reward(32) ‖ sig(64) ‖ stake_blind(32) ‖ shield_tx
+            // Wire: delegator_pk(32) ‖ target_addr(20) ‖ stake(8) ‖ reward(32) ‖ sig(64) ‖ stake_blind(64) ‖ shield_tx
             r.push(row("[1..33]".into(), "delegator pubkey (ed25519)", hex_at(0, 32)));
             r.push(row("[33..53]".into(), "target validator address", hex_at(32, 20)));
             r.push(row("[53..61]".into(), "stake (u64 LE) -> Ctx.stake", rd_u64(body, 52).map(zcry)?));
             r.push(row("[61..93]".into(), "reward address", hex_at(60, 32)));
             r.push(row("[93..157]".into(), "ed25519 signature", hex_at(92, 64)));
-            r.push(row("[157..189]".into(), "stake blind", hex_at(156, 32)));
-            if let Some(stx) = body.get(188..).and_then(shield_tx::from_bytes) {
-                shield_rows("[189..] pledge", &stx, &mut r);
+            r.push(row("[157..221]".into(), "stake blind", hex_at(156, BB)));
+            if let Some(stx) = body.get(156 + BB..).and_then(shield_tx::from_bytes) {
+                shield_rows("[221..] pledge", &stx, &mut r);
             }
         }
         0x60 => {

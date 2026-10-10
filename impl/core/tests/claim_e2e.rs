@@ -103,7 +103,7 @@ fn claimed_reward_coins_are_spendable() {
     // Pad the tree with a handful of coins so the real coins hide among a
     // non-trivial shielded pool.
     for k in (all.len() as u64)..16u64 {
-        node.seed_coin(account.own_coin(1_000 + k, [k, k ^ 0x9e37, k.wrapping_add(1), k.wrapping_add(2)]).commitment());
+        node.seed_coin(account.own_coin(1_000 + k, zcrypt_shield::widen_blind([k, k ^ 0x9e37, k.wrapping_add(1), k.wrapping_add(2)])).commitment());
     }
     let pool: Vec<Commitment> = node.commitment_leaves();
 

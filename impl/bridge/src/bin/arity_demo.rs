@@ -16,13 +16,13 @@ fn main() {
     // Seed a decoy pool (native ZCRYPT) so the single input has a ring to hide in.
     for k in 0..20u64 {
         let pk = spend_pubkey(&[k + 1, k + 2, k + 3, k + 4, k + 5, k + 6, k + 7, k + 8]);
-        let c = commit(1_000 + k, &[k + 7, k + 9, k + 11, k + 13], &pk);
+        let c = commit(1_000 + k, &zcrypt_shield::widen_blind([k + 7, k + 9, k + 11, k + 13]), &pk);
         let _ = zc.broadcast(&swap::seed_tx(&c));
     }
 
     // Seed ONE coin Alice owns. (broadcast_tx_commit is synchronous, so it is in
     // the commitment tree by the time this returns.)
-    let coin = alice.own_coin(500_000, [0x11, 0x22, 0x11u64.wrapping_add(1), 0x22u64.wrapping_add(1)]);
+    let coin = alice.own_coin(500_000, zcrypt_shield::widen_blind([0x11, 0x22, 0x11u64.wrapping_add(1), 0x22u64.wrapping_add(1)]));
     zc.broadcast(&swap::seed_tx(&coin.commitment())).expect("seed owned coin");
     println!("Seeded a SINGLE owned coin worth 500000 (native ZCRYPT).");
 

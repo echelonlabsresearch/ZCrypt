@@ -261,7 +261,7 @@ struct PendingDeposit {
 #[derive(Clone, Serialize, Deserialize)]
 struct SwapChange {
     value: u64,
-    blind: [u64; 4],
+    blind: zcrypt_shield::Blind,
     spend_secret: [u64; 8],
     #[serde(default)]
     asset_id: u64,
@@ -601,7 +601,7 @@ struct PersistCoin {
     coin_id: String,
     value: u64,
     /// 4 field limbs (~124-bit hiding).
-    blind: [u64; 4],
+    blind: zcrypt_shield::Blind,
     /// 8 field limbs (~248-bit spend secret).
     spend_secret: [u64; 8],
     #[serde(default)]
@@ -1885,7 +1885,7 @@ fn build_gas_note(
     gas_i: usize,
     chain_id: &[u8],
     envelope: &[u8],
-) -> Result<(shield_tx::ShieldTx, [u64; 4], Option<CoinRec>), String> {
+) -> Result<(shield_tx::ShieldTx, zcrypt_shield::Blind, Option<CoinRec>), String> {
     let gas_coin = w.coins.get(gas_i).ok_or("gas coin is missing")?.coin;
     let gidx = chain::find_index(leaves, &gas_coin.commitment()).ok_or("gas coin not on chain")?;
     let (gps, gpd) = chain::merkle_path(leaves, gidx as usize).ok_or("gas coin not in the tree")?;
@@ -1930,7 +1930,7 @@ fn build_gas_note(
     Ok((gas_tx, gas_blind, gchg_rec))
 }
 
-/// The encoded GAS PREFIX (`gas_blind(32) ‖ gas_len(4) ‖ gas_tx`) a state-creating tx
+/// The encoded GAS PREFIX (`gas_blind(64) ‖ gas_len(4) ‖ gas_tx`) a state-creating tx
 /// (REGISTER / HTLC_OPEN) must carry. `payload` is the transparent body that follows the
 /// prefix; the gas proof is bound to `gas_pay_envelope(payload)`, which is what consensus
 /// verifies. Returns the prefix, the index of the spent gas coin, and the change coin
@@ -1955,8 +1955,8 @@ fn mint_gas_prefix(
     Ok((out, gas_i, gchg_rec))
 }
 
-/// Serialize a bundled `0x55` transfer: `0x55 ‖ gas_blind(32) ‖ gas_len(4) ‖ gas_tx ‖ main_tx`.
-fn bundle_transfer(gas_blind: &[u64; 4], gas_tx: &shield_tx::ShieldTx, main_tx: &shield_tx::ShieldTx) -> Vec<u8> {
+/// Serialize a bundled `0x55` transfer: `0x55 ‖ gas_blind(64) ‖ gas_len(4) ‖ gas_tx ‖ main_tx`.
+fn bundle_transfer(gas_blind: &zcrypt_shield::Blind, gas_tx: &shield_tx::ShieldTx, main_tx: &shield_tx::ShieldTx) -> Vec<u8> {
     let gas_bytes = shield_tx::to_bytes(gas_tx);
     let main_bytes = shield_tx::to_bytes(main_tx);
     let mut raw = vec![0x55u8];
@@ -2514,17 +2514,18 @@ fn open_external(target: String) -> R<bool> {
     ok(true)
 }
 
-/// Local copy of the node's gas-prefix parser: `gas_blind(32) ‖ gas_len(4) ‖ gas_tx ‖ rest`.
+/// Local copy of the node's gas-prefix parser: `gas_blind(64) ‖ gas_len(4) ‖ gas_tx ‖ rest`.
 fn parse_gas_prefix(b: &[u8]) -> Option<(shield_tx::ShieldTx, &[u8])> {
-    if b.len() < 36 {
+    const BB: usize = zcrypt_shield::BLIND_BYTES;
+    if b.len() < BB + 4 {
         return None;
     }
-    let gas_len = u32::from_le_bytes(b[32..36].try_into().ok()?) as usize;
-    let gas_end = 36usize.checked_add(gas_len)?;
+    let gas_len = u32::from_le_bytes(b[BB..BB + 4].try_into().ok()?) as usize;
+    let gas_end = (BB + 4).checked_add(gas_len)?;
     if b.len() < gas_end {
         return None;
     }
-    let gas_tx = shield_tx::from_bytes(&b[36..gas_end])?;
+    let gas_tx = shield_tx::from_bytes(&b[BB + 4..gas_end])?;
     Some((gas_tx, &b[gas_end..]))
 }
 
@@ -2547,7 +2548,7 @@ pub fn shield_txs_in_tx(tx: &[u8]) -> Vec<shield_tx::ShieldTx> {
     };
     match tag {
         0x55 => {
-            // gas_blind(32) ‖ gas_len(4) ‖ gas_tx ‖ main_tx
+            // gas_blind(64) ‖ gas_len(4) ‖ gas_tx ‖ main_tx
             if let Some((gas, main)) = bswap::parse_transfer_payload(body) {
                 out.push(gas);
                 out.push(main);
@@ -2559,16 +2560,16 @@ pub fn shield_txs_in_tx(tx: &[u8]) -> Vec<shield_tx::ShieldTx> {
                 out.push(gas);
             }
         }
-        // bond: pk(32) stake(8) reward(32) commission(2) nonce(8) sig(64) stake_blind(32) ‖ shield
-        0x57 => at(178, &mut out),
-        // burn-lock: value(8) blind(32) asset(8) hashlock(32) timeout(8) refund_pk(64) ‖ shield
-        0x5D => at(152, &mut out),
-        // delegate: del_pk(32) target(20) stake(8) reward(32) sig(64) stake_blind(32) ‖ shield
-        0x5F => at(188, &mut out),
-        // swap-lock: value(8) blind(32) asset(8) hashlock(32) timeout(8) counterparty(64) refund(64) ‖ shield
-        0x62 => at(216, &mut out),
+        // bond: pk(32) stake(8) reward(32) commission(2) nonce(8) sig(64) stake_blind(64) ‖ shield
+        0x57 => at(146 + zcrypt_shield::BLIND_BYTES, &mut out),
+        // burn-lock: value(8) blind(64) asset(8) hashlock(32) timeout(8) refund_pk(64) ‖ shield
+        0x5D => at(120 + zcrypt_shield::BLIND_BYTES, &mut out),
+        // delegate: del_pk(32) target(20) stake(8) reward(32) sig(64) stake_blind(64) ‖ shield
+        0x5F => at(156 + zcrypt_shield::BLIND_BYTES, &mut out),
+        // swap-lock: value(8) blind(64) asset(8) hashlock(32) timeout(8) counterparty(64) refund(64) ‖ shield
+        0x62 => at(184 + zcrypt_shield::BLIND_BYTES, &mut out),
         // burn-lock with btc_claim_pk(33) ‖ burn-lock body
-        0x67 => at(185, &mut out),
+        0x67 => at(33 + 120 + zcrypt_shield::BLIND_BYTES, &mut out),
         _ => {}
     }
     out
@@ -3153,7 +3154,7 @@ fn bond_tx_presigned(
     stake: u64,
     reward: [u8; 32],
     commission: u16,
-    stake_blind: [u64; 4],
+    stake_blind: zcrypt_shield::Blind,
     nonce: u64,
     pledge: &shield_tx::ShieldTx,
 ) -> Vec<u8> {
@@ -3324,7 +3325,7 @@ fn build_stake_pledge(
     // The signed header's envelope (`staking::bond_envelope` / `delegate_envelope`): the
     // proof is bound to it, so nobody can re-wrap this pledge under another key.
     envelope: &[u8],
-) -> Result<(shield_tx::ShieldTx, [u64; 4], Vec<usize>, Option<CoinRec>), String> {
+) -> Result<(shield_tx::ShieldTx, zcrypt_shield::Blind, Vec<usize>, Option<CoinRec>), String> {
     let mut cand: Vec<usize> = w
         .coins
         .iter()
@@ -3436,7 +3437,7 @@ fn delegate_tx(
     target: &[u8],
     stake: u64,
     reward: [u8; 32],
-    stake_blind: [u64; 4],
+    stake_blind: zcrypt_shield::Blind,
     pledge: &shield_tx::ShieldTx,
     chain_id: &[u8],
 ) -> Vec<u8> {
@@ -3959,7 +3960,7 @@ fn bridge_init(state: State<AppState>) -> R<u64> {
         // coins pad the anonymity set without ever being redeemable.
         let c = zcrypt_shield::commit_asset(
             1_000 + k,
-            &[k + 7, k + 9, k + 11, k + 13],
+            &zcrypt_shield::widen_blind([k + 7, k + 9, k + 11, k + 13]),
             &zcrypt_core::htlc_shield::BURN_PK,
             asset,
         );

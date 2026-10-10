@@ -136,7 +136,7 @@ fn claim_mints_a_spendable_private_zbtc_coin() {
     let coin2 = alice.own_asset_coin(value, keys::random_blind(), asset);
     node.seed_coin(coin2.commitment()); // tree index 1 (minted coin is index 0)
     for k in 2..16u64 {
-        node.seed_coin(alice.own_asset_coin(1_000 + k, [k, k ^ 0x9e37, k.wrapping_add(1), k.wrapping_add(2)], asset).commitment());
+        node.seed_coin(alice.own_asset_coin(1_000 + k, zcrypt_shield::widen_blind([k, k ^ 0x9e37, k.wrapping_add(1), k.wrapping_add(2)]), asset).commitment());
     }
     let pool: Vec<Commitment> = node.commitment_leaves();
     assert_eq!(pool[0], minted);
@@ -182,7 +182,7 @@ fn asset_lock_tx(
     node: &mut Node,
     asset: u64,
     lock_value: u64,
-    burn_blind: [u64; 4],
+    burn_blind: zcrypt_shield::Blind,
     fee: u64,
     // The lock envelope the spend is bound to; must match what the node rebuilds from the
     // lock parameters, or the proof is (correctly) rejected as malleated.
@@ -194,7 +194,7 @@ fn asset_lock_tx(
     node.seed_coin(c0.commitment());
     node.seed_coin(c1.commitment());
     for k in 2..16u64 {
-        node.seed_coin(alice.own_asset_coin(1_000 + k, [k, k ^ 0x9e37, k.wrapping_add(1), k.wrapping_add(2)], asset).commitment());
+        node.seed_coin(alice.own_asset_coin(1_000 + k, zcrypt_shield::widen_blind([k, k ^ 0x9e37, k.wrapping_add(1), k.wrapping_add(2)]), asset).commitment());
     }
     let pool: Vec<Commitment> = node.commitment_leaves();
     let mk = |c: &Coin, leaf_idx: usize| {
@@ -228,7 +228,7 @@ fn burn_lock_tx(
     node: &mut Node,
     asset: u64,
     lock_value: u64,
-    burn_blind: [u64; 4],
+    burn_blind: zcrypt_shield::Blind,
     envelope: &[u8],
 ) -> zcrypt_core::shield_tx::ShieldTx {
     asset_lock_tx(alice, node, asset, lock_value, burn_blind, zcrypt_core::emission::MIN_FEE, envelope)
@@ -240,7 +240,7 @@ fn swap_asset_tx(
     node: &mut Node,
     asset: u64,
     lock_value: u64,
-    burn_blind: [u64; 4],
+    burn_blind: zcrypt_shield::Blind,
     envelope: &[u8],
 ) -> zcrypt_core::shield_tx::ShieldTx {
     asset_lock_tx(alice, node, asset, lock_value, burn_blind, 0, envelope)
@@ -248,7 +248,7 @@ fn swap_asset_tx(
 
 /// Seed a ZCRYPT coin and prove a fee-0 spend whose output[0] burns exactly 0.01 ZCRYPT.
 /// Returns `(gas_tx, gas_blind)`.
-fn zcrypt_gas(owner: &Account, node: &mut Node, payload: &[u8]) -> (zcrypt_core::shield_tx::ShieldTx, [u64; 4]) {
+fn zcrypt_gas(owner: &Account, node: &mut Node, payload: &[u8]) -> (zcrypt_core::shield_tx::ShieldTx, zcrypt_shield::Blind) {
     let fee = zcrypt_core::emission::MIN_FEE;
     let coin = owner.own_coin(fee + 1_000, keys::random_blind());
     node.seed_coin(coin.commitment());

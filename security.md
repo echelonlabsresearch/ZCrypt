@@ -13,7 +13,8 @@ Every cryptographic primitive on the value layer is hash-based or lattice-based:
 | Note encryption | ML-KEM-768 (FIPS 203 lattice KEM) | Module-LWE |
 | Mint / rotation authority | ML-DSA-65, M-of-N threshold | Module-LWE/SIS |
 | Bridge hashlocks | SHA-256 (shared with Bitcoin script) | hash security |
-| STARK parameters | 112 FRI queries, rate 1/4, 20-bit grinding: 244 conjectured bits, fixed in every build | FRI conjecture |
+| STARK parameters | Plonky3 0.6.1, 112 FRI queries, rate 1/4, 20-bit grinding, degree-5 extension: 132 Johnson-bound bits (the floor the node checks); 244 is the list-decoding conjecture, not a floor | Johnson bound; FRI conjecture |
+| Digest width | 8 BabyBear limbs (about 247 bits): roughly 124-bit classical collision, roughly 82-bit generic quantum (BHT) collision, roughly 124-bit quantum preimage. Not 128-bit post-quantum collision resistance | ideal-permutation model |
 
 There is **no signature scheme on the shielded money**. Spend authority is knowledge
 of a hash preimage (`pk = Poseidon2(spend_secret)`) proven inside the circuit. No
@@ -32,10 +33,12 @@ toxic waste existed, so there is no moment to have compromised.
 
 ## Soundness: why hidden value cannot be forged
 
-* **Commitments bind the owner.** `C = Poseidon2(value, blind, pk, asset_id)`
-  binds amount, owner, and asset in one hash. The sender of a coin knows `pk`
+* **Commitments bind the owner.** `C = Poseidon2(value, Poseidon2(pk, blind), asset_id)`
+  binds amount, owner, and asset: an inner compression over the 8-limb spend pubkey and the
+  8-limb (~248-bit) blind, then an outer, role-tagged compression over that digest, the value
+  and the asset. The sender of a coin knows `pk`
   but not the preimage, so only the recipient can ever spend it.
-* **Canonical nullifiers.** `nf = Poseidon2(spend_secret, value, blind, asset_id)`
+* **Canonical nullifiers.** `nf = Poseidon2(Poseidon2(spend_secret, blind), value, asset_id)`
   is a deterministic function of the coin: re-spends collide in the nullifier set (a
   sparse Merkle tree folded into the app hash) and are rejected by consensus. The
   commitment, nullifier and spend-key preimages carry distinct role tags, so the three

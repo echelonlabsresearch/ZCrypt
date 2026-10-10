@@ -114,6 +114,24 @@ pub enum AddressKind {
     Stealth,
 }
 
+/// Canonical byte serialization of a field limb everywhere a limb is serialized
+/// here: 8 bytes, little-endian `u64`, value `< p`. Non-canonical limbs are rejected.
+pub const LIMB_BYTES: usize = 8;
+/// Spend public key: 8 canonical limbs.
+pub const PUBKEY_BYTES: usize = 8 * LIMB_BYTES;
+/// ML-KEM-768 encapsulation key (FIPS 203).
+pub const ML_KEM_768_EK_BYTES: usize = 1184;
+/// Address payload: `kind(1) ‖ pk(64) ‖ ek(1184)` = 1249 bytes.
+pub const ADDRESS_BYTES: usize = 1 + PUBKEY_BYTES + ML_KEM_768_EK_BYTES;
+/// Bearer coin payload: `value(8) ‖ blind(64) ‖ spend_secret(64) ‖ asset(8)` = 144 bytes.
+pub const BEARER_COIN_BYTES: usize = LIMB_BYTES + zcrypt_shield::BLIND_BYTES + 8 * LIMB_BYTES + LIMB_BYTES;
+const BC_BLIND: usize = LIMB_BYTES;
+const BC_SS: usize = BC_BLIND + zcrypt_shield::BLIND_BYTES;
+const BC_ASSET: usize = BC_SS + 8 * LIMB_BYTES;
+/// Encoded `zc1…` address length in characters: hrp(2) + separator(1) +
+/// ceil(1249·8/5) = 1999 data characters + 6 checksum = 2008.
+pub const ADDRESS_BECH32_CHARS: usize = 2 + 1 + (ADDRESS_BYTES * 8 + 4) / 5 + 6;
+
 /// A recipient address: an ML-KEM encapsulation key (for note encryption) plus the
 /// recipient's spend public key `pk` (bound into the coin commitment so only the
 /// recipient can spend), plus a kind tag.
@@ -428,9 +446,11 @@ impl Account {
     }
 }
 
-// Note layout: value(8 LE) ‖ blind(4×8 LE) ‖ asset_id(8 LE) = 48 bytes.
+/// Note plaintext layout: value(8 LE) ‖ blind(8×8 LE) ‖ asset_id(8 LE) = 80 bytes
+/// (padded to `kem::PAD_LEN` before encryption).
+pub const NOTE_PLAIN_LEN: usize = 8 + zcrypt_shield::BLIND_BYTES + 8;
 fn encode_note(value: u64, blind: &Blind, asset_id: u64) -> Vec<u8> {
-    let mut v = Vec::with_capacity(48);
+    let mut v = Vec::with_capacity(NOTE_PLAIN_LEN);
     v.extend_from_slice(&value.to_le_bytes());
     for x in blind {
         v.extend_from_slice(&x.to_le_bytes());
@@ -440,15 +460,16 @@ fn encode_note(value: u64, blind: &Blind, asset_id: u64) -> Vec<u8> {
 }
 
 fn decode_note(b: &[u8]) -> Option<(u64, Blind, u64)> {
-    // Current format: 8 + 32 + 8 = 48.
-    if b.len() < 48 {
+    // Current format: 8 + 64 + 8 = 80.
+    if b.len() < NOTE_PLAIN_LEN {
         return None;
     }
     let value = u64::from_le_bytes(b[0..8].try_into().ok()?);
     let blind: Blind = core::array::from_fn(|i| {
         zcrypt_shield::field_limb(u64::from_le_bytes(b[8 + i * 8..16 + i * 8].try_into().unwrap()))
     });
-    let asset_id = u64::from_le_bytes(b[40..48].try_into().ok()?);
+    let a = 8 + zcrypt_shield::BLIND_BYTES;
+    let asset_id = u64::from_le_bytes(b[a..a + 8].try_into().ok()?);
     // The commitment lane is the asset id reduced into the field, so a sender could write
     // `id + p` and the recipient would recompute the same commitment while displaying an
     // unknown asset. Only canonical ids are accepted (registry ids always are).
@@ -539,12 +560,17 @@ pub fn reward_address(pk: &PubKey) -> Hash {
 pub fn claim_blind(pk: &PubKey, index: u64) -> Blind {
     let d0 = h(b"ZC-CLAIM-BLIND", &[&pk_bytes(pk), &index.to_le_bytes()]);
     let d1 = h(b"ZC-CLAIM-BLN2", &[&pk_bytes(pk), &index.to_le_bytes()]);
-    [
-        zcrypt_shield::field_limb(u64::from_le_bytes(d0[0..8].try_into().unwrap())),
-        zcrypt_shield::field_limb(u64::from_le_bytes(d0[8..16].try_into().unwrap())),
-        zcrypt_shield::field_limb(u64::from_le_bytes(d1[0..8].try_into().unwrap())),
-        zcrypt_shield::field_limb(u64::from_le_bytes(d1[8..16].try_into().unwrap())),
-    ]
+    blind_from_digests(&d0, &d1)
+}
+
+/// Eight canonical limbs from two 32-byte digests: four limbs from each, reduced into
+/// the field. Shared by every deterministic public blind.
+fn blind_from_digests(d0: &Hash, d1: &Hash) -> Blind {
+    core::array::from_fn(|i| {
+        let d = if i < 4 { d0 } else { d1 };
+        let o = (i % 4) * 8;
+        zcrypt_shield::field_limb(u64::from_le_bytes(d[o..o + 8].try_into().unwrap()))
+    })
 }
 
 /// The coinbase commitment the node mints for the `index`-th claimed reward coin
@@ -559,12 +585,7 @@ pub fn reward_commitment(pk: &PubKey, value: u64, index: u64) -> Commitment {
 fn fee_reward_blind(pk: &PubKey, asset_id: u64, index: u64) -> Blind {
     let d0 = h(b"ZC-FEE-BLIND", &[&pk_bytes(pk), &asset_id.to_le_bytes(), &index.to_le_bytes()]);
     let d1 = h(b"ZC-FEE-BLN2", &[&pk_bytes(pk), &asset_id.to_le_bytes(), &index.to_le_bytes()]);
-    [
-        zcrypt_shield::field_limb(u64::from_le_bytes(d0[0..8].try_into().unwrap())),
-        zcrypt_shield::field_limb(u64::from_le_bytes(d0[8..16].try_into().unwrap())),
-        zcrypt_shield::field_limb(u64::from_le_bytes(d1[0..8].try_into().unwrap())),
-        zcrypt_shield::field_limb(u64::from_le_bytes(d1[8..16].try_into().unwrap())),
-    ]
+    blind_from_digests(&d0, &d1)
 }
 
 /// The commitment the node mints for the `index`-th claimed bridge-fee coin of `value`
@@ -610,12 +631,7 @@ pub fn claim_chunks(amount: u64, first_claim: bool) -> Vec<u64> {
 pub fn htlc_blind(pk: &PubKey, escrow_id: &Hash) -> Blind {
     let d0 = h(b"ZC-HTLC-BLIND", &[&pk_bytes(pk), escrow_id]);
     let d1 = h(b"ZC-HTLC-BLN2", &[&pk_bytes(pk), escrow_id]);
-    [
-        zcrypt_shield::field_limb(u64::from_le_bytes(d0[0..8].try_into().unwrap())),
-        zcrypt_shield::field_limb(u64::from_le_bytes(d0[8..16].try_into().unwrap())),
-        zcrypt_shield::field_limb(u64::from_le_bytes(d1[0..8].try_into().unwrap())),
-        zcrypt_shield::field_limb(u64::from_le_bytes(d1[8..16].try_into().unwrap())),
-    ]
+    blind_from_digests(&d0, &d1)
 }
 
 /// The coinbase commitment the node mints to settle an HTLC claim: `value` of
@@ -679,10 +695,10 @@ impl BearerCoin {
         self.coin.commitment()
     }
 
-    /// Serialize the whole coin (`value ‖ blind(4) ‖ spend_secret(8) ‖ asset_id`) —
-    /// this IS the money (112 bytes). Anyone with these bytes can spend it.
+    /// Serialize the whole coin (`value ‖ blind(8) ‖ spend_secret(8) ‖ asset_id`) —
+    /// this IS the money (144 bytes). Anyone with these bytes can spend it.
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut v = Vec::with_capacity(112);
+        let mut v = Vec::with_capacity(BEARER_COIN_BYTES);
         v.extend_from_slice(&self.coin.value.to_le_bytes());
         for x in &self.coin.blind {
             v.extend_from_slice(&x.to_le_bytes());
@@ -695,18 +711,24 @@ impl BearerCoin {
     }
 
     pub fn from_bytes(b: &[u8]) -> Option<Self> {
-        // value(8) + blind(32) + spend_secret(64) + asset(8) = 112
-        if b.len() < 112 {
+        // value(8) + blind(64) + spend_secret(64) + asset(8) = 144, exactly. Trailing
+        // bytes are rejected so one coin has one byte string (and one bech32m string).
+        if b.len() != BEARER_COIN_BYTES {
             return None;
         }
         let value = u64::from_le_bytes(b[0..8].try_into().ok()?);
         let blind: Blind = core::array::from_fn(|i| {
-            zcrypt_shield::field_limb(u64::from_le_bytes(b[8 + i * 8..16 + i * 8].try_into().unwrap()))
+            u64::from_le_bytes(b[BC_BLIND + i * 8..BC_BLIND + 8 + i * 8].try_into().unwrap())
         });
         let spend_secret: SpendSecret = core::array::from_fn(|i| {
-            zcrypt_shield::field_limb(u64::from_le_bytes(b[40 + i * 8..48 + i * 8].try_into().unwrap()))
+            u64::from_le_bytes(b[BC_SS + i * 8..BC_SS + 8 + i * 8].try_into().unwrap())
         });
-        let asset_id = u64::from_le_bytes(b[104..112].try_into().ok()?);
+        // Every limb is a canonical field element (< p). A limb `x + p` would open the
+        // same coin as `x` under a second encoding; reject rather than reduce.
+        if !blind.iter().chain(spend_secret.iter()).all(|&x| x < zcrypt_shield::FIELD_ORDER) {
+            return None;
+        }
+        let asset_id = u64::from_le_bytes(b[BC_ASSET..BC_ASSET + 8].try_into().ok()?);
         if asset_id >= zcrypt_shield::FIELD_ORDER {
             return None; // non-canonical asset lane (see decode_note)
         }
@@ -796,9 +818,9 @@ mod tests {
         // Consensus pins every note to `kem::NOTE_WIRE_LEN`; real notes and cover notes
         // must both hit it exactly or every wallet transfer would be rejected.
         let (acct, _) = new_account();
-        let real = kem::ciphertext_to_bytes(&encrypt_note(&acct.normal_address(), 5, [1, 2, 3, 4]));
+        let real = kem::ciphertext_to_bytes(&encrypt_note(&acct.normal_address(), 5, [1, 2, 3, 4, 5, 6, 7, 8]));
         assert_eq!(real.len(), kem::NOTE_WIRE_LEN);
-        let asset = kem::ciphertext_to_bytes(&encrypt_note_asset(&acct.stealth_address(), 5, [1, 2, 3, 4], 77));
+        let asset = kem::ciphertext_to_bytes(&encrypt_note_asset(&acct.stealth_address(), 5, [1, 2, 3, 4, 5, 6, 7, 8], 77));
         assert_eq!(asset.len(), kem::NOTE_WIRE_LEN);
         assert_eq!(cover_note_bytes().len(), kem::NOTE_WIRE_LEN);
     }
@@ -928,6 +950,54 @@ mod tests {
         chars[mid] = if chars[mid] == 'q' { 'p' } else { 'q' };
         let corrupted: String = chars.into_iter().collect();
         assert!(Address::from_bech32(&corrupted).is_none(), "checksum must reject a typo");
+    }
+
+    #[test]
+    fn serialized_lengths_are_exactly_the_published_ones() {
+        let addr = Account::from_seed(seed(5)).normal_address();
+        assert_eq!(BEARER_COIN_BYTES, 144);
+        assert_eq!(PUBKEY_BYTES, 64);
+        assert_eq!(ML_KEM_768_EK_BYTES, 1184);
+        assert_eq!(ADDRESS_BYTES, 1249);
+        assert_eq!(ADDRESS_BECH32_CHARS, 2008);
+        assert_eq!(addr.to_bytes().len(), ADDRESS_BYTES);
+        assert_eq!(addr.to_bech32().len(), ADDRESS_BECH32_CHARS);
+        assert_eq!(BearerCoin::create(1).to_bytes().len(), BEARER_COIN_BYTES);
+    }
+
+    #[test]
+    fn decoders_reject_trailing_bytes_and_noncanonical_limbs() {
+        let mut a = Account::from_seed(seed(6)).normal_address().to_bytes();
+        assert!(Address::from_bytes(&a).is_some());
+        a.push(0);
+        assert!(Address::from_bytes(&a).is_none(), "address: trailing byte");
+        a.pop();
+        a.pop();
+        assert!(Address::from_bytes(&a).is_none(), "address: truncated");
+
+        let b = BearerCoin::create(777).to_bytes();
+        let mut t = b.clone();
+        t.push(0);
+        assert!(BearerCoin::from_bytes(&t).is_none(), "bearer: trailing byte");
+        assert!(BearerCoin::from_bytes(&b[..BEARER_COIN_BYTES - 1]).is_none(), "bearer: truncated");
+        // Every limb slot: 0, 1, p-1 accepted; p, p+1, 2^32, 2^64-1 rejected.
+        let p = zcrypt_shield::FIELD_ORDER;
+        for off in (BC_BLIND..BC_ASSET).step_by(8) {
+            for (v, ok) in [(0u64, true), (1, true), (p - 1, true), (p, false), (p + 1, false), (1 << 32, false), (u64::MAX, false)] {
+                let mut m = b.clone();
+                m[off..off + 8].copy_from_slice(&v.to_le_bytes());
+                assert_eq!(BearerCoin::from_bytes(&m).is_some(), ok, "limb at {off} = {v}");
+            }
+        }
+        // A reduced alias (x + p) must not decode to the same coin as x.
+        let mut m = b.clone();
+        let x = u64::from_le_bytes(b[8..16].try_into().unwrap());
+        m[8..16].copy_from_slice(&(x + p).to_le_bytes());
+        assert!(BearerCoin::from_bytes(&m).is_none());
+        // Asset lane: same canonical rule.
+        let mut m = b.clone();
+        m[BC_ASSET..BC_ASSET + 8].copy_from_slice(&p.to_le_bytes());
+        assert!(BearerCoin::from_bytes(&m).is_none());
     }
 
     #[test]
