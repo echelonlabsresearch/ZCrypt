@@ -801,6 +801,48 @@ pub fn finalize_margin_policy(network: bitcoin::Network, requested: Option<u64>,
     Ok(margin)
 }
 
+/// Transport policy for the operator's bitcoind RPC URL. The bitcoind client speaks plain
+/// HTTP with basic auth (no TLS), so on a real network the URL must stay on a private path:
+/// loopback, an RFC 1918 / CGNAT / link-local / ULA address (a WireGuard or VPC interface),
+/// a single-label hostname (a compose service or LAN name), or an `https://` URL fronted by
+/// a TLS proxy. Plain `http://` to a public address or a dotted hostname would send the
+/// RPC password and every wallet call across the internet in the clear, so it is refused
+/// unless `allow_public` (env `ZCRYPT_BTC_RPC_ALLOW_PUBLIC=1`) is set. Regtest is exempt.
+pub fn btc_rpc_url_policy(network: bitcoin::Network, url: &str, allow_public: bool) -> Result<(), String> {
+    if network == bitcoin::Network::Regtest || allow_public {
+        return Ok(());
+    }
+    let parsed = url::Url::parse(url).map_err(|e| format!("BTC_URL {url:?}: {e}"))?;
+    if parsed.scheme() == "https" {
+        return Ok(());
+    }
+    if parsed.scheme() != "http" {
+        return Err(format!("BTC_URL {url:?}: expected http:// or https://"));
+    }
+    let private = match parsed.host() {
+        Some(url::Host::Ipv4(ip)) => {
+            ip.is_loopback()
+                || ip.is_private()
+                || ip.is_link_local()
+                || (ip.octets()[0] == 100 && (64..128).contains(&ip.octets()[1]))
+        }
+        Some(url::Host::Ipv6(ip)) => {
+            ip.is_loopback() || (ip.segments()[0] & 0xfe00) == 0xfc00 || (ip.segments()[0] & 0xffc0) == 0xfe80
+        }
+        Some(url::Host::Domain(d)) => d == "localhost" || !d.contains('.'),
+        None => false,
+    };
+    if private {
+        return Ok(());
+    }
+    Err(format!(
+        "BTC_URL {url:?} is plain http to a public host on {network:?}. The bitcoind RPC carries the RPC \
+         password and wallet calls unencrypted, so reach the node over a private link instead (WireGuard, \
+         VPC peering, an SSH tunnel to 127.0.0.1) or front it with TLS and use https://. Set \
+         ZCRYPT_BTC_RPC_ALLOW_PUBLIC=1 only if you accept the exposure."
+    ))
+}
+
 /// Load the operator's RESERVE key the way the daemon expects it (bridge L4). Sources, in
 /// order of preference:
 ///
@@ -858,6 +900,29 @@ pub fn previous_reserve_keys_from_env() -> Result<Vec<Key>, String> {
 mod tests {
     use super::*;
     use bitcoin::hashes::Hash as _;
+
+    #[test]
+    fn btc_rpc_url_policy_keeps_mainnet_rpc_off_the_public_internet() {
+        use bitcoin::Network::{Bitcoin, Regtest};
+        for ok in [
+            "http://127.0.0.1:8332",
+            "http://localhost:8332",
+            "http://10.8.0.2:8332",
+            "http://192.168.1.10:8332",
+            "http://172.31.5.9:8332",
+            "http://100.64.3.1:8332",
+            "http://[fd00::1]:8332",
+            "http://bitcoind:8332",
+            "https://btc.example.com:8332",
+        ] {
+            assert!(btc_rpc_url_policy(Bitcoin, ok, false).is_ok(), "{ok}");
+        }
+        for bad in ["http://203.0.113.5:8332", "http://btc.example.com:8332", "http://100.128.0.1:8332", "ftp://x"] {
+            assert!(btc_rpc_url_policy(Bitcoin, bad, false).is_err(), "{bad}");
+        }
+        assert!(btc_rpc_url_policy(Bitcoin, "http://203.0.113.5:8332", true).is_ok());
+        assert!(btc_rpc_url_policy(Regtest, "http://203.0.113.5:18443", false).is_ok());
+    }
     use bitcoin::Network;
     use std::cell::{Cell, RefCell};
     use zcrypt_core::nullifier::htlc_hashlock;

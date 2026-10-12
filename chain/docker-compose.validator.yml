@@ -74,7 +74,7 @@ services:
       # Override SEED_RPC/SEED_P2P_* in .env to join a different chain (e.g. a local
       # foundation). GENESIS_URL is an optional static-file override.
       SEED_RPC: ${SEED_RPC:-https://rpc.zcrypt.network}
-      SEED_P2P_HOST: ${SEED_P2P_HOST:-foundation.zcrypt.network}
+      SEED_P2P_HOST: ${SEED_P2P_HOST:-rpc.zcrypt.network}
       SEED_P2P_PORT: ${SEED_P2P_PORT:-26656}
       GENESIS_URL: ${GENESIS_URL:-}
       # The SHA-256 the foundation published for genesis.json. When set, the node refuses to

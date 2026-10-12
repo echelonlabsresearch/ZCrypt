@@ -6,7 +6,9 @@
 //!
 //! Config (env):
 //!   ZC_URL                  ZCrypt CometBFT RPC              (default http://localhost:36657)
-//!   BTC_URL/USER/PASS       bitcoind RPC                    (regtest/dev backend)
+//!   BTC_URL/USER/PASS       bitcoind RPC. Plain HTTP + basic auth, so outside regtest the
+//!                           URL must be loopback, a private/VPN address, a single-label
+//!                           host, or https:// (ZCRYPT_BTC_RPC_ALLOW_PUBLIC=1 overrides).
 //!   BTC_WALLET              operator payout wallet          (default "operator")
 //!   BTC_NETWORK             regtest|signet|testnet|bitcoin  (default regtest)
 //!   ZCRYPT_RESERVE_KEY_FILE file with the DERIVED 32-byte reserve key (64 hex or raw). This
@@ -43,7 +45,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use zcrypt_bridge::watcher::{
-    finalize_margin_policy, previous_reserve_keys_from_env, reserve_key_from_env, watcher_tick_persisting, WatcherState,
+    btc_rpc_url_policy, finalize_margin_policy, previous_reserve_keys_from_env, reserve_key_from_env, watcher_tick_persisting, WatcherState,
 };
 use zcrypt_bridge::zcrypt::Zcrypt;
 use zcrypt_bridge::{swap, Btc};
@@ -79,6 +81,13 @@ fn main() {
     let zc = Zcrypt::new(&env("ZC_URL", "http://localhost:36657"));
     let btc_url = env("BTC_URL", "http://localhost:18443");
     let net = zcrypt_bridge::network_from_str(&env("BTC_NETWORK", "regtest"));
+    // Startup invariant: the bitcoind RPC is plaintext, so on a real network it must be
+    // reached over a private link (see `btc_rpc_url_policy`).
+    let allow_public = matches!(env("ZCRYPT_BTC_RPC_ALLOW_PUBLIC", "0").trim(), "1" | "true" | "yes");
+    if let Err(e) = btc_rpc_url_policy(net, &btc_url, allow_public) {
+        eprintln!("[bridge-watcher] {e}");
+        std::process::exit(2);
+    }
     let wallet = env("BTC_WALLET", "operator");
     let _ = Btc::ensure_wallet(&btc_url, &env("BTC_USER", "zcrypt"), &env("BTC_PASS", "zcrypt"), &wallet);
     let operator_btc = Btc::connect(&btc_url, &env("BTC_USER", "zcrypt"), &env("BTC_PASS", "zcrypt"), &wallet, net)

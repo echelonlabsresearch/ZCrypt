@@ -1,7 +1,8 @@
 # ZCrypt mainnet launch runbook
 
-Everything below assumes the repo state as of 2026-09-07 (post-audit fixes: genesis-bound
-zBTC reserve key, digest-pinned validator image, secrets out of the environment).
+Everything below assumes the repo state as of 2026-10-12 (genesis-bound zBTC reserve key,
+digest-pinned validator image, secrets out of the environment, 8-limb blind and two-block
+commitments; a node or wallet built before 2026-10-10 is wire-incompatible with this chain).
 Order matters: steps 1, 2 and 5 fix consensus constants and genesis fields, so they happen
 BEFORE the first block ever exists. Once block 1 is signed, these are fixed forever.
 
@@ -161,6 +162,44 @@ redeem margin, are fixed in code; see the audit history in ../security.md):
    by hand, monitor the daemon, and keep `WATCHER_FINALIZE_MARGIN` at or above the
    daemon's floor (it refuses to start below it).
 
+### Operator bitcoind on a separate host (AWS) over a private link
+
+The watcher's bitcoind client is plain HTTP with basic auth: no TLS. When bitcoind runs on
+another machine (the AWS node) the RPC must never cross the public internet. The daemon
+enforces this: outside regtest it refuses to start with a `BTC_URL` that is plain `http://`
+to a public address or a dotted hostname (loopback, RFC 1918 / CGNAT / link-local / ULA
+addresses, single-label hosts and `https://` pass; `ZCRYPT_BTC_RPC_ALLOW_PUBLIC=1` overrides).
+
+1. WireGuard between the DigitalOcean droplet and the AWS instance. AWS security group:
+   UDP 51820 inbound from the droplet's public IP only; 8332 not open to anything. DO cloud
+   firewall: inbound 22, 80, 443, 26656 TCP from anywhere, UDP 51820 from the AWS IP only.
+2. `bitcoin.conf` on the AWS node (mainnet, fully synced):
+
+   ```
+   server=1
+   txindex=1
+   rpcauth=<rpcauth.py output for user zcrypt>
+   rpcbind=127.0.0.1
+   rpcbind=<AWS WireGuard IP>
+   rpcallowip=<droplet WireGuard IP>/32
+   ```
+
+   `txindex` is required: the watcher reads non-wallet transactions (user claims) with
+   `getrawtransaction`. Do not pre-create a wallet; the daemon creates and loads `operator`.
+3. From the droplet, confirm the tunnel before enabling the bridge profile:
+
+   ```sh
+   curl -s --user zcrypt:<pass> --data-binary \
+     '{"jsonrpc":"1.0","id":"t","method":"getblockcount","params":[]}' http://<AWS-WG-IP>:8332/
+   ```
+
+4. In `.env`: `BTC_URL=http://<AWS-WG-IP>:8332`, `BTC_USER`, `BTC_PASS`, `BTC_NETWORK=bitcoin`.
+5. Fund the operator wallet (`bitcoin-cli -rpcwallet=operator getnewaddress` on the AWS box)
+   with the BTC float that pays redeems. The watcher also relays Bitcoin headers into
+   consensus on every pass, so while it or the AWS node is down, deposits wait for headers
+   and redeems queue; nothing is lost, and deposits still mint only on a consensus-verified
+   SPV proof.
+
 ### 7. Bitcoin SPV checkpoint (do tonight, before bring-up)
 
 Mainnet cannot start without `ZCRYPT_BTC_CHECKPOINT` (the node fails closed). Generate it:
@@ -170,8 +209,9 @@ cd chain && ./mainnet-checkpoint.sh
 # -> ZCRYPT_BTC_CHECKPOINT=<160-hex-header>:<height>   (height is a multiple of 2016)
 ```
 
-INDEPENDENTLY VERIFY the header against a second source before trusting it (your own
-`bitcoin-cli getblockheader <hash> false`, or a second explorer). You set
+INDEPENDENTLY VERIFY the header against your AWS node before trusting it:
+`bitcoin-cli getblockhash <height>` then `bitcoin-cli getblockheader <hash> false` must
+print the same 160 hex characters. You set
 `ZCRYPT_BTC_NET` + `ZCRYPT_BTC_CHECKPOINT` ONCE, on the foundation, before `docker
 compose up`: the cometbft entrypoint bakes both into the genesis `app_state` (alongside
 `foundation_addr`), so the genesis fully describes the bridge. Validators do NOT set them

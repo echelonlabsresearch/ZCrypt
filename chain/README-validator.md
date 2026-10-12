@@ -44,7 +44,7 @@ The validator's own RPC is published on `127.0.0.1:56657` only (set `VALIDATOR_R
 to open it deliberately); P2P `56656` must be reachable by peers.
 
 It is plug-and-play because the compose defaults point at the public foundation
-(`foundation.zcrypt.network`): it fetches the genesis and finds a peer from the seed node's
+(`rpc.zcrypt.network`, which also serves P2P on 26656): it fetches the genesis and finds a peer from the seed node's
 RPC, and the genesis carries the foundation address in its `app_state`, so a downloaded
 genesis fully describes the chain.
 
@@ -114,7 +114,7 @@ ZCRYPT_REWARD_ADDR=<64hex> ./validator-bond.sh    # reward address from the wall
 Don't want to run a node? Stake to someone else's validator and share its rewards. In the
 wallet, go to **Rewards → 🤝 Delegate to a validator**:
 
-- Pick a validator from the dropdown — it shows each one's **stake** and **commission**, so
+- Pick a validator from the dropdown: it shows each one's **stake** and **commission**, so
   you can shop for a low commission.
 - Enter an amount and click **Delegate**. The stake is pledged from your wallet balance.
 - You earn a share of that validator's rewards **proportional to your stake, net of its
@@ -129,9 +129,9 @@ and honest.
 
 Validators **and** delegators earn two income streams, both in the wallet's **Rewards** tab:
 
-- **ZCRYPT block rewards** — your share of the per-block emission (net of commission if you
+- **ZCRYPT block rewards**: your share of the per-block emission (net of commission if you
   delegated). Shows as **Claimable**; click **Claim** to mint it into spendable ZCRYPT.
-- **🌉 Bridge-fee yield** — a share of the fees from bridge volume, denominated in the
+- **🌉 Bridge-fee yield**: a share of the fees from bridge volume, denominated in the
   **bridged asset itself** (e.g. real zBTC), split by the same stake × participation rule.
   Each asset shows its claimable balance with a **Claim** button.
 
@@ -142,7 +142,7 @@ too, with how long until each stake is free.
 ## Join a local test foundation instead of the public one
 
 Point the validator at a local foundation with a `.env` next to the compose file (see
-`validator.env.example`) — genesis and peer both come from the seed RPC, nothing to host:
+`validator.env.example`): genesis and peer both come from the seed RPC, nothing to host:
 
 ```sh
 SEED_RPC=http://host.docker.internal:36657
