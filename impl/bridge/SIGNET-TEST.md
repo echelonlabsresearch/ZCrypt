@@ -122,6 +122,22 @@ shows your signet BTC balance (from the `demo` wallet) and a **deposit address**
 - No step ever calls `mine()` (it would error on signet); every advance waits for a real
   confirmation.
 
+## Running the operator watcher against signet
+
+The two-party flow (user wallet + `bridge_watcher`) runs on signet with `BTC_NETWORK=signet`
+and the watcher pointed at the signet bitcoind above. Three start-up knobs matter on a test
+box that has been used before:
+
+- `WATCHER_CURSOR_SEED=<zc height>`: a fresh watcher starts scanning there instead of at
+  genesis (a from-genesis scan also picks up every earlier test's deposits and redeems).
+- `ZCRYPT_WATCHER_FRESH_STATE=1`: a fresh watcher whose bitcoind wallet already shows P2WSH
+  (HTLC) sends from earlier runs is otherwise refused as a probably lost state file.
+- `<WATCHER_STATE>.lock`: only one watcher per state file; stop the old one first.
+
+Redeem locks the watcher funds are anchored to the burn's ZC block time through Bitcoin's
+median-time-past (six hours back), so on signet expect the funded CLTV to sit roughly 36
+blocks below `tip + 288`; that is by design (the lock is reproducible after a state loss).
+
 ## Known rough edges (expected on this test)
 
 - **It blocks.** Each confirmation wait freezes the wallet command for a block interval —

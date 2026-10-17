@@ -19,17 +19,38 @@
 //! Correctness here is money-critical (a wrong address sends BTC into the void), so
 //! the derivation is checked against the official BIP-84 test vectors in the tests.
 
-use bitcoin::bip32::{DerivationPath, Xpriv, Xpub};
+use bitcoin::bip32::{ChainCode, DerivationPath, Xpriv, Xpub};
 use bitcoin::secp256k1::{Secp256k1, SignOnly};
 use bitcoin::{Address, CompressedPublicKey, Network, PrivateKey};
 use std::str::FromStr;
+use zeroize::Zeroizing;
+
+/// An extended private key that is wiped when dropped (bridge L6). `Xpriv` itself does
+/// not implement `Zeroize`, so the secret scalar and the chain code are overwritten by
+/// hand. Best effort, as with every in-memory wipe: `Xpriv` is `Copy`, so copies the
+/// compiler made in registers or moved-from stack slots are not covered.
+struct ZeroizingXpriv(Xpriv);
+
+impl std::ops::Deref for ZeroizingXpriv {
+    type Target = Xpriv;
+    fn deref(&self) -> &Xpriv {
+        &self.0
+    }
+}
+
+impl Drop for ZeroizingXpriv {
+    fn drop(&mut self) {
+        self.0.private_key.non_secure_erase();
+        self.0.chain_code = ChainCode::from([0u8; 32]);
+    }
+}
 
 /// A BIP-84 hierarchical-deterministic Bitcoin wallet for one account (account 0),
-/// scoped to a network. Holds the account-level extended private key; addresses and
-/// signing keys are derived on demand.
+/// scoped to a network. Holds the account-level extended private key (wiped on drop);
+/// addresses and signing keys are derived on demand.
 pub struct HdWallet {
     network: Network,
-    account: Xpriv,
+    account: ZeroizingXpriv,
     secp: Secp256k1<SignOnly>,
 }
 
@@ -62,7 +83,9 @@ impl HdWallet {
         let secp = Secp256k1::signing_only();
         let path = DerivationPath::from_str(&format!("m/84'/{}'/{account_index}'", coin_type(network)))
             .map_err(|e| e.to_string())?;
-        let account = master.derive_priv(&secp, &path).map_err(|e| e.to_string())?;
+        // The master key is a throwaway on this path: wrap it so it is wiped too.
+        let master = ZeroizingXpriv(master);
+        let account = ZeroizingXpriv(master.derive_priv(&secp, &path).map_err(|e| e.to_string())?);
         Ok(Self { network, account, secp })
     }
 
@@ -72,10 +95,11 @@ impl HdWallet {
         Xpub::from_priv(&self.secp, &self.account)
     }
 
-    /// The extended private key for one leaf, `m/84'/coin'/0'/change/index`.
-    fn leaf(&self, change: u32, index: u32) -> Result<Xpriv, String> {
+    /// The extended private key for one leaf, `m/84'/coin'/0'/change/index`, wiped when
+    /// the returned guard drops.
+    fn leaf(&self, change: u32, index: u32) -> Result<ZeroizingXpriv, String> {
         let path = DerivationPath::from_str(&format!("m/{change}/{index}")).map_err(|e| e.to_string())?;
-        self.account.derive_priv(&self.secp, &path).map_err(|e| e.to_string())
+        Ok(ZeroizingXpriv(self.account.derive_priv(&self.secp, &path).map_err(|e| e.to_string())?))
     }
 
     /// The P2WPKH address at `change`/`index` (change: 0 = receive, 1 = change).
@@ -95,10 +119,19 @@ impl HdWallet {
         self.address(1, index)
     }
 
-    /// The WIF/private key for signing an input owned by `change`/`index` — used to
-    /// sign funding and HTLC transactions locally. Never leaves the process.
+    /// The WIF/private key for signing an input owned by `change`/`index`. Never leaves the
+    /// process. `bitcoin::PrivateKey` is a plain `Copy` value that is NOT wiped on drop, so
+    /// the transaction signer uses [`Self::signing_secret`] instead; this accessor remains
+    /// for callers that need the WIF form.
     pub fn signing_key(&self, change: u32, index: u32) -> Result<PrivateKey, String> {
         Ok(self.leaf(change, index)?.to_priv())
+    }
+
+    /// The raw 32-byte secret for the input owned by `change`/`index`, in a buffer that is
+    /// zeroized on drop (bridge L6). The signer builds a transient `SecretKey` from it and
+    /// erases that too once the signature is made.
+    pub fn signing_secret(&self, change: u32, index: u32) -> Result<Zeroizing<[u8; 32]>, String> {
+        Ok(Zeroizing::new(self.leaf(change, index)?.private_key.secret_bytes()))
     }
 
     pub fn network(&self) -> Network {

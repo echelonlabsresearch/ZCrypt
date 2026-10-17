@@ -119,3 +119,48 @@ internet.
 3. Land step 6 (custody) and step 7 (auth).
 4. Re-run on signet with the production custody setup.
 5. Set `btc_network=bitcoin`, point at a mainnet bitcoind, start with small caps.
+
+## Operator watcher daemon: operating notes (audit 2026-10)
+
+`bridge_watcher` is the always-on operator process (see `bridge/src/bin/bridge_watcher.rs` for
+the full env reference). Items that matter for a production deployment:
+
+- **Block-time assumption.** Every ZC-height-to-seconds conversion in the daemon and the
+  wallet (`swap::ZC_BLOCK_TIME_SECS`) assumes **1 s ZCrypt blocks**. The shipped compose runs
+  a 2 s `timeout_commit`, which errs on the safe side: escrows then live LONGER in wall time
+  than the daemon computes, so every BTC lock it funds expires earlier relative to the escrow,
+  not later. Never run a chain with blocks FASTER than 1 s against this constant.
+- **State file schema.** `WatcherState` carries a `schema` field. A file written by a newer
+  daemon (higher schema) is refused at start-up instead of being loaded and re-saved with
+  fields silently dropped. Downgrade by restoring a backup written by the older version.
+- **Single instance.** The daemon takes an exclusive lock file `<WATCHER_STATE>.lock` (PID
+  inside). A second daemon on the same state refuses to start: two watchers on one wallet
+  would each fund every open redeem. A stale lock from a crashed process is taken over.
+- **Lost-state guard.** With no state file, cursor 0 and no `WATCHER_CURSOR_SEED`, the daemon
+  checks whether the operator wallet already has P2WSH (HTLC) sends. If it does, the state
+  file was almost certainly lost (volume recreated, host migration, wrong `WATCHER_STATE`) and
+  the daemon refuses to start. Restore the file, or set `WATCHER_CURSOR_SEED=<zc height>`, or
+  set `ZCRYPT_WATCHER_FRESH_STATE=1` only when the wallet history belongs to a previous, fully
+  settled deployment.
+- **Deterministic redeem locks.** The BTC HTLC the daemon funds for a redeem is derived from
+  CONSENSUS data (the burn's ZC block time anchored to Bitcoin's median-time-past, six hours
+  back) rather than from the Bitcoin tip at planning time, so a replan after a state loss
+  reproduces the identical P2WSH address and the existing funding is reused instead of funded
+  twice. The daemon needs `getblockheader` access on its bitcoind for this (it already does
+  for header relay).
+- **Proof of mint.** Sweeps no longer depend on the escrow record (consensus prunes settled
+  escrows after `ESCROW_RETENTION_BLOCKS`): the daemon also consults `/spv/claimed/<txid>:<vout>`,
+  the permanent claimed-outpoint set, and persists `claimed = true` on each tracked deposit.
+- **Transient errors never skip a block.** A failed `/htlc/<id>` or claimed-set query during a
+  scan puts that height into `retry_heights`; the cursor still advances and the block is
+  re-scanned every tick until clean. A block the node cannot serve at all stops the cursor.
+- **Unconfirmed fundings have a deadline.** A funding that sits unconfirmed is fee-bumped
+  (`bumpfee`, so run the operator wallet with RBF enabled) every `FUNDING_BUMP_AFTER_BLOCKS`
+  Bitcoin blocks, and once the Bitcoin tip is within the user's minimum claim window of its
+  CLTV (or the ZC escrow is within the finalize SLA of expiry) it is promoted to the pending
+  set so the refund path runs at the CLTV. It is never re-funded.
+- **Refunds wait for the confirmation floor.** A refund the daemon broadcast keeps its redeem
+  pending until it has `min_conf_for(network)` confirmations (6 on mainnet); if a reorg mines
+  the user's claim instead, the burn is finalized, not forgotten.
+- **Testnet.** `BTC_NETWORK=testnet` is served with the SIGNET safety profile (confirmation
+  floors, sweep depths, minimum deposits), never the regtest one.

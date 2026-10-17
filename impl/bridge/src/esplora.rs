@@ -33,6 +33,34 @@ pub struct Utxo {
     pub block_height: Option<u64>,
 }
 
+/// The spend of one output as Esplora reports it: the spending txid and whether that
+/// spending tx is confirmed (a mempool spend has `confirmed == false`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Outspend {
+    pub txid: String,
+    pub confirmed: bool,
+}
+
+/// Parse an `/outspend` body. Pure so it can be unit-tested offline.
+fn parse_outspend(v: &Value) -> Result<Option<Outspend>, String> {
+    if !v["spent"].as_bool().unwrap_or(false) {
+        return Ok(None);
+    }
+    let txid = v["txid"].as_str().ok_or("outspend: spent but no spending txid")?.to_string();
+    let confirmed = v["status"]["confirmed"].as_bool().unwrap_or(false);
+    Ok(Some(Outspend { txid, confirmed }))
+}
+
+/// Pick the rate for `target` from a `/fee-estimates` body: the exact target, else the
+/// 6-block estimate, else [`crate::FALLBACK_FEE_RATE_SAT_VB`]. Pure for offline tests.
+fn pick_fee_rate(v: &Value, target: u32) -> f64 {
+    v[target.to_string()]
+        .as_f64()
+        .or_else(|| v["6"].as_f64())
+        .filter(|r| r.is_finite() && *r > 0.0)
+        .unwrap_or(crate::FALLBACK_FEE_RATE_SAT_VB)
+}
+
 /// A wallet UTXO tagged with the HD path that owns it, so the signer can derive the
 /// exact key (`change` = 0 receive / 1 change; `index` = address index).
 #[derive(Clone, Debug)]
@@ -98,17 +126,15 @@ impl Esplora {
     }
 
     /// Fee rate (sat/vB) for confirmation within ~`target` blocks. Falls back to the
-    /// 6-block estimate, then a 1 sat/vB floor. The result is clamped to
+    /// 6-block estimate, then to the conservative [`crate::FALLBACK_FEE_RATE_SAT_VB`]
+    /// (not a 1 sat/vB floor, which could strand an HTLC claim below the relay rate until
+    /// its timelock passes, bridge L4). The result is clamped to
     /// [`crate::MAX_FEE_RATE_SAT_VB`]: Esplora is a third party, and a lying or
     /// compromised endpoint must not be able to make the wallet burn an HTLC in fees
     /// (bridge M4).
     pub fn fee_rate_sat_vb(&self, target: u32) -> Result<f64, String> {
         let v = self.get_json("/fee-estimates")?;
-        let pick = v[target.to_string()]
-            .as_f64()
-            .or_else(|| v["6"].as_f64())
-            .unwrap_or(1.0);
-        Ok(crate::cap_fee_rate(pick))
+        Ok(crate::cap_fee_rate(pick_fee_rate(&v, target)))
     }
 
     /// Confirmation status of a transaction: `(confirmed, block_height, block_hash)` where
@@ -147,16 +173,21 @@ impl Esplora {
         self.get_json(&format!("/tx/{txid}"))
     }
 
-    /// The txid that SPENT output `vout` of `txid`, if any (`/tx/:txid/outspend/:vout`).
-    /// `Ok(None)` when the output is still unspent. Lets the redeem watcher detect a user's
-    /// HTLC claim without scanning blocks.
+    /// The txid that SPENT output `vout` of `txid`, if any (`/tx/:txid/outspend/:vout`),
+    /// confirmed OR still in the mempool. `Ok(None)` when the output is unspent. Callers
+    /// that must distinguish a confirmed spend use [`Self::outspend_status`].
     pub fn outspend(&self, txid: &str, vout: u32) -> Result<Option<String>, String> {
+        Ok(self.outspend_status(txid, vout)?.map(|s| s.txid))
+    }
+
+    /// The spend of output `vout` of `txid` with its confirmation state, or `Ok(None)` when
+    /// unspent. Esplora reports a mempool spend with `spent: true` and
+    /// `status.confirmed: false`; such a spend can still be replaced or dropped, so it is
+    /// NOT a confirmed spend (bridge M12). Lets the redeem watcher detect a user's HTLC
+    /// claim without scanning blocks.
+    pub fn outspend_status(&self, txid: &str, vout: u32) -> Result<Option<Outspend>, String> {
         let v = self.get_json(&format!("/tx/{txid}/outspend/{vout}"))?;
-        if v["spent"].as_bool().unwrap_or(false) {
-            Ok(v["txid"].as_str().map(|s| s.to_string()))
-        } else {
-            Ok(None)
-        }
+        parse_outspend(&v)
     }
 
     /// Current chain tip height.
@@ -295,6 +326,31 @@ mod tests {
     // Network-dependent smoke tests — ignored by default so CI stays offline. Run with:
     //   cargo test -p zcrypt-bridge --lib esplora -- --ignored --nocapture
     const SIGNET: &str = "https://mempool.space/signet/api";
+
+    #[test]
+    fn outspend_distinguishes_mempool_from_confirmed_spend() {
+        let unspent = serde_json::json!({ "spent": false });
+        assert_eq!(parse_outspend(&unspent).unwrap(), None);
+        let mempool = serde_json::json!({ "spent": true, "txid": "ab", "status": { "confirmed": false } });
+        assert_eq!(parse_outspend(&mempool).unwrap(), Some(Outspend { txid: "ab".into(), confirmed: false }));
+        let confirmed = serde_json::json!({
+            "spent": true, "txid": "cd", "status": { "confirmed": true, "block_height": 7 }
+        });
+        assert_eq!(parse_outspend(&confirmed).unwrap(), Some(Outspend { txid: "cd".into(), confirmed: true }));
+        // spent without a txid is malformed, not "unspent"
+        assert!(parse_outspend(&serde_json::json!({ "spent": true })).is_err());
+    }
+
+    #[test]
+    fn fee_estimate_falls_back_conservatively() {
+        let v = serde_json::json!({ "3": 12.5, "6": 8.0 });
+        assert_eq!(pick_fee_rate(&v, 3), 12.5);
+        assert_eq!(pick_fee_rate(&v, 4), 8.0); // missing target: 6-block estimate
+        let empty = serde_json::json!({});
+        assert_eq!(pick_fee_rate(&empty, 3), crate::FALLBACK_FEE_RATE_SAT_VB);
+        let zero = serde_json::json!({ "6": 0.0 });
+        assert_eq!(pick_fee_rate(&zero, 3), crate::FALLBACK_FEE_RATE_SAT_VB);
+    }
 
     #[test]
     #[ignore]

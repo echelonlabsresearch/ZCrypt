@@ -199,6 +199,11 @@ pub struct OpenAuth<'a> {
     pub value: u64,
     pub hashlock: &'a Hash,
     pub timeout_height: u64,
+    /// The claim coin the beneficiary chose. Bound so a front-runner cannot open
+    /// the deposit to a commitment the depositor cannot spend.
+    pub claim_commitment: &'a [u64; 8],
+    /// [`crate::htlc_shield::note_bind`] of the note that carries the blind.
+    pub note_bind: &'a Hash,
 }
 
 /// Domain-separated digest the depositor's **refund key** signs to AUTHORIZE an SPV mint
@@ -207,8 +212,8 @@ pub struct OpenAuth<'a> {
 /// cannot re-open the same deposit with any other parameters.
 pub fn open_auth_digest(a: &OpenAuth<'_>) -> [u8; 32] {
     use bitcoin::hashes::{sha256, Hash as _};
-    let mut buf = Vec::with_capacity(16 + 4 + a.chain_id.len() + 36 + 64 + 8 + 8 + 32 + 8);
-    buf.extend_from_slice(b"ZC-BRIDGE-OPEN-2");
+    let mut buf = Vec::with_capacity(16 + 4 + a.chain_id.len() + 36 + 64 + 8 + 8 + 32 + 8 + 64 + 32);
+    buf.extend_from_slice(b"ZC-BRIDGE-OPEN-3");
     buf.extend_from_slice(&(a.chain_id.len() as u32).to_le_bytes());
     buf.extend_from_slice(a.chain_id);
     buf.extend_from_slice(a.outpoint);
@@ -219,6 +224,10 @@ pub fn open_auth_digest(a: &OpenAuth<'_>) -> [u8; 32] {
     buf.extend_from_slice(&a.value.to_le_bytes());
     buf.extend_from_slice(a.hashlock);
     buf.extend_from_slice(&a.timeout_height.to_le_bytes());
+    for limb in a.claim_commitment {
+        buf.extend_from_slice(&limb.to_le_bytes());
+    }
+    buf.extend_from_slice(a.note_bind);
     sha256::Hash::hash(&buf).to_byte_array()
 }
 
@@ -509,7 +518,10 @@ impl HeaderChain {
     pub fn locktime_margin(&self) -> u64 {
         match self.net {
             BtcNet::Regtest | BtcNet::Signet => 20,
-            BtcNet::Mainnet => 144,
+            // Audit 2026-10 M8: must exceed the operator's worst-case safe-sweep depth plus a
+            // sweep SLA, or a depositor who locks at the minimum and claims at once forces every
+            // sweep into the at-risk window. 288 ≈ 2 days against a 100-block maturity cap.
+            BtcNet::Mainnet => 288,
         }
     }
 
@@ -871,6 +883,11 @@ impl HeaderChain {
         if !coinbase.is_coinbase() {
             return Err("SPV proof: coinbase transaction is not a coinbase".to_string());
         }
+        // Audit 2026-10 L2: a coinbase output is unspendable for COINBASE_MATURITY (100) blocks,
+        // which eats into (or on small-margin networks exceeds) the reserve's sweep window.
+        if tx.is_coinbase() {
+            return Err("SPV proof: funding tx must not be a coinbase".to_string());
+        }
         let mut matched = Vec::new();
         let mut indexes = Vec::new();
         mb.extract_matches(&mut matched, &mut indexes)
@@ -916,7 +933,10 @@ impl HeaderChain {
             ));
         }
         if require_locktime_margin {
-            let min_locktime = self.tip_height() + self.locktime_margin();
+            // Audit 2026-10 L1: the claim gate refuses once `tip + margin >= locktime`, so an open
+            // at exactly `tip + margin` was accepted yet never claimable (and burned the outpoint).
+            // Require a real claim window above the margin: the open gate is strictly stronger.
+            let min_locktime = self.tip_height() + self.locktime_margin() + self.min_conf();
             if u64::from(proof.btc_locktime) < min_locktime {
                 return Err(format!(
                     "SPV proof: refund locktime {} too soon (need >= {min_locktime})",
@@ -1357,6 +1377,8 @@ pub mod testutil {
         pub hashlock: &'a [u8; 32],
         pub timeout_height: u64,
         pub claim_pk: &'a [u64; 8],
+        pub claim_commitment: &'a [u64; 8],
+        pub note_bind: &'a [u8; 32],
     }
 
     /// Produce the refund-key open-authorization signature for `proof`'s funding outpoint
@@ -1374,6 +1396,8 @@ pub mod testutil {
             value: terms.value,
             hashlock: terms.hashlock,
             timeout_height: terms.timeout_height,
+            claim_commitment: terms.claim_commitment,
+            note_bind: terms.note_bind,
         };
         super::sign_open_auth(&test_sk(refund_n), &a)
     }
@@ -1729,7 +1753,12 @@ mod tests {
         let op = [5u8; 36];
         let pk = [3u64; 8];
         let lock = [9u8; 32];
-        let good = OpenAuth { chain_id: b"zcrypt-1", outpoint: &op, claim_pk: &pk, asset_id: 42, value: 1_000, hashlock: &lock, timeout_height: 500 };
+        let commit = [1u64; 8];
+        let bind = [2u8; 32];
+        let good = OpenAuth {
+            chain_id: b"zcrypt-1", outpoint: &op, claim_pk: &pk, asset_id: 42, value: 1_000,
+            hashlock: &lock, timeout_height: 500, claim_commitment: &commit, note_bind: &bind,
+        };
         let sig = sign_open_auth(&test_sk(9), &good);
         let refund = test_pk(9);
         assert!(verify_open_auth(&refund, &good, &sig).is_ok());
@@ -1741,6 +1770,10 @@ mod tests {
         assert!(verify_open_auth(&refund, &OpenAuth { hashlock: &other_lock, ..good }, &sig).is_err(), "hashlock");
         let other_pk = [4u64; 8];
         assert!(verify_open_auth(&refund, &OpenAuth { claim_pk: &other_pk, ..good }, &sig).is_err(), "recipient");
+        let other_commit = [9u64; 8];
+        assert!(verify_open_auth(&refund, &OpenAuth { claim_commitment: &other_commit, ..good }, &sig).is_err(), "commitment");
+        let other_bind = [3u8; 32];
+        assert!(verify_open_auth(&refund, &OpenAuth { note_bind: &other_bind, ..good }, &sig).is_err(), "note");
     }
 
     #[test]

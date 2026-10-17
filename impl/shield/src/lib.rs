@@ -921,6 +921,8 @@ pub fn compress2(l: &Commitment, r: &Commitment) -> Commitment {
 
 pub mod tree;
 pub mod zvm;
+/// Opening proof: knowledge of a hidden blind for one settlement coin.
+pub mod opening;
 #[cfg(test)]
 mod tall_spike;
 /// The production tall-skinny shield circuit (see [`prove`]/[`verify`]).

@@ -24,11 +24,15 @@ fn open_mint(
     value: u64,
     lock: [u8; 32],
     timeout: u64,
-    pk: [u64; 8],
+    beneficiary: &Account,
 ) -> Result<[u8; 32], String> {
-    let msg = mint_auth::mint_message(CHAIN, asset, value, &lock, timeout, &pk);
+    let (_, opening) = zcrypt_core::htlc_shield::CoinOpening::create(&beneficiary.normal_address(), value, asset)?;
+    let pk = beneficiary.pubkey();
+    let msg = mint_auth::mint_message(
+        CHAIN, asset, value, &lock, timeout, &pk, &opening.coin.commitment, &opening.coin.note_bind(),
+    );
     let sigs = mint_auth::authorize(ks, signers, &msg);
-    node.htlc_open(CHAIN, asset, value, lock, timeout, pk, ks, &sigs)
+    node.htlc_open(CHAIN, asset, value, lock, timeout, pk, &opening, ks, &sigs)
 }
 
 /// A 32-byte preimage from a short label (consensus accepts exactly 32 bytes).
@@ -47,13 +51,26 @@ fn open_spv(
     value: u64,
     lock: [u8; 32],
     timeout: u64,
-    claim_pk: [u64; 8],
+    beneficiary: &Account,
     proof: &MintProof,
 ) -> Result<[u8; 32], String> {
+    let net = value - zcrypt_core::emission::bridge_fee(value);
+    let (_, opening) = zcrypt_core::htlc_shield::CoinOpening::create(&beneficiary.normal_address(), net, asset)?;
+    let pk = beneficiary.pubkey();
     let auth = testutil::open_auth_for_proof(refund_n, proof, testutil::OpenTerms {
-        chain_id: CHAIN, asset_id: asset, value, hashlock: &lock, timeout_height: timeout, claim_pk: &claim_pk,
+        chain_id: CHAIN, asset_id: asset, value, hashlock: &lock, timeout_height: timeout, claim_pk: &pk,
+        claim_commitment: &opening.coin.commitment, note_bind: &opening.coin.note_bind(),
     });
-    node.htlc_open_spv(CHAIN, asset, value, lock, timeout, claim_pk, proof, &auth)
+    node.htlc_open_spv(CHAIN, asset, value, lock, timeout, pk, proof, &auth, &opening)
+}
+
+/// Decrypt the settlement note the escrow stores. `claim` selects the claim coin.
+fn settled_coin(acct: &Account, node: &Node, id: &[u8; 32], claim: bool) -> Coin {
+    let e = node.htlc_escrow(id).expect("escrow");
+    let hidden = if claim { &e.claim_coin } else { &e.refund_coin };
+    let bytes = &hidden.as_ref().expect("settlement note").enc_note;
+    let ct = zcrypt_core::kem::ciphertext_from_bytes(bytes).expect("note bytes");
+    acct.receive(&ct).expect("beneficiary decrypts the settlement note")
 }
 
 fn setup() -> (Account, Node, u64, MintKeySet, Vec<MintSigner>) {
@@ -96,8 +113,8 @@ fn authority_rotation_hands_off_minting_and_resists_replay() {
 
     // The OLD key set can no longer mint; the NEW key set can.
     let lock = htlc_hashlock(&pre("post-rotation-preimage"));
-    assert!(open_mint(&mut node, &old_ks, &old_signers, asset, 1_000, lock, 200, alice.pubkey()).is_err());
-    open_mint(&mut node, &new_ks, &new_signers, asset, 1_000, lock, 200, alice.pubkey()).unwrap();
+    assert!(open_mint(&mut node, &old_ks, &old_signers, asset, 1_000, lock, 200, &alice).is_err());
+    open_mint(&mut node, &new_ks, &new_signers, asset, 1_000, lock, 200, &alice).unwrap();
 
     // Replaying the exact rotation tx fails: the epoch has advanced, so the signed message
     // no longer matches (single-use). Even re-rotating BACK needs a fresh signature.
@@ -114,9 +131,10 @@ fn claim_mints_a_spendable_private_zbtc_coin() {
 
     // Free-mint guard: without the M-of-N signatures (here an empty bundle) the escrow
     // cannot be opened — the threshold gate rejects it.
-    assert!(node.htlc_open(CHAIN, asset, value, lock, 100, alice.pubkey(), &keyset, &[]).is_err());
+    let (_, bare) = zcrypt_core::htlc_shield::CoinOpening::create(&alice.normal_address(), value, asset).unwrap();
+    assert!(node.htlc_open(CHAIN, asset, value, lock, 100, alice.pubkey(), &bare, &keyset, &[]).is_err());
     // LP opens the escrow to Alice's key with a valid threshold authorization.
-    let id = open_mint(&mut node, &keyset, &signers, asset, value, lock, 100, alice.pubkey()).unwrap();
+    let id = open_mint(&mut node, &keyset, &signers, asset, value, lock, 100, &alice).unwrap();
 
     // A wrong preimage cannot claim.
     assert!(node.htlc_claim(&id, b"nope").is_err());
@@ -124,7 +142,7 @@ fn claim_mints_a_spendable_private_zbtc_coin() {
     let minted = node.htlc_claim(&id, x).unwrap().expect("mint escrow yields a coin");
 
     // Alice reconstructs the exact coin from her key + the public escrow id.
-    let coin = alice.htlc_coin(value, asset, &id);
+    let coin = settled_coin(&alice, &node, &id, true);
     assert_eq!(coin.commitment(), minted, "claimer rebuilds the minted coin");
     assert_eq!(coin.asset_id, asset);
     assert_eq!(node.asset_minted(asset), value, "supply tracks the mint");
@@ -283,10 +301,14 @@ fn zcrypt_gas(owner: &Account, node: &mut Node, payload: &[u8]) -> (zcrypt_core:
 }
 
 /// The envelope for a plain `0x5D` burn-lock (claim and refund both go to `owner`).
-fn burn_env(asset: u64, value: u64, lock: [u8; 32], timeout: u64, owner: &Account) -> Vec<u8> {
+fn burn_env(
+    asset: u64, value: u64, lock: [u8; 32], timeout: u64, owner: &Account,
+    refund: &zcrypt_core::htlc_shield::HiddenCoin,
+) -> Vec<u8> {
     zcrypt_core::htlc_shield::lock_envelope(
         zcrypt_core::htlc_shield::ENV_BURN_LOCK,
         asset, value, &lock, timeout, &owner.pubkey(), &owner.pubkey(), &[],
+        std::slice::from_ref(refund),
     )
 }
 
@@ -294,11 +316,19 @@ fn burn_env(asset: u64, value: u64, lock: [u8; 32], timeout: u64, owner: &Accoun
 /// refunded on timeout.
 fn swap_env(
     asset: u64, value: u64, lock: [u8; 32], timeout: u64, counterparty: &Account, locker: &Account,
+    claim: &zcrypt_core::htlc_shield::HiddenCoin, refund: &zcrypt_core::htlc_shield::HiddenCoin,
 ) -> Vec<u8> {
     zcrypt_core::htlc_shield::lock_envelope(
         zcrypt_core::htlc_shield::ENV_SWAP_LOCK,
         asset, value, &lock, timeout, &counterparty.pubkey(), &locker.pubkey(), &[],
+        &[claim.clone(), refund.clone()],
     )
+}
+
+fn swap_openings(counterparty: &Account, locker: &Account, value: u64, asset: u64) -> (zcrypt_core::htlc_shield::CoinOpening, zcrypt_core::htlc_shield::CoinOpening) {
+    let claim = zcrypt_core::htlc_shield::CoinOpening::create(&counterparty.normal_address(), value, asset).unwrap().1;
+    let refund = zcrypt_core::htlc_shield::CoinOpening::create(&locker.normal_address(), value, asset).unwrap().1;
+    (claim, refund)
 }
 
 #[test]
@@ -308,17 +338,18 @@ fn burn_lock_then_claim_burns_zbtc() {
     let lock_value = 150_000u64;
     let burn_blind = keys::random_blind();
     let x = &pre("redeem-preimage-99");
+    let refund = zcrypt_core::htlc_shield::CoinOpening::create(&alice.normal_address(), lock_value, asset).unwrap().1;
     let tx = burn_lock_tx(&alice, &mut node, asset, lock_value, burn_blind,
-        &burn_env(asset, lock_value, htlc_hashlock(x), 100, &alice));
+        &burn_env(asset, lock_value, htlc_hashlock(x), 100, &alice, &refund.coin));
 
     // Declaring a value that doesn't match output[0]'s actual opening is rejected
     // (the node binds the escrow to the real coin, so you can't over-declare).
     assert!(node
-        .htlc_burn_lock(CHAIN, &tx, lock_value + 1, burn_blind, asset, htlc_hashlock(x), 100, alice.pubkey(), &[])
+        .htlc_burn_lock(CHAIN, &tx, lock_value + 1, burn_blind, asset, htlc_hashlock(x), 100, alice.pubkey(), &[], &refund)
         .is_err());
 
     let id = node
-        .htlc_burn_lock(CHAIN, &tx, lock_value, burn_blind, asset, htlc_hashlock(x), 100, alice.pubkey(), &[])
+        .htlc_burn_lock(CHAIN, &tx, lock_value, burn_blind, asset, htlc_hashlock(x), 100, alice.pubkey(), &[], &refund)
         .unwrap();
     // Bridge claims with the preimage -> zBTC burned, nothing minted.
     assert!(node.htlc_claim(&id, b"wrong").is_err());
@@ -333,10 +364,11 @@ fn burn_lock_then_expire_refunds_owner() {
     let lock_value = 60_000u64;
     let burn_blind = keys::random_blind();
     let x = &pre("never-revealed");
+    let refund = zcrypt_core::htlc_shield::CoinOpening::create(&alice.normal_address(), lock_value, asset).unwrap().1;
     let tx = burn_lock_tx(&alice, &mut node, asset, lock_value, burn_blind,
-        &burn_env(asset, lock_value, htlc_hashlock(x), 20, &alice));
+        &burn_env(asset, lock_value, htlc_hashlock(x), 20, &alice, &refund.coin));
     let id = node
-        .htlc_burn_lock(CHAIN, &tx, lock_value, burn_blind, asset, htlc_hashlock(x), 20, alice.pubkey(), &[])
+        .htlc_burn_lock(CHAIN, &tx, lock_value, burn_blind, asset, htlc_hashlock(x), 20, alice.pubkey(), &[], &refund)
         .unwrap();
 
     // Before timeout, expire is rejected.
@@ -344,7 +376,7 @@ fn burn_lock_then_expire_refunds_owner() {
     // After timeout, expiry refunds Alice's zBTC back to her key.
     node.set_height(20);
     let refunded = node.htlc_expire(&id).unwrap().expect("burn refund mints a coin");
-    let refund_coin = alice.htlc_coin(lock_value, asset, &id);
+    let refund_coin = settled_coin(&alice, &node, &id, false);
     assert_eq!(refund_coin.commitment(), refunded, "refund coin reconstructable");
     assert_eq!(refund_coin.asset_id, asset);
 }
@@ -376,32 +408,40 @@ fn malleated_burn_lock_envelope_is_rejected() {
     let blind = keys::random_blind();
     let x = &pre("redeem-preimage-99");
     let lock = htlc_hashlock(x);
+    let refund = zcrypt_core::htlc_shield::CoinOpening::create(&alice.normal_address(), value, asset).unwrap().1;
     let tx = burn_lock_tx(&alice, &mut node, asset, value, blind,
-        &burn_env(asset, value, lock, timeout, &alice));
+        &burn_env(asset, value, lock, timeout, &alice, &refund.coin));
 
     // Each of these is a distinct rewrite of the envelope the victim proved over.
     // The proof is untouched and its nullifiers are unspent, so before the fix every one of
     // them was accepted.
     assert!(
-        node.htlc_burn_lock(CHAIN, &tx, value, blind, asset, lock, timeout, attacker.pubkey(), &[]).is_err(),
+        node.htlc_burn_lock(CHAIN, &tx, value, blind, asset, lock, timeout, attacker.pubkey(), &[], &refund).is_err(),
         "refund key redirected to the attacker must be rejected"
     );
+    // An attacker who proves their own opening still cannot spend the copied proof:
+    // the envelope the victim signed includes Alice's coin, not the attacker's.
+    let attacker_refund = zcrypt_core::htlc_shield::CoinOpening::create(&attacker.normal_address(), value, asset).unwrap().1;
     assert!(
-        node.htlc_burn_lock(CHAIN, &tx, value, blind, asset, htlc_hashlock(&pre("attacker")), timeout, alice.pubkey(), &[]).is_err(),
+        node.htlc_burn_lock(CHAIN, &tx, value, blind, asset, lock, timeout, attacker.pubkey(), &[], &attacker_refund).is_err(),
+        "attacker-chosen refund coin must be rejected"
+    );
+    assert!(
+        node.htlc_burn_lock(CHAIN, &tx, value, blind, asset, htlc_hashlock(&pre("attacker")), timeout, alice.pubkey(), &[], &refund).is_err(),
         "substituted hashlock must be rejected"
     );
     assert!(
-        node.htlc_burn_lock(CHAIN, &tx, value, blind, asset, lock, timeout + 1, alice.pubkey(), &[]).is_err(),
+        node.htlc_burn_lock(CHAIN, &tx, value, blind, asset, lock, timeout + 1, alice.pubkey(), &[], &refund).is_err(),
         "altered timeout must be rejected"
     );
     // A 0x5D envelope must not pass as a 0x67 one: the kind is domain-separated.
     assert!(
-        node.htlc_burn_lock(CHAIN, &tx, value, blind, asset, lock, timeout, alice.pubkey(), &btc_pk(3)).is_err(),
+        node.htlc_burn_lock(CHAIN, &tx, value, blind, asset, lock, timeout, alice.pubkey(), &btc_pk(3), &refund).is_err(),
         "a burn-lock envelope must not be replayable as a BTC redeem"
     );
     // ...and the untouched original still works, so the binding costs the honest path nothing.
     let id = node
-        .htlc_burn_lock(CHAIN, &tx, value, blind, asset, lock, timeout, alice.pubkey(), &[])
+        .htlc_burn_lock(CHAIN, &tx, value, blind, asset, lock, timeout, alice.pubkey(), &[], &refund)
         .expect("the envelope the user actually proved over is accepted");
     assert_eq!(node.htlc_escrow(&id).unwrap().state, EscrowState::Open);
 }
@@ -416,23 +456,25 @@ fn malleated_redeem_payout_key_is_rejected() {
     let blind = keys::random_blind();
     let lock = htlc_hashlock(&pre("redeem-x"));
     let (user_pk, attacker_pk) = (btc_pk(1), btc_pk(2));
+    let refund = zcrypt_core::htlc_shield::CoinOpening::create(&alice.normal_address(), value, asset).unwrap().1;
     let envelope = zcrypt_core::htlc_shield::lock_envelope(
         zcrypt_core::htlc_shield::ENV_BURN_LOCK_BTC,
         asset, value, &lock, timeout, &alice.pubkey(), &alice.pubkey(), &user_pk,
+        std::slice::from_ref(&refund.coin),
     );
     let tx = burn_lock_tx(&alice, &mut node, asset, value, blind, &envelope);
 
     assert!(
-        node.htlc_burn_lock(CHAIN, &tx, value, blind, asset, lock, timeout, alice.pubkey(), &attacker_pk).is_err(),
+        node.htlc_burn_lock(CHAIN, &tx, value, blind, asset, lock, timeout, alice.pubkey(), &attacker_pk, &refund).is_err(),
         "payout key swapped to the attacker's must be rejected"
     );
     // A malformed key is refused outright: the watcher would otherwise lock reserve BTC to an
     // address nobody can claim.
     assert!(
-        node.htlc_burn_lock(CHAIN, &tx, value, blind, asset, lock, timeout, alice.pubkey(), &[0xFFu8; 33]).is_err(),
+        node.htlc_burn_lock(CHAIN, &tx, value, blind, asset, lock, timeout, alice.pubkey(), &[0xFFu8; 33], &refund).is_err(),
         "malformed payout key must be rejected"
     );
-    node.htlc_burn_lock(CHAIN, &tx, value, blind, asset, lock, timeout, alice.pubkey(), &user_pk)
+    node.htlc_burn_lock(CHAIN, &tx, value, blind, asset, lock, timeout, alice.pubkey(), &user_pk, &refund)
         .expect("the user's own payout key is accepted");
 }
 
@@ -449,8 +491,9 @@ fn malleated_swap_lock_envelope_is_rejected() {
     let (value, timeout) = (100_000u64, 100u64);
     let blind = keys::random_blind();
     let lock = htlc_hashlock(&pre("swap-x"));
+    let (claim, refund) = swap_openings(&bob, &alice, value, asset);
     let tx = swap_asset_tx(&alice, &mut node, asset, value, blind,
-        &swap_env(asset, value, lock, timeout, &bob, &alice));
+        &swap_env(asset, value, lock, timeout, &bob, &alice, &claim.coin, &refund.coin));
     let (gas_tx, gas_blind) = zcrypt_gas(&alice, &mut node, &shield_tx::txbind(CHAIN, &tx));
 
     // A nonzero asset fee is rejected before either proof mutates state, so the gas
@@ -458,24 +501,24 @@ fn malleated_swap_lock_envelope_is_rejected() {
     let mut bad_fee = tx.clone();
     bad_fee.fee = 1;
     let err = node
-        .swap_lock(CHAIN, &bad_fee, &gas_tx, gas_blind, value, blind, asset, lock, timeout, bob.pubkey(), alice.pubkey())
+        .swap_lock(CHAIN, &bad_fee, &gas_tx, gas_blind, value, blind, asset, lock, timeout, bob.pubkey(), alice.pubkey(), &claim, &refund)
         .unwrap_err();
     assert!(err.contains("fee 0"), "{err}");
     // The gas note's first output must be the 0.01 ZCRYPT burn coin, not the asset spend.
     let err = node
-        .swap_lock(CHAIN, &tx, &tx, gas_blind, value, blind, asset, lock, timeout, bob.pubkey(), alice.pubkey())
+        .swap_lock(CHAIN, &tx, &tx, gas_blind, value, blind, asset, lock, timeout, bob.pubkey(), alice.pubkey(), &claim, &refund)
         .unwrap_err();
     assert!(err.contains("burn coin"), "{err}");
 
     assert!(
-        node.swap_lock(CHAIN, &tx, &gas_tx, gas_blind, value, blind, asset, lock, timeout, attacker.pubkey(), alice.pubkey()).is_err(),
+        node.swap_lock(CHAIN, &tx, &gas_tx, gas_blind, value, blind, asset, lock, timeout, attacker.pubkey(), alice.pubkey(), &claim, &refund).is_err(),
         "counterparty redirected to the attacker must be rejected"
     );
     assert!(
-        node.swap_lock(CHAIN, &tx, &gas_tx, gas_blind, value, blind, asset, lock, timeout, bob.pubkey(), attacker.pubkey()).is_err(),
+        node.swap_lock(CHAIN, &tx, &gas_tx, gas_blind, value, blind, asset, lock, timeout, bob.pubkey(), attacker.pubkey(), &claim, &refund).is_err(),
         "refund key redirected to the attacker must be rejected"
     );
-    node.swap_lock(CHAIN, &tx, &gas_tx, gas_blind, value, blind, asset, lock, timeout, bob.pubkey(), alice.pubkey())
+    node.swap_lock(CHAIN, &tx, &gas_tx, gas_blind, value, blind, asset, lock, timeout, bob.pubkey(), alice.pubkey(), &claim, &refund)
         .expect("the envelope the locker actually proved over is accepted");
 }
 
@@ -483,7 +526,7 @@ fn malleated_swap_lock_envelope_is_rejected() {
 fn expired_escrow_never_mints() {
     let (alice, mut node, asset, keyset, signers) = setup();
     let x = &pre("unused-preimage");
-    let id = open_mint(&mut node, &keyset, &signers, asset, 500, htlc_hashlock(x), 100, alice.pubkey()).unwrap();
+    let id = open_mint(&mut node, &keyset, &signers, asset, 500, htlc_hashlock(x), 100, &alice).unwrap();
 
     // After the timeout the preimage no longer claims...
     node.set_height(100);
@@ -512,20 +555,22 @@ fn in_pool_atomic_swap_between_two_assets() {
 
     // Alice locks 100_000 A, claimable by Bob (refund to Alice on timeout). Gas is 0.01 ZCRYPT.
     let a_blind = keys::random_blind();
+    let (a_claim, a_refund) = swap_openings(&bob, &alice, 100_000, asset_a);
     let a_tx = swap_asset_tx(&alice, &mut node, asset_a, 100_000, a_blind,
-        &swap_env(asset_a, 100_000, lock, 100, &bob, &alice));
+        &swap_env(asset_a, 100_000, lock, 100, &bob, &alice, &a_claim.coin, &a_refund.coin));
     let (a_gas, a_gas_blind) = zcrypt_gas(&alice, &mut node, &shield_tx::txbind(CHAIN, &a_tx));
     let a_escrow = node
-        .swap_lock(CHAIN, &a_tx, &a_gas, a_gas_blind, 100_000, a_blind, asset_a, lock, 100, bob.pubkey(), alice.pubkey())
+        .swap_lock(CHAIN, &a_tx, &a_gas, a_gas_blind, 100_000, a_blind, asset_a, lock, 100, bob.pubkey(), alice.pubkey(), &a_claim, &a_refund)
         .unwrap();
 
     // Bob locks 120_000 B, claimable by Alice (refund to Bob on timeout).
     let b_blind = keys::random_blind();
+    let (b_claim, b_refund) = swap_openings(&alice, &bob, 120_000, asset_b);
     let b_tx = swap_asset_tx(&bob, &mut node, asset_b, 120_000, b_blind,
-        &swap_env(asset_b, 120_000, lock, 100, &alice, &bob));
+        &swap_env(asset_b, 120_000, lock, 100, &alice, &bob, &b_claim.coin, &b_refund.coin));
     let (b_gas, b_gas_blind) = zcrypt_gas(&bob, &mut node, &shield_tx::txbind(CHAIN, &b_tx));
     let b_escrow = node
-        .swap_lock(CHAIN, &b_tx, &b_gas, b_gas_blind, 120_000, b_blind, asset_b, lock, 100, alice.pubkey(), bob.pubkey())
+        .swap_lock(CHAIN, &b_tx, &b_gas, b_gas_blind, 120_000, b_blind, asset_b, lock, 100, alice.pubkey(), bob.pubkey(), &b_claim, &b_refund)
         .unwrap();
 
     let (a_supply, b_supply) = (node.asset_minted(asset_a), node.asset_minted(asset_b));
@@ -535,8 +580,8 @@ fn in_pool_atomic_swap_between_two_assets() {
     let got_a = node.htlc_claim(&a_escrow, x).unwrap().expect("swap claim yields a coin");
 
     // Each party reconstructs the coin they received (keyed by their key + the escrow id).
-    let alice_b = alice.htlc_coin(120_000, asset_b, &b_escrow);
-    let bob_a = bob.htlc_coin(100_000, asset_a, &a_escrow);
+    let alice_b = settled_coin(&alice, &node, &b_escrow, true);
+    let bob_a = settled_coin(&bob, &node, &a_escrow, true);
     assert_eq!(alice_b.commitment(), got_b, "Alice rebuilds her received B coin");
     assert_eq!(bob_a.commitment(), got_a, "Bob rebuilds his received A coin");
     assert_eq!(alice_b.asset_id, asset_b);
@@ -584,35 +629,40 @@ fn spv_mint_end_to_end_and_trustless_guarantees() {
     let __refund_auth = 9u8; let __proof_auth = &proof; let __pk_auth = alice.pubkey();
 
     // Minting more than the locked sats is rejected (1:1 backing).
-    assert!(open_spv(&mut node, __refund_auth, asset, value + 1, lock, 100, alice.pubkey(), __proof_auth).is_err());
+    assert!(open_spv(&mut node, __refund_auth, asset, value + 1, lock, 100, &alice, __proof_auth).is_err());
 
     // The SPV-verified deposit opens the escrow; Alice claims with the preimage
     // and gets a private zBTC coin, supply advances.
-    let id = open_spv(&mut node, __refund_auth, asset, value, lock, 100, alice.pubkey(), __proof_auth).unwrap();
+    let id = open_spv(&mut node, __refund_auth, asset, value, lock, 100, &alice, __proof_auth).unwrap();
     let minted = node.htlc_claim(&id, x).unwrap().expect("mint escrow yields a coin");
     // The recipient's coin is value minus the protocol bridge fee (skimmed to stakers);
     // supply still counts the full value (net to Alice + fee to stakers = value, 1:1 backed).
     let net = value - zcrypt_core::emission::bridge_fee(value);
-    assert_eq!(alice.htlc_coin(net, asset, &id).commitment(), minted);
+    let settled = settled_coin(&alice, &node, &id, true);
+    assert_eq!(settled.value, net);
+    assert_eq!(settled.commitment(), minted);
     assert_eq!(node.asset_minted(asset), value);
 
     // One deposit mints ONCE. A replay with a different hashlock dies on the
     // script binding (the deposit's HTLC commits to the original preimage)...
     let lock2 = htlc_hashlock(&pre("different-preimage-0123456789"));
-    assert!(open_spv(&mut node, __refund_auth, asset, value, lock2, 200, alice.pubkey(), __proof_auth)
+    assert!(open_spv(&mut node, __refund_auth, asset, value, lock2, 200, &alice, __proof_auth)
         .unwrap_err()
         .contains("HTLC script"));
     // ...and a replay with the SAME hashlock (fresh escrow id via a new timeout)
     // dies on the claimed-outpoint guard — the deposit is spent.
-    assert!(open_spv(&mut node, __refund_auth, asset, value, lock, 200, alice.pubkey(), __proof_auth)
+    assert!(open_spv(&mut node, __refund_auth, asset, value, lock, 200, &alice, __proof_auth)
         .unwrap_err()
         .contains("already minted"));
 
     // NO threshold key set can mint zBTC: no keyset commits to the SPV sentinel.
     let (ks, signers) = mint_auth::derive_keyset(b"would-be-treasury", 3, 2);
-    let msg = mint_auth::mint_message(CHAIN, asset, 1_000, &lock2, 200, &alice.pubkey());
+    let (_, opening) = zcrypt_core::htlc_shield::CoinOpening::create(&alice.normal_address(), 1_000, asset).unwrap();
+    let msg = mint_auth::mint_message(
+        CHAIN, asset, 1_000, &lock2, 200, &alice.pubkey(), &opening.coin.commitment, &opening.coin.note_bind(),
+    );
     let sigs = mint_auth::authorize(&ks, &signers, &msg);
-    assert!(node.htlc_open(CHAIN, asset, 1_000, lock2, 200, alice.pubkey(), &ks, &sigs).is_err());
+    assert!(node.htlc_open(CHAIN, asset, 1_000, lock2, 200, alice.pubkey(), &opening, &ks, &sigs).is_err());
 
     // And the authority can NEVER rotate away from SPV (one-way trustlessness):
     // a rotation needs a threshold signature from a key set committing to the
@@ -655,7 +705,7 @@ fn spv_mint_matures_or_voids_on_reorg() {
         node.submit_btc_headers(h).unwrap();
     }
     let __refund_auth = 9u8; let __proof_auth = &proof; let __pk_auth = attacker.pubkey();
-    let escrow = open_spv(&mut node, __refund_auth, asset, value, lock, 500, attacker.pubkey(), __proof_auth).unwrap();
+    let escrow = open_spv(&mut node, __refund_auth, asset, value, lock, 500, &attacker, __proof_auth).unwrap();
     let coin = node.htlc_claim(&escrow, x).unwrap().unwrap();
 
     // Immediately after claim: supply counted, but the coin is IMMATURE — held out of
@@ -708,7 +758,7 @@ fn spv_mint_matures_or_voids_on_reorg() {
         p = n;
     }
     let __refund_auth2 = 9u8; let __proof_auth2 = &proof2; let __pk_auth2 = alice.pubkey();
-    let e2 = open_spv(&mut node, __refund_auth2, asset, value, lock2, 500, alice.pubkey(), __proof_auth2).unwrap();
+    let e2 = open_spv(&mut node, __refund_auth2, asset, value, lock2, 500, &alice, __proof_auth2).unwrap();
     let coin2 = node.htlc_claim(&e2, x2).unwrap().unwrap();
     // The deposit already has ≥ maturity_conf confirmations, so the next sweep matures it.
     let r2 = node.process_btc_maturity();
@@ -751,7 +801,7 @@ fn spv_mint_reanchors_across_a_benign_reorg() {
         node.submit_btc_headers(h).unwrap();
     }
     let __refund_auth = 9u8; let __proof_auth = &proof_a; let __pk_auth = alice.pubkey();
-    let e = open_spv(&mut node, __refund_auth, asset, value, lock, 500, alice.pubkey(), __proof_auth).unwrap();
+    let e = open_spv(&mut node, __refund_auth, asset, value, lock, 500, &alice, __proof_auth).unwrap();
     let coin = node.htlc_claim(&e, x).unwrap().unwrap();
     assert_eq!(node.immature_count(), 1);
 
@@ -821,11 +871,11 @@ fn bridge_fee_accrues_to_stakers_and_conserves() {
         p = n;
     }
     let __refund_auth = 9u8; let __proof_auth = &proof; let __pk_auth = alice.pubkey();
-    let e = open_spv(&mut node, __refund_auth, asset, value, lock, 500, alice.pubkey(), __proof_auth).unwrap();
+    let e = open_spv(&mut node, __refund_auth, asset, value, lock, 500, &alice, __proof_auth).unwrap();
     let minted = node.htlc_claim(&e, x).unwrap().unwrap();
 
     // Recipient's coin is net; supply counts the full value (net + fee, 1:1 backed).
-    assert_eq!(alice.htlc_coin(value - fee, asset, &e).commitment(), minted);
+    assert_eq!(settled_coin(&alice, &node, &e, true).commitment(), minted);
     assert_eq!(node.asset_minted(asset), value);
     // No fee is claimable before maturity.
     assert_eq!(node.claimable_fee(&staker.pubkey(), asset), 0);
@@ -884,13 +934,13 @@ fn spv_mint_rejects_non_reserve_deposits() {
     );
     node.submit_btc_headers(&block).unwrap();
     let __refund_auth = 13u8; let __proof_auth = &proof; let __pk_auth = alice.pubkey();
-    assert!(open_spv(&mut node, __refund_auth, asset, 500_000, lock, 100, alice.pubkey(), __proof_auth)
+    assert!(open_spv(&mut node, __refund_auth, asset, 500_000, lock, 100, &alice, __proof_auth)
         .unwrap_err()
         .contains("reserve key"));
     // Lying about the claim key instead fails the script check inside the proof.
     let lying = MintProof { reserve_pk: reserve, ..proof };
     let __refund_auth_lying = 13u8; let __proof_auth_lying = &lying; let __pk_auth_lying = alice.pubkey();
-    assert!(open_spv(&mut node, __refund_auth_lying, asset, 500_000, lock, 100, alice.pubkey(), __proof_auth_lying).is_err());
+    assert!(open_spv(&mut node, __refund_auth_lying, asset, 500_000, lock, 100, &alice, __proof_auth_lying).is_err());
     assert_eq!(node.asset_minted(asset), 0, "no unbacked zBTC exists");
 }
 
@@ -905,11 +955,12 @@ fn swap_escrow_refunds_the_locker_on_timeout() {
     node.set_height(10);
     let x = &pre("never-revealed-preimage");
     let a_blind = keys::random_blind();
+    let (a_claim, a_refund) = swap_openings(&bob, &alice, 100_000, asset_a);
     let a_tx = swap_asset_tx(&alice, &mut node, asset_a, 100_000, a_blind,
-        &swap_env(asset_a, 100_000, htlc_hashlock(x), 100, &bob, &alice));
+        &swap_env(asset_a, 100_000, htlc_hashlock(x), 100, &bob, &alice, &a_claim.coin, &a_refund.coin));
     let (a_gas, a_gas_blind) = zcrypt_gas(&alice, &mut node, &shield_tx::txbind(CHAIN, &a_tx));
     let a_escrow = node
-        .swap_lock(CHAIN, &a_tx, &a_gas, a_gas_blind, 100_000, a_blind, asset_a, htlc_hashlock(x), 100, bob.pubkey(), alice.pubkey())
+        .swap_lock(CHAIN, &a_tx, &a_gas, a_gas_blind, 100_000, a_blind, asset_a, htlc_hashlock(x), 100, bob.pubkey(), alice.pubkey(), &a_claim, &a_refund)
         .unwrap();
 
     // Before timeout: expire is rejected.
@@ -917,7 +968,7 @@ fn swap_escrow_refunds_the_locker_on_timeout() {
     // After timeout: the locked A refunds to ALICE (the locker), not Bob.
     node.set_height(100);
     let refunded = node.htlc_expire(&a_escrow).unwrap().expect("expire refunds the locker");
-    assert_eq!(alice.htlc_coin(100_000, asset_a, &a_escrow).commitment(), refunded);
+    assert_eq!(settled_coin(&alice, &node, &a_escrow, false).commitment(), refunded);
     // A claim after expiry is impossible.
     assert!(node.htlc_claim(&a_escrow, x).is_err());
 }
@@ -952,7 +1003,7 @@ fn spv_mint_claim_is_refused_once_the_refund_lock_is_within_sweep_margin() {
         let (block, proof) =
             testutil::deposit_proof(&REGTEST_GENESIS, &tx, 1_296_689_000, reserve, refund, btc_locktime, 0, 1);
         node.submit_btc_headers(&block).unwrap();
-        let id = open_spv(&mut node, 9, asset, value, lock, 100, alice.pubkey(), &proof).unwrap();
+        let id = open_spv(&mut node, 9, asset, value, lock, 100, &alice, &proof).unwrap();
 
         let mut prev = block;
         let mut tip = 1;
@@ -987,19 +1038,19 @@ fn pruned_escrow_ids_cannot_be_reopened_before_their_timeout() {
     let x = &pre("retired-id-regression-preimage-1");
     let lock = htlc_hashlock(x);
     let timeout = 10 + 2 * ESCROW_RETENTION_BLOCKS; // still far in the future after pruning
-    let id = open_mint(&mut node, &keyset, &signers, asset, 1_000, lock, timeout, alice.pubkey()).unwrap();
+    let id = open_mint(&mut node, &keyset, &signers, asset, 1_000, lock, timeout, &alice).unwrap();
     node.set_height(11);
     node.htlc_claim(&id, x).unwrap();
     // Same parameters while the settled escrow is still in the book: plain duplicate.
-    assert!(open_mint(&mut node, &keyset, &signers, asset, 1_000, lock, timeout, alice.pubkey()).is_err());
+    assert!(open_mint(&mut node, &keyset, &signers, asset, 1_000, lock, timeout, &alice).is_err());
     // Advance past the retention window so end_block prunes the settled entry.
     node.set_height(11 + ESCROW_RETENTION_BLOCKS + 1);
     node.end_block();
     assert!(node.htlc_escrow(&id).is_none(), "settled escrow is pruned");
-    let err = open_mint(&mut node, &keyset, &signers, asset, 1_000, lock, timeout, alice.pubkey()).unwrap_err();
+    let err = open_mint(&mut node, &keyset, &signers, asset, 1_000, lock, timeout, &alice).unwrap_err();
     assert!(err.contains("already used"), "re-open of a retired id must be refused: {err}");
     // A different timeout is a different escrow: allowed.
-    open_mint(&mut node, &keyset, &signers, asset, 1_000, lock, timeout + 1, alice.pubkey()).unwrap();
+    open_mint(&mut node, &keyset, &signers, asset, 1_000, lock, timeout + 1, &alice).unwrap();
 }
 
 
@@ -1031,12 +1082,12 @@ fn spv_open_and_claim_refuse_a_stale_bitcoin_tip() {
 
     // Block clock far past the tip's header time: the open is refused.
     node.set_block_time(u64::from(header_time) + max_age + 1);
-    let err = open_spv(&mut node, 9, asset, value, lock, 100, alice.pubkey(), &proof).unwrap_err();
+    let err = open_spv(&mut node, 9, asset, value, lock, 100, &alice, &proof).unwrap_err();
     assert!(err.contains("behind the block clock"), "{err}");
 
     // Fresh again (within the bound): the open succeeds.
     node.set_block_time(u64::from(header_time) + max_age);
-    let id = open_spv(&mut node, 9, asset, value, lock, 100, alice.pubkey(), &proof).unwrap();
+    let id = open_spv(&mut node, 9, asset, value, lock, 100, &alice, &proof).unwrap();
 
     // The tip goes stale before the claim (relay outage / header flood): claim refused, the
     // escrow stays Open (so it can still be claimed once headers catch up).
@@ -1100,7 +1151,7 @@ fn spv_reserve_key_rotation() {
     assert!(node.rotate_spv_reserve(CHAIN, asset, &new_pk, &old_pk, &sig).is_err());
 
     // Deposit A (old key, mined before the rotation) still opens and mints.
-    let id_a = open_spv(&mut node, 9, asset, value, lock_a, 100, alice.pubkey(), &proof_a).unwrap();
+    let id_a = open_spv(&mut node, 9, asset, value, lock_a, 100, &alice, &proof_a).unwrap();
     node.htlc_claim(&id_a, xa).unwrap().expect("old-key deposit still mints");
 
     // Deposit B: paid to the NEW key, mined after the rotation: accepted.
@@ -1109,7 +1160,7 @@ fn spv_reserve_key_rotation() {
     let tx_b = testutil::funding_tx(&lock_b, &new_pk, &refund, 100, value, 2);
     let (block2, proof_b) = testutil::deposit_proof(&block1, &tx_b, 1_296_689_600, new_pk, refund, 100, 0, 2);
     node.submit_btc_headers(&block2).unwrap();
-    let id_b = open_spv(&mut node, 9, asset, value, lock_b, 100, alice.pubkey(), &proof_b).unwrap();
+    let id_b = open_spv(&mut node, 9, asset, value, lock_b, 100, &alice, &proof_b).unwrap();
     node.htlc_claim(&id_b, xb).unwrap().expect("new-key deposit mints");
 
     // Deposit C: paid to the OLD key but mined well past the retirement grace: refused.
@@ -1123,7 +1174,7 @@ fn spv_reserve_key_rotation() {
     let tx_c = testutil::funding_tx(&lock_c, &old_pk, &refund, 100, value, 3);
     let (late, proof_c) = testutil::deposit_proof(&prev, &tx_c, 1_296_695_000, old_pk, refund, 100, 0, 3);
     node.submit_btc_headers(&late).unwrap();
-    let err = open_spv(&mut node, 9, asset, value, lock_c, 100, alice.pubkey(), &proof_c).unwrap_err();
+    let err = open_spv(&mut node, 9, asset, value, lock_c, 100, &alice, &proof_c).unwrap_err();
     assert!(err.contains("pinned reserve key"), "{err}");
 
     // The rotation survives a snapshot round trip (it is source-of-truth state).
@@ -1151,18 +1202,20 @@ fn swap_leg_claimed_by_the_revealer_must_expire_first() {
         let lock = htlc_hashlock(x);
         // Alice (taker) locks A, claimable by Bob; Bob (maker) locks B, claimable by Alice.
         let a_blind = keys::random_blind();
+        let (a_claim, a_refund) = swap_openings(&bob, &alice, 100_000, asset_a);
         let a_tx = swap_asset_tx(&alice, &mut node, asset_a, 100_000, a_blind,
-            &swap_env(asset_a, 100_000, lock, a_timeout, &bob, &alice));
+            &swap_env(asset_a, 100_000, lock, a_timeout, &bob, &alice, &a_claim.coin, &a_refund.coin));
         let (a_gas, a_gas_blind) = zcrypt_gas(&alice, &mut node, &shield_tx::txbind(CHAIN, &a_tx));
         let a_escrow = node
-            .swap_lock(CHAIN, &a_tx, &a_gas, a_gas_blind, 100_000, a_blind, asset_a, lock, a_timeout, bob.pubkey(), alice.pubkey())
+            .swap_lock(CHAIN, &a_tx, &a_gas, a_gas_blind, 100_000, a_blind, asset_a, lock, a_timeout, bob.pubkey(), alice.pubkey(), &a_claim, &a_refund)
             .unwrap();
         let b_blind = keys::random_blind();
+        let (b_claim, b_refund) = swap_openings(&alice, &bob, 120_000, asset_b);
         let b_tx = swap_asset_tx(&bob, &mut node, asset_b, 120_000, b_blind,
-            &swap_env(asset_b, 120_000, lock, b_timeout, &alice, &bob));
+            &swap_env(asset_b, 120_000, lock, b_timeout, &alice, &bob, &b_claim.coin, &b_refund.coin));
         let (b_gas, b_gas_blind) = zcrypt_gas(&bob, &mut node, &shield_tx::txbind(CHAIN, &b_tx));
         let b_escrow = node
-            .swap_lock(CHAIN, &b_tx, &b_gas, b_gas_blind, 120_000, b_blind, asset_b, lock, b_timeout, alice.pubkey(), bob.pubkey())
+            .swap_lock(CHAIN, &b_tx, &b_gas, b_gas_blind, 120_000, b_blind, asset_b, lock, b_timeout, alice.pubkey(), bob.pubkey(), &b_claim, &b_refund)
             .unwrap();
         // Alice waits until the EARLIER of the two timeouts has passed, then tries to take
         // both: refund her own lock, and claim Bob's with the preimage.

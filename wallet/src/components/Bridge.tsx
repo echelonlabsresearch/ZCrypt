@@ -35,6 +35,17 @@ interface PendingDeposit {
   started: number;
 }
 
+interface PendingRedeem {
+  index: number;
+  value_sats: string;
+  escrow_id_hex: string | null;
+  zc_timeout: number;
+  funded: boolean;
+  burn_error: string | null;
+  claim_error: string | null;
+  started: number;
+}
+
 /** 1 zBTC = 100,000,000 base units (8 decimals, like BTC). */
 const ZBTC_BASE = 100_000_000;
 const zfmt = (base: number) => (base / ZBTC_BASE).toLocaleString(undefined, { maximumFractionDigits: 8 });
@@ -59,6 +70,7 @@ export default function Bridge({
   const [progress, setProgress] = useState<Progress | null>(null);
   const [fixMsg, setFixMsg] = useState("");
   const [pendingDeposits, setPendingDeposits] = useState<PendingDeposit[]>([]);
+  const [pendingRedeems, setPendingRedeems] = useState<PendingRedeem[]>([]);
 
   // `withBtc` = also ask the Esplora server for the Bitcoin balance. Off for every
   // automatic refresh: a hosted Esplora learns the deposit address of whoever asks, so
@@ -74,7 +86,26 @@ export default function Bridge({
     } catch {
       setPendingDeposits([]);
     }
+    try {
+      setPendingRedeems(await call<PendingRedeem[]>("list_pending_redeems"));
+    } catch {
+      setPendingRedeems([]);
+    }
   }, []);
+
+  async function retryClaim(index: number) {
+    setErr("");
+    setFixMsg("");
+    setBusy("retry");
+    try {
+      setFixMsg(await call<string>("bridge_retry_redeem_claim", { index }));
+      await load();
+    } catch (e) {
+      setErr(String(e));
+    } finally {
+      setBusy("");
+    }
+  }
 
   async function refundDeposit(index: number) {
     setErr("");
@@ -324,6 +355,33 @@ export default function Bridge({
                 {!d.refund_txid && (
                   <button className="btn-secondary" disabled={busy !== ""} onClick={() => refundDeposit(d.index)}>
                     {busy === "refund" ? "Refunding…" : "Refund"}
+                  </button>
+                )}
+              </div>
+            ))}
+          </div>
+        )}
+
+        {pendingRedeems.length > 0 && (
+          <div className="card" style={{ marginTop: "0.75rem", background: "var(--bg-grid)", borderLeft: "3px solid var(--color-amber, #d99a00)" }}>
+            <div style={{ fontWeight: "bold" }}>⏸ {pendingRedeems.length} zBTC redeem(s) in flight</div>
+            <div style={{ fontSize: "0.72rem", color: "var(--color-text-dim)", marginTop: 4 }}>
+              Each burns zBTC into an escrow the operator pays BTC against. The wallet keeps checking in the
+              background while unlocked; if the operator never pays, the zBTC comes back when the escrow expires.
+            </div>
+            {pendingRedeems.map((r) => (
+              <div key={r.index} style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 6, fontSize: "0.8rem", flexWrap: "wrap" }}>
+                <span>#{r.index}: {zfmt(Number(r.value_sats))} zBTC</span>
+                <span style={{ color: "var(--color-text-dim)" }}>
+                  {r.escrow_id_hex ? (r.funded ? "operator BTC lock seen" : "waiting for the operator") : "burn not yet confirmed on the node"}
+                  {r.zc_timeout > 0 ? ` · refunds at block ${r.zc_timeout}` : ""}
+                  {r.burn_error ? ` · burn error: ${r.burn_error.slice(0, 80)}` : ""}
+                  {r.claim_error ? ` · claim rejected: ${r.claim_error.slice(0, 80)}` : ""}
+                </span>
+                <span className="spacer" />
+                {r.claim_error && (
+                  <button className="btn-secondary" disabled={busy !== ""} onClick={() => retryClaim(r.index)}>
+                    {busy === "retry" ? "Retrying…" : "Retry claim"}
                   </button>
                 )}
               </div>

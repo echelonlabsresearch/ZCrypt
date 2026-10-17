@@ -28,11 +28,22 @@ fn open_mint(
     value: u64,
     lock: [u8; 32],
     timeout: u64,
-    pk: [u64; 8],
+    beneficiary: &Account,
 ) -> Result<[u8; 32], String> {
-    let msg = mint_auth::mint_message(CHAIN, asset, value, &lock, timeout, &pk);
+    let (_, opening) = zcrypt_core::htlc_shield::CoinOpening::create(&beneficiary.normal_address(), value, asset)?;
+    let pk = beneficiary.pubkey();
+    let msg = mint_auth::mint_message(
+        CHAIN, asset, value, &lock, timeout, &pk, &opening.coin.commitment, &opening.coin.note_bind(),
+    );
     let sigs = mint_auth::authorize(ks, signers, &msg);
-    node.htlc_open(CHAIN, asset, value, lock, timeout, pk, ks, &sigs)
+    node.htlc_open(CHAIN, asset, value, lock, timeout, pk, &opening, ks, &sigs)
+}
+
+fn settled_coin(acct: &Account, node: &Node, id: &[u8; 32], claim: bool) -> Coin {
+    let e = node.htlc_escrow(id).expect("escrow");
+    let hidden = if claim { &e.claim_coin } else { &e.refund_coin };
+    let ct = kem::ciphertext_from_bytes(&hidden.as_ref().expect("note").enc_note).expect("note bytes");
+    acct.receive(&ct).expect("beneficiary decrypts the settlement note")
 }
 
 /// A 32-byte preimage from a short label (consensus accepts exactly 32 bytes).
@@ -222,10 +233,10 @@ fn full_product_surface_happy_path() {
     let lock = htlc_hashlock(preimage);
     node.set_height(emission::EPOCH + 1);
     let escrow =
-        open_mint(&mut node, &gold_ks, &gold_signers, gold, 500_000, lock, emission::EPOCH + 100, alice.pubkey())
+        open_mint(&mut node, &gold_ks, &gold_signers, gold, 500_000, lock, emission::EPOCH + 100, &alice)
             .unwrap();
     let gold_minted = node.htlc_claim(&escrow, preimage).unwrap().expect("mint yields a coin");
-    let gold_coin = alice.htlc_coin(500_000, gold, &escrow);
+    let gold_coin = settled_coin(&alice, &node, &escrow, true);
     assert_eq!(gold_coin.commitment(), gold_minted);
     assert_eq!(node.asset_minted(gold), 500_000);
     // Spend GOLD: 300k to Bob, the rest change to Alice. The fee is paid in GOLD — the
@@ -292,9 +303,14 @@ fn shielded_swap_end_to_end() {
         let note = kem::ciphertext_to_bytes(&keys::encrypt_note_asset(&locker.normal_address(), chg, chg_blind, asset));
         // The lock parameters are bound into the proof, so a front-runner cannot rewrite the
         // counterparty or refund key and redirect either leg of the trade.
+        let (claim_open, refund_open) = (
+            zcrypt_core::htlc_shield::CoinOpening::create(&counterparty.normal_address(), value, asset).unwrap().1,
+            zcrypt_core::htlc_shield::CoinOpening::create(&locker.normal_address(), value, asset).unwrap().1,
+        );
         let env = zcrypt_core::htlc_shield::lock_envelope(
             zcrypt_core::htlc_shield::ENV_SWAP_LOCK,
             asset, value, &lock, timeout, &counterparty.pubkey(), &locker.pubkey(), &[],
+            &[claim_open.coin.clone(), refund_open.coin.clone()],
         );
         let stx = build_shield_bound(node, &[coin.clone()], [burn_out, chg_out], 0, vec![keys::cover_note_bytes(), note], &env).unwrap();
         let gas_coin = locker.own_coin(FEE + 1_000, keys::random_blind());
@@ -311,7 +327,7 @@ fn shielded_swap_end_to_end() {
             &shield_tx::gas_pay_envelope(&shield_tx::txbind(CHAIN, &stx)),
         )
         .unwrap();
-        node.swap_lock(CHAIN, &stx, &gas_tx, gas_blind, value, burn_blind, asset, lock, timeout, counterparty.pubkey(), locker.pubkey()).unwrap()
+        node.swap_lock(CHAIN, &stx, &gas_tx, gas_blind, value, burn_blind, asset, lock, timeout, counterparty.pubkey(), locker.pubkey(), &claim_open, &refund_open).unwrap()
     };
 
     // Alice locks A → Bob; Bob locks B → Alice (same hashlock).
@@ -321,11 +337,11 @@ fn shielded_swap_end_to_end() {
     // Alice claims B (revealing the preimage); Bob then claims A. Atomic — both or neither.
     node.htlc_claim(&b_escrow, x).unwrap().expect("Alice receives B");
     node.htlc_claim(&a_escrow, x).unwrap().expect("Bob receives A");
-    let alice_b = alice.htlc_coin(take_b, asset_b, &b_escrow);
+    let alice_b = settled_coin(&alice, &node, &b_escrow, true);
     assert_eq!(alice_b.asset_id, asset_b);
     assert_eq!(alice_b.value, take_b);
     // Bob likewise reconstructs the A he received.
-    assert_eq!(bob.htlc_coin(give_a, asset_a, &a_escrow).asset_id, asset_a);
+    assert_eq!(settled_coin(&bob, &node, &a_escrow, true).asset_id, asset_a);
 
     // THE POINT: the received B is a real, spendable, PRIVATE coin — Alice pays Carol
     // 50_000 B from it, entirely inside the shielded pool.
@@ -412,7 +428,7 @@ fn product_surface_abuse_cases() {
     let lock = htlc_hashlock(&pre("cap-mint-preimage-01"));
     node.set_height(1);
     assert!(
-        open_mint(&mut node, &cap_ks, &cap_signers, capped, 2_000, lock, 100, alice.pubkey()).is_err(),
+        open_mint(&mut node, &cap_ks, &cap_signers, capped, 2_000, lock, 100, &alice).is_err(),
         "mint over the cap must be rejected at open"
     );
 
@@ -671,9 +687,9 @@ fn transfer_of_a_shielded_asset_pays_zcrypt_gas() {
     let lock = zcrypt_core::nullifier::htlc_hashlock(preimage);
     node.set_height(1);
     let escrow =
-        open_mint(&mut node, &gold_ks, &gold_signers, gold, 500_000, lock, 100, alice.pubkey()).unwrap();
+        open_mint(&mut node, &gold_ks, &gold_signers, gold, 500_000, lock, 100, &alice).unwrap();
     node.htlc_claim(&escrow, preimage).unwrap();
-    let gold_coin = alice.htlc_coin(500_000, gold, &escrow);
+    let gold_coin = settled_coin(&alice, &node, &escrow, true);
 
     // Alice also holds a ZCRYPT coin, purely to pay gas.
     let gas_coin = alice.own_coin(FEE + 1_000, keys::random_blind());

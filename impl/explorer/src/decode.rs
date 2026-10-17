@@ -44,11 +44,46 @@ fn rd_pk(b: &[u8], off: usize) -> Option<[u64; 8]> {
     Some(pk)
 }
 
-/// Swap-lock body after the 216-byte header is the same gas prefix a transfer uses,
-/// then the asset spend. Returns `(gas_tx, asset_tx)`.
+/// Burn-lock header: value(8) ‖ lock blind(64) ‖ asset(8) ‖ hashlock(32) ‖ timeout(8) ‖ refund pk(64).
+const BURN_HEAD: usize = 8 + BB + 8 + 32 + 8 + 64;
+/// Swap-lock header: the burn-lock header plus the counterparty pk (64). 248 bytes.
+const SWAP_HEAD: usize = BURN_HEAD + 64;
+
+/// Swap-lock body: the 248-byte header, then the claim opening, the refund opening,
+/// then the same gas prefix a transfer uses, then the asset spend.
+/// Returns `(gas_tx, asset_tx)`.
 fn parse_swap_proofs(body: &[u8]) -> Option<(ShieldTx, ShieldTx)> {
-    const HEAD: usize = 8 + BB + 8 + 32 + 8 + 64 + 64; // swap-lock header (248)
-    parse_transfer(body.get(HEAD..)?)
+    let (_, n1) = zcrypt_core::htlc_shield::CoinOpening::decode(body.get(SWAP_HEAD..)?)?;
+    let (_, n2) = zcrypt_core::htlc_shield::CoinOpening::decode(body.get(SWAP_HEAD + n1..)?)?;
+    parse_transfer(body.get(SWAP_HEAD + n1 + n2..)?)
+}
+
+/// Display range for `len` body bytes at `off`. Byte 0 of the transaction is the tag,
+/// so body offset 0 is displayed as 1.
+fn range_at(off: usize, len: usize) -> String {
+    format!("[{}..{}]", off + 1, off + 1 + len)
+}
+
+/// Rows for one settlement [`CoinOpening`]: commitment (public), encrypted note
+/// (the blind is only here), proof length, proof. Returns bytes consumed.
+fn push_opening(body: &[u8], off: usize, which: &str, r: &mut Vec<Value>) -> Option<usize> {
+    let (opening, n) = zcrypt_core::htlc_shield::CoinOpening::decode(body.get(off..)?)?;
+    let note_len = opening.coin.enc_note.len();
+    let proof_len = opening.proof.len();
+    let commit = format!("{which} commitment (public leaf; the blind is not this field)");
+    let note = format!("{which} encrypted note (ML-KEM; the blind travels only here)");
+    let plen = format!("{which} opening proof length (u32 LE)");
+    let proof = format!("{which} opening proof");
+    let mut cbytes = Vec::with_capacity(64);
+    for limb in &opening.coin.commitment {
+        cbytes.extend_from_slice(&limb.to_le_bytes());
+    }
+    r.push(row(range_at(off, 64), &commit, hex::encode(cbytes)));
+    r.push(row(range_at(off + 64, note_len), &note, format!("{note_len} bytes")));
+    let plen_off = off + 64 + note_len;
+    r.push(row(range_at(plen_off, 4), &plen, format!("{proof_len}")));
+    r.push(row(range_at(plen_off + 4, proof_len), &proof, format!("{proof_len} bytes")));
+    Some(n)
 }
 
 /// The 0x55 bundle body: `gas_blind(64) ‖ gas_len(4) ‖ gas_tx ‖ main_tx`.
@@ -179,7 +214,25 @@ which hides among the whole pool", hex_at(0, 64)));
             r.push(row("[17..49]".into(), "hashlock (SHA-256) -> Ctx.hashlock", hex_at(16, 32)));
             r.push(row("[49..57]".into(), "timeout height (u64 LE) -> Ctx.timeout", format!("{}", rd_u64(body, 48)?)));
             r.push(row("[57..121]".into(), "claimer shield pubkey", hex_at(56, 64)));
-            r.push(row("[121..]".into(), "mint authorization: threshold(u32) ‖ n(u32) ‖ ML-DSA keys ‖ signatures -> Ctx.mint_*", format!("{} bytes", body.len().saturating_sub(120))));
+            // 120-byte header, then one CoinOpening, then the M-of-N auth blob.
+            // The proof length is not fixed, so the auth range starts where the opening ended.
+            match push_opening(body, 120, "claim settlement", &mut r) {
+                Some(n) => {
+                    let auth_off = 120 + n;
+                    r.push(row(
+                        format!("[{}..]", auth_off + 1),
+                        "mint authorization: threshold(u32) ‖ n(u32) ‖ ML-DSA keys ‖ signatures -> Ctx.mint_* (binds the claim commitment and note_bind)",
+                        format!("{} bytes", body.len().saturating_sub(auth_off)),
+                    ));
+                }
+                None => {
+                    r.push(row(
+                        "[121..]".into(),
+                        "claim settlement opening (commitment ‖ encrypted note ‖ proof), then the M-of-N mint authorization",
+                        "truncated or not a settlement opening".into(),
+                    ));
+                }
+            }
         }
         0x5B => {
             r.push(row("[1..33]".into(), "escrow id -> Ctx.escrow_open lookup", hex_at(0, 32)));
@@ -194,13 +247,18 @@ which hides among the whole pool", hex_at(0, 64)));
             r.push(row("[81..113]".into(), "hashlock (SHA-256)", hex_at(16 + BB, 32)));
             r.push(row("[113..121]".into(), "timeout height (u64 LE)", format!("{}", rd_u64(body, 48 + BB)?)));
             r.push(row("[121..185]".into(), "refund shield pubkey", hex_at(56 + BB, 64)));
-            if let Some(stx) = body.get(120 + BB..).and_then(shield_tx::from_bytes) {
-                shield_rows("[185..] lock", &stx, &mut r);
+            // 184-byte header, then one refund opening, then the shield spend.
+            if let Some(n) = push_opening(body, BURN_HEAD, "refund settlement", &mut r) {
+                let stx_off = BURN_HEAD + n;
+                if let Some(stx) = body.get(stx_off..).and_then(shield_tx::from_bytes) {
+                    shield_rows(&format!("[{}..] lock", stx_off + 1), &stx, &mut r);
+                }
             }
         }
         0x62 => {
             let aid = rd_u64(body, 8 + BB)?;
             r.push(row("".into(), "STRUCTURE", "a 0x62 swap lock keeps the 248-byte escrow header, then the \
+claim opening and the refund opening (commitment public, blind only inside each encrypted note), then the \
 same ZCRYPT gas prefix a transfer uses (0.01 burned, the locked asset is not charged), then the asset spend \
 whose output[0] is the locked-value burn coin.".into()));
             r.push(row("[1..9]".into(), "locked value (u64 LE, in the asset's own atomic units)", asset_amt(rd_u64(body, 0)?, Some(aid), None, None)));
@@ -210,13 +268,16 @@ whose output[0] is the locked-value burn coin.".into()));
             r.push(row("[113..121]".into(), "timeout height (u64 LE)", format!("{}", rd_u64(body, 48 + BB)?)));
             r.push(row("[121..185]".into(), "counterparty shield pubkey", hex_at(56 + BB, 64)));
             r.push(row("[185..249]".into(), "refund shield pubkey", hex_at(120 + BB, 64)));
-            let head = 184 + BB; // 248-byte escrow header
-            let gas_len = rd_u32(body, head + BB)? as usize;
-            r.push(row("[249..313]".into(), "gas blind: the PUBLIC opening of the 0.01 ZCRYPT burn", hex_at(head, BB)));
-            r.push(row("[313..317]".into(), "gas tx length (u32 LE)", format!("{gas_len}")));
+            let n1 = push_opening(body, SWAP_HEAD, "claim settlement", &mut r)?;
+            let n2 = push_opening(body, SWAP_HEAD + n1, "refund settlement", &mut r)?;
+            let gas_off = SWAP_HEAD + n1 + n2;
+            let gas_len = rd_u32(body, gas_off + BB)? as usize;
+            r.push(row(range_at(gas_off, BB), "gas blind: the PUBLIC opening of the 0.01 ZCRYPT burn", hex_at(gas_off, BB)));
+            r.push(row(range_at(gas_off + BB, 4), "gas tx length (u32 LE)", format!("{gas_len}")));
             let (gas, asset_tx) = parse_swap_proofs(body)?;
-            shield_rows(&format!("[253..{}] gas", 253 + gas_len), &gas, &mut r);
-            shield_rows(&format!("[{}..] asset spend", 253 + gas_len), &asset_tx, &mut r);
+            let gas_tx_off = gas_off + BB + 4;
+            shield_rows(&format!("[{}..{}] gas", gas_tx_off + 1, gas_tx_off + 1 + gas_len), &gas, &mut r);
+            shield_rows(&format!("[{}..] asset spend", gas_tx_off + gas_len + 1), &asset_tx, &mut r);
         }
         0x5E => {
             // Wire: pubkey(32) ‖ nonce(8) ‖ sig(64) — nonce is signed for replay protection
@@ -264,9 +325,21 @@ whose output[0] is the locked-value burn coin.".into()));
             r.push(row("[17..49]".into(), "hashlock (SHA-256) -> Ctx.hashlock", hex_at(16, 32)));
             r.push(row("[49..57]".into(), "timeout height (u64 LE) -> Ctx.timeout", format!("{}", rd_u64(body, 48)?)));
             r.push(row("[57..121]".into(), "claimer shield pubkey", hex_at(56, 64)));
-            r.push(row("[121..154]".into(), "Bitcoin reserve claim key (33B) — must hash to the asset's SPV authority", hex_at(120, 33)));
-            r.push(row("[154..187]".into(), "depositor refund key (33B)", hex_at(153, 33)));
-            r.push(row("[187..]".into(), "refund locktime ‖ vout ‖ raw funding tx ‖ merkleblock proof -> Ctx.spv_ok", format!("{} bytes", body.len().saturating_sub(186))));
+            r.push(row(
+                "[121..185]".into(),
+                "open_auth (64-byte ECDSA): binds the escrow, the claim commitment, and the note bind — not a Bitcoin reserve key",
+                hex_at(120, 64),
+            ));
+            // 184-byte header, then one opening, then MintProof consumed exactly.
+            // The reserve key lives inside that proof, not at body offset 120.
+            if let Some(n) = push_opening(body, 184, "claim settlement", &mut r) {
+                let proof_off = 184 + n;
+                r.push(row(
+                    format!("[{}..]", proof_off + 1),
+                    "MintProof (exact consume): reserve key ‖ depositor refund key ‖ locktime ‖ vout ‖ funding tx ‖ merkle proof ‖ coinbase -> Ctx.spv_ok",
+                    format!("{} bytes", body.len().saturating_sub(proof_off)),
+                ));
+            }
         }
         _ => return None,
     }
@@ -335,15 +408,24 @@ pub fn describe_tx(b: &[u8], chain_id: &[u8], with_rules: bool, height: u64) -> 
             "explains": "Ticker, decimals, and hard cap are public; the mint authority is a commitment to an M-of-N ML-DSA key set (no secret on chain).",
         }),
         Some(0x5A) => {
-            let auth_off = 8 + 8 + 32 + 8 + 64;
+            // Header is 120 bytes; the opening sits in front of the auth blob.
+            let opened = zcrypt_core::htlc_shield::CoinOpening::decode(body.get(120..).unwrap_or(&[]));
+            let (claim_commitment, mint_authority) = match opened {
+                Some((opening, n)) => (
+                    Some(short(&opening.coin.commitment)),
+                    mint_auth_summary(body.get(120 + n..).unwrap_or(&[])),
+                ),
+                None => (None, json!(null)),
+            };
             json!({
                 "type": "HTLC open (mint escrow)", "tag": tag_hex,
                 "asset_id": rd_u64(body, 0).map(|a| a.to_string()),
                 "value_atomic": rd_u64(body, 8),
                 "hashlock": rd_hex(body, 16, 32),
                 "timeout_height": rd_u64(body, 48),
-                "mint_authority": mint_auth_summary(body.get(auth_off..).unwrap_or(&[])),
-                "explains": "The bridge mints a shielded asset into an escrow. The value is public (an atomic swap requires it); minting is authorized by M-of-N ML-DSA signatures over these exact parameters.",
+                "claim_commitment": claim_commitment,
+                "mint_authority": mint_authority,
+                "explains": "The value and asset are public (an atomic swap requires it). The claim commitment is in this transaction; the blind travels only in the encrypted note. Minting is authorized by M-of-N ML-DSA signatures over these parameters, that commitment, and the note bind.",
             })
         }
         Some(0x5B) => json!({
@@ -360,11 +442,12 @@ pub fn describe_tx(b: &[u8], chain_id: &[u8], with_rules: bool, height: u64) -> 
         Some(0x5D) => json!({
             "type": "HTLC burn-lock (zBTC redeem)", "tag": tag_hex,
             "value_atomic": rd_u64(body, 0),
-            "asset_id": rd_u64(body, 40).map(|a| a.to_string()),
-            "hashlock": rd_hex(body, 48, 32),
-            "timeout_height": rd_u64(body, 80),
-            "hidden": ["which coins funded the lock"],
-            "explains": "Value locked into a burn escrow is public (the swap peg requires it); the coins that funded it stay hidden behind the whole-pool proof.",
+            "asset_id": rd_u64(body, 8 + BB).map(|a| a.to_string()),
+            "hashlock": rd_hex(body, 16 + BB, 32),
+            "timeout_height": rd_u64(body, 48 + BB),
+            "refund_commitment": zcrypt_core::htlc_shield::CoinOpening::decode(body.get(BURN_HEAD..).unwrap_or(&[])).map(|(o, _)| short(&o.coin.commitment)),
+            "hidden": ["which coins funded the lock", "the settlement blind"],
+            "explains": "Value locked into a burn escrow is public (the swap peg requires it); the coins that funded it stay hidden behind the whole-pool proof. The refund commitment is in this transaction; its blind travels only in the encrypted note.",
         }),
         Some(0x5E) => json!({
             "type": "Unbond", "tag": tag_hex,
@@ -392,29 +475,56 @@ pub fn describe_tx(b: &[u8], chain_id: &[u8], with_rules: bool, height: u64) -> 
             "new_authority": rd_hex(body, 8, 32),
             "explains": "Rotates an asset's mint authority to a new M-of-N key set, authorized by a threshold signature from the current one. Epoch-bound, so it cannot be replayed.",
         }),
-        Some(0x62) => json!({
-            "type": "In-pool swap lock", "tag": tag_hex,
-            "value_atomic": rd_u64(body, 0),
-            "asset_id": rd_u64(body, 40).map(|a| a.to_string()),
-            "hashlock": rd_hex(body, 48, 32),
-            "timeout_height": rd_u64(body, 80),
-            "hidden": ["which coins funded the lock"],
-            "explains": "One leg of a private asset-for-asset swap. The locked value and asset are public for the escrow; the funding coins are hidden. Gas is 0.01 ZCRYPT in a separate proof, and the locked asset is not charged. Two such legs under one hashlock settle atomically.",
-        }),
+        Some(0x62) => {
+            let opened = zcrypt_core::htlc_shield::CoinOpening::decode(body.get(SWAP_HEAD..).unwrap_or(&[]));
+            let (claim_commitment, refund_commitment) = match opened {
+                Some((claim, n1)) => {
+                    let refund = zcrypt_core::htlc_shield::CoinOpening::decode(body.get(SWAP_HEAD + n1..).unwrap_or(&[]))
+                        .map(|(o, _)| short(&o.coin.commitment));
+                    (Some(short(&claim.coin.commitment)), refund)
+                }
+                None => (None, None),
+            };
+            json!({
+                "type": "In-pool swap lock", "tag": tag_hex,
+                "value_atomic": rd_u64(body, 0),
+                "asset_id": rd_u64(body, 8 + BB).map(|a| a.to_string()),
+                "hashlock": rd_hex(body, 16 + BB, 32),
+                "timeout_height": rd_u64(body, 48 + BB),
+                "claim_commitment": claim_commitment,
+                "refund_commitment": refund_commitment,
+                "hidden": ["which coins funded the lock", "the settlement blinds"],
+                "explains": "One leg of an in-pool asset-for-asset swap. The locked value and asset are public for the escrow; the funding coins are hidden. Both settlement commitments are in this transaction; their blinds travel only in the encrypted notes. Gas is 0.01 ZCRYPT in a separate proof, and the locked asset is not charged. Two such legs under one hashlock settle atomically.",
+            })
+        }
         Some(0x63) => json!({
             "type": "Bitcoin header relay", "tag": tag_hex,
             "headers": body.len() / 80,
             "explains": "Raw Bitcoin block headers feeding the consensus SPV chain — the trustless zBTC mint gate. Anyone may relay; each header proves itself by its proof-of-work, so the relayer is untrusted.",
         }),
-        Some(0x64) => json!({
-            "type": "HTLC open (SPV-verified mint)", "tag": tag_hex,
-            "asset_id": rd_u64(body, 0).map(|a| a.to_string()),
-            "value_atomic": rd_u64(body, 8),
-            "hashlock": rd_hex(body, 16, 32),
-            "timeout_height": rd_u64(body, 48),
-            "reserve_pk": rd_hex(body, 120, 33),
-            "explains": "A trustless bridge mint: every validator re-verified a Bitcoin SPV proof that real BTC (≥ the minted base units, 1:1) is locked in an HTLC claimable only by the pinned reserve key. No treasury, no signatures — nothing to trust.",
-        }),
+        Some(0x64) => {
+            // Header is 184 bytes (claim pk, then open_auth). The reserve key is
+            // inside the MintProof that follows the opening, not at offset 120.
+            let parsed = zcrypt_core::htlc_shield::CoinOpening::decode(body.get(184..).unwrap_or(&[])).and_then(|(opening, n)| {
+                let proof = zcrypt_core::spv::MintProof::from_bytes(body.get(184 + n..)?)?;
+                Some((short(&opening.coin.commitment), hex::encode(proof.reserve_pk)))
+            });
+            let (claim_commitment, reserve_pk) = match parsed {
+                Some((c, pk)) => (Some(c), Some(pk)),
+                None => (None, None),
+            };
+            json!({
+                "type": "HTLC open (SPV-verified mint)", "tag": tag_hex,
+                "asset_id": rd_u64(body, 0).map(|a| a.to_string()),
+                "value_atomic": rd_u64(body, 8),
+                "hashlock": rd_hex(body, 16, 32),
+                "timeout_height": rd_u64(body, 48),
+                "open_auth": rd_hex(body, 120, 64),
+                "claim_commitment": claim_commitment,
+                "reserve_pk": reserve_pk,
+                "explains": "A trustless bridge mint: every validator re-verified a Bitcoin SPV proof that real BTC (≥ the minted base units, 1:1) is locked in an HTLC claimable only by the reserve key inside the mint proof. The claim commitment is in this transaction; the blind travels only in the encrypted note. open_auth binds that commitment and the note.",
+            })
+        }
         _ => json!({ "type": "Unknown", "tag": tag_hex, "bytes": b.len() }),
     };
     // Attach the validity rule: the auditability-VM bytecode that defines this tx type, plus
@@ -593,30 +703,41 @@ fn gate_op_result(tag: u8, op: u8, body: &[u8], chain_id: &[u8], height: u64) ->
             Some(ran(ok, format!("explorer re-checked \"{ticker}\" against the format rule → {}", if ok { "valid" } else { "invalid" })))
         }
         0x1C => {
-            // CHECK_BURN_OUTPUT (swap-lock 0x62 / burn-lock 0x5D). A swap lock's asset
-            // spend sits after the gas prefix, not immediately after the 216-byte header.
+            // CHECK_BURN_OUTPUT (swap-lock 0x62 / burn-lock 0x5D). The shield spend
+            // follows the settlement opening(s), not the fixed header.
             let value = rd_u64(body, 0)?;
             let blind = rd_blind(body, 8)?;
-            let asset = rd_u64(body, 40)?;
+            let asset = rd_u64(body, 8 + BB)?;
             let stx = if tag == 0x62 {
                 parse_swap_proofs(body)?.1
             } else {
-                body.get(152..).and_then(shield_tx::from_bytes)?
+                let (_, n) = zcrypt_core::htlc_shield::CoinOpening::decode(body.get(BURN_HEAD..)?)?;
+                shield_tx::from_bytes(body.get(BURN_HEAD + n..)?)?
             };
             let expected = zcrypt_shield::commit_asset(value, &blind, &zcrypt_core::htlc_shield::BURN_PK, asset);
             let ok = stx.output_commitments.first() == Some(&expected);
             Some(ran(ok, format!("explorer recomputed commit_asset(value, blind, BURN_PK, asset) = {} and compared to output[0] → {}", short(&expected), if ok { "equal" } else { "MISMATCH" })))
         }
         0x1D if tag == 0x5A => {
-            // CHECK_THRESHOLD_SIG (htlc_open: asset8 value8 lock32 timeout8 claim_pk64 auth…)
+            // CHECK_THRESHOLD_SIG. Header is 120 bytes, then one CoinOpening, then the auth blob.
             let asset = rd_u64(body, 0)?;
             let value = rd_u64(body, 8)?;
             let mut lock = [0u8; 32];
             lock.copy_from_slice(body.get(16..48)?);
             let timeout = rd_u64(body, 48)?;
             let pk = rd_pk(body, 56)?;
-            let (keyset, sigs) = zcrypt_core::mint_auth::decode_auth(body.get(120..)?)?;
-            let msg = zcrypt_core::mint_auth::mint_message(chain_id, asset, value, &lock, timeout, &pk);
+            let (opening, n) = zcrypt_core::htlc_shield::CoinOpening::decode(body.get(120..)?)?;
+            let (keyset, sigs) = zcrypt_core::mint_auth::decode_auth(body.get(120 + n..)?)?;
+            let msg = zcrypt_core::mint_auth::mint_message(
+                chain_id,
+                asset,
+                value,
+                &lock,
+                timeout,
+                &pk,
+                &opening.coin.commitment,
+                &opening.coin.note_bind(),
+            );
             let ok = zcrypt_core::mint_auth::verify_threshold(&keyset, &msg, &sigs);
             Some(ran(ok, format!("explorer re-verified {}-of-{} ML-DSA signatures over the mint message → {}", keyset.threshold, keyset.n(), if ok { "valid" } else { "INVALID" })))
         }

@@ -65,10 +65,13 @@ fn main() {
 
     // ---- Attacker mints + claims zBTC against the (now 3-confirmed) deposit ----
     const CHAIN: &[u8] = b"zcrypt-devnet";
+    let net = value - zcrypt_core::emission::bridge_fee(value);
+    let (_, opening) = zcrypt_core::htlc_shield::CoinOpening::create(&attacker.normal_address(), net, asset).unwrap();
     let auth = testutil::open_auth_for_proof(9, &proof, testutil::OpenTerms {
         chain_id: CHAIN, asset_id: asset, value, hashlock: &lock, timeout_height: 500, claim_pk: &attacker.pubkey(),
+        claim_commitment: &opening.coin.commitment, note_bind: &opening.coin.note_bind(),
     });
-    let escrow = node.htlc_open_spv(CHAIN, asset, value, lock, 500, attacker.pubkey(), &proof, &auth).unwrap();
+    let escrow = node.htlc_open_spv(CHAIN, asset, value, lock, 500, attacker.pubkey(), &proof, &auth, &opening).unwrap();
     let coin = node.htlc_claim(&escrow, x).unwrap().unwrap();
     node.process_btc_maturity(); // deposit only 2 deep < maturity_conf 3 ⇒ stays immature
     println!("[mint]  SPV proof accepted → {value} zBTC minted, but held IMMATURE (deposit only");

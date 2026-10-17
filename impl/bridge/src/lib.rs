@@ -124,20 +124,29 @@ pub fn refund_key_legacy(seed: &[u8; 32]) -> Key {
 /// (whitespace tolerated) or exactly 32 raw bytes. A 32-byte file whose every byte is an
 /// ASCII hex digit is REFUSED as ambiguous (it is almost certainly a truncated hex key,
 /// and reading it as raw bytes would silently derive a different, wrong key).
+///
+/// The 32 bytes are also checked to be a VALID secp256k1 scalar (non-zero and below the
+/// curve order), so a corrupt or hand-made key file fails here with a clear error instead
+/// of panicking later inside [`Key::from_bytes`] (bridge L5).
 pub fn parse_secret_bytes(raw: &[u8]) -> Result<[u8; 32], String> {
-    if raw.len() == 32 {
+    let bytes: [u8; 32] = if raw.len() == 32 {
         if raw.iter().all(|b| b.is_ascii_hexdigit()) {
             return Err("secret: 32 bytes that are all hex characters is ambiguous (a truncated hex \
                         key?); write the key as 64 hex characters or as 32 raw bytes that are not \
                         all ASCII hex"
                 .to_string());
         }
-        return raw.try_into().map_err(|_| "secret: not 32 bytes".to_string());
-    }
-    let text = std::str::from_utf8(raw).map_err(|_| "secret: neither 32 raw bytes nor hex text")?;
-    let h: String = text.chars().filter(|c| !c.is_whitespace()).collect();
-    let b = hex::decode(&h).map_err(|e| format!("secret: invalid hex: {e}"))?;
-    b.try_into().map_err(|_| "secret: hex must decode to exactly 32 bytes".to_string())
+        raw.try_into().map_err(|_| "secret: not 32 bytes".to_string())?
+    } else {
+        let text = std::str::from_utf8(raw).map_err(|_| "secret: neither 32 raw bytes nor hex text")?;
+        let h: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+        let b = hex::decode(&h).map_err(|e| format!("secret: invalid hex: {e}"))?;
+        b.try_into().map_err(|_| "secret: hex must decode to exactly 32 bytes".to_string())?
+    };
+    // Reject zero and anything >= the curve order: neither is a usable private key.
+    SecretKey::from_slice(&bytes)
+        .map_err(|e| format!("secret: not a valid secp256k1 scalar (zero or >= curve order): {e}"))?;
+    Ok(bytes)
 }
 
 // ---------------------------------------------------------------------------
@@ -151,6 +160,12 @@ pub const MAX_FEE_RATE_SAT_VB: f64 = 500.0;
 /// A single HTLC spend or funding tx never pays more than this fraction of the value it
 /// moves as fees (1/4), except the absolute relay floor on tiny amounts.
 pub const MAX_FEE_FRACTION_DEN: u64 = 4;
+
+/// Fee rate (sat/vB) used when the estimator cannot answer (missing target, endpoint
+/// without an estimate, `estimatesmartfee` with no `feerate`). Deliberately conservative:
+/// a 1-2 sat/vB guess can strand an HTLC claim below the relay floor until its CLTV
+/// timelock passes (bridge L4). The M4 quarter-of-value cap still bounds the absolute fee.
+pub const FALLBACK_FEE_RATE_SAT_VB: f64 = 15.0;
 
 /// Clamp a fee rate into `[1, MAX_FEE_RATE_SAT_VB]`.
 pub fn cap_fee_rate(rate: f64) -> f64 {
@@ -214,14 +229,50 @@ impl Drop for Key {
 }
 
 impl Key {
-    pub fn from_bytes(b: &[u8; 32]) -> Self {
+    /// Build a keypair from a 32-byte scalar, rejecting zero and values >= the curve order
+    /// (bridge L5). Use this for anything read from a file or the network.
+    pub fn try_from_bytes(b: &[u8; 32]) -> Result<Self, String> {
         let secp = Secp256k1::new();
-        let sk = SecretKey::from_slice(b).expect("valid secret");
+        let sk = SecretKey::from_slice(b)
+            .map_err(|e| format!("invalid secp256k1 secret (zero or >= curve order): {e}"))?;
         let pk = PublicKey::new(bitcoin::secp256k1::PublicKey::from_secret_key(&secp, &sk));
-        Key { sk, pk }
+        Ok(Key { sk, pk })
+    }
+
+    /// Infallible wrapper over [`Self::try_from_bytes`] for scalars that are KNOWN valid:
+    /// hash-derived keys (`H(domain, seed)` is outside the valid range with probability
+    /// about 2^-128) and fixed test constants. Panics on an invalid scalar, so never feed it
+    /// untrusted input; parse that with [`parse_secret_bytes`] (which validates) first.
+    pub fn from_bytes(b: &[u8; 32]) -> Self {
+        Self::try_from_bytes(b).expect("Key::from_bytes: caller passed an invalid secp256k1 scalar")
     }
     pub fn compressed(&self) -> CompressedPublicKey {
         CompressedPublicKey(self.pk.inner)
+    }
+}
+
+/// nSequence for every HTLC claim or refund spend: 0xFFFFFFFD is non-final (nLockTime and
+/// so CLTV are enforced) AND signals BIP-125 replace-by-fee (bridge L4).
+pub const HTLC_SPEND_SEQUENCE: Sequence = Sequence(0xFFFF_FFFD);
+
+/// Length of the SHA-256 preimage an HTLC claim must reveal; the script's `OP_SIZE 32`
+/// guard makes any other length unspendable, so a witness item 1 of another length is
+/// not a claim.
+pub const HTLC_PREIMAGE_LEN: usize = 32;
+
+/// Decode the preimage slot (witness item 1) of an HTLC spend: exactly 32 bytes is a
+/// claim, empty is the refund branch (the OP_IF selector false leaves the slot empty),
+/// anything else is not an HTLC spend this code recognises (bridge M11).
+pub fn classify_htlc_witness_item(item: &[u8]) -> Result<HtlcSpend, String> {
+    if item.len() == HTLC_PREIMAGE_LEN {
+        Ok(HtlcSpend::Claimed(item.to_vec()))
+    } else if item.is_empty() {
+        Ok(HtlcSpend::Refunded)
+    } else {
+        Err(format!(
+            "HTLC spend witness item 1 is {} bytes: neither a 32-byte preimage nor the empty refund slot",
+            item.len()
+        ))
     }
 }
 
@@ -518,15 +569,28 @@ impl Btc {
     }
 
     /// Whether `utxo` is still unspent on this node's CONFIRMED chain (`gettxout` without
-    /// the mempool). `Some(false)` means a confirmed spend exists; the block scan that
-    /// extracts the preimage can then be limited to spent outputs (bridge N8).
+    /// the mempool). `Some(true)`: the output is in the confirmed UTXO set. `Some(false)`: a
+    /// CONFIRMED spend exists (the funding tx is confirmed, yet the output is gone), so the
+    /// block scan that extracts the preimage can be limited to spent outputs (bridge N8).
+    /// `None`: unknown, which covers a funding tx that is still unconfirmed or that this
+    /// node does not know at all; a bare `gettxout` null cannot tell those apart from a
+    /// spend, and reporting them as "spent" would make the watcher give up on a live lock
+    /// (bridge M12).
     pub fn utxo_unspent(&self, utxo: &HtlcUtxo) -> Result<Option<bool>, String> {
         use serde_json::json;
         let v: serde_json::Value = self
             .rpc
             .call("gettxout", &[json!(utxo.outpoint.txid.to_string()), json!(utxo.outpoint.vout), json!(false)])
             .map_err(|e| e.to_string())?;
-        Ok(Some(!v.is_null()))
+        if !v.is_null() {
+            return Ok(Some(true));
+        }
+        // The output is not in the confirmed UTXO set. Only call that a spend when the
+        // FUNDING tx itself is confirmed; otherwise the output simply is not there yet.
+        match self.rpc.get_raw_transaction_info(&utxo.outpoint.txid, None) {
+            Ok(info) if info.confirmations.unwrap_or(0) > 0 => Ok(Some(false)),
+            _ => Ok(None),
+        }
     }
 
     /// The hash of the block `txid` is confirmed in on this node's best chain (internal
@@ -594,12 +658,11 @@ impl Btc {
         locktime: LockTime,
         mk_witness: impl Fn(Vec<u8>) -> Witness,
     ) -> Result<Txid, String> {
-        // The refund branch needs a non-final sequence for CLTV to be enforced.
-        let sequence = if locktime == LockTime::ZERO {
-            Sequence::ENABLE_RBF_NO_LOCKTIME
-        } else {
-            Sequence::ENABLE_LOCKTIME_NO_RBF
-        };
+        // Both branches use nSequence 0xFFFFFFFD: non-final, so CLTV is enforced on the
+        // refund branch, and below 0xFFFFFFFE, so the spend signals BIP-125 RBF and a
+        // fee-starved claim or refund can be bumped before the timelock race is lost
+        // (bridge L4).
+        let sequence = HTLC_SPEND_SEQUENCE;
         if fee >= utxo.value {
             return Err(format!(
                 "HTLC spend fee {} sats >= utxo value {} sats",
@@ -636,13 +699,32 @@ impl Btc {
     }
 
     /// Extract the SHA-256 preimage revealed in a claim tx (witness item 1), so the
-    /// other leg can be settled from what's actually on-chain.
+    /// other leg can be settled from what's actually on-chain. Only a txid is known here,
+    /// so the first input whose witness item 1 is exactly 32 bytes is taken (the caller
+    /// checks it against the hashlock); a refund (empty item 1) or any other shape yields
+    /// `None`, never an empty preimage (bridge M11). When the HTLC outpoint is known use
+    /// [`Self::htlc_spend_in_tx`], which matches the input by outpoint.
     pub fn preimage_from_claim(&self, txid: &Txid) -> Option<Vec<u8>> {
         let tx = self.rpc.get_raw_transaction(txid, None).ok()?;
         // claim witness = [sig, preimage, 0x01, witnessScript]
-        let w = &tx.input.first()?.witness;
-        let item = w.nth(1)?;
-        Some(item.to_vec())
+        tx.input.iter().find_map(|vin| match vin.witness.nth(1) {
+            Some(item) if item.len() == HTLC_PREIMAGE_LEN => Some(item.to_vec()),
+            _ => None,
+        })
+    }
+
+    /// How `spend_txid` spends the HTLC `outpoint`: the input is selected by its prevout,
+    /// never by position, and its witness item 1 is classified by
+    /// [`classify_htlc_witness_item`]. Errors when no input of the tx spends `outpoint`.
+    pub fn htlc_spend_in_tx(&self, spend_txid: &Txid, outpoint: &OutPoint) -> Result<HtlcSpend, String> {
+        let tx = self.rpc.get_raw_transaction(spend_txid, None).map_err(|e| e.to_string())?;
+        let vin = tx
+            .input
+            .iter()
+            .find(|vin| vin.previous_output == *outpoint)
+            .ok_or_else(|| format!("tx {spend_txid} does not spend HTLC outpoint {outpoint}"))?;
+        let item = vin.witness.nth(1).ok_or("HTLC spend input has no witness item 1")?;
+        classify_htlc_witness_item(item)
     }
 }
 
@@ -692,6 +774,14 @@ pub trait BtcBackend {
     /// operator watcher recover BTC it locked for a redeem the user never claimed (bridge M5).
     fn refund(&self, _utxo: &HtlcUtxo, _key: &Key, _locktime: u32, _dest: &Address, _fee: Amount) -> Result<Txid, String> {
         Err("refund not supported by this backend".to_string())
+    }
+    /// A fresh address for one operator payout (sweep or redeem refund). Reusing one
+    /// address for every payout clusters the reserve's activity (bridge M15). Backends
+    /// that have no address rotation return an error containing "not supported"; the
+    /// caller may then keep its process-lifetime destination. A real wallet error must
+    /// NOT be treated that way — the caller retries next tick.
+    fn fresh_payout_address(&self) -> Result<Address, String> {
+        Err("fresh payout address not supported".into())
     }
     /// The block (internal byte order) `txid` is confirmed in on this backend's best chain,
     /// `None` while unconfirmed. Used to detect a deposit re-mined by a reorg so its immature
@@ -778,6 +868,9 @@ impl BtcBackend for Btc {
     fn refund(&self, utxo: &HtlcUtxo, key: &Key, locktime: u32, dest: &Address, fee: Amount) -> Result<Txid, String> {
         Btc::refund(self, utxo, key, locktime, dest, fee)
     }
+    fn fresh_payout_address(&self) -> Result<Address, String> {
+        self.new_address()
+    }
     fn tx_block_hash(&self, txid: &Txid) -> Result<Option<[u8; 32]>, String> {
         Btc::tx_block_hash(self, txid)
     }
@@ -794,9 +887,15 @@ impl BtcBackend for Btc {
             .rpc
             .call("estimatesmartfee", &[serde_json::json!(target)])
             .map_err(|e| e.to_string())?;
-        let sat_vb = res["feerate"].as_f64().unwrap_or(0.0) * 100_000_000.0 / 1000.0;
+        // No `feerate` (node still warming up, or too few samples): fall back to a
+        // conservative constant rather than a 1-2 sat/vB guess that could strand a
+        // claim below the relay floor (bridge L4). M4 caps the absolute fee regardless.
+        let sat_vb = match res["feerate"].as_f64() {
+            Some(btc_kvb) if btc_kvb > 0.0 => btc_kvb * 100_000_000.0 / 1000.0,
+            _ => FALLBACK_FEE_RATE_SAT_VB,
+        };
         // Never act on an absurd estimate (bridge M4).
-        Ok(cap_fee_rate(if sat_vb >= 1.0 { sat_vb } else { 2.0 }))
+        Ok(cap_fee_rate(sat_vb))
     }
     fn find_htlc_spend(&self, utxo: &HtlcUtxo, since_height: u64) -> Result<HtlcSpend, String> {
         let tip = self.height()?;
@@ -813,14 +912,15 @@ impl BtcBackend for Btc {
                     if vin["txid"].as_str() == Some(want_txid.as_str())
                         && vin["vout"].as_u64() == Some(utxo.outpoint.vout as u64)
                     {
-                        // Claim witness = [sig, PREIMAGE, selector=1, script]; refund has an empty item 1.
-                        let pre = vin["txinwitness"].as_array().and_then(|w| w.get(1)).and_then(|x| x.as_str());
-                        return Ok(match pre {
-                            Some(hexpre) if !hexpre.is_empty() => {
-                                HtlcSpend::Claimed(hex::decode(hexpre).map_err(|e| e.to_string())?)
-                            }
-                            _ => HtlcSpend::Refunded, // refund branch: empty preimage slot
-                        });
+                        // Claim witness = [sig, PREIMAGE(32), selector=1, script]; refund has an
+                        // empty item 1. Any other length is not an HTLC spend (bridge M11).
+                        let hexpre = vin["txinwitness"]
+                            .as_array()
+                            .and_then(|w| w.get(1))
+                            .and_then(|x| x.as_str())
+                            .ok_or("HTLC spend input has no witness item 1")?;
+                        let item = hex::decode(hexpre).map_err(|e| e.to_string())?;
+                        return classify_htlc_witness_item(&item);
                     }
                 }
             }
@@ -897,6 +997,37 @@ pub mod txbuilder;
 pub mod wallet_flows;
 pub mod watcher;
 pub mod zcrypt;
+
+#[cfg(test)]
+mod key_input_tests {
+    use super::*;
+
+    #[test]
+    fn parse_secret_bytes_rejects_invalid_scalars() {
+        // zero
+        assert!(parse_secret_bytes(&hex::encode([0u8; 32]).into_bytes()).is_err());
+        // curve order n and n+1 (>= order)
+        let n = "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141";
+        assert!(parse_secret_bytes(n.as_bytes()).is_err());
+        assert!(parse_secret_bytes(&[0xFF; 32]).is_err());
+        // n - 1 is the largest valid scalar
+        let n_minus_1 = "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364140";
+        assert!(parse_secret_bytes(n_minus_1.as_bytes()).is_ok());
+        assert!(Key::try_from_bytes(&[0u8; 32]).is_err());
+        assert!(Key::try_from_bytes(&[0xFF; 32]).is_err());
+        assert!(Key::try_from_bytes(&[7u8; 32]).is_ok());
+    }
+
+    #[test]
+    fn htlc_witness_item_classification() {
+        assert_eq!(classify_htlc_witness_item(&[1u8; 32]).unwrap(), HtlcSpend::Claimed(vec![1u8; 32]));
+        assert_eq!(classify_htlc_witness_item(&[]).unwrap(), HtlcSpend::Refunded);
+        assert!(classify_htlc_witness_item(&[1u8; 31]).is_err());
+        assert!(classify_htlc_witness_item(&[1u8; 33]).is_err());
+        assert_eq!(HTLC_SPEND_SEQUENCE.to_consensus_u32(), 0xFFFF_FFFD);
+        assert!(HTLC_SPEND_SEQUENCE.is_rbf() && HTLC_SPEND_SEQUENCE.enables_absolute_lock_time());
+    }
+}
 
 /// A fixed P2WPKH address whose private key nobody uses — mining here burns the
 /// coinbase so confirming swap txs doesn't credit any tracked wallet's balance.

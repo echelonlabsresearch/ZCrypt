@@ -219,6 +219,21 @@ struct EscrowRec {
     /// SPV-backed mint (the settled coin is net of the bridge fee).
     #[serde(default)]
     spv: bool,
+    /// "mint" | "burn" | "swap" (empty on records written before this field).
+    #[serde(default)]
+    kind: String,
+    /// The escrow's hashlock (hex), so a seed restore can match a deterministic preimage
+    /// to it and rebuild the in-flight redeem record.
+    #[serde(default)]
+    hashlock_hex: String,
+    /// The escrow's timeout height (0 when unknown): consensus auto-expires the escrow at
+    /// the end of that block, so a refund-role record past it is checked by state query.
+    #[serde(default)]
+    timeout: u64,
+    /// Settlement blind (8×u64 LE hex) once this wallet created it or decrypted the note.
+    /// Empty until then. Never the escrow id.
+    #[serde(default)]
+    blind_hex: String,
 }
 
 /// A BTC to zBTC deposit this wallet STARTED: everything needed to pick it back up from
@@ -254,6 +269,12 @@ struct PendingDeposit {
     /// The refund tx this wallet broadcast after the CLTV passed, if any.
     #[serde(default)]
     refund_txid: Option<String>,
+    /// Closed on a proven negative (output spent, or never funded long past its lock). The
+    /// record, and with it the preimage, is kept on disk; only the UI hides it.
+    #[serde(default)]
+    archived: bool,
+    #[serde(default)]
+    archive_note: String,
 }
 
 /// Change from a swap lock. The blind and spend secret are what let the wallet
@@ -306,6 +327,11 @@ struct PendingSwap {
     /// Offer text the taker hands to the maker. Empty for the maker.
     #[serde(default)]
     ticket: String,
+    /// HD index of the stealth sub-account this wallet used as its key in the swap (the
+    /// refund key of its own lock and the claim key of the other side's). `None` on records
+    /// from before per-swap keys: the main account.
+    #[serde(default)]
+    my_index: Option<u32>,
 }
 
 /// A zBTC -> BTC redeem in flight (wallet M11). Written and SAVED before the burn escrow is
@@ -334,6 +360,23 @@ struct PendingRedeemRec {
     claim_txid: Option<String>,
     #[serde(default)]
     expired: bool,
+    /// ZC height when the burn was attempted, so a missing escrow id can be recovered by
+    /// scanning forward from here for a 0x67 whose hashlock matches.
+    #[serde(default)]
+    started_height: i64,
+    /// `tx_id` of this redeem's history row (updated when the BTC is claimed).
+    #[serde(default)]
+    hist_id: String,
+    /// The burn broadcast returned an error (the tx may still have committed).
+    #[serde(default)]
+    burn_error: Option<String>,
+    /// The Bitcoin claim was rejected: the preimage may already be known to the Bitcoin
+    /// backend, so resume does not re-broadcast it until the user asks (wallet L12).
+    #[serde(default)]
+    claim_error: Option<String>,
+    /// Next ZC height the escrow-id recovery scan reads (see `recover_redeem_escrow_id`).
+    #[serde(default)]
+    id_scan_cursor: i64,
 }
 
 /// A secret the wallet must hand to the user and that lives NOWHERE else (a bearer token, a
@@ -497,6 +540,11 @@ impl Wallet {
         self.clock
     }
     fn push_hist(&mut self, kind: &str, amount: i64, counterparty: String, asset_id: u64) {
+        self.push_hist_id(kind, amount, counterparty, asset_id);
+    }
+    /// Like [`Wallet::push_hist`] but returns the row's `tx_id`, so a later event (a BTC
+    /// claim landing) can update the row's label instead of leaving it "awaiting" forever.
+    fn push_hist_id(&mut self, kind: &str, amount: i64, counterparty: String, asset_id: u64) -> String {
         let t = self.tick();
         // ZCRYPT is 6 decimals; every shielded asset is standardized to 8. So the UI can
         // format each row with the right scale instead of assuming ZCRYPT everywhere.
@@ -514,12 +562,46 @@ impl Wallet {
                 decimals,
             },
         );
+        format!("{kind}-{t}")
+    }
+}
+
+/// Update a redeem's history row once its BTC was claimed (wallet L10).
+fn mark_redeem_claimed(w: &mut Wallet, index: u32, txid: &str) {
+    let hist_id = w.pending_redeems.iter().find(|r| r.index == index).map(|r| r.hist_id.clone()).unwrap_or_default();
+    if hist_id.is_empty() {
+        return;
+    }
+    if let Some(h) = w.history.iter_mut().find(|h| h.tx_id == hist_id) {
+        h.counterparty = format!("zBTC→BTC (BTC claimed {})", short(txid));
+    }
+}
+
+// Set only on the bridge-worker thread for the duration of a settle tick. UI commands
+// never set it, so they cannot see the settler.
+thread_local! {
+    static SETTLE_SCOPE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+struct SettleScope;
+impl SettleScope {
+    fn enter() -> Self {
+        SETTLE_SCOPE.with(|c| c.set(true));
+        SettleScope
+    }
+}
+impl Drop for SettleScope {
+    fn drop(&mut self) {
+        SETTLE_SCOPE.with(|c| c.set(false));
     }
 }
 
 #[derive(Default)]
 struct AppState {
     wallet: Mutex<Option<Wallet>>,
+    /// In-flight swaps, redeems, or deposits kept after the UI locks, so settlement can
+    /// finish. Ordinary commands never read this. Lock `wallet` before `settler`.
+    settler: Mutex<Option<Wallet>>,
     data_dir: Mutex<String>,
     /// The last failed post-action save, surfaced to the UI as a persistent banner
     /// (wallet H2): a failed save must never cost the user the result of an action.
@@ -798,7 +880,12 @@ fn create_wallet(password: String, state: State<AppState>) -> R<CreateResult> {
     write_keystore(&dir, &ks)?;
     let address = account.normal_address().to_bech32();
     let out = CreateResult { address, seed_phrase: phrase.to_string() };
-    *state.wallet.lock().unwrap() = Some(Wallet::fresh(account, phrase));
+    {
+        let mut wallet = state.wallet.lock().unwrap();
+        let mut settler = state.settler.lock().unwrap();
+        *settler = None;
+        *wallet = Some(Wallet::fresh(account, phrase));
+    }
     ok(out)
 }
 
@@ -816,10 +903,15 @@ fn restore_wallet(password: String, mnemonic: String, state: State<AppState>) ->
     let ks = seal(&password, &mnemonic);
     write_keystore(&dir, &ks)?;
     let address = account.normal_address().to_bech32();
-    *state.wallet.lock().unwrap() = Some(Wallet::fresh(account, mnemonic));
-    // if this machine already has coins for this mnemonic, restore them
-    if let Some(w) = state.wallet.lock().unwrap().as_mut() {
-        load_state(w, &dir);
+    {
+        let mut wallet = state.wallet.lock().unwrap();
+        let mut settler = state.settler.lock().unwrap();
+        *settler = None;
+        *wallet = Some(Wallet::fresh(account, mnemonic));
+        // if this machine already has coins for this mnemonic, restore them
+        if let Some(w) = wallet.as_mut() {
+            load_state(w, &dir);
+        }
     }
     ok(CreateResult { address, seed_phrase: String::new() })
 }
@@ -829,45 +921,114 @@ fn unlock_wallet(password: String, state: State<AppState>) -> R<bool> {
     let dir = state.data_dir.lock().unwrap().clone();
     let raw = std::fs::read_to_string(keystore_path(&dir)).map_err(|_| "no wallet on disk")?;
     let ks: Keystore = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
+    // Verify the password before touching either wallet mutex.
     let mnemonic = unseal(&password, &ks).ok_or("wrong password")?;
     let account = Account::from_mnemonic(&mnemonic, "").ok_or("corrupt keystore")?;
-    *state.wallet.lock().unwrap() = Some(Wallet::fresh(account, mnemonic));
-    // restore persisted coins/history/scan-height for this account
-    if let Some(w) = state.wallet.lock().unwrap().as_mut() {
-        load_state(w, &dir);
+    let mut wallet = state.wallet.lock().unwrap();
+    let mut settler = state.settler.lock().unwrap();
+    if let Some(w) = settler.take() {
+        drop(account);
+        drop(mnemonic);
+        // The settler holds the in-flight state. Install it; disk is the backup.
+        if let Err(e) = save_state(&w, &dir) {
+            let msg = format!(
+                "the wallet unlocked, but it could NOT save the in-flight settlement state: {e}. \
+                 It is back in this session; fix permissions on ~/.zcrypt before locking again."
+            );
+            eprintln!("[wallet] {msg}");
+            *state.last_save_error.lock().unwrap() = Some(msg);
+        }
+        *wallet = Some(w);
+    } else {
+        *wallet = Some(Wallet::fresh(account, mnemonic));
+        if let Some(w) = wallet.as_mut() {
+            load_state(w, &dir);
+        }
     }
     ok(true)
 }
 
+/// Swaps, redeems, or a deposit that is still resumable. An archived deposit is done.
+fn wallet_has_settle_work(w: &Wallet) -> bool {
+    !w.pending_swaps.is_empty() || !w.pending_redeems.is_empty() || w.pending_deposits.iter().any(|p| !p.archived)
+}
+
 #[tauri::command]
 fn lock_wallet(state: State<AppState>) -> R<bool> {
-    *state.wallet.lock().unwrap() = None;
+    // wallet then settler. Pending work moves to the settler; the UI sees a locked wallet.
+    let mut wallet = state.wallet.lock().unwrap();
+    let mut settler = state.settler.lock().unwrap();
+    if let Some(w) = wallet.take() {
+        if wallet_has_settle_work(&w) {
+            *settler = Some(w);
+        }
+    }
     ok(true)
+}
+
+fn save_wallet_result(state: &State<AppState>, w: &Wallet, dir: &str) {
+    match save_state(w, dir) {
+        Ok(()) => *state.last_save_error.lock().unwrap() = None,
+        Err(e) => {
+            // H2: the action already happened (coins may have moved on-chain), so the
+            // result is NEVER discarded: for a bearer token or a stealth note it is the
+            // only copy of the money. The failure is kept for the UI banner instead.
+            let msg = format!(
+                "the action went through, but the wallet could NOT save to disk: {e}. \
+                 Fix permissions on ~/.zcrypt (e.g. `sudo chown -R $(whoami) ~/.zcrypt`) — \
+                 until then nothing persists across restarts: copy any token or note shown to you now."
+            );
+            eprintln!("[wallet] {msg}");
+            *state.last_save_error.lock().unwrap() = Some(msg);
+        }
+    }
 }
 
 fn with_wallet<T>(state: &State<AppState>, f: impl FnOnce(&mut Wallet) -> Result<T, String>) -> Result<T, String> {
     let dir = state.data_dir.lock().unwrap().clone();
     let mut g = state.wallet.lock().unwrap();
-    let w = g.as_mut().ok_or("wallet is locked")?;
-    let r = f(w);
-    if r.is_ok() {
-        match save_state(w, &dir) {
-            Ok(()) => *state.last_save_error.lock().unwrap() = None,
-            Err(e) => {
-                // H2: the action already happened (coins may have moved on-chain), so the
-                // result is NEVER discarded: for a bearer token or a stealth note it is the
-                // only copy of the money. The failure is kept for the UI banner instead.
-                let msg = format!(
-                    "the action went through, but the wallet could NOT save to disk: {e}. \
-                     Fix permissions on ~/.zcrypt (e.g. `sudo chown -R $(whoami) ~/.zcrypt`) — \
-                     until then nothing persists across restarts: copy any token or note shown to you now."
-                );
-                eprintln!("[wallet] {msg}");
-                *state.last_save_error.lock().unwrap() = Some(msg);
-            }
+    if let Some(w) = g.as_mut() {
+        let r = f(w);
+        if r.is_ok() {
+            save_wallet_result(state, w, &dir);
         }
+        return r;
     }
-    r
+    // UI commands leave SETTLE_SCOPE false, so a locked wallet stays locked for them.
+    if SETTLE_SCOPE.with(|c| c.get()) {
+        let mut s = state.settler.lock().unwrap();
+        let w = s.as_mut().ok_or("wallet is locked")?;
+        let r = f(w);
+        if r.is_ok() {
+            save_wallet_result(state, w, &dir);
+        }
+        return r;
+    }
+    Err("wallet is locked".into())
+}
+
+/// The wallet a settle tick may read: the unlocked wallet, or the settler when this
+/// thread is inside [`SettleScope`] and the UI wallet is locked. Lock order is wallet
+/// then settler. The guard holds both until it drops.
+struct HeldWallet<'a> {
+    wallet: std::sync::MutexGuard<'a, Option<Wallet>>,
+    settler: Option<std::sync::MutexGuard<'a, Option<Wallet>>>,
+}
+
+impl HeldWallet<'_> {
+    fn get(&self) -> Option<&Wallet> {
+        self.wallet.as_ref().or_else(|| self.settler.as_ref().and_then(|s| s.as_ref()))
+    }
+}
+
+fn lock_active_wallet<'a>(state: &'a State<'_, AppState>) -> HeldWallet<'a> {
+    let wallet = state.wallet.lock().unwrap();
+    let settler = if wallet.is_none() && SETTLE_SCOPE.with(|c| c.get()) {
+        Some(state.settler.lock().unwrap())
+    } else {
+        None
+    };
+    HeldWallet { wallet, settler }
 }
 
 /// Save NOW, inside a `with_wallet` closure, before an irreversible action. Errors abort the
@@ -1634,7 +1795,11 @@ fn bridge_settings(dir: &str) -> Result<Settings, String> {
 /// per target), and the broadcast jitter switch.
 fn apply_transport(s: &Settings) {
     chain::set_tor(tor_proxy_url(s));
-    zcrypt_bridge::set_tor(tor_raw_proxy(s).map(|p| chain::socks_isolated(&p, "bridge")));
+    // A bridge operation in flight owns the bridge circuit it rotated onto: a settings read
+    // from the UI must not reset it mid-operation (wallet M13).
+    if BRIDGE_OPS_IN_FLIGHT.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+        zcrypt_bridge::set_tor(tor_raw_proxy(s).map(|p| chain::socks_isolated(&p, "bridge")));
+    }
     chain::set_broadcast_jitter(s.broadcast_jitter);
 }
 
@@ -2562,17 +2727,57 @@ pub fn shield_txs_in_tx(tx: &[u8]) -> Vec<shield_tx::ShieldTx> {
         }
         // bond: pk(32) stake(8) reward(32) commission(2) nonce(8) sig(64) stake_blind(64) ‖ shield
         0x57 => at(146 + zcrypt_shield::BLIND_BYTES, &mut out),
-        // burn-lock: value(8) blind(64) asset(8) hashlock(32) timeout(8) refund_pk(64) ‖ shield
-        0x5D => at(120 + zcrypt_shield::BLIND_BYTES, &mut out),
+        // burn-lock: header(184) ‖ opening ‖ shield. Pre-opening locks had the shield at 184.
+        0x5D => push_lock_shield(body, 184, &mut out),
         // delegate: del_pk(32) target(20) stake(8) reward(32) sig(64) stake_blind(64) ‖ shield
         0x5F => at(156 + zcrypt_shield::BLIND_BYTES, &mut out),
-        // swap-lock: value(8) blind(64) asset(8) hashlock(32) timeout(8) counterparty(64) refund(64) ‖ shield
-        0x62 => at(184 + zcrypt_shield::BLIND_BYTES, &mut out),
-        // burn-lock with btc_claim_pk(33) ‖ burn-lock body
-        0x67 => at(33 + 120 + zcrypt_shield::BLIND_BYTES, &mut out),
+        // swap-lock: header(248) ‖ claim opening ‖ refund opening ‖ gas prefix ‖ shield
+        0x62 => push_swap_shields(body, &mut out),
+        // burn-lock-btc: btc key(33) ‖ header(184) ‖ opening ‖ shield
+        0x67 => push_lock_shield(body, 33 + 184, &mut out),
         _ => {}
     }
     out
+}
+
+/// Shield tx after a lock header and one settlement opening. If the opening is absent
+/// (a lock from before notes were appended), the shield tx starts at `off`.
+fn push_lock_shield(body: &[u8], off: usize, out: &mut Vec<shield_tx::ShieldTx>) {
+    if body.len() <= off {
+        return;
+    }
+    let at = match zcrypt_core::htlc_shield::CoinOpening::decode(&body[off..]) {
+        Some((_, n)) => off + n,
+        None => off,
+    };
+    if body.len() > at {
+        if let Some(stx) = shield_tx::from_bytes(&body[at..]) {
+            out.push(stx);
+        }
+    }
+}
+
+/// Gas tx and main shield tx of a swap lock. Openings sit between the 248-byte header
+/// and the gas prefix; older locks put the gas prefix directly after the header.
+fn push_swap_shields(body: &[u8], out: &mut Vec<shield_tx::ShieldTx>) {
+    const OFF: usize = 248;
+    if body.len() <= OFF {
+        return;
+    }
+    let rest = if let Some((_, n1)) = zcrypt_core::htlc_shield::CoinOpening::decode(&body[OFF..]) {
+        match zcrypt_core::htlc_shield::CoinOpening::decode(&body[OFF + n1..]) {
+            Some((_, n2)) => &body[OFF + n1 + n2..],
+            None => return,
+        }
+    } else {
+        &body[OFF..]
+    };
+    if let Some((gas, main)) = parse_gas_prefix(rest) {
+        out.push(gas);
+        if let Some(stx) = shield_tx::from_bytes(main) {
+            out.push(stx);
+        }
+    }
 }
 
 /// A shield pk as its 64-byte wire form (8 × u64 LE).
@@ -2583,6 +2788,45 @@ fn pk64(pk: &zcrypt_shield::PubKey) -> [u8; 64] {
     }
     b
 }
+
+use zcrypt_core::htlc_shield::EscrowKind;
+
+/// The consensus escrow id, which binds the escrow kind and BOTH keys (so a burn lock can
+/// never squat a swap id). Mint escrows have one key (the claimer refunds to itself),
+/// burn escrows refund to their one party, swaps carry (counterparty, refund).
+fn escrow_id_for(
+    kind: EscrowKind,
+    asset: u64,
+    value: u64,
+    hashlock: &[u8; 32],
+    timeout: u64,
+    party_pk: &zcrypt_shield::PubKey,
+    refund_pk: &zcrypt_shield::PubKey,
+) -> [u8; 32] {
+    zcrypt_core::htlc_shield::escrow_id(kind, asset, value, hashlock, timeout, party_pk, refund_pk)
+}
+
+/// Bridge operations in flight (shield, redeem, resume, maturity relay). While one runs the
+/// transport layer must not swap the bridge's Tor circuit from under it (wallet M13).
+static BRIDGE_OPS_IN_FLIGHT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// RAII marker for one bridge operation (see [`BRIDGE_OPS_IN_FLIGHT`]).
+struct BridgeOpGuard;
+impl BridgeOpGuard {
+    fn enter() -> BridgeOpGuard {
+        BRIDGE_OPS_IN_FLIGHT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        BridgeOpGuard
+    }
+}
+impl Drop for BridgeOpGuard {
+    fn drop(&mut self) {
+        BRIDGE_OPS_IN_FLIGHT.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// Serialises the settle / resume passes so the background worker and a UI-initiated pass
+/// never race each other on the same records (both would broadcast the same claim).
+static SETTLE_LOCK: Mutex<()> = Mutex::new(());
 
 /// One scan pass over already-fetched blocks. Everything here is offline: notes are
 /// trial-decrypted, reward / fee / escrow coins are reconstructed from the public
@@ -2608,6 +2852,114 @@ struct ScanOut {
     claim_counters: std::collections::BTreeMap<String, u64>,
     fee_claim_counters: std::collections::BTreeMap<String, u64>,
     max_index_seen: Option<u32>,
+}
+
+/// 8×u64 little-endian limbs. Stored only after this wallet created the opening or
+/// decrypted the note. Never an escrow id.
+fn blind_to_hex(b: &zcrypt_shield::Blind) -> String {
+    let mut raw = [0u8; 64];
+    for (i, limb) in b.iter().enumerate() {
+        raw[i * 8..i * 8 + 8].copy_from_slice(&limb.to_le_bytes());
+    }
+    hex::encode(raw)
+}
+
+fn blind_from_hex(s: &str) -> Option<zcrypt_shield::Blind> {
+    let raw = hex::decode(s.trim()).ok()?;
+    if raw.len() != 64 {
+        return None;
+    }
+    let mut blind = [0u64; 8];
+    for (i, limb) in blind.iter_mut().enumerate() {
+        *limb = u64::from_le_bytes(raw[i * 8..i * 8 + 8].try_into().ok()?);
+    }
+    Some(blind)
+}
+
+/// Header value for a non-SPV escrow; the net note value for an SPV mint.
+fn settled_value(value: u64, spv: bool) -> u64 {
+    if spv {
+        value - zcrypt_core::emission::bridge_fee(value)
+    } else {
+        value
+    }
+}
+
+/// Decrypt a settlement note. Empty notes and notes for someone else are `None`.
+fn coin_from_note(acct: &Account, note: &[u8]) -> Option<Coin> {
+    if note.is_empty() {
+        return None;
+    }
+    let ct = kem::ciphertext_from_bytes(note)?;
+    acct.receive(&ct)
+}
+
+/// Encrypted note of the opening at `off`, plus how many bytes the opening occupied.
+fn opening_note(body: &[u8], off: usize) -> Option<(Vec<u8>, usize)> {
+    let (opening, n) = zcrypt_core::htlc_shield::CoinOpening::decode(body.get(off..)?)?;
+    Some((opening.coin.enc_note, n))
+}
+
+fn stamp_opening(
+    rec: &mut EscrowRec,
+    keys: &ScanKeys,
+    note: Option<&[u8]>,
+    opened: &mut std::collections::HashMap<(String, String), Coin>,
+) {
+    let Some(note) = note else { return };
+    let Some((_, acct)) = keys.accounts.iter().find(|(i, _)| *i == Some(rec.index)) else { return };
+    let Some(coin) = coin_from_note(acct, note) else { return };
+    rec.blind_hex = blind_to_hex(&coin.blind);
+    opened.insert((rec.id_hex.clone(), rec.role.clone()), coin);
+}
+
+/// Keep one local record per (id, role). A blind learned this pass fills an empty one.
+fn record_escrow(escrows: &mut Vec<EscrowRec>, out: &mut Vec<EscrowRec>, mut rec: EscrowRec) {
+    if let Some(existing) = escrows.iter_mut().find(|e| e.id_hex == rec.id_hex && e.role == rec.role) {
+        if existing.blind_hex.is_empty() && !rec.blind_hex.is_empty() {
+            existing.blind_hex = rec.blind_hex.clone();
+        }
+        if rec.blind_hex.is_empty() {
+            rec.blind_hex = existing.blind_hex.clone();
+        }
+        out.push(rec);
+    } else {
+        escrows.push(rec.clone());
+        out.push(rec);
+    }
+}
+
+fn upsert_escrow_blind(
+    w: &mut Wallet,
+    index: u32,
+    id: &[u8; 32],
+    role: &str,
+    kind: &str,
+    value: u64,
+    asset: u64,
+    hashlock_hex: &str,
+    timeout: u64,
+    spv: bool,
+    blind: zcrypt_shield::Blind,
+) {
+    let id_hex = hex::encode(id);
+    let blind_hex = blind_to_hex(&blind);
+    if let Some(e) = w.escrows.iter_mut().find(|e| e.id_hex == id_hex && e.role == role) {
+        e.blind_hex = blind_hex;
+    } else {
+        w.escrows.push(EscrowRec {
+            id_hex,
+            value,
+            asset_id: asset,
+            index,
+            role: role.into(),
+            spv,
+            kind: kind.into(),
+            hashlock_hex: hashlock_hex.into(),
+            timeout,
+            blind_hex,
+        });
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2636,6 +2988,9 @@ fn scan_pass(
     let mut known: HashSet<zcrypt_shield::Commitment> = known.clone();
     let mut own_nf: HashMap<[u8; 32], zcrypt_shield::Commitment> = own_nf_seed.clone();
     let mut escrows: Vec<EscrowRec> = escrows_seed.to_vec();
+    // Coins whose notes opened this pass, keyed by (escrow id hex, role). A later
+    // 0x5B/0x5C in the same pass credits these instead of a public escrow id.
+    let mut opened: HashMap<(String, String), Coin> = HashMap::new();
     let seen_idx = |o: &mut ScanOut, i: Option<u32>| {
         if let Some(i) = i {
             o.max_index_seen = Some(o.max_index_seen.map_or(i, |m| m.max(i)));
@@ -2752,59 +3107,88 @@ fn scan_pass(
                                     lock.copy_from_slice(&pl[16..48]);
                                     let timeout = u64::from_le_bytes(pl[48..56].try_into().unwrap());
                                     let pk = keys.accounts[i].1.pubkey();
-                                    let id = zcrypt_core::htlc_shield::escrow_id(asset, value, &lock, timeout, &pk);
-                                    let rec = EscrowRec { id_hex: hex::encode(id), value, asset_id: asset, index: idx, role: "claim".into(), spv: tag == 0x64 };
+                                    let id = escrow_id_for(EscrowKind::Mint, asset, value, &lock, timeout, &pk, &pk);
+                                    // 0x5A body (after the gas prefix): opening at offset 120.
+                                    // 0x64 body: opening at offset 184 (open-auth occupies 120..184).
+                                    let note = opening_note(pl, if tag == 0x5A { 120 } else { 184 }).map(|(n, _)| n);
+                                    let mut rec = EscrowRec {
+                                        id_hex: hex::encode(id),
+                                        value,
+                                        asset_id: asset,
+                                        index: idx,
+                                        role: "claim".into(),
+                                        spv: tag == 0x64,
+                                        kind: "mint".into(),
+                                        hashlock_hex: hex::encode(lock),
+                                        timeout,
+                                        blind_hex: String::new(),
+                                    };
+                                    stamp_opening(&mut rec, keys, note.as_deref(), &mut opened);
                                     seen_idx(&mut out, Some(idx));
-                                    escrows.push(rec.clone());
-                                    out.escrows.push(rec);
+                                    record_escrow(&mut escrows, &mut out.escrows, rec);
                                 }
                             }
                         }
                     }
                 }
-                // burn-lock (redeem): value(8) blind(32) asset(8) hashlock(32) timeout(8) refund_pk(64)
+                // burn-lock (redeem), both forms: decoded by the bridge crate's parser so the
+                // offsets always follow the wire layout (the blind is 64 bytes now, wallet M1).
                 0x5D | 0x67 => {
-                    let off = if tag == 0x67 { 33 } else { 0 };
-                    if body.len() >= off + 152 {
-                        let pl = &body[off..];
-                        let refund_pk: [u8; 64] = pl[88..152].try_into().unwrap();
+                    if let Some(f) = zcrypt_bridge::wallet_flows::parse_burn_lock_any(tag, body) {
+                        let refund_pk = pk64(&f.refund_pk);
                         if let Some(&i) = keys.by_pk.get(&refund_pk) {
                             if let Some(idx) = pk_at(i) {
-                                let value = u64::from_le_bytes(pl[0..8].try_into().unwrap());
-                                let asset = u64::from_le_bytes(pl[40..48].try_into().unwrap());
-                                let mut lock = [0u8; 32];
-                                lock.copy_from_slice(&pl[48..80]);
-                                let timeout = u64::from_le_bytes(pl[80..88].try_into().unwrap());
                                 let pk = keys.accounts[i].1.pubkey();
-                                let id = zcrypt_core::htlc_shield::escrow_id(asset, value, &lock, timeout, &pk);
-                                let rec = EscrowRec { id_hex: hex::encode(id), value, asset_id: asset, index: idx, role: "refund".into(), spv: false };
+                                let id = escrow_id_for(EscrowKind::Burn, f.asset, f.value, &f.hashlock, f.timeout, &pk, &pk);
+                                // 0x5D: opening at 184. 0x67: 33-byte btc key, then the same header.
+                                let note = opening_note(body, if tag == 0x67 { 33 + 184 } else { 184 }).map(|(n, _)| n);
+                                let mut rec = EscrowRec {
+                                    id_hex: hex::encode(id),
+                                    value: f.value,
+                                    asset_id: f.asset,
+                                    index: idx,
+                                    role: "refund".into(),
+                                    spv: false,
+                                    kind: "burn".into(),
+                                    hashlock_hex: hex::encode(f.hashlock),
+                                    timeout: f.timeout,
+                                    blind_hex: String::new(),
+                                };
+                                stamp_opening(&mut rec, keys, note.as_deref(), &mut opened);
                                 seen_idx(&mut out, Some(idx));
-                                escrows.push(rec.clone());
-                                out.escrows.push(rec);
+                                record_escrow(&mut escrows, &mut out.escrows, rec);
                             }
                         }
                     }
                 }
-                // swap-lock: ... counterparty_pk(64) refund_pk(64); escrow keyed by counterparty.
-                0x62 if body.len() >= 216 => {
-                    let party: [u8; 64] = body[88..152].try_into().unwrap();
-                    let refund: [u8; 64] = body[152..216].try_into().unwrap();
-                    let value = u64::from_le_bytes(body[0..8].try_into().unwrap());
-                    let asset = u64::from_le_bytes(body[40..48].try_into().unwrap());
-                    let mut lock = [0u8; 32];
-                    lock.copy_from_slice(&body[48..80]);
-                    let timeout = u64::from_le_bytes(body[80..88].try_into().unwrap());
-                    let party_pk_limbs = |b: &[u8; 64]| -> zcrypt_shield::PubKey {
-                        core::array::from_fn(|k| u64::from_le_bytes(b[k * 8..k * 8 + 8].try_into().unwrap()))
-                    };
-                    let id = zcrypt_core::htlc_shield::escrow_id(asset, value, &lock, timeout, &party_pk_limbs(&party));
-                    for (pkb, role) in [(party, "claim"), (refund, "refund")] {
-                        if let Some(&i) = keys.by_pk.get(&pkb) {
-                            if let Some(idx) = pk_at(i) {
-                                let rec = EscrowRec { id_hex: hex::encode(id), value, asset_id: asset, index: idx, role: role.into(), spv: false };
-                                seen_idx(&mut out, Some(idx));
-                                escrows.push(rec.clone());
-                                out.escrows.push(rec);
+                // swap-lock: value(8) blind(64) asset(8) hashlock(32) timeout(8) counterparty(64)
+                // refund(64) ‖ gas ‖ spend; the escrow id binds both keys.
+                0x62 => {
+                    if let Some((value, _blind, asset, lock, timeout, party, refund)) = bswap::parse_swap_lock(body) {
+                        let id = escrow_id_for(EscrowKind::Swap, asset, value, &lock, timeout, &party, &refund);
+                        // header(248) ‖ claim opening ‖ refund opening ‖ gas prefix ‖ shield tx
+                        let claim_note = opening_note(body, 248);
+                        let refund_note = claim_note.as_ref().and_then(|(_, n1)| opening_note(body, 248 + *n1));
+                        for (pkb, role) in [(pk64(&party), "claim"), (pk64(&refund), "refund")] {
+                            if let Some(&i) = keys.by_pk.get(&pkb) {
+                                if let Some(idx) = pk_at(i) {
+                                    let note = if role == "claim" { &claim_note } else { &refund_note };
+                                    let mut rec = EscrowRec {
+                                        id_hex: hex::encode(id),
+                                        value,
+                                        asset_id: asset,
+                                        index: idx,
+                                        role: role.into(),
+                                        spv: false,
+                                        kind: "swap".into(),
+                                        hashlock_hex: hex::encode(lock),
+                                        timeout,
+                                        blind_hex: String::new(),
+                                    };
+                                    stamp_opening(&mut rec, keys, note.as_ref().map(|(n, _)| n.as_slice()), &mut opened);
+                                    seen_idx(&mut out, Some(idx));
+                                    record_escrow(&mut escrows, &mut out.escrows, rec);
+                                }
                             }
                         }
                     }
@@ -2814,17 +3198,25 @@ fn scan_pass(
                     let id_hex = hex::encode(&body[0..32]);
                     let role = if tag == 0x5B { "claim" } else { "refund" };
                     if let Some(rec) = escrows.iter().find(|e| e.id_hex == id_hex && e.role == role).cloned() {
-                        let net = if rec.spv { rec.value - zcrypt_core::emission::bridge_fee(rec.value) } else { rec.value };
-                        let mut id = [0u8; 32];
-                        id.copy_from_slice(&body[0..32]);
-                        let acct = keys.accounts.iter().find(|(i, _)| *i == Some(rec.index)).map(|(_, a)| a);
-                        if let Some(acct) = acct {
-                            let coin = acct.htlc_coin(net, rec.asset_id, &id);
+                        // Prefer the coin decrypted from the opening this pass (an SPV note
+                        // carries the net value). Otherwise the blind stored on the record.
+                        // No blind: leave the record; reconcile fetches /htlc and decrypts.
+                        let from_note = opened.get(&(id_hex.clone(), role.to_string())).copied();
+                        let coin = if let Some(coin) = from_note {
+                            Some(coin)
+                        } else if let Some(blind) = blind_from_hex(&rec.blind_hex) {
+                            keys.accounts.iter().find(|(i, _)| *i == Some(rec.index)).map(|(_, acct)| {
+                                acct.htlc_coin(settled_value(rec.value, rec.spv), rec.asset_id, blind)
+                            })
+                        } else {
+                            None
+                        };
+                        if let Some(coin) = coin {
                             // SPV mints are held immature (not a leaf yet): record them anyway.
                             add_coin(&mut out, &mut known, &mut own_nf, coin, if rec.spv { "shield" } else { "escrow" }, !rec.spv);
+                            escrows.retain(|e| !(e.id_hex == id_hex && e.role == role));
+                            out.settled_escrows.push(id_hex);
                         }
-                        escrows.retain(|e| !(e.id_hex == id_hex && e.role == role));
-                        out.settled_escrows.push(id_hex);
                     }
                 }
                 _ => {}
@@ -2840,6 +3232,148 @@ fn scan_pass(
         }
     }
     out
+}
+
+/// Settle escrow records by their CONSENSUS state. Open escrows auto-expire at the end of
+/// the block their `timeout_height` falls in: no 0x5C transaction is ever published, so the
+/// block scanner cannot see the refund. Every refund-role record past its timeout (and every
+/// claim-role record) is checked against `/htlc/<id>`: "expired" credits the refund coin,
+/// "claimed" credits the claim coin, and an "open" record past its timeout gets a 0x5C as a
+/// harmless accelerator and is re-read. Also rebuilds a missing redeem record from a burn
+/// escrow whose deterministic preimage matches (seed restore, wallet M2). Returns notes.
+fn reconcile_escrow_states(state: &State<AppState>, url: &str) -> Vec<String> {
+    let zc = Zcrypt::new(url);
+    let Ok(tip) = zc.height() else { return Vec::new() };
+    let tip = tip.max(0) as u64;
+    let recs: Vec<EscrowRec> = {
+        let g = state.wallet.lock().unwrap();
+        match g.as_ref() {
+            Some(w) => w.escrows.clone(),
+            None => return Vec::new(),
+        }
+    };
+    let mut notes = Vec::new();
+    for e in recs {
+        // A burn escrow we refund to but hold no redeem record for is a restore case: it is
+        // read even before its timeout so the record can be rebuilt. Every other refund-role
+        // record only matters once consensus may have expired it.
+        let orphan_burn = e.kind == "burn" && e.role == "refund" && {
+            let g = state.wallet.lock().unwrap();
+            g.as_ref().is_some_and(|w| {
+                !w.pending_redeems.iter().any(|r| {
+                    r.escrow_id_hex.as_deref() == Some(e.id_hex.as_str()) || (r.escrow_id_hex.is_none() && r.hashlock_hex == e.hashlock_hex)
+                })
+            })
+        };
+        if e.role == "refund" && e.timeout > tip && !orphan_burn {
+            continue;
+        }
+        let Ok(id) = parse_id_hex(&e.id_hex) else { continue };
+        let Ok(Some(info)) = bswap::query_escrow(&zc, &id) else { continue };
+        let mut st = info.state.clone();
+        if e.role == "refund" && st == "open" && tip >= info.timeout_height {
+            // Consensus expires it at the end of this block anyway; a 0x5C only hurries it.
+            let _ = zc.broadcast(&bswap::expire_tx(&id));
+            if let Ok(Some(again)) = bswap::query_escrow(&zc, &id) {
+                st = again.state;
+            }
+        }
+        let credit = matches!((e.role.as_str(), st.as_str()), ("refund", "expired") | ("claim", "claimed"));
+        let gone = matches!((e.role.as_str(), st.as_str()), ("refund", "claimed") | ("claim", "expired"));
+        if e.role == "refund" && e.kind == "burn" && st == "open" {
+            // A burn escrow we refund to, with no redeem record: rebuild it from the seed.
+            let _ = with_wallet(state, |w| {
+                if w.pending_redeems.iter().any(|r| r.escrow_id_hex.as_deref() == Some(e.id_hex.as_str())) {
+                    return Ok(());
+                }
+                let Some(hashlock) = parse_hex32(&e.hashlock_hex) else { return Ok(()) };
+                let seed = Zeroizing::new(w.account.seed());
+                let preimage = zcrypt_bridge::wallet_flows::bridge_preimage(&seed, e.index);
+                if zcrypt_core::nullifier::htlc_hashlock(&preimage) != hashlock {
+                    return Ok(());
+                }
+                // A pre-id record for this very redeem (burn broadcast, id never saved).
+                if let Some(r) = w.pending_redeems.iter_mut().find(|r| r.escrow_id_hex.is_none() && r.hashlock_hex == e.hashlock_hex) {
+                    r.escrow_id_hex = Some(e.id_hex.clone());
+                    r.zc_timeout = info.timeout_height;
+                    return Ok(());
+                }
+                let alice_key = alice_key_at(&w.account, e.index);
+                w.note_action(e.index, "redeem", "");
+                w.pending_redeems.push(PendingRedeemRec {
+                    index: e.index,
+                    preimage_hex: hex::encode(preimage),
+                    hashlock_hex: e.hashlock_hex.clone(),
+                    value_sats: e.value,
+                    asset_id: e.asset_id,
+                    btc_claim_pk_hex: hex::encode(alice_key.pk.inner.serialize()),
+                    reserve_pk_hex: String::new(),
+                    escrow_id_hex: Some(e.id_hex.clone()),
+                    zc_timeout: info.timeout_height,
+                    started: w.clock,
+                    funding: None,
+                    claim_txid: None,
+                    expired: false,
+                    started_height: 0,
+                    hist_id: String::new(),
+                    burn_error: None,
+                    claim_error: None,
+                    id_scan_cursor: 0,
+                });
+                notes.push(format!("rebuilt the redeem record for burn escrow {} from the seed", short(&e.id_hex)));
+                Ok(())
+            });
+        }
+        if !(credit || gone) {
+            continue;
+        }
+        // A non-empty note that does not open is not ours: leave the record and retry.
+        // An empty note may use the blind this wallet stored. Never the escrow id.
+        let enc_note = if e.role == "claim" { info.claim_enc_note.clone() } else { info.refund_enc_note.clone() };
+        let _ = with_wallet(state, |w| {
+            let mut did_credit = false;
+            if credit {
+                let acct = w.key_at(e.index);
+                let built = if !enc_note.is_empty() {
+                    coin_from_note(&acct, &enc_note)
+                } else {
+                    blind_from_hex(&e.blind_hex).map(|b| acct.htlc_coin(settled_value(e.value, e.spv), e.asset_id, b))
+                };
+                if let Some(coin) = built {
+                    did_credit = true;
+                    let com = coin.commitment();
+                    if !w.coins.iter().any(|c| c.coin.commitment() == com) {
+                        let born = tip as i64;
+                        let amount = coin.value;
+                        w.coins.push(CoinRec::new(coin, born));
+                        let label = match (e.kind.as_str(), e.role.as_str()) {
+                            ("burn", _) => "redeem escrow expired: zBTC refunded",
+                            ("swap", "refund") => "swap refund",
+                            ("swap", "claim") => "swap received",
+                            ("mint", _) => "mint claimed",
+                            _ => "escrow settled",
+                        };
+                        w.push_hist("escrow", amount as i64, label.into(), e.asset_id);
+                        notes.push(format!("{label}: {} base units of asset {} credited", amount, e.asset_id));
+                    }
+                }
+            }
+            // Keep the record when the note did not open, so a later pass can retry.
+            if !(did_credit || gone) {
+                return Ok(());
+            }
+            // The records that were waiting on this escrow are done with it.
+            if e.kind == "burn" && e.role == "refund" {
+                w.pending_redeems.retain(|r| r.escrow_id_hex.as_deref() != Some(e.id_hex.as_str()));
+            }
+            if e.kind == "swap" && e.role == "refund" {
+                w.pending_swaps.retain(|s| s.my_escrow_hex != e.id_hex);
+            }
+            w.escrows.retain(|x| !(x.id_hex == e.id_hex && x.role == e.role));
+            Ok(())
+        });
+    }
+    notes
 }
 
 /// Blocks a stale-coin reconcile leaves alone after a coin's birth: a send that commits
@@ -3021,7 +3555,11 @@ fn scan_onchain(state: State<AppState>) -> R<usize> {
                 }
             }
             for e in res.escrows {
-                if !w.escrows.iter().any(|x| x.id_hex == e.id_hex && x.role == e.role) {
+                if let Some(existing) = w.escrows.iter_mut().find(|x| x.id_hex == e.id_hex && x.role == e.role) {
+                    if existing.blind_hex.is_empty() && !e.blind_hex.is_empty() {
+                        existing.blind_hex = e.blind_hex;
+                    }
+                } else {
                     w.escrows.push(e);
                 }
             }
@@ -3041,6 +3579,12 @@ fn scan_onchain(state: State<AppState>) -> R<usize> {
         if pass + 1 == MAX_GAP_PASSES {
             eprintln!("[scan] gap walk hit {MAX_GAP_PASSES} passes; the cursor stays put so the next scan re-reads these blocks");
         }
+    }
+
+    // Escrows settle by consensus state (auto-expiry publishes no tx): credit refunds and
+    // claims the block scan cannot see, and rebuild redeem records a seed restore lost.
+    for n in reconcile_escrow_states(&state, &url) {
+        eprintln!("[scan] {n}");
     }
 
     // Reconcile against reality under a BRIEF lock, then persist.
@@ -3860,25 +4404,61 @@ fn swap_backend(
     state: &State<AppState>,
     account: u32,
 ) -> Result<(Box<dyn zcrypt_bridge::BtcBackend>, bitcoin::Address), String> {
+    let (backend, dest) = swap_backend_lazy(state, account)?;
+    let dest = dest()?;
+    Ok((backend, dest))
+}
+
+/// The self-custody wallet for `account`, when self-custody mode is in use (real networks).
+fn selfcustody_wallet(state: &State<AppState>, account: u32) -> Result<Option<zcrypt_bridge::selfcustody::SelfCustodyBtc>, String> {
     let dir = state.data_dir.lock().unwrap().clone();
     let s = bridge_settings(&dir)?;
     let network = zcrypt_bridge::network_from_str(&s.btc_network);
-    if s.btc_selfcustody && network != bitcoin::Network::Regtest {
+    if !(s.btc_selfcustody && network != bitcoin::Network::Regtest) {
+        return Ok(None);
+    }
+    let mnemonic = {
+        let g = state.wallet.lock().unwrap();
+        g.as_ref().ok_or("wallet locked")?.mnemonic.clone()
+    };
+    Ok(Some(zcrypt_bridge::selfcustody::SelfCustodyBtc::new_account(&mnemonic, "", network, &s.esplora_url, account)?))
+}
+
+/// Like [`swap_backend`] but the payout address is derived ONLY when the returned closure
+/// is called. In self-custody mode deriving it walks the BIP-84 receive chain through
+/// Esplora (one query per address), so a headers-only task such as the maturity relay, or a
+/// resume pass that ends up claiming nothing, never performs that scan (wallet M13).
+#[allow(clippy::type_complexity)]
+fn swap_backend_lazy(
+    state: &State<AppState>,
+    account: u32,
+) -> Result<(Box<dyn zcrypt_bridge::BtcBackend>, Box<dyn Fn() -> Result<bitcoin::Address, String>>), String> {
+    if let Some(sc) = selfcustody_wallet(state, account)? {
+        let dir = state.data_dir.lock().unwrap().clone();
+        let s = load_settings(&dir);
+        let network = zcrypt_bridge::network_from_str(&s.btc_network);
         let mnemonic = {
             let g = state.wallet.lock().unwrap();
             g.as_ref().ok_or("wallet locked")?.mnemonic.clone()
         };
-        let sc = zcrypt_bridge::selfcustody::SelfCustodyBtc::new_account(
-            &mnemonic, "", network, &s.esplora_url, account,
-        )?;
+        let esplora_url = s.esplora_url.clone();
         // A fresh BIP-84 receive address per swap (gap-limit aware), so redeem payouts and
         // deposit change never reuse index 0 (privacy H3 residual N14).
-        let dest = sc.fresh_receive_address()?;
-        Ok((Box::new(sc), dest))
+        let dest = move || -> Result<bitcoin::Address, String> {
+            let sc = zcrypt_bridge::selfcustody::SelfCustodyBtc::new_account(&mnemonic, "", network, &esplora_url, account)?;
+            sc.fresh_receive_address()
+        };
+        Ok((Box::new(sc), Box::new(dest)))
     } else {
         let b = if account == 0 { btc_client(state)? } else { btc_bridge(state)? };
-        let dest = b.new_address()?;
-        Ok((Box::new(b), dest))
+        let dir = state.data_dir.lock().unwrap().clone();
+        let s = load_settings(&dir);
+        let network = zcrypt_bridge::network_from_str(&s.btc_network);
+        let wallet = if account == 0 { s.btc_wallet.clone() } else { "bridge".to_string() };
+        let dest = move || -> Result<bitcoin::Address, String> {
+            Btc::connect(&s.btc_url, &s.btc_user, &s.btc_pass, &wallet, network)?.new_address()
+        };
+        Ok((Box::new(b), Box::new(dest)))
     }
 }
 fn zc_client(state: &State<AppState>) -> Result<Zcrypt, String> {
@@ -4082,10 +4662,12 @@ fn held_assets(state: State<AppState>) -> R<Vec<HeldAsset>> {
     ok(out)
 }
 
-/// How long the taker's offer stays open, in ZCrypt blocks. The maker's lock expires
-/// this many blocks before the taker's, which is the window the maker has to claim
-/// after the preimage is revealed.
-const SWAP_WINDOW_BLOCKS: u64 = 1_800;
+/// How long the MAKER's lock lives once placed, in ZCrypt blocks (one hour at 1 s
+/// blocks): the taker's window to claim it. The taker's own lock lives this long PLUS
+/// `bswap::SWAP_MAKER_CLAIM_MARGIN_BLOCKS` (hours, not minutes: audit 2026-10 H9), which
+/// is the window the maker has to claim after the preimage is revealed; the background
+/// bridge worker settles inside it even with the UI closed.
+const SWAP_WINDOW_BLOCKS: u64 = 3_600;
 
 /// A shielded-asset offer. Both wallets derive the maker's escrow from the taker's
 /// timeout, so the text carries no secret. The preimage never leaves the taker.
@@ -4099,11 +4681,16 @@ struct SwapTicket {
     give_timeout: u64,
     give_escrow: [u8; 32],
     maker_pk: zcrypt_shield::PubKey,
+    /// The taker's stealth address (ML-KEM key included), so the maker can encrypt
+    /// the take-leg claim note to the taker. The maker address is what the taker typed.
+    taker_address: Address,
 }
 
 fn encode_swap_ticket(t: &SwapTicket) -> String {
-    let mut b = Vec::with_capacity(1 + 8 * 4 + 32 + 64 + 8 + 32 + 64);
-    b.push(1u8);
+    let addr = t.taker_address.to_bytes();
+    // version(1) + v1 body(232) + addr_len(4) + address
+    let mut b = Vec::with_capacity(237 + addr.len());
+    b.push(2u8);
     for x in [t.give_asset, t.give_amount, t.take_asset, t.take_amount] {
         b.extend_from_slice(&x.to_le_bytes());
     }
@@ -4112,16 +4699,23 @@ fn encode_swap_ticket(t: &SwapTicket) -> String {
     b.extend_from_slice(&t.give_timeout.to_le_bytes());
     b.extend_from_slice(&t.give_escrow);
     b.extend_from_slice(&pk64(&t.maker_pk));
+    b.extend_from_slice(&(addr.len() as u32).to_le_bytes());
+    b.extend_from_slice(&addr);
     format!("zcswap1.{}", hex::encode(b))
 }
 
 fn decode_swap_ticket(s: &str) -> Result<SwapTicket, String> {
     let hexpart = s.trim().strip_prefix("zcswap1.").ok_or("paste a swap offer (it starts with zcswap1.)")?;
     let b = hex::decode(hexpart).map_err(|_| "that offer is not intact — copy it again".to_string())?;
-    // 1 + 32 + 32 + 64 + 8 + 32 + 64
-    if b.len() != 233 || b[0] != 1 {
+    // Version 2 only. v1 body is 232 bytes after the version byte; the address follows.
+    if b.first() != Some(&2) || b.len() < 237 {
         return Err("that offer is not a version this wallet can read".to_string());
     }
+    let addr_len = u32::from_le_bytes(b[233..237].try_into().unwrap()) as usize;
+    if addr_len != b.len() - 237 {
+        return Err("that offer is not a version this wallet can read".to_string());
+    }
+    let taker_address = Address::from_bytes(&b[237..]).ok_or("that offer is not a version this wallet can read")?;
     let u64_at = |off: usize| u64::from_le_bytes(b[off..off + 8].try_into().unwrap());
     let pk_at = |off: usize| -> zcrypt_shield::PubKey {
         let mut pk = [0u64; 8];
@@ -4144,6 +4738,7 @@ fn decode_swap_ticket(s: &str) -> Result<SwapTicket, String> {
         give_timeout: u64_at(129),
         give_escrow,
         maker_pk: pk_at(169),
+        taker_address,
     })
 }
 
@@ -4165,7 +4760,41 @@ fn parse_id_hex(s: &str) -> Result<[u8; 32], String> {
 /// searching blocks.
 fn maker_escrow_id(t: &SwapTicket) -> [u8; 32] {
     let take_timeout = t.give_timeout.saturating_sub(bswap::SWAP_MAKER_CLAIM_MARGIN_BLOCKS);
-    zcrypt_core::htlc_shield::escrow_id(t.take_asset, t.take_amount, &t.hashlock, take_timeout, &t.taker_pk)
+    escrow_id_for(EscrowKind::Swap, t.take_asset, t.take_amount, &t.hashlock, take_timeout, &t.taker_pk, &t.maker_pk)
+}
+
+/// The taker's lock named by a ticket: pays the maker, refunds to the taker.
+fn taker_escrow_id(t: &SwapTicket) -> [u8; 32] {
+    escrow_id_for(EscrowKind::Swap, t.give_asset, t.give_amount, &t.hashlock, t.give_timeout, &t.maker_pk, &t.taker_pk)
+}
+
+/// Decimal places for a swap leg, or an error when the chain has no metadata for the
+/// asset: a guessed scale would show (and lock) the wrong amount (wallet L8).
+fn asset_label_strict(url: &str, asset_id: u64) -> Result<(String, u8), String> {
+    if asset_id == zcrypt_shield::ASSET_ZCRYPT {
+        return Ok(("ZCRYPT".to_string(), 6));
+    }
+    chain::asset_meta(url, asset_id).ok_or_else(|| {
+        format!("the chain has no metadata for asset {asset_id}, so its amounts cannot be shown; refusing to continue")
+    })
+}
+
+/// Every spend key this wallet controls that a counterparty may have been given: the main
+/// account and the stealth sub-accounts inside the scan window. Returns the HD index
+/// (`None` for the main account) of the one matching `pk`, if any.
+fn own_key_index(w: &Wallet, pk: &zcrypt_shield::PubKey) -> Option<Option<u32>> {
+    if w.account.pubkey() == *pk {
+        return Some(None);
+    }
+    (0..w.next_change.saturating_add(20)).find(|&i| w.key_at(i).pubkey() == *pk).map(Some)
+}
+
+/// The account behind a swap record's key.
+fn swap_account(w: &Wallet, my_index: Option<u32>) -> Account {
+    match my_index {
+        Some(i) => w.key_at(i),
+        None => Account::from_seed(*Zeroizing::new(w.account.seed())),
+    }
 }
 
 #[cfg(test)]
@@ -4178,7 +4807,7 @@ mod swap_ticket_tests {
         let (maker, _) = keys::new_account();
         let hashlock = [9u8; 32];
         let give_timeout = 50_000u64;
-        let give_escrow = zcrypt_core::htlc_shield::escrow_id(5, 100, &hashlock, give_timeout, &maker.pubkey());
+        let give_escrow = escrow_id_for(EscrowKind::Swap, 5, 100, &hashlock, give_timeout, &maker.pubkey(), &taker.pubkey());
         let ticket = SwapTicket {
             give_asset: 5,
             give_amount: 100,
@@ -4189,6 +4818,7 @@ mod swap_ticket_tests {
             give_timeout,
             give_escrow,
             maker_pk: maker.pubkey(),
+            taker_address: taker.stealth_address(),
         };
         let back = decode_swap_ticket(&encode_swap_ticket(&ticket)).expect("offer decodes");
         assert_eq!(back.give_asset, 5);
@@ -4196,6 +4826,8 @@ mod swap_ticket_tests {
         assert_eq!(back.taker_pk, taker.pubkey());
         assert_eq!(back.maker_pk, maker.pubkey());
         assert_eq!(back.give_escrow, give_escrow);
+        assert_eq!(back.taker_address.to_bytes(), taker.stealth_address().to_bytes());
+        assert_eq!(back.taker_address.pubkey(), taker.pubkey());
         let take_timeout = bswap::maker_take_timeout_for(
             &bswap::SwapLock {
                 escrow_id: give_escrow,
@@ -4209,9 +4841,68 @@ mod swap_ticket_tests {
             1,
         )
         .expect("timeout");
-        let named = zcrypt_core::htlc_shield::escrow_id(9, 50, &hashlock, take_timeout, &taker.pubkey());
+        let named = escrow_id_for(EscrowKind::Swap, 9, 50, &hashlock, take_timeout, &taker.pubkey(), &maker.pubkey());
         assert_eq!(maker_escrow_id(&back), named);
+        assert_eq!(taker_escrow_id(&back), give_escrow);
+        // A burn lock with the same public terms can no longer squat the swap id (H7).
+        assert_ne!(
+            escrow_id_for(EscrowKind::Burn, 9, 50, &hashlock, take_timeout, &taker.pubkey(), &taker.pubkey()),
+            named
+        );
         assert!(decode_swap_ticket("not-an-offer").is_err());
+        // Version 1 (233 bytes, version byte 1) is no longer accepted.
+        let mut v1 = vec![1u8];
+        v1.extend_from_slice(&[0u8; 232]);
+        assert!(decode_swap_ticket(&format!("zcswap1.{}", hex::encode(v1))).is_err());
+    }
+
+    #[test]
+    fn scanner_finds_swap_and_burn_escrows_from_wire_bytes() {
+        let (acct, phrase) = keys::new_account();
+        let w = Wallet::fresh(acct, Zeroizing::new(phrase));
+        let me = w.key_at(3);
+        let (other, _) = keys::new_account();
+        let stx = shield_tx::ShieldTx { inputs: vec![], output_commitments: vec![], enc_notes: vec![], fee: 0, root: [0u64; 8], proof: vec![] };
+        let blind = keys::random_blind();
+        let lock = [4u8; 32];
+        // Header parsers ignore the bytes after the header. This opening does not decrypt.
+        let opening = zcrypt_core::htlc_shield::CoinOpening {
+            coin: zcrypt_core::htlc_shield::HiddenCoin {
+                commitment: [1u64; 8],
+                enc_note: vec![0u8; zcrypt_core::kem::NOTE_WIRE_LEN],
+            },
+            proof: vec![1],
+        };
+        // Our key refunds the swap lock; the counterparty claims it.
+        let swap = bswap::swap_lock_tx(70, &blind, 11, &lock, 900, &other.pubkey(), &me.pubkey(), &blind, &stx, &stx, &opening, &opening);
+        // Our key refunds a redeem burn.
+        let btc_pk = BtcKey::from_bytes(&[8u8; 32]).pk;
+        let burn = bswap::burn_lock_btc_tx(&btc_pk, 500, &blind, 12, &lock, 950, &me.pubkey(), &stx, &opening);
+        let accounts: Vec<(Option<u32>, Account)> = (0..5).map(|i| (Some(i), w.key_at(i))).collect();
+        let by_pk = accounts.iter().enumerate().map(|(p, (_, a))| (pk64(&a.pubkey()), p)).collect();
+        let keys = ScanKeys { accounts, by_pk, by_reward: Default::default(), by_delegator: Default::default() };
+        let out = scan_pass(&[(1, vec![swap, burn])], &keys, &[], &Default::default(), &Default::default(), &[], &Default::default(), &Default::default());
+        assert_eq!(out.escrows.len(), 2);
+        let s = out.escrows.iter().find(|e| e.kind == "swap").expect("swap escrow recorded");
+        assert_eq!((s.role.as_str(), s.index, s.value, s.asset_id, s.timeout), ("refund", 3, 70, 11, 900));
+        assert_eq!(s.id_hex, hex::encode(escrow_id_for(EscrowKind::Swap, 11, 70, &lock, 900, &other.pubkey(), &me.pubkey())));
+        let b = out.escrows.iter().find(|e| e.kind == "burn").expect("burn escrow recorded");
+        assert_eq!((b.role.as_str(), b.index, b.value, b.asset_id, b.timeout), ("refund", 3, 500, 12, 950));
+        assert_eq!(b.hashlock_hex, hex::encode(lock));
+        assert_eq!(b.id_hex, hex::encode(escrow_id_for(EscrowKind::Burn, 12, 500, &lock, 950, &me.pubkey(), &me.pubkey())));
+    }
+
+    #[test]
+    fn own_key_lookup_covers_main_and_stealth_keys() {
+        let (acct, phrase) = keys::new_account();
+        let mut w = Wallet::fresh(acct, Zeroizing::new(phrase));
+        w.next_change = 2;
+        assert_eq!(own_key_index(&w, &w.account.pubkey()), Some(None));
+        assert_eq!(own_key_index(&w, &w.key_at(7).pubkey()), Some(Some(7)));
+        let (other, _) = keys::new_account();
+        assert_eq!(own_key_index(&w, &other.pubkey()), None);
+        assert_eq!(swap_account(&w, Some(7)).pubkey(), w.key_at(7).pubkey());
+        assert_eq!(swap_account(&w, None).pubkey(), w.account.pubkey());
     }
 
     #[test]
@@ -4229,13 +4920,57 @@ mod swap_ticket_tests {
     }
 }
 
-fn credit_htlc(w: &mut Wallet, url: &str, value: u64, asset: u64, escrow: &[u8; 32]) {
-    let coin = w.account.htlc_coin(value, asset, escrow);
+/// Credit the settlement coin of `escrow` to the key at `my_index` (the main account when
+/// `None`). `role` is "claim" or "refund" and selects which note to decrypt.
+///
+/// `Ok((true, value))` is a newly credited coin (value is the note's value when the note
+/// opened). `Ok((false, _))` means the coin was already in the wallet — the swap can close.
+/// `Err` means the note did not open, or no note and no stored blind: leave the swap pending.
+fn credit_htlc(
+    w: &mut Wallet,
+    url: &str,
+    my_index: Option<u32>,
+    value: u64,
+    asset: u64,
+    escrow: &[u8; 32],
+    role: &str,
+) -> Result<(bool, u64), String> {
+    let acct = swap_account(w, my_index);
+    let queried = match bswap::query_escrow(&Zcrypt::new(url), escrow) {
+        Ok(Some(info)) => Some(if role == "claim" { info.claim_enc_note } else { info.refund_enc_note }),
+        Ok(None) => Some(Vec::new()),
+        Err(_) => None,
+    };
+    let coin = match queried.as_deref() {
+        Some(note) if !note.is_empty() => match coin_from_note(&acct, note) {
+            Some(c) => c,
+            None if role == "claim" => {
+                return Err("their lock's settlement note does not open to this wallet".into());
+            }
+            None => return Err("the refund's settlement note does not open to this wallet".into()),
+        },
+        _ => {
+            let id_hex = hex::encode(escrow);
+            let blind = w
+                .escrows
+                .iter()
+                .find(|e| e.id_hex == id_hex && e.role == role)
+                .and_then(|e| blind_from_hex(&e.blind_hex))
+                .ok_or("the settlement note is not available yet; the swap stays pending")?;
+            acct.htlc_coin(value, asset, blind)
+        }
+    };
+    let id_hex = hex::encode(escrow);
+    if let Some(e) = w.escrows.iter_mut().find(|e| e.id_hex == id_hex && e.role == role) {
+        e.blind_hex = blind_to_hex(&coin.blind);
+    }
+    let amount = coin.value;
     if w.coins.iter().any(|c| c.coin.commitment() == coin.commitment()) {
-        return;
+        return Ok((false, amount));
     }
     let born = tip_or(url, w);
     w.coins.push(CoinRec::new(coin, born));
+    Ok((true, amount))
 }
 
 fn mark_swap_inputs_spent(w: &mut Wallet, commitments: &[String]) {
@@ -4279,9 +5014,11 @@ struct PreparedSwapLock {
     changes: Vec<SwapChange>,
 }
 
-/// Lock `value` of `asset` payable to `counterparty`, refunding to this wallet. Gas is a
-/// separate ZCRYPT coin. Does not broadcast and does not mark coins spent. `next_change`
-/// advances so the saved wallet already covers the change addresses.
+/// Lock `value` of `asset` payable to `counterparty` (the bech32 they pasted; its ML-KEM
+/// key receives the claim note), refunding to this wallet. Gas is a separate ZCRYPT coin.
+/// Does not broadcast and does not mark coins spent. `next_change` advances so the saved
+/// wallet already covers the change addresses. The refund blind is stored on an escrow
+/// record when `my_index` is `Some`, so a timeout refund does not need the counterparty.
 fn prepare_swap_lock(
     w: &mut Wallet,
     url: &str,
@@ -4289,7 +5026,8 @@ fn prepare_swap_lock(
     value: u64,
     hashlock: &[u8; 32],
     timeout: u64,
-    counterparty: &zcrypt_shield::PubKey,
+    counterparty: &Address,
+    my_index: Option<u32>,
 ) -> Result<PreparedSwapLock, String> {
     if value == 0 || value > MAX_COIN {
         return Err("enter an amount this coin can hold".to_string());
@@ -4371,16 +5109,25 @@ fn prepare_swap_lock(
     let change_addr = change_acct.stealth_address();
     let change_out = keys::out_asset_coin(&change_addr, change, change_blind, asset);
     let change_note = kem::ciphertext_to_bytes(&keys::encrypt_note_asset(&change_addr, change, change_blind, asset));
-    let me = w.account.pubkey();
+    // Openings first, then the envelope that binds them, then the shield proof.
+    // The refund key is a per-swap stealth sub-account, never the reusable Normal pk (H10).
+    let my_account = swap_account(w, my_index);
+    let me = my_account.pubkey();
+    let party_pk = counterparty.pubkey();
+    let refund_addr = my_account.stealth_address();
+    let (_claim_blind, claim_open) = zcrypt_core::htlc_shield::CoinOpening::create(counterparty, value, asset)?;
+    let (refund_blind, refund_open) = zcrypt_core::htlc_shield::CoinOpening::create(&refund_addr, value, asset)?;
+    let settlements = [claim_open.coin.clone(), refund_open.coin.clone()];
     let envelope = zcrypt_core::htlc_shield::lock_envelope(
         zcrypt_core::htlc_shield::ENV_SWAP_LOCK,
         asset,
         value,
         hashlock,
         timeout,
-        counterparty,
+        &party_pk,
         &me,
         &[],
+        &settlements,
     );
     let main_tx = shield_tx::build_bound(&chain_id, &spends, &[burn_out, change_out], 0, vec![keys::cover_note_bytes(), change_note], &envelope)
         .ok_or("could not prove the lock")?;
@@ -4415,8 +5162,14 @@ fn prepare_swap_lock(
         &gas_env,
     )
     .ok_or("could not prove the fee")?;
-    let raw = bswap::swap_lock_tx(value, &burn_blind, asset, hashlock, timeout, counterparty, &me, &gas_blind, &gas_tx, &main_tx);
-    let escrow = zcrypt_core::htlc_shield::escrow_id(asset, value, hashlock, timeout, counterparty);
+    let raw = bswap::swap_lock_tx(
+        value, &burn_blind, asset, hashlock, timeout, &party_pk, &me, &gas_blind, &gas_tx, &main_tx, &claim_open, &refund_open,
+    );
+    let escrow = escrow_id_for(EscrowKind::Swap, asset, value, hashlock, timeout, &party_pk, &me);
+    // The main account (my_index None) has no HD index to store; its refund note is on /htlc.
+    if let Some(index) = my_index {
+        upsert_escrow_blind(w, index, &escrow, "refund", "swap", value, asset, &hex::encode(hashlock), timeout, false, refund_blind);
+    }
     let mut inputs: Vec<String> = chosen.iter().map(|&i| commitment_hex(&w.coins[i].coin.commitment())).collect();
     inputs.push(commitment_hex(&w.coins[gas_i].coin.commitment()));
     let mut changes = Vec::new();
@@ -4431,17 +5184,32 @@ fn prepare_swap_lock(
     Ok(PreparedSwapLock { raw, escrow, inputs, changes })
 }
 
-/// Save `pending` (it holds the preimage), then broadcast. A rejected broadcast removes
-/// the record and saves again. Coins are marked spent only after the node accepts.
+/// Whether a broadcast error PROVES the transaction did not commit: the node refused it in
+/// CheckTx or DeliverTx. Anything else (a timeout, a dropped connection) may have landed.
+fn broadcast_definitely_failed(e: &str) -> bool {
+    e.starts_with("rejected")
+}
+
+/// Save `pending` (it holds the preimage), then broadcast. A broadcast the node provably
+/// refused removes the record and saves again; any other error keeps it (the lock may be
+/// in a block already) and the settle pass resolves it. Coins are marked spent only after
+/// the node accepts.
 fn commit_swap_lock(state: &State<AppState>, w: &mut Wallet, url: &str, prepared: &PreparedSwapLock, pending: PendingSwap) -> Result<(), String> {
     let escrow_hex = pending.my_escrow_hex.clone();
     w.pending_swaps.push(pending);
     if let Err(e) = save_now(state, w, "lock a swap") {
         w.pending_swaps.retain(|s| s.my_escrow_hex != escrow_hex);
+        w.escrows.retain(|e| !(e.id_hex == escrow_hex && e.role == "refund"));
         return Err(e);
     }
     if let Err(e) = chain::broadcast(url, &prepared.raw) {
+        if !broadcast_definitely_failed(&e) {
+            return Err(format!(
+                "{e}. The lock may still have reached the chain: the swap stays listed and settles or clears on its own"
+            ));
+        }
         w.pending_swaps.retain(|s| s.my_escrow_hex != escrow_hex);
+        w.escrows.retain(|e| !(e.id_hex == escrow_hex && e.role == "refund"));
         return match save_now(state, w, "drop a swap lock the node did not accept") {
             Ok(()) => Err(e),
             Err(save_e) => Err(format!("{e} ({save_e})")),
@@ -4451,6 +5219,10 @@ fn commit_swap_lock(state: &State<AppState>, w: &mut Wallet, url: &str, prepared
     materialize_swap_changes(w, url, &prepared.changes);
     Ok(())
 }
+
+/// Blocks after a lock's start before a "no such escrow" answer means the lock never landed
+/// (the broadcast may have timed out with the tx still in a mempool, wallet L9).
+const SWAP_LOCK_SETTLE_GRACE_BLOCKS: i64 = 60;
 
 #[derive(Serialize)]
 struct RegisteredAsset {
@@ -4483,6 +5255,19 @@ struct SwapOffer {
     my_timeout: u64,
 }
 
+/// A fresh stealth address for the other side of a swap to put in its offer (wallet H10): a
+/// per-swap sub-account key, never the reusable payment address, so repeated counterparties
+/// cannot build a trade graph on a static key.
+#[tauri::command]
+fn swap_receive_address(state: State<AppState>) -> R<String> {
+    with_wallet(&state, |w| {
+        let idx = w.alloc_index();
+        w.note_action(idx, "swap", "");
+        Ok(w.key_at(idx).stealth_address().to_bech32())
+    })
+    .and_then(ok)
+}
+
 /// Lock `give_amount` of `give_asset` and hand back an offer the other wallet accepts.
 #[tauri::command]
 fn swap_asset_start(
@@ -4501,33 +5286,40 @@ fn swap_asset_start(
     if give_asset == take_asset {
         return Err("choose two different assets".to_string());
     }
-    let maker_pk = Address::from_bech32(maker_address.trim()).ok_or("their address should start with zc1")?.pubkey();
+    let maker_addr = Address::from_bech32(maker_address.trim()).ok_or("their address should start with zc1")?;
+    let maker_pk = maker_addr.pubkey();
     let url = node_url(&state)?;
     if take_asset != zcrypt_shield::ASSET_ZCRYPT && chain::asset_meta(&url, take_asset).is_none() {
         return Err("that asset is not registered on this chain".to_string());
     }
-    let (give_ticker, _) = asset_label(&url, give_asset);
-    let (take_ticker, _) = asset_label(&url, take_asset);
+    let (give_ticker, _) = asset_label_strict(&url, give_asset)?;
+    let (take_ticker, _) = asset_label_strict(&url, take_asset)?;
     let zc = zc_client(&state)?;
     let tip = zc.height()?;
     let (give_timeout, _) = bswap::swap_timeouts(tip as u64, SWAP_WINDOW_BLOCKS);
-    let preimage = bswap::fresh_preimage();
-    let hashlock = zcrypt_core::nullifier::htlc_hashlock(&preimage);
     with_wallet(&state, |w| {
-        if maker_pk == w.account.pubkey() {
+        if own_key_index(w, &maker_pk).is_some() {
             return Err("that address is this wallet — the other side has to be someone else".to_string());
         }
-        let prepared = prepare_swap_lock(w, &url, give_asset, give_amount, &hashlock, give_timeout, &maker_pk)?;
+        // A fresh stealth key for this swap (H10) and a preimage derived from the seed and
+        // that key's index (M2), so a seed restore can rebuild both.
+        let idx = w.alloc_index();
+        w.note_action(idx, "swap", "");
+        let me = w.key_at(idx);
+        let preimage = zcrypt_bridge::wallet_flows::bridge_preimage(&Zeroizing::new(w.account.seed()), idx);
+        let hashlock = zcrypt_core::nullifier::htlc_hashlock(&preimage);
+        let prepared = prepare_swap_lock(w, &url, give_asset, give_amount, &hashlock, give_timeout, &maker_addr, Some(idx))?;
         let ticket_body = SwapTicket {
             give_asset,
             give_amount,
             take_asset,
             take_amount,
             hashlock,
-            taker_pk: w.account.pubkey(),
+            taker_pk: me.pubkey(),
             give_timeout,
             give_escrow: prepared.escrow,
             maker_pk,
+            taker_address: me.stealth_address(),
         };
         let ticket = encode_swap_ticket(&ticket_body);
         let their = maker_escrow_id(&ticket_body);
@@ -4548,6 +5340,7 @@ fn swap_asset_start(
             started_height: tip,
             scanned_through: 30,
             ticket: ticket.clone(),
+            my_index: Some(idx),
         };
         commit_swap_lock(&state, w, &url, &prepared, pending)?;
         w.push_hist("swap", -(give_amount as i64), format!("locked for {take_ticker}"), give_asset);
@@ -4556,13 +5349,33 @@ fn swap_asset_start(
     .and_then(ok)
 }
 
-/// Lock the other side of an offer someone sent you.
-#[tauri::command]
-fn swap_asset_accept(ticket: String, state: State<AppState>) -> R<String> {
-    let t = decode_swap_ticket(&ticket)?;
-    let url = node_url(&state)?;
-    let zc = zc_client(&state)?;
-    let info = bswap::query_escrow(&zc, &t.give_escrow)?.ok_or("their lock is not on the chain yet")?;
+/// The decoded terms of an offer, for the maker to read BEFORE anything is locked (H8).
+#[derive(Serialize)]
+struct SwapPreview {
+    /// What the taker locked and this wallet would receive.
+    receive_ticker: String,
+    #[serde(with = "u64_str")]
+    receive_amount: u64,
+    receive_decimals: u8,
+    /// What this wallet would lock and the taker would take.
+    pay_ticker: String,
+    #[serde(with = "u64_str")]
+    pay_amount: u64,
+    pay_decimals: u8,
+    /// Where the taker's lock expires, and how many blocks that is from now.
+    their_timeout: u64,
+    blocks_left: i64,
+    /// Where this wallet's lock would expire (it must expire first).
+    my_timeout: u64,
+    /// The spendable balance this wallet has of the asset it would pay.
+    #[serde(with = "u64_str")]
+    pay_balance: u64,
+}
+
+/// Check an offer against consensus: the taker's lock must exist, be open, be a swap, and
+/// carry exactly the ticket's terms and keys. Returns the lock and the current ZC tip.
+fn verify_offer_lock(zc: &Zcrypt, t: &SwapTicket) -> Result<(bswap::EscrowInfo, u64), String> {
+    let info = bswap::query_escrow(zc, &t.give_escrow)?.ok_or("their lock is not on the chain yet")?;
     if info.state != "open" {
         return Err("their lock is no longer open".to_string());
     }
@@ -4574,11 +5387,27 @@ fn swap_asset_accept(ticket: String, state: State<AppState>) -> R<String> {
     if info.party_pk != pk64(&t.maker_pk).to_vec() || info.refund_pk != pk64(&t.taker_pk).to_vec() {
         return Err("their lock pays someone else".to_string());
     }
-    let expected = zcrypt_core::htlc_shield::escrow_id(t.give_asset, t.give_amount, &t.hashlock, t.give_timeout, &t.maker_pk);
-    if expected != t.give_escrow {
+    if t.taker_address.pubkey() != t.taker_pk {
+        return Err("this offer's address does not match the key it names".to_string());
+    }
+    if taker_escrow_id(t) != t.give_escrow {
         return Err("this offer does not match the lock it names".to_string());
     }
     let tip = zc.height()? as u64;
+    Ok((info, tip))
+}
+
+/// Decode an offer and show its terms, with nothing locked. The UI must display these and
+/// get an explicit confirmation before `swap_asset_accept` (wallet H8). Fails when the chain
+/// has no decimals for either asset (wallet L8) rather than guessing a scale.
+#[tauri::command]
+fn swap_asset_preview(ticket: String, state: State<AppState>) -> R<SwapPreview> {
+    let t = decode_swap_ticket(&ticket)?;
+    let url = node_url(&state)?;
+    let zc = zc_client(&state)?;
+    let (info, tip) = verify_offer_lock(&zc, &t)?;
+    let (receive_ticker, receive_decimals) = asset_label_strict(&url, t.give_asset)?;
+    let (pay_ticker, pay_decimals) = asset_label_strict(&url, t.take_asset)?;
     let taker_lock = bswap::SwapLock {
         escrow_id: t.give_escrow,
         asset: t.give_asset,
@@ -4586,25 +5415,76 @@ fn swap_asset_accept(ticket: String, state: State<AppState>) -> R<String> {
         hashlock: t.hashlock,
         timeout: t.give_timeout,
         locker_pk: t.taker_pk,
-        height: zc.height()?,
+        height: tip as i64,
+    };
+    let my_timeout = bswap::maker_take_timeout_for(&taker_lock, tip)?;
+    let pay_balance = {
+        let g = state.wallet.lock().unwrap();
+        let w = g.as_ref().ok_or("wallet is locked")?;
+        let my_index = own_key_index(w, &t.maker_pk).ok_or("this offer is addressed to a key this wallet does not hold")?;
+        let acct = swap_account(w, my_index);
+        if coin_from_note(&acct, &info.claim_enc_note).is_none() {
+            return Err("their lock's settlement note does not open to this wallet".to_string());
+        }
+        w.coins.iter().filter(|c| !c.spent && c.coin.asset_id == t.take_asset).map(|c| c.value).sum()
+    };
+    ok(SwapPreview {
+        receive_ticker,
+        receive_amount: t.give_amount,
+        receive_decimals,
+        pay_ticker,
+        pay_amount: t.take_amount,
+        pay_decimals,
+        their_timeout: t.give_timeout,
+        blocks_left: t.give_timeout as i64 - tip as i64,
+        my_timeout,
+        pay_balance,
+    })
+}
+
+/// Lock the other side of an offer someone sent you. The UI shows `swap_asset_preview`
+/// first; this re-checks everything against consensus at the moment of locking.
+#[tauri::command]
+fn swap_asset_accept(ticket: String, state: State<AppState>) -> R<String> {
+    let t = decode_swap_ticket(&ticket)?;
+    let url = node_url(&state)?;
+    let zc = zc_client(&state)?;
+    let (info, tip) = verify_offer_lock(&zc, &t)?;
+    let taker_lock = bswap::SwapLock {
+        escrow_id: t.give_escrow,
+        asset: t.give_asset,
+        value: t.give_amount,
+        hashlock: t.hashlock,
+        timeout: t.give_timeout,
+        locker_pk: t.taker_pk,
+        height: tip as i64,
     };
     let take_timeout = bswap::maker_take_timeout_for(&taker_lock, tip)?;
     let their = maker_escrow_id(&t);
-    let mine = zcrypt_core::htlc_shield::escrow_id(t.take_asset, t.take_amount, &t.hashlock, take_timeout, &t.taker_pk);
+    let mine = escrow_id_for(EscrowKind::Swap, t.take_asset, t.take_amount, &t.hashlock, take_timeout, &t.taker_pk, &t.maker_pk);
     if mine != their {
         return Err("this offer's timing does not match the wallet's swap rule".to_string());
     }
-    let (take_ticker, _) = asset_label(&url, t.take_asset);
-    let (give_ticker, _) = asset_label(&url, t.give_asset);
+    let (take_ticker, _) = asset_label_strict(&url, t.take_asset)?;
+    let (give_ticker, _) = asset_label_strict(&url, t.give_asset)?;
     with_wallet(&state, |w| {
-        if w.account.pubkey() != t.maker_pk {
-            return Err("this offer is for a different wallet address".to_string());
+        // The offer must name a key this wallet holds: the main account or any stealth
+        // sub-account (the one `swap_receive_address` handed out), wallet H10.
+        let my_index = own_key_index(w, &t.maker_pk).ok_or("this offer is addressed to a key this wallet does not hold")?;
+        let acct = swap_account(w, my_index);
+        if coin_from_note(&acct, &info.claim_enc_note).is_none() {
+            return Err("their lock's settlement note does not open to this wallet".to_string());
+        }
+        if let Some(i) = my_index {
+            w.note_action(i, "swap", "");
         }
         if w.pending_swaps.iter().any(|p| p.my_escrow_hex == hex::encode(mine)) {
             return Err("this wallet already accepted that offer".to_string());
         }
-        let prepared = prepare_swap_lock(w, &url, t.take_asset, t.take_amount, &t.hashlock, take_timeout, &t.taker_pk)?;
+        let prepared = prepare_swap_lock(w, &url, t.take_asset, t.take_amount, &t.hashlock, take_timeout, &t.taker_address, my_index)?;
         if prepared.escrow != mine {
+            let id_hex = hex::encode(prepared.escrow);
+            w.escrows.retain(|e| !(e.id_hex == id_hex && e.role == "refund"));
             return Err("the lock this wallet would publish is not the one this offer asked for".to_string());
         }
         let pending = PendingSwap {
@@ -4624,10 +5504,13 @@ fn swap_asset_accept(ticket: String, state: State<AppState>) -> R<String> {
             started_height: tip as i64,
             scanned_through: 30,
             ticket: String::new(),
+            my_index,
         };
         commit_swap_lock(&state, w, &url, &prepared, pending)?;
         w.push_hist("swap", -(t.take_amount as i64), format!("locked for {give_ticker}"), t.take_asset);
-        Ok(format!("Locked {take_ticker}. Their wallet claims it, then yours collects the {give_ticker}. Keep this wallet open."))
+        Ok(format!(
+            "Locked {take_ticker}. Their wallet claims it, then yours collects the {give_ticker}; the wallet keeps checking in the background while it is unlocked."
+        ))
     })
     .and_then(ok)
 }
@@ -4684,19 +5567,25 @@ fn list_pending_swaps(state: State<AppState>) -> R<Vec<PendingSwapView>> {
 }
 
 /// Advance every open swap: claim when the other side has locked, or refund once the
-/// lock has expired. Returns one line per swap that moved.
+/// lock has expired. Returns one line per swap that moved. The background worker runs the
+/// same pass while any swap is pending (wallet H9); the two never overlap.
 #[tauri::command]
 fn swap_asset_settle(state: State<AppState>) -> R<Vec<String>> {
-    let url = node_url(&state)?;
-    let zc = zc_client(&state)?;
+    settle_all_swaps(&state).and_then(ok)
+}
+
+fn settle_all_swaps(state: &State<AppState>) -> Result<Vec<String>, String> {
+    let _serial = SETTLE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let url = node_url(state)?;
+    let zc = zc_client(state)?;
     let tip = zc.height()?;
     let pending = {
-        let g = state.wallet.lock().unwrap();
-        g.as_ref().ok_or("wallet is locked")?.pending_swaps.clone()
+        let g = lock_active_wallet(state);
+        g.get().ok_or("wallet is locked")?.pending_swaps.clone()
     };
     let mut notes = Vec::new();
     for p in pending {
-        let moved = settle_one_swap(&state, &url, &zc, tip, &p);
+        let moved = settle_one_swap(state, &url, &zc, tip, &p);
         match moved {
             Ok(Some(m)) => notes.push(m),
             Ok(None) => {}
@@ -4704,12 +5593,58 @@ fn swap_asset_settle(state: State<AppState>) -> R<Vec<String>> {
             Err(e) => eprintln!("[swap] {e}"),
         }
     }
-    ok(notes)
+    Ok(notes)
+}
+
+/// Credit the other side's lock to this wallet and close the swap record.
+fn finish_swap(state: &State<AppState>, url: &str, p: &PendingSwap, their_escrow: &[u8; 32]) -> Result<Option<String>, String> {
+    let (value, asset) = if p.role == "taker" { (p.take_amount, p.take_asset) } else { (p.give_amount, p.give_asset) };
+    with_wallet(state, |w| {
+        let (fresh, credited) = credit_htlc(w, url, p.my_index, value, asset, their_escrow, "claim")?;
+        if fresh {
+            w.push_hist("swap", credited as i64, "swap received".into(), asset);
+        }
+        let (ticker, _) = asset_label(url, asset);
+        w.pending_swaps.retain(|s| s.my_escrow_hex != p.my_escrow_hex);
+        Ok(Some(format!("Swap complete — {ticker} is in this wallet.")))
+    })
+}
+
+/// Claim the other side's lock with `preimage`. A broadcast error is NOT taken as
+/// "not claimed": the escrow is re-read, and a lock that is claimed (by this very tx, or an
+/// earlier pass) is credited (wallet M14).
+fn claim_their_lock(
+    state: &State<AppState>,
+    url: &str,
+    zc: &Zcrypt,
+    p: &PendingSwap,
+    their_escrow: &[u8; 32],
+    preimage: &[u8],
+) -> Result<Option<String>, String> {
+    match chain::broadcast(url, &bswap::claim_tx(their_escrow, preimage)) {
+        Ok(()) => finish_swap(state, url, p, their_escrow),
+        Err(e) => {
+            if bswap::query_escrow(zc, their_escrow)?.is_some_and(|x| x.state == "claimed") {
+                return finish_swap(state, url, p, their_escrow);
+            }
+            Err(format!("swap claim did not go through: {e}"))
+        }
+    }
 }
 
 fn settle_one_swap(state: &State<AppState>, url: &str, zc: &Zcrypt, tip: i64, p: &PendingSwap) -> Result<Option<String>, String> {
     let my_escrow = parse_id_hex(&p.my_escrow_hex)?;
     let their_escrow = parse_id_hex(&p.their_escrow_hex)?;
+    let hashlock = parse_id_hex(&p.hashlock_hex)?;
+    let counterparty: [u8; 64] = hex::decode(&p.counterparty_pk_hex)
+        .ok()
+        .and_then(|v| v.try_into().ok())
+        .ok_or("corrupt swap record (counterparty key)")?;
+    let my_pk = {
+        let g = lock_active_wallet(state);
+        let w = g.get().ok_or("wallet is locked")?;
+        pk64(&swap_account(w, p.my_index).pubkey())
+    };
     let mine = bswap::query_escrow(zc, &my_escrow)?;
     // A lock that reached the chain spends those coins even if the wallet crashed first.
     if mine.is_some() {
@@ -4723,12 +5658,16 @@ fn settle_one_swap(state: &State<AppState>, url: &str, zc: &Zcrypt, tip: i64, p:
             Ok(())
         });
     } else {
-        // The node has no escrow. Drop the record only when every input is still
-        // unspent — that is a lock that never landed. A query error never reaches
-        // here. Spent inputs stay pending: the query may be behind a lock that did.
+        // The node has no escrow. Drop the record only once the lock has had a grace
+        // window to land (a timed-out broadcast may still be in a mempool, wallet L9) AND
+        // every input is still unspent. Spent inputs stay pending: the query may be
+        // behind a lock that did land.
+        if tip < p.started_height.saturating_add(SWAP_LOCK_SETTLE_GRACE_BLOCKS) {
+            return Ok(None);
+        }
         let unspent = {
-            let g = state.wallet.lock().unwrap();
-            g.as_ref().is_some_and(|w| swap_inputs_still_unspent(w, &p.input_commitments))
+            let g = lock_active_wallet(state);
+            g.get().is_some_and(|w| swap_inputs_still_unspent(w, &p.input_commitments))
         };
         if unspent {
             let dropped = with_wallet(state, |w| {
@@ -4739,21 +5678,24 @@ fn settle_one_swap(state: &State<AppState>, url: &str, zc: &Zcrypt, tip: i64, p:
             if dropped {
                 return Ok(Some("That lock never landed, so nothing was spent.".to_string()));
             }
-            return Ok(None);
         }
+        return Ok(None);
+    }
+    let theirs = bswap::query_escrow(zc, &their_escrow)?;
+    // Either role: a counter-escrow that is already claimed is ours to credit (an earlier
+    // pass broadcast the claim and then failed, or the scan beat us to it), wallet M14.
+    if theirs.as_ref().is_some_and(|e| e.state == "claimed") {
+        return finish_swap(state, url, p, &their_escrow);
     }
     if p.role == "taker" {
         let preimage = hex::decode(&p.preimage_hex).map_err(|e| e.to_string())?;
-        let want_lock = parse_id_hex(&p.hashlock_hex)?;
-        if bswap::query_escrow(zc, &their_escrow)?.is_some_and(|e| e.state == "open" && e.asset_id == p.take_asset && e.value == p.take_amount && e.hashlock == want_lock) {
-            chain::broadcast(url, &bswap::claim_tx(&their_escrow, &preimage))?;
-            return with_wallet(state, |w| {
-                credit_htlc(w, url, p.take_amount, p.take_asset, &their_escrow);
-                let (ticker, _) = asset_label(url, p.take_asset);
-                w.push_hist("swap", p.take_amount as i64, "swap received".into(), p.take_asset);
-                w.pending_swaps.retain(|s| s.my_escrow_hex != p.my_escrow_hex);
-                Ok(Some(format!("Swap complete — {ticker} is in this wallet.")))
-            });
+        if let Some(e) = theirs.as_ref() {
+            // H6: reveal the preimage only against a lock that is a swap, pays this key,
+            // refunds to the counterparty, matches the terms and has life left.
+            match zcrypt_bridge::wallet_flows::swap_claim_is_safe(e, tip as u64, &my_pk, &counterparty, p.take_asset, p.take_amount, &hashlock) {
+                Ok(()) => return claim_their_lock(state, url, zc, p, &their_escrow, &preimage),
+                Err(why) => eprintln!("[swap] not claiming their lock: {why}"),
+            }
         }
         if tip as u64 >= p.my_timeout {
             return refund_swap(state, url, zc, p, &my_escrow, p.give_amount, p.give_asset);
@@ -4762,21 +5704,26 @@ fn settle_one_swap(state: &State<AppState>, url: &str, zc: &Zcrypt, tip: i64, p:
     }
     // Maker: once they claim our lock, the preimage is in that claim and we collect theirs.
     if mine.as_ref().is_some_and(|e| e.state == "claimed") {
-        let hashlock = parse_id_hex(&p.hashlock_hex)?;
         let lookback = p.scanned_through.max(30);
         let mut from = tip.saturating_sub(lookback).max(p.started_height);
         if from > tip {
             from = tip;
         }
         if let Some((preimage, _)) = bswap::find_claim_preimage(zc, from, tip, &my_escrow, &hashlock)? {
-            chain::broadcast(url, &bswap::claim_tx(&their_escrow, &preimage))?;
-            return with_wallet(state, |w| {
-                credit_htlc(w, url, p.give_amount, p.give_asset, &their_escrow);
-                let (ticker, _) = asset_label(url, p.give_asset);
-                w.push_hist("swap", p.give_amount as i64, "swap received".into(), p.give_asset);
-                w.pending_swaps.retain(|s| s.my_escrow_hex != p.my_escrow_hex);
-                Ok(Some(format!("Swap complete — {ticker} is in this wallet.")))
-            });
+            match theirs.as_ref() {
+                // The preimage is already public, so the only margin needed is enough life
+                // for the claim to be delivered (CheckTx needs timeout > height + 1).
+                Some(e) if e.state == "open" && e.timeout_height > tip as u64 + 2 => {
+                    return claim_their_lock(state, url, zc, p, &their_escrow, &preimage);
+                }
+                Some(e) if e.state == "expired" => {
+                    return with_wallet(state, |w| {
+                        w.pending_swaps.retain(|s| s.my_escrow_hex != p.my_escrow_hex);
+                        Ok(Some("Their lock expired before this wallet could claim it; the swap is closed.".to_string()))
+                    });
+                }
+                _ => {}
+            }
         }
         let _ = with_wallet(state, |w| {
             if let Some(s) = w.pending_swaps.iter_mut().find(|s| s.my_escrow_hex == p.my_escrow_hex) {
@@ -4794,6 +5741,9 @@ fn settle_one_swap(state: &State<AppState>, url: &str, zc: &Zcrypt, tip: i64, p:
     Ok(None)
 }
 
+/// Take this wallet's own lock back. Consensus expires the escrow by itself at the end of
+/// its timeout block; a 0x5C only hurries that along, so "not open" after the timeout is
+/// success, and the refund coin is credited from the escrow's state, never from the tx.
 fn refund_swap(
     state: &State<AppState>,
     url: &str,
@@ -4803,20 +5753,26 @@ fn refund_swap(
     value: u64,
     asset: u64,
 ) -> Result<Option<String>, String> {
-    let info = bswap::query_escrow(zc, my_escrow)?;
+    let mut info = bswap::query_escrow(zc, my_escrow)?;
+    if info.as_ref().is_some_and(|e| e.state == "open") {
+        let _ = chain::broadcast(url, &bswap::expire_tx(my_escrow));
+        info = bswap::query_escrow(zc, my_escrow)?;
+    }
     match info.as_ref().map(|e| e.state.as_str()) {
-        Some("open") => {
-            chain::broadcast(url, &bswap::expire_tx(my_escrow))?;
-        }
         Some("expired") => {}
-        Some("claimed") => return Ok(None),
-        _ => return Ok(None),
+        // Still open (the expiry block has not been finalized yet): try again next pass.
+        Some("open") => return Ok(None),
+        // Claimed by the other side: nothing to refund (the maker collects theirs instead).
+        Some(_) | None => return Ok(None),
     }
     with_wallet(state, |w| {
-        credit_htlc(w, url, value, asset, my_escrow);
+        let (fresh, credited) = credit_htlc(w, url, p.my_index, value, asset, my_escrow, "refund")?;
+        if fresh {
+            w.push_hist("swap", credited as i64, "swap refund".into(), asset);
+        }
         let (ticker, _) = asset_label(url, asset);
-        w.push_hist("swap", value as i64, "swap refund".into(), asset);
         w.pending_swaps.retain(|s| s.my_escrow_hex != p.my_escrow_hex);
+        w.escrows.retain(|e| !(e.id_hex == p.my_escrow_hex && e.role == "refund"));
         Ok(Some(format!("The swap expired. {ticker} is back in this wallet.")))
     })
 }
@@ -4841,7 +5797,9 @@ fn swap_asset_refund(escrow_hex: String, state: State<AppState>) -> R<String> {
     }
     let my_escrow = parse_id_hex(&p.my_escrow_hex)?;
     let (value, asset) = if p.role == "taker" { (p.give_amount, p.give_asset) } else { (p.take_amount, p.take_asset) };
-    refund_swap(&state, &url, &zc, &p, &my_escrow, value, asset)?.ok_or("that lock can no longer be refunded".to_string()).and_then(ok)
+    refund_swap(&state, &url, &zc, &p, &my_escrow, value, asset)?
+        .ok_or("the escrow has not expired yet (it closes at the end of its timeout block); try again shortly".to_string())
+        .and_then(ok)
 }
 
 #[derive(Serialize)]
@@ -4905,12 +5863,20 @@ fn btc_wallet_snapshot(state: &State<AppState>) -> BtcWallet {
 /// Withdraw real BTC from your wallet to an external Bitcoin address.
 #[tauri::command]
 fn withdraw_btc(address: String, btc: String, state: State<AppState>) -> R<String> {
-    let client = btc_client(&state)?;
     let sats = parse_decimal_units(&btc, 8)?;
     if sats == 0 {
         return Err("enter a BTC amount".into());
     }
     let amt = bitcoin::Amount::from_sat(sats);
+    let _op = BridgeOpGuard::enter();
+    // Self-custody (real networks): sign locally and broadcast through Esplora; the
+    // bitcoind wallet is only the regtest / self-custody-off path (wallet L11).
+    if let Some(sc) = selfcustody_wallet(&state, 0)? {
+        let dest = zcrypt_bridge::parse_address(address.trim(), sc.network())?;
+        let (txid, _fee) = zcrypt_bridge::wallet_flows::selfcustody_send(&sc, &dest, amt)?;
+        return ok(txid.to_string());
+    }
+    let client = btc_client(&state)?;
     client.send_to_address(address.trim(), amt).and_then(ok)
 }
 
@@ -5042,23 +6008,30 @@ fn mint_asset(
         w.note_action(idx, "mint", "");
         let claimer = w.key_at(idx);
         let pk = claimer.pubkey();
-        let escrow = zcrypt_core::htlc_shield::escrow_id(asset_id, amount, &lock, timeout, &pk);
+        let claim_addr = claimer.stealth_address();
+        // The opening exists before the auth, the body, and the gas proof that binds the body.
+        let (blind, opening) = zcrypt_core::htlc_shield::CoinOpening::create(&claim_addr, amount, asset_id)?;
+        let escrow = escrow_id_for(EscrowKind::Mint, asset_id, amount, &lock, timeout, &pk, &pk);
         // Authorize the mint with a threshold signature over the exact escrow params (bound
         // to this chain id, so it cannot replay on another network); no minting secret goes
         // on-chain. The open is a state-creating tx and carries a ZCRYPT gas note.
         let cid = chain_id_for(&url)?;
-        let auth = sign_mint(&zcrypt_core::mint_auth::mint_message(&cid, asset_id, amount, &lock, timeout, &pk));
-        let body = bswap::open_body(asset_id, amount, &lock, timeout, &pk, &auth);
+        let note_bind = opening.coin.note_bind();
+        let auth = sign_mint(&zcrypt_core::mint_auth::mint_message(
+            &cid, asset_id, amount, &lock, timeout, &pk, &opening.coin.commitment, &note_bind,
+        ));
+        let body = bswap::open_body(asset_id, amount, &lock, timeout, &pk, &opening, &auth);
         let (gas, gas_i, gchg) = mint_gas_prefix(w, &url, &body)?;
-        chain::broadcast(&url, &bswap::open_tx(asset_id, amount, &lock, timeout, &pk, &auth, &gas))?;
+        chain::broadcast(&url, &bswap::open_tx(asset_id, amount, &lock, timeout, &pk, &opening, &auth, &gas))?;
         w.coins[gas_i].spent = true;
         if let Some(rec) = gchg {
             w.coins.push(rec);
         }
         chain::broadcast(&url, &bswap::claim_tx(&escrow, &preimage))?;
-        let coin = claimer.htlc_coin(amount, asset_id, &escrow);
+        let coin = claimer.htlc_coin(amount, asset_id, blind);
         let born = w.scan_height;
         w.coins.push(CoinRec::new(coin, born));
+        upsert_escrow_blind(w, idx, &escrow, "claim", "mint", amount, asset_id, &hex::encode(lock), timeout, false, blind);
         w.push_hist("mint", amount as i64, format!("minted {t}"), asset_id);
         Ok(asset_id.to_string())
     })
@@ -5165,6 +6138,7 @@ fn list_pending_deposits(state: State<AppState>) -> R<Vec<PendingDepositView>> {
     let w = g.as_ref().ok_or("wallet locked")?;
     ok(w.pending_deposits
         .iter()
+        .filter(|p| !p.archived)
         .map(|p| PendingDepositView {
             index: p.index,
             value_sats: p.value_sats,
@@ -5193,6 +6167,7 @@ fn bridge_refund_deposit(index: u32, state: State<AppState>) -> R<String> {
     };
     let preimage = hex::decode(&p.preimage_hex).ok().filter(|v| v.len() == 32).ok_or("corrupt preimage record")?;
     let lock = zcrypt_core::nullifier::htlc_hashlock(&preimage);
+    let _op = BridgeOpGuard::enter();
     let (alice_bk, dest) = swap_backend(&state, 0)?;
     let zc = zc_client(&state)?;
     let reserve_pk = reserve_pk_for(&zc, p.asset_id, &p.reserve_pk_hex)?;
@@ -5300,7 +6275,10 @@ fn swap_shield_btc_impl(
     if btc_sats != zbtc_amount {
         return Err(format!("shield must be 1:1: {btc_sats} sats != {zbtc_amount} zBTC base units"));
     }
-    let (alice_bk, _alice_dest) = swap_backend(state, 0)?;
+    let _op = BridgeOpGuard::enter();
+    // Headers and funding only: the deposit never pays out to a wallet address, so no
+    // receive-chain walk is needed here (wallet M13).
+    let (alice_bk, _alice_dest) = swap_backend_lazy(state, 0)?;
     let zc = zc_client(state)?;
     let asset = zbtc_asset(&zc)?;
     let net = alice_bk.network();
@@ -5319,13 +6297,14 @@ fn swap_shield_btc_impl(
     let btc_tip = alice_bk.height()?;
     let zc_tip = zc.height()? as u64;
     let (btc_locktime, zc_timeout) = bswap::shield_timeouts(net, btc_tip, zc_tip)?;
-    let preimage = bswap::fresh_preimage(); // 32 random bytes (HTLC hashlock security)
-    let lock = zcrypt_core::nullifier::htlc_hashlock(&preimage);
     // Record and SAVE the preimage plus the exact script parameters before funding, so a
-    // crash or a rejected mint can always be resumed or refunded from the record alone.
-    let (idx, alice_key, claimer) = with_wallet(state, |w| {
+    // crash or a rejected mint can always be resumed or refunded from the record alone. The
+    // preimage is derived from the seed and this deposit's HD index (wallet M2), so even a
+    // lost record can be rebuilt by trying the indices the seed ever used.
+    let (idx, alice_key, claimer, preimage) = with_wallet(state, |w| {
         let idx = w.alloc_index();
         w.note_action(idx, "shield", "");
+        let preimage = zcrypt_bridge::wallet_flows::bridge_preimage(&Zeroizing::new(w.account.seed()), idx);
         w.pending_deposits.push(PendingDeposit {
             index: idx,
             preimage_hex: hex::encode(preimage),
@@ -5337,21 +6316,27 @@ fn swap_shield_btc_impl(
             btc_locktime,
             funding: None,
             refund_txid: None,
+            archived: false,
+            archive_note: String::new(),
         });
         save_now(state, w, "shield BTC")?;
-        Ok((idx, alice_key_at(&w.account, idx), w.key_at(idx)))
+        Ok((idx, alice_key_at(&w.account, idx), w.key_at(idx), preimage))
     })?;
+    let lock = zcrypt_core::nullifier::htlc_hashlock(&preimage);
     progress(10, "Locking your BTC in a hashlocked HTLC to the chain's reserve key…");
     let script = zcrypt_bridge::htlc_script(&lock, &reserve_pk, &alice_key.pk, btc_locktime);
-    let utxo = match alice_bk.fund_htlc(&script, btc_amt) {
+    // C2: the record is NEVER dropped on a funding error. A broadcast that errored after the
+    // tx propagated still locked the BTC, and only this record holds the hashlock that can
+    // refund it. The funding is broadcast WITHOUT waiting, the outpoint is saved at once,
+    // and only then does the wallet wait for confirmations.
+    let utxo = match alice_bk.fund_htlc_unconfirmed(&script, btc_amt) {
         Ok(u) => u,
         Err(e) => {
-            // Nothing moved: drop the draft record.
-            let _ = with_wallet(state, |w| {
-                w.pending_deposits.retain(|p| p.index != idx);
-                Ok(())
-            });
-            return Err(format!("could not fund the Bitcoin HTLC: {e}"));
+            return Err(format!(
+                "could not fund the Bitcoin HTLC: {e}. The deposit record is kept: if the funding did reach the \
+                 Bitcoin network, 'Diagnose & fix a stuck swap' picks it up from the HTLC; if it never did, the \
+                 record is closed once its lock is long past"
+            ));
         }
     };
     with_wallet(state, |w| {
@@ -5360,6 +6345,15 @@ fn swap_shield_btc_impl(
         }
         Ok(())
     })?;
+    progress(20, "Funding broadcast; waiting for Bitcoin confirmations…");
+    if let Err(e) = alice_bk.confirm(&utxo.outpoint.txid) {
+        return Err(format!(
+            "the funding tx {} is broadcast but not confirmed yet: {e}. Your BTC is in the HTLC and the deposit stays \
+             pending: 'Diagnose & fix a stuck swap' resumes the mint once it confirms, and offers a Refund once \
+             Bitcoin block {btc_locktime} passes",
+            utxo.outpoint.txid
+        ));
+    }
     let coin = bswap::resume_public_shield(
         &zc, alice_bk.as_ref(), &alice_key, &reserve_pk, &claimer, asset, &preimage, &utxo, btc_locktime, zc_timeout,
         zbtc_amount, progress,
@@ -5373,8 +6367,14 @@ fn swap_shield_btc_impl(
     let res = with_wallet(state, |w| {
         w.pending_deposits.retain(|p| p.index != idx);
         let born = w.scan_height;
+        let credited = coin.value;
         w.coins.push(CoinRec::new(coin, born));
-        w.push_hist("shield", zbtc_amount as i64, "BTC→zBTC (maturing)".into(), asset);
+        // L10: the credited coin is net of the bridge fee; show the net and the fee apart.
+        w.push_hist("shield", credited as i64, "BTC→zBTC (maturing)".into(), asset);
+        let fee = zbtc_amount.saturating_sub(credited);
+        if fee > 0 {
+            w.push_hist("fee", -(fee as i64), "bridge fee (to stakers)".into(), asset);
+        }
         Ok(zbtc_amount)
     });
     let _ = bswap::relay_btc_headers(&zc, alice_bk.as_ref());
@@ -5389,9 +6389,12 @@ fn swap_shield_btc_impl(
 /// stale and pending coins would never mature. Returns "<pending_count>:<pending_value>".
 #[tauri::command]
 fn bridge_mature(state: State<AppState>) -> R<String> {
+    let _op = BridgeOpGuard::enter();
     let zc = zc_client(&state)?;
     // Relay from the user's Bitcoin backend (untrusted transport — headers self-prove).
-    if let Ok((backend, _)) = swap_backend(&state, 0) {
+    // Headers only: no receive address is derived, so the periodic relay never walks the
+    // wallet's address chain through Esplora (wallet M13).
+    if let Ok((backend, _dest)) = swap_backend_lazy(&state, 0) {
         let _ = bswap::relay_btc_headers(&zc, backend.as_ref());
     }
     ok(zc.query("/spv/pending").unwrap_or_default())
@@ -5420,10 +6423,13 @@ fn swap_redeem_btc_impl(btc: &str, progress: &dyn Fn(u8, &str), state: &State<Ap
     }
     let fee = zcrypt_core::emission::MIN_FEE;
     let url = node_url(state)?;
-    let (alice_bk, alice_dest) = swap_backend(state, 0)?;
+    let _op = BridgeOpGuard::enter();
+    // The payout address is derived only at claim time (wallet M13).
+    let (alice_bk, alice_dest) = swap_backend_lazy(state, 0)?;
     let zc = zc_client(state)?;
     let asset = zbtc_asset(&zc)?;
     let net = alice_bk.network();
+    let zc_tip_now = zc.height()?;
     // M11: everything that could leave zBTC burned with nobody to pay BTC is checked BEFORE
     // the burn: an operator reserve key must exist on-chain, the amount must be one the
     // operator serves, and the inputs must be committed leaves.
@@ -5475,7 +6481,9 @@ fn swap_redeem_btc_impl(btc: &str, progress: &dyn Fn(u8, &str), state: &State<Ap
         let idx = w.alloc_index();
         w.note_action(idx, "redeem", "");
         let alice_key = alice_key_at(&w.account, idx);
-        let preimage = bswap::fresh_preimage(); // 32 random bytes (HTLC hashlock security)
+        // Seed-derived per index (wallet M2): a seed restore can rebuild this preimage from
+        // the burn escrow's public hashlock.
+        let preimage = zcrypt_bridge::wallet_flows::bridge_preimage(&Zeroizing::new(w.account.seed()), idx);
         let lock = zcrypt_core::nullifier::htlc_hashlock(&preimage);
         w.pending_redeems.push(PendingRedeemRec {
             index: idx,
@@ -5491,6 +6499,11 @@ fn swap_redeem_btc_impl(btc: &str, progress: &dyn Fn(u8, &str), state: &State<Ap
             funding: None,
             claim_txid: None,
             expired: false,
+            started_height: zc_tip_now,
+            hist_id: String::new(),
+            burn_error: None,
+            claim_error: None,
+            id_scan_cursor: 0,
         });
         // The preimage is what claims the operator's BTC: it must be on disk BEFORE the burn.
         save_now(state, w, "redeem zBTC")?;
@@ -5502,15 +6515,24 @@ fn swap_redeem_btc_impl(btc: &str, progress: &dyn Fn(u8, &str), state: &State<Ap
         match bswap::redeem_user_burn(&zc, &refund_acct, &coins, asset, &lock, round_value, &alice_key.pk) {
             Ok(r) => r,
             Err(e) => {
+                // H1: a broadcast error is NOT proof the burn did not commit (a timeout after
+                // commit looks the same). The record and its preimage stay; the resume pass
+                // finds the escrow by its hashlock if it did land, and closes the record only
+                // once the inputs are provably unspent.
                 let _ = with_wallet(state, |w| {
-                    w.pending_redeems.retain(|r| r.index != idx);
+                    if let Some(r) = w.pending_redeems.iter_mut().find(|r| r.index == idx) {
+                        r.burn_error = Some(e.clone());
+                    }
                     Ok(())
                 });
-                return Err(format!("burn not accepted (nothing was spent): {e}"));
+                return Err(format!(
+                    "the burn was not confirmed by the node: {e}. The redeem stays pending: 'Diagnose & fix a stuck \
+                     swap' finds the escrow if the burn did commit and continues from there"
+                ));
             }
         };
-    let info = bswap::query_escrow(&zc, &escrow_id)?
-        .ok_or("the burn escrow is not visible on the node after broadcast")?;
+    // H1: everything the broadcast taught us is saved in ONE step BEFORE any further query:
+    // the escrow id, the spent inputs and the change coin's blind.
     with_wallet(state, |w| {
         for &i in &chosen {
             w.coins[i].spent = true;
@@ -5521,43 +6543,85 @@ fn swap_redeem_btc_impl(btc: &str, progress: &dyn Fn(u8, &str), state: &State<Ap
             let born = w.scan_height;
             w.coins.push(CoinRec::new(change, born));
         }
+        // L10: the burn moves `round_value` into the escrow and pays the fee separately.
+        let hist_id = w.push_hist_id("redeem", -(round_value as i64), "zBTC→BTC (awaiting operator)".into(), asset);
+        w.push_hist("fee", -(fee as i64), "redeem fee".into(), asset);
         if let Some(r) = w.pending_redeems.iter_mut().find(|r| r.index == idx) {
             r.escrow_id_hex = Some(hex::encode(escrow_id));
+            r.hist_id = hist_id;
+            r.burn_error = None;
+        }
+        Ok(())
+    })?;
+    let info = bswap::query_escrow(&zc, &escrow_id)?
+        .ok_or("the burn escrow is not visible on the node after broadcast; the redeem stays pending and resume re-checks it")?;
+    with_wallet(state, |w| {
+        if let Some(r) = w.pending_redeems.iter_mut().find(|r| r.index == idx) {
             r.zc_timeout = info.timeout_height;
         }
-        w.push_hist("redeem", -(round_value as i64), "zBTC→BTC (awaiting operator)".into(), asset);
+        let acct = w.key_at(idx);
+        let blind = coin_from_note(&acct, &info.refund_enc_note).map(|c| c.blind);
+        if let Some(blind) = blind {
+            upsert_escrow_blind(
+                w, idx, &escrow_id, "refund", "burn", round_value, asset, &hex::encode(lock), info.timeout_height, false, blind,
+            );
+        }
         Ok(())
     })?;
     progress(40, "Waiting for the bridge operator to lock BTC for you…");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(REDEEM_WAIT_SECS);
+    let min_conf = zcrypt_core::spv::min_conf_for(bswap::spv_net(net));
     let (utxo, _lt) = loop {
         let zc_tip = zc.height()? as u64;
-        if let Some(found) = zcrypt_bridge::wallet_flows::find_operator_redeem_htlc(
+        if let Some((utxo, lt)) = zcrypt_bridge::wallet_flows::find_operator_redeem_htlc(
             alice_bk.as_ref(), zc_tip, info.timeout_height, &lock, &alice_key.pk, &reserve_pk,
             bitcoin::Amount::from_sat(round_value),
         )? {
-            break found;
+            let _ = with_wallet(state, |w| {
+                if let Some(r) = w.pending_redeems.iter_mut().find(|r| r.index == idx) {
+                    r.funding = Some((utxo.outpoint.txid.to_string(), utxo.outpoint.vout));
+                }
+                Ok(())
+            });
+            // H2: the preimage is revealed only against a funding buried `min_conf` deep
+            // (an RBF replacement of a 0-conf funding would orphan the claim and hand the
+            // operator the preimage) and a CLTV with room for the claim to confirm.
+            let confs = alice_bk.tx_confirmations(&utxo.outpoint.txid).unwrap_or(0);
+            let btc_tip = alice_bk.height()?;
+            match zcrypt_bridge::wallet_flows::redeem_claim_is_safe(confs, min_conf, lt, btc_tip, min_conf) {
+                Ok(()) => break (utxo, lt),
+                Err(why) => progress(60, &format!("The operator's BTC lock is visible; {why}…")),
+            }
         }
         if std::time::Instant::now() >= deadline {
             return Err(format!(
-                "the operator has not locked BTC yet. Your redeem stays pending: 'Diagnose & fix a stuck swap' \
-                 claims the BTC once it is funded, and recovers the zBTC automatically if the escrow expires \
-                 (zcrypt block {}).",
+                "the operator has not locked (or confirmed) BTC yet. Your redeem stays pending: the wallet keeps \
+                 checking in the background and 'Diagnose & fix a stuck swap' claims the BTC once it is safely \
+                 funded; if the escrow expires (zcrypt block {}) the zBTC is refunded to you automatically.",
                 info.timeout_height
             ));
         }
         std::thread::sleep(std::time::Duration::from_secs(REDEEM_POLL_SECS));
         progress(50, "Still waiting for the operator's Bitcoin lock…");
     };
-    with_wallet(state, |w| {
-        if let Some(r) = w.pending_redeems.iter_mut().find(|r| r.index == idx) {
-            r.funding = Some((utxo.outpoint.txid.to_string(), utxo.outpoint.vout));
-        }
-        Ok(())
-    })?;
     progress(80, "Claiming your BTC (revealing the preimage)…");
-    let txid = bswap::redeem_user_claim(alice_bk.as_ref(), &alice_key, &utxo, &preimage, &alice_dest)?;
+    let alice_dest = alice_dest()?;
+    let txid = match bswap::redeem_user_claim(alice_bk.as_ref(), &alice_key, &utxo, &preimage, &alice_dest) {
+        Ok(t) => t,
+        Err(e) => {
+            // L12: remember that this claim was rejected so resume does not blindly
+            // re-broadcast the preimage; the user retries explicitly.
+            let _ = with_wallet(state, |w| {
+                if let Some(r) = w.pending_redeems.iter_mut().find(|r| r.index == idx) {
+                    r.claim_error = Some(e.clone());
+                }
+                Ok(())
+            });
+            return Err(format!("the operator funded BTC but the claim failed: {e}. The redeem stays pending; retry from the pending list"));
+        }
+    };
     with_wallet(state, |w| {
+        mark_redeem_claimed(w, idx, &txid.to_string());
         w.pending_redeems.retain(|r| r.index != idx);
         Ok(())
     })?;
@@ -5589,17 +6653,30 @@ struct RecoverResult {
 /// completed and a human-readable note per deposit that could not be.
 fn resume_pending_deposits(state: &State<AppState>, notes: &mut Vec<String>) -> Result<u32, String> {
     let pending: Vec<PendingDeposit> = {
-        let g = state.wallet.lock().unwrap();
-        g.as_ref().ok_or("wallet locked")?.pending_deposits.clone()
+        let g = lock_active_wallet(state);
+        g.get().ok_or("wallet locked")?.pending_deposits.iter().filter(|p| !p.archived).cloned().collect()
     };
     if pending.is_empty() {
         return Ok(0);
     }
+    let _op = BridgeOpGuard::enter();
     let dir = state.data_dir.lock().unwrap().clone();
     let s = bridge_settings(&dir)?;
     let net = zcrypt_bridge::network_from_str(&s.btc_network);
-    let (alice_bk, _dest) = swap_backend(state, 0)?;
+    // A deposit never pays out to a wallet address: headers and HTLC lookups only (M13).
+    let (alice_bk, _dest) = swap_backend_lazy(state, 0)?;
     let zc = zc_client(state)?;
+    // C2 / M12: a record is never deleted. A proven negative archives it (the preimage
+    // stays on disk) and the UI stops listing it.
+    let archive = |state: &State<AppState>, index: u32, note: String| {
+        let _ = with_wallet(state, |w| {
+            if let Some(d) = w.pending_deposits.iter_mut().find(|d| d.index == index) {
+                d.archived = true;
+                d.archive_note = note;
+            }
+            Ok(())
+        });
+    };
     let btc_tip_now = alice_bk.height()?;
     let zc_tip = zc.height()? as u64;
     let lock_blocks = bswap::btc_lock_blocks(net);
@@ -5620,22 +6697,20 @@ fn resume_pending_deposits(state: &State<AppState>, notes: &mut Vec<String>) -> 
             }
         };
         let (refund, claimer) = {
-            let g = state.wallet.lock().unwrap();
-            let w = g.as_ref().ok_or("wallet locked")?;
+            let g = lock_active_wallet(state);
+            let w = g.get().ok_or("wallet locked")?;
             (alice_key_at(&w.account, p.index), w.key_at(p.index))
         };
         let horizon = shield_locktime_candidates(&p, net).into_iter().max().unwrap_or(0);
         let Some((utxo, btc_locktime)) = find_shield_funding(alice_bk.as_ref(), &p, net, &lock, &reserve_pk, &refund.pk)? else {
             if p.funding.is_none() && btc_tip_now >= horizon.saturating_add(2016) {
                 // Two weeks past the lock with no funding ever seen: the HTLC was never broadcast.
-                notes.push(format!(
-                    "deposit #{} ({} sats): no funding was ever found on Bitcoin and its lock passed two weeks ago; dropping the record (nothing was locked)",
+                let note = format!(
+                    "deposit #{} ({} sats): no funding was ever found on Bitcoin and its lock passed two weeks ago; the record is archived (nothing was locked)",
                     p.index, p.value_sats
-                ));
-                let _ = with_wallet(state, |w| {
-                    w.pending_deposits.retain(|d| d.index != p.index);
-                    Ok(())
-                });
+                );
+                notes.push(note.clone());
+                archive(state, p.index, note);
             } else if btc_tip_now >= horizon {
                 notes.push(format!(
                     "deposit #{} ({} sats): its Bitcoin lock (block {horizon}) has passed but no funding is visible; the record is kept so a Refund is possible once your Bitcoin backend shows the HTLC",
@@ -5662,12 +6737,12 @@ fn resume_pending_deposits(state: &State<AppState>, notes: &mut Vec<String>) -> 
         // the refund branch (the Refund button, or the refund we already broadcast). The record
         // is NEVER dropped while the HTLC output is unspent.
         if u64::from(btc_locktime) <= btc_tip_now {
+            // M12: `Some(false)` means a CONFIRMED spend; `None` (unknown or unconfirmed) keeps
+            // the record, as does any backend error.
             if alice_bk.utxo_unspent(&utxo).unwrap_or(None) == Some(false) {
-                notes.push(format!("deposit #{}: its HTLC output has been spent (refund confirmed or mint settled); record closed", p.index));
-                let _ = with_wallet(state, |w| {
-                    w.pending_deposits.retain(|d| d.index != p.index);
-                    Ok(())
-                });
+                let note = format!("deposit #{}: its HTLC output has been spent (refund confirmed or mint settled); record archived", p.index);
+                notes.push(note.clone());
+                archive(state, p.index, note);
             } else if let Some(t) = &p.refund_txid {
                 notes.push(format!("deposit #{}: refund {t} broadcast, waiting for it to confirm", p.index));
             } else {
@@ -5697,8 +6772,13 @@ fn resume_pending_deposits(state: &State<AppState>, notes: &mut Vec<String>) -> 
                     let born = w.scan_height;
                     let com = coin.commitment();
                     if !w.coins.iter().any(|c| c.coin.commitment() == com) {
+                        let credited = coin.value;
                         w.coins.push(CoinRec::new(coin, born));
-                        w.push_hist("shield", p.value_sats as i64, "BTC→zBTC (resumed, maturing)".into(), p.asset_id);
+                        w.push_hist("shield", credited as i64, "BTC→zBTC (resumed, maturing)".into(), p.asset_id);
+                        let fee = p.value_sats.saturating_sub(credited);
+                        if fee > 0 {
+                            w.push_hist("fee", -(fee as i64), "bridge fee (to stakers)".into(), p.asset_id);
+                        }
                     }
                     Ok(())
                 })?;
@@ -5710,20 +6790,94 @@ fn resume_pending_deposits(state: &State<AppState>, notes: &mut Vec<String>) -> 
     Ok(resumed)
 }
 
-/// Resume every in-flight zBTC→BTC redeem from its persisted record (wallet M11): claim the
-/// operator's HTLC if it is funded, or expire the burn escrow (zBTC comes back) once the
-/// operator's window is over. Returns how many were completed.
+/// Blocks a resume pass reads per call while looking for a burn whose escrow id was never
+/// saved, so one pass stays bounded; the cursor persists across passes.
+const REDEEM_ID_SCAN_CHUNK: i64 = 300;
+
+/// Outcome of looking for the burn escrow of a redeem record that has no saved id (H1).
+enum RecoveredId {
+    /// The escrow exists in consensus: its id and timeout.
+    Found([u8; 32], u64),
+    /// Not found yet; blocks remain to be read (or the record predates height tracking).
+    Pending(String),
+    /// Every block since the burn attempt has been read and holds no such burn: nothing
+    /// was spent.
+    NeverLanded,
+}
+
+/// Recover the escrow id of a burn the wallet broadcast but never recorded: first from the
+/// escrow records the block scanner keeps (the refund key is this wallet's), then by reading
+/// blocks forward from the burn attempt for a 0x67 whose hashlock and refund key match.
+fn recover_redeem_escrow_id(state: &State<AppState>, zc: &Zcrypt, r: &PendingRedeemRec, tip: i64) -> Result<RecoveredId, String> {
+    let (refund_pk, known) = {
+        let g = lock_active_wallet(state);
+        let w = g.get().ok_or("wallet locked")?;
+        let known = w
+            .escrows
+            .iter()
+            .find(|e| e.kind == "burn" && e.role == "refund" && e.hashlock_hex == r.hashlock_hex)
+            .map(|e| (e.id_hex.clone(), e.timeout));
+        (w.key_at(r.index).pubkey(), known)
+    };
+    if let Some((id_hex, timeout)) = known {
+        if let Ok(id) = parse_id_hex(&id_hex) {
+            return Ok(RecoveredId::Found(id, timeout));
+        }
+    }
+    if r.started_height <= 0 {
+        return Ok(RecoveredId::Pending(
+            "the record predates height tracking; its escrow is recovered by the regular scan if the burn committed".to_string(),
+        ));
+    }
+    let hashlock = parse_hex32(&r.hashlock_hex).ok_or("corrupt hashlock record")?;
+    let from = r.id_scan_cursor.max(r.started_height).max(1);
+    let to = (from + REDEEM_ID_SCAN_CHUNK - 1).min(tip);
+    for h in from..=to {
+        for tx in zc.block_txs(h)? {
+            if tx.first() != Some(&0x67) {
+                continue;
+            }
+            let Some(f) = zcrypt_bridge::wallet_flows::parse_burn_lock_any(0x67, &tx[1..]) else { continue };
+            if f.hashlock != hashlock || f.refund_pk != refund_pk {
+                continue;
+            }
+            let id = escrow_id_for(EscrowKind::Burn, f.asset, f.value, &f.hashlock, f.timeout, &f.refund_pk, &f.refund_pk);
+            if bswap::query_escrow(zc, &id)?.is_some() {
+                return Ok(RecoveredId::Found(id, f.timeout));
+            }
+        }
+    }
+    let _ = with_wallet(state, |w| {
+        if let Some(x) = w.pending_redeems.iter_mut().find(|x| x.index == r.index) {
+            x.id_scan_cursor = to + 1;
+        }
+        Ok(())
+    });
+    if to >= tip && tip >= r.started_height.saturating_add(SWAP_LOCK_SETTLE_GRACE_BLOCKS) {
+        return Ok(RecoveredId::NeverLanded);
+    }
+    Ok(RecoveredId::Pending(format!("blocks {from}..{to} read, none holds the burn yet")))
+}
+
+/// Resume every in-flight zBTC→BTC redeem from its persisted record (wallet M11): recover a
+/// missing escrow id (H1), claim the operator's HTLC once it is safely funded (H2), and
+/// credit the refund once consensus has expired the escrow. A record is closed only on a
+/// settled or provably never-created escrow. Returns how many were completed.
 fn resume_pending_redeems(state: &State<AppState>, notes: &mut Vec<String>) -> Result<u32, String> {
     let pending: Vec<PendingRedeemRec> = {
-        let g = state.wallet.lock().unwrap();
-        g.as_ref().ok_or("wallet locked")?.pending_redeems.clone()
+        let g = lock_active_wallet(state);
+        g.get().ok_or("wallet locked")?.pending_redeems.clone()
     };
     if pending.is_empty() {
         return Ok(0);
     }
-    let (alice_bk, dest) = swap_backend(state, 0)?;
+    let _op = BridgeOpGuard::enter();
+    // The payout address is derived only when a claim actually happens (M13).
+    let (alice_bk, dest) = swap_backend_lazy(state, 0)?;
     let zc = zc_client(state)?;
-    let zc_tip = zc.height()? as u64;
+    let zc_tip = zc.height()?.max(0) as u64;
+    let net = alice_bk.network();
+    let min_conf = zcrypt_core::spv::min_conf_for(bswap::spv_net(net));
     let mut done = 0u32;
     for r in pending {
         let drop_record = |state: &State<AppState>| {
@@ -5732,21 +6886,46 @@ fn resume_pending_redeems(state: &State<AppState>, notes: &mut Vec<String>) -> R
                 Ok(())
             });
         };
-        let Some(eid) = r.escrow_id_hex.as_deref().and_then(parse_hex32) else {
-            notes.push(format!(
-                "redeem #{}: no escrow was ever created (interrupted before the burn was accepted); record closed. If the inputs show as spent after a scan, the escrow refunds to you automatically at its timeout",
-                r.index
-            ));
-            drop_record(state);
-            continue;
-        };
         let Some(preimage) = hex::decode(&r.preimage_hex).ok().filter(|v| v.len() == 32) else {
             notes.push(format!("redeem #{}: corrupt preimage record", r.index));
             continue;
         };
         let lock = zcrypt_core::nullifier::htlc_hashlock(&preimage);
+        let eid = match r.escrow_id_hex.as_deref().and_then(parse_hex32) {
+            Some(e) => e,
+            None => match recover_redeem_escrow_id(state, &zc, &r, zc_tip as i64)? {
+                RecoveredId::Found(id, timeout) => {
+                    let _ = with_wallet(state, |w| {
+                        if let Some(x) = w.pending_redeems.iter_mut().find(|x| x.index == r.index) {
+                            x.escrow_id_hex = Some(hex::encode(id));
+                            x.zc_timeout = timeout;
+                            x.burn_error = None;
+                        }
+                        Ok(())
+                    });
+                    notes.push(format!("redeem #{}: recovered its burn escrow {} from the chain", r.index, short(&hex::encode(id))));
+                    id
+                }
+                RecoveredId::Pending(why) => {
+                    notes.push(format!("redeem #{}: the burn's escrow id was never saved; {why}; the record is kept", r.index));
+                    continue;
+                }
+                RecoveredId::NeverLanded => {
+                    notes.push(format!(
+                        "redeem #{}: every block since the attempt was read and holds no burn for it, so nothing was spent; record closed",
+                        r.index
+                    ));
+                    drop_record(state);
+                    continue;
+                }
+            },
+        };
         let Some(info) = bswap::query_escrow(&zc, &eid)? else {
-            notes.push(format!("redeem #{}: consensus has no escrow {}; record closed", r.index, hex::encode(eid)));
+            notes.push(format!(
+                "redeem #{}: consensus no longer has escrow {} (settled long ago and pruned); record closed",
+                r.index,
+                short(&hex::encode(eid))
+            ));
             drop_record(state);
             continue;
         };
@@ -5756,47 +6935,92 @@ fn resume_pending_redeems(state: &State<AppState>, notes: &mut Vec<String>) -> R
                 drop_record(state);
             }
             "expired" => {
-                notes.push(format!("redeem #{}: the escrow expired; your zBTC is refunded (picked up by the next scan)", r.index));
-                drop_record(state);
+                if credit_redeem_refund(state, &r, &eid, zc_tip) {
+                    notes.push(format!("redeem #{}: the escrow expired; your zBTC is back in this wallet", r.index));
+                } else {
+                    notes.push(format!(
+                        "redeem #{}: the escrow expired, but its refund note does not open to this wallet yet; the record stays",
+                        r.index
+                    ));
+                }
             }
             _ => {
+                if let Some(e) = &r.claim_error {
+                    notes.push(format!(
+                        "redeem #{}: the BTC claim was rejected earlier ({e}); the preimage is not re-broadcast on its own; use Retry claim",
+                        r.index
+                    ));
+                    continue;
+                }
                 let reserve_pk = reserve_pk_for(&zc, r.asset_id, &r.reserve_pk_hex)?;
                 let alice_key = {
-                    let g = state.wallet.lock().unwrap();
-                    alice_key_at(&g.as_ref().ok_or("wallet locked")?.account, r.index)
+                    let g = lock_active_wallet(state);
+                    alice_key_at(&g.get().ok_or("wallet locked")?.account, r.index)
                 };
                 match zcrypt_bridge::wallet_flows::find_operator_redeem_htlc(
                     alice_bk.as_ref(), zc_tip, info.timeout_height, &lock, &alice_key.pk, &reserve_pk,
                     bitcoin::Amount::from_sat(r.value_sats),
                 )? {
                     Some((utxo, lt)) => {
-                        if alice_bk.height()? >= u64::from(lt) {
-                            notes.push(format!(
-                                "redeem #{}: the operator's BTC lock (block {lt}) has passed, so it may refund itself; the burn escrow expires at zcrypt block {} and your zBTC returns then",
-                                r.index, info.timeout_height
-                            ));
+                        let _ = with_wallet(state, |w| {
+                            if let Some(x) = w.pending_redeems.iter_mut().find(|x| x.index == r.index) {
+                                x.funding = Some((utxo.outpoint.txid.to_string(), utxo.outpoint.vout));
+                            }
+                            Ok(())
+                        });
+                        let btc_tip = alice_bk.height()?;
+                        let confs = alice_bk.tx_confirmations(&utxo.outpoint.txid).unwrap_or(0);
+                        // H2: no preimage against an unconfirmed funding or a CLTV too close.
+                        if let Err(why) = zcrypt_bridge::wallet_flows::redeem_claim_is_safe(confs, min_conf, lt, btc_tip, min_conf) {
+                            notes.push(format!("redeem #{}: the operator's BTC lock is visible; {why}", r.index));
                             continue;
                         }
+                        let dest = dest()?;
                         match bswap::redeem_user_claim(alice_bk.as_ref(), &alice_key, &utxo, &preimage, &dest) {
                             Ok(txid) => {
                                 notes.push(format!("redeem #{}: claimed the operator's BTC ({txid})", r.index));
-                                drop_record(state);
+                                let _ = with_wallet(state, |w| {
+                                    mark_redeem_claimed(w, r.index, &txid.to_string());
+                                    w.pending_redeems.retain(|x| x.index != r.index);
+                                    Ok(())
+                                });
                                 done += 1;
                             }
-                            Err(e) => notes.push(format!("redeem #{}: the operator funded BTC but the claim failed: {e}", r.index)),
+                            Err(e) => {
+                                // L12: remember the rejection; no automatic re-broadcast.
+                                let _ = with_wallet(state, |w| {
+                                    if let Some(x) = w.pending_redeems.iter_mut().find(|x| x.index == r.index) {
+                                        x.claim_error = Some(e.clone());
+                                    }
+                                    Ok(())
+                                });
+                                notes.push(format!("redeem #{}: the operator funded BTC but the claim failed: {e}", r.index));
+                            }
                         }
                     }
                     None => {
                         if zc_tip >= info.timeout_height {
-                            match zc.broadcast(&bswap::expire_tx(&eid)) {
-                                Ok(_) => {
-                                    notes.push(format!(
-                                        "redeem #{}: the operator never funded; the escrow was expired and your zBTC returns as a refund coin on the next scan",
-                                        r.index
-                                    ));
-                                    drop_record(state);
+                            // Consensus expires the escrow at the end of this block on its own; the
+                            // 0x5C only hurries it, and "not open" afterwards is success.
+                            let _ = zc.broadcast(&bswap::expire_tx(&eid));
+                            match bswap::query_escrow(&zc, &eid)? {
+                                Some(again) if again.state == "expired" => {
+                                    if credit_redeem_refund(state, &r, &eid, zc_tip) {
+                                        notes.push(format!(
+                                            "redeem #{}: the operator never funded; the escrow expired and your zBTC is back in this wallet",
+                                            r.index
+                                        ));
+                                    } else {
+                                        notes.push(format!(
+                                            "redeem #{}: the escrow expired, but its refund note does not open to this wallet yet; the record stays",
+                                            r.index
+                                        ));
+                                    }
                                 }
-                                Err(e) => notes.push(format!("redeem #{}: could not expire the escrow yet: {e}", r.index)),
+                                _ => notes.push(format!(
+                                    "redeem #{}: the escrow's timeout block has been reached; the refund is credited once that block is final",
+                                    r.index
+                                )),
                             }
                         } else {
                             notes.push(format!(
@@ -5812,13 +7036,186 @@ fn resume_pending_redeems(state: &State<AppState>, notes: &mut Vec<String>) -> R
     Ok(done)
 }
 
+/// Credit the refund coin of an expired burn escrow and close the redeem record.
+/// The coin comes from the refund note, or from the blind stored when this wallet
+/// created the opening. Returns false (and keeps the record) when neither yields a coin.
+fn credit_redeem_refund(state: &State<AppState>, r: &PendingRedeemRec, eid: &[u8; 32], tip: u64) -> bool {
+    let note = node_url(state).ok().and_then(|url| match bswap::query_escrow(&Zcrypt::new(&url), eid) {
+        Ok(Some(info)) => Some(info.refund_enc_note),
+        Ok(None) => Some(Vec::new()),
+        Err(_) => None,
+    });
+    with_wallet(state, |w| {
+        let acct = w.key_at(r.index);
+        let coin = match note.as_deref() {
+            Some(n) if !n.is_empty() => match coin_from_note(&acct, n) {
+                Some(c) => Some(c),
+                None => return Ok(false),
+            },
+            _ => {
+                let id_hex = hex::encode(eid);
+                w.escrows
+                    .iter()
+                    .find(|e| e.id_hex == id_hex && e.role == "refund")
+                    .and_then(|e| blind_from_hex(&e.blind_hex))
+                    .map(|b| acct.htlc_coin(r.value_sats, r.asset_id, b))
+            }
+        };
+        let Some(coin) = coin else { return Ok(false) };
+        let com = coin.commitment();
+        let amount = coin.value;
+        if !w.coins.iter().any(|c| c.coin.commitment() == com) {
+            w.coins.push(CoinRec::new(coin, tip as i64));
+            w.push_hist("escrow", amount as i64, "redeem escrow expired: zBTC refunded".into(), r.asset_id);
+        }
+        let id_hex = hex::encode(eid);
+        if let Some(h) = w.history.iter_mut().find(|h| !r.hist_id.is_empty() && h.tx_id == r.hist_id) {
+            h.counterparty = "zBTC→BTC (expired, zBTC refunded)".into();
+        }
+        w.pending_redeems.retain(|x| x.index != r.index);
+        w.escrows.retain(|e| !(e.id_hex == id_hex && e.role == "refund"));
+        Ok(true)
+    })
+    .unwrap_or(false)
+}
+
+#[derive(Serialize)]
+struct PendingRedeemView {
+    index: u32,
+    #[serde(with = "u64_str")]
+    value_sats: u64,
+    escrow_id_hex: Option<String>,
+    zc_timeout: u64,
+    funded: bool,
+    burn_error: Option<String>,
+    claim_error: Option<String>,
+    started: u64,
+}
+
+/// The wallet's in-flight zBTC→BTC redeems (for the Bridge tab's pending list).
+#[tauri::command]
+fn list_pending_redeems(state: State<AppState>) -> R<Vec<PendingRedeemView>> {
+    let g = state.wallet.lock().unwrap();
+    let w = g.as_ref().ok_or("wallet locked")?;
+    ok(w.pending_redeems
+        .iter()
+        .map(|r| PendingRedeemView {
+            index: r.index,
+            value_sats: r.value_sats,
+            escrow_id_hex: r.escrow_id_hex.clone(),
+            zc_timeout: r.zc_timeout,
+            funded: r.funding.is_some(),
+            burn_error: r.burn_error.clone(),
+            claim_error: r.claim_error.clone(),
+            started: r.started,
+        })
+        .collect())
+}
+
+/// Clear a redeem's recorded claim rejection and try the Bitcoin claim again, on the
+/// user's explicit request (wallet L12).
+#[tauri::command]
+fn bridge_retry_redeem_claim(index: u32, state: State<AppState>) -> R<String> {
+    with_wallet(&state, |w| {
+        let r = w.pending_redeems.iter_mut().find(|r| r.index == index).ok_or("no such pending redeem")?;
+        r.claim_error = None;
+        Ok(())
+    })?;
+    let _serial = SETTLE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let mut notes = Vec::new();
+    resume_pending_redeems(&state, &mut notes)?;
+    ok(notes.into_iter().filter(|n| n.starts_with(&format!("redeem #{index}"))).collect::<Vec<_>>().join(" "))
+}
+
+/// Save an idle settler and drop it so spend keys are not kept after the work is done.
+/// Lock order is data_dir (released), then wallet, then settler. A failed save keeps the settler.
+fn drop_idle_settler(state: &State<AppState>) {
+    let dir = state.data_dir.lock().unwrap().clone();
+    let _wallet_guard = state.wallet.lock().unwrap();
+    let mut settler = state.settler.lock().unwrap();
+    let saved = if let Some(w) = settler.as_ref() {
+        if wallet_has_settle_work(w) {
+            None
+        } else {
+            Some(save_state(w, &dir))
+        }
+    } else {
+        None
+    };
+    match saved {
+        Some(Ok(())) => *settler = None,
+        Some(Err(e)) => eprintln!("[worker] could not save the locked wallet's settlement state: {e}"),
+        None => {}
+    }
+}
+
+/// Background settlement (wallet H9): advance pending swaps, redeems, and deposits even
+/// after the UI locks. The unlocked wallet is used when it is present; otherwise the
+/// settler. Swaps settle every tick (node RPC only); the Bitcoin-side resumes run on a
+/// slower cadence so the Esplora endpoint is not polled every few seconds. Lock failures
+/// are treated as "busy". An idle settler is saved and dropped so spend keys are not kept.
+fn bridge_worker_tick(state: &State<AppState>, slow: bool) {
+    let (swaps, redeems, deposits) = {
+        // wallet then settler. Guards drop before the settle calls, which take the locks again.
+        let wallet = state.wallet.lock().unwrap();
+        let settler = state.settler.lock().unwrap();
+        let wallet_work = wallet.as_ref().is_some_and(wallet_has_settle_work);
+        let settler_work = settler.as_ref().is_some_and(wallet_has_settle_work);
+        if !wallet_work && !settler_work {
+            let drop_it = settler.is_some();
+            drop(settler);
+            drop(wallet);
+            if drop_it {
+                drop_idle_settler(state);
+            }
+            return;
+        }
+        let w = if wallet.is_some() { wallet.as_ref() } else { settler.as_ref() }.expect("a wallet with pending work");
+        (!w.pending_swaps.is_empty(), !w.pending_redeems.is_empty(), w.pending_deposits.iter().any(|p| !p.archived))
+    };
+    {
+        let _scope = SettleScope::enter();
+        if swaps {
+            if let Err(e) = settle_all_swaps(state) {
+                eprintln!("[worker] swap settle: {e}");
+            }
+        }
+        if slow && (redeems || deposits) {
+            if let Ok(_serial) = SETTLE_LOCK.try_lock() {
+                let mut notes = Vec::new();
+                if redeems {
+                    if let Err(e) = resume_pending_redeems(state, &mut notes) {
+                        eprintln!("[worker] redeem resume: {e}");
+                    }
+                }
+                if deposits {
+                    if let Err(e) = resume_pending_deposits(state, &mut notes) {
+                        eprintln!("[worker] deposit resume: {e}");
+                    }
+                }
+                for n in notes {
+                    eprintln!("[worker] {n}");
+                }
+            }
+        }
+    }
+    drop_idle_settler(state);
+}
+
+/// Seconds between background swap-settle ticks and between Bitcoin-side resume ticks.
+const WORKER_FAST_SECS: u64 = 10;
+const WORKER_SLOW_EVERY: u64 = 6;
+
 #[tauri::command]
 fn bridge_recover(state: State<AppState>) -> R<RecoverResult> {
+    let _serial = SETTLE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let url = node_url(&state)?;
     let leaves = chain::fetch_leaves(&url)?;
     let zc = zc_client(&state)?;
     let asset = zbtc_asset(&zc).unwrap_or(0);
-    let mut notes: Vec<String> = Vec::new();
+    // Escrows this wallet is party to settle by consensus state (auto-expiry publishes no
+    // transaction): credit every expired refund and claimed coin first.
+    let mut notes: Vec<String> = reconcile_escrow_states(&state, &url);
     let resumed = match resume_pending_deposits(&state, &mut notes) {
         Ok(n) => n,
         Err(e) => {
@@ -5959,6 +7356,21 @@ fn main() {
             // FIX 2: point chain-id pinning at the same data dir (chain_id.txt lives next
             // to keystore.json) so every future signature is bound to the pinned chain.
             chain::set_pin_dir(dir_str);
+            // H9: a background worker settles swaps and resumes redeems / deposits while the
+            // wallet is unlocked, whatever tab is open (or none).
+            let handle = app.handle().clone();
+            std::thread::Builder::new()
+                .name("bridge-worker".into())
+                .spawn(move || {
+                    let mut tick: u64 = 0;
+                    loop {
+                        std::thread::sleep(std::time::Duration::from_secs(WORKER_FAST_SECS));
+                        tick = tick.wrapping_add(1);
+                        let state = handle.state::<AppState>();
+                        bridge_worker_tick(&state, tick % WORKER_SLOW_EVERY == 0);
+                    }
+                })
+                .expect("spawn bridge worker");
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -6009,11 +7421,15 @@ fn main() {
             wallet_health,
             held_assets,
             registered_assets,
+            swap_receive_address,
             swap_asset_start,
+            swap_asset_preview,
             swap_asset_accept,
             swap_asset_settle,
             swap_asset_refund,
             list_pending_swaps,
+            list_pending_redeems,
+            bridge_retry_redeem_claim,
             btc_wallet_info,
             withdraw_btc,
             mint_asset,

@@ -93,7 +93,22 @@ each is a promise someone must be able to verify:
   locked amount, the asset, the hashlock and the parties' keys; a BTC deposit escrow
   also embeds the raw Bitcoin transaction and its inclusion proof. Which coins funded
   a lock stays hidden behind the whole-pool proof, but the escrow itself is not
-  private, and the in-pool swap is not yet a private swap.
+  private, and the in-pool swap is not yet a private swap. The coin an escrow
+  settles into (a mint, a swap claim, a refund) is chosen by the beneficiary:
+  they pick the blind, and an opening proof shows the commitment opens to the
+  public (value, asset) and their spend key. The blind travels only in the
+  encrypted note and is never a public field. While the escrow record is
+  retained it names the settlement commitment; after it is pruned, a tree-only
+  observer cannot recompute the leaf from the escrow id. The open transaction
+  still contains the commitment, so block history links the open to the leaf.
+  Only the coin's later spend is hidden.
+  Because exact amounts survive shielding until a coin is split by a transfer,
+  a bridge coin redeemed untouched is matchable to its mint by value. Reshape
+  bridge coins with an ordinary transfer before relying on their privacy.
+* **The reserve is one public address set.** Every BTC deposit script names the
+  pinned reserve key and every sweep spends from it, so the bridge's Bitcoin
+  reserve is clusterable on the Bitcoin side. Reserve rotation is a custody
+  measure, not a privacy one: it publishes the old-to-new mapping.
 * **The key you hand out.** A Normal address contains the spend public key. Every
   transparent action above (claim, bond, delegate, mint, bridge escrow, swap) publishes
   the key it acts for, so anyone who has your Normal address can recognise those
@@ -103,14 +118,14 @@ each is a promise someone must be able to verify:
 
 ## Network layer
 
-The wallet routes all node RPC and Esplora traffic through Tor by default (hostnames
-are resolved inside Tor) and fails closed if the proxy is missing or misconfigured. Two
-edges remain honest ones: the node RPC is plain HTTP unless you point the wallet at an
-HTTPS edge or an onion service, so a Tor exit can read (not forge) what a wallet sends
-to a clearnet node; and the wallet checks whether its coins are spent by asking the node
-about nullifier keys in decoy batches, which a node operator can correlate across
-sessions. Both are being closed on the wallet side (HTTPS-or-onion enforcement, local
-spent detection from downloaded blocks).
+The wallet routes node RPC and Esplora traffic through Tor by default (hostnames are
+resolved inside Tor) and fails closed if the proxy is missing or misconfigured. A
+direct bitcoind RPC connection (the operator and regtest setups) is not Tor-routed by
+design. Spent detection is local, from downloaded blocks: the wallet never asks a node
+about its nullifiers. One honest edge remains: the node RPC is plain HTTP unless you
+point the wallet at an HTTPS edge or an onion service, so a Tor exit can read (not
+forge) what a wallet sends to a clearnet node; the wallet refuses plain HTTP to remote
+nodes outside regtest.
 
 ## Honest edges
 

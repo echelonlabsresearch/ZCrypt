@@ -152,8 +152,11 @@ fn main() {
     swap::relay_btc_headers(&zc, &user_btc).expect("relay");
     let late_preimage = swap::fresh_preimage();
     let late = swap::prepare_spv_deposit(&zc, &user_btc, &refund, &old.pk, &late_preimage, pre_amount).expect("late deposit");
+    let (_blind, opening) = swap::spv_claim_opening(&user.normal_address(), late.sats, asset).expect("claim opening");
     let err = zc
-        .broadcast(&swap::open_spv_tx(asset, late.sats, &late.lock, late.zc_timeout, &user.pubkey(), &late.proof, &refund))
+        .broadcast(&swap::open_spv_tx(
+            asset, late.sats, &late.lock, late.zc_timeout, &user.pubkey(), &late.proof, &refund, &opening,
+        ))
         .expect_err("a deposit to the retired key past the grace must be refused");
     assert!(err.contains("pinned reserve key"), "refused for the reserve-key reason: {err}");
     let new_preimage = swap::fresh_preimage();

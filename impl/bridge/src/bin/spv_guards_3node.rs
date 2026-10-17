@@ -74,7 +74,10 @@ fn main() {
     let p2 = swap::fresh_preimage();
     let d2 = swap::prepare_spv_deposit(&zc, &user_btc, &refund, &reserve.pk, &p2, amount).expect("deposit 2");
     let open = |d: &swap::PreparedDeposit| -> Result<[u8; 32], String> {
-        let data = zc.broadcast(&swap::open_spv_tx(asset, d.sats, &d.lock, d.zc_timeout, &user.pubkey(), &d.proof, &refund))?;
+        let (_blind, opening) = swap::spv_claim_opening(&user.normal_address(), d.sats, asset)?;
+        let data = zc.broadcast(&swap::open_spv_tx(
+            asset, d.sats, &d.lock, d.zc_timeout, &user.pubkey(), &d.proof, &refund, &opening,
+        ))?;
         swap::escrow_id_from(&data)
     };
     let e1 = open(&d1).expect("open D1 while the tip is fresh");

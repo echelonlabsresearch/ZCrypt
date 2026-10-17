@@ -20,6 +20,14 @@
 //!                           spends the operator's shielded coins).
 //!   ZCRYPT_RESERVE_SEED     legacy: the DERIVED key as 64 hex in the environment.
 //!   WATCHER_STATE           state file path                 (default ./bridge-watcher-state.json)
+//!                           An exclusive lock file `<state>.lock` sits next to it: a second
+//!                           daemon on the same state refuses to start (it would fund every
+//!                           open redeem twice).
+//!   WATCHER_CURSOR_SEED     ZC height a FRESH state (no file) starts scanning from, instead
+//!                           of genesis. Ignored once the state has a cursor.
+//!   ZCRYPT_WATCHER_FRESH_STATE=1  allow a fresh state (no file, cursor 0, no seed) although
+//!                           the operator wallet already shows P2WSH sends. Without it such a
+//!                           start is refused as a probably LOST state file.
 //!   WATCHER_POLL_SECS       seconds between passes          (default 10)
 //!   WATCHER_FINALIZE_MARGIN ZCrypt blocks a redeem escrow must have left. Default: the
 //!                           network redeem window (mainnet 475200, what the compose ships).
@@ -45,13 +53,37 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use zcrypt_bridge::watcher::{
-    btc_rpc_url_policy, finalize_margin_policy, previous_reserve_keys_from_env, reserve_key_from_env, watcher_tick_persisting, WatcherState,
+    btc_rpc_url_policy, finalize_margin_policy, fresh_state_guard, previous_reserve_keys_from_env, reserve_key_from_env, seed_cursor,
+    watcher_tick_persisting, FeeBumper, InstanceLock, WatcherState,
 };
 use zcrypt_bridge::zcrypt::Zcrypt;
 use zcrypt_bridge::{swap, Btc};
 
 fn env(k: &str, d: &str) -> String {
     std::env::var(k).unwrap_or_else(|_| d.to_string())
+}
+
+/// Whether the operator wallet has ever SENT to a P2WSH address (an HTLC funding): read from
+/// `listtransactions`, decoding each send's address and checking its output script type.
+fn wallet_has_p2wsh_sends(btc: &Btc) -> Result<bool, String> {
+    use bitcoincore_rpc::RpcApi as _;
+    use serde_json::json;
+    use std::str::FromStr as _;
+    let lt: serde_json::Value = btc
+        .rpc
+        .call("listtransactions", &[json!("*"), json!(10_000), json!(0), json!(true)])
+        .map_err(|e| e.to_string())?;
+    for t in lt.as_array().into_iter().flatten() {
+        if t["category"].as_str() != Some("send") {
+            continue;
+        }
+        let Some(addr) = t["address"].as_str() else { continue };
+        let Ok(a) = bitcoin::Address::from_str(addr) else { continue };
+        if a.assume_checked().script_pubkey().is_p2wsh() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn main() {
@@ -81,6 +113,9 @@ fn main() {
     let zc = Zcrypt::new(&env("ZC_URL", "http://localhost:36657"));
     let btc_url = env("BTC_URL", "http://localhost:18443");
     let net = zcrypt_bridge::network_from_str(&env("BTC_NETWORK", "regtest"));
+    if matches!(net, bitcoin::Network::Testnet | bitcoin::Network::Testnet4) {
+        eprintln!("[bridge-watcher] BTC_NETWORK testnet: served with the SIGNET safety profile (no regtest shortcuts)");
+    }
     // Startup invariant: the bitcoind RPC is plaintext, so on a real network it must be
     // reached over a private link (see `btc_rpc_url_policy`).
     let allow_public = matches!(env("ZCRYPT_BTC_RPC_ALLOW_PUBLIC", "0").trim(), "1" | "true" | "yes");
@@ -134,7 +169,16 @@ fn main() {
         poll.as_secs()
     );
 
+    // Single instance per state file (audit H5): two daemons on one wallet would double-fund.
+    let _lock = match InstanceLock::acquire(&state_path) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("[bridge-watcher] {e}");
+            std::process::exit(2);
+        }
+    };
     // A present but unparseable state file is fatal (bridge N12): never restart from empty.
+    let state_file_existed = state_path.exists();
     let mut state = match WatcherState::load(&state_path) {
         Ok(s) => s,
         Err(e) => {
@@ -142,17 +186,36 @@ fn main() {
             std::process::exit(2);
         }
     };
+    let seed: Option<i64> = std::env::var("WATCHER_CURSOR_SEED").ok().and_then(|s| s.trim().parse().ok());
+    if let Some(c) = seed_cursor(&mut state, seed) {
+        eprintln!("[bridge-watcher] fresh state: cursor seeded at ZC height {c} (WATCHER_CURSOR_SEED)");
+    }
+    // A fresh state over a wallet that already funded HTLCs is almost always a LOST state
+    // file (audit H5): refuse unless the operator says otherwise.
+    let allow_fresh = matches!(env("ZCRYPT_WATCHER_FRESH_STATE", "0").trim(), "1" | "true" | "yes");
+    let has_p2wsh_sends = match wallet_has_p2wsh_sends(&operator_btc) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("[bridge-watcher] could not list the operator wallet's sends ({e}); assuming it has HTLC history");
+            true
+        }
+    };
+    if let Err(e) = fresh_state_guard(state_file_existed, state.cursor, has_p2wsh_sends, allow_fresh) {
+        eprintln!("[bridge-watcher] {e}");
+        std::process::exit(2);
+    }
     let persist = |st: &WatcherState| st.save(&state_path);
+    let bumper: &dyn FeeBumper = &operator_btc;
     loop {
-        match watcher_tick_persisting(&mut state, &zc, &operator_btc, &keys, &shield_dest, asset, margin, fee_target, &persist) {
+        match watcher_tick_persisting(&mut state, &zc, &operator_btc, &keys, &shield_dest, asset, margin, fee_target, Some(bumper), &persist) {
             Ok(r) => {
                 if r.swept + r.locked + r.finalized + r.refunded + r.reanchored + r.resumed + r.deferred + r.at_risk + r.critical + r.rejected > 0
                     || r.pause_new_shields
                     || !r.errors.is_empty()
                 {
                     eprintln!(
-                        "[bridge-watcher] cursor={} swept={} locked={} finalized={} refunded={} reanchored={} resumed={} deferred={} at_risk={} critical={} pause_shields={} rejected={} errors={}",
-                        state.cursor, r.swept, r.locked, r.finalized, r.refunded, r.reanchored, r.resumed, r.deferred, r.at_risk, r.critical,
+                        "[bridge-watcher] cursor={} retry_heights={} swept={} locked={} finalized={} refunded={} reanchored={} resumed={} deferred={} bumped={} promoted={} at_risk={} critical={} pause_shields={} rejected={} errors={}",
+                        state.cursor, state.retry_heights.len(), r.swept, r.locked, r.finalized, r.refunded, r.reanchored, r.resumed, r.deferred, r.bumped, r.promoted, r.at_risk, r.critical,
                         r.pause_new_shields, r.rejected, r.errors.len()
                     );
                 }

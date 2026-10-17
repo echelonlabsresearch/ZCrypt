@@ -202,9 +202,16 @@ impl AssetRegistry {
         // One mint authority may back only one asset. Otherwise a registrant could bind
         // a second ticker to zBTC's reserve key and re-open a proven deposit under the
         // other asset id (bridge M1).
-        if authority.is_some() && self.by_id.values().any(|m| m.authority == authority) {
+        if authority.is_some()
+            && self.by_id.values().any(|m| {
+                m.authority == authority
+                    // Audit 2026-10 L3: a RETIRED reserve key still accepts deposits inside its
+                    // grace window, so it must stay bound to the asset it backed.
+                    || m.retired_reserves.iter().any(|r| Some(r.authority) == authority)
+            })
+        {
             return Err(format!(
-                "the mint authority for '{ticker}' already backs another registered asset"
+                "the mint authority for '{ticker}' already backs (or backed) another registered asset"
             ));
         }
         // Uniqueness is keyed on the canonical (case-insensitive) form; the display

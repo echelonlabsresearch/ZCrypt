@@ -47,6 +47,25 @@ pub trait ZcNode {
     fn block_txs(&self, height: i64) -> Result<Vec<Vec<u8>>, String>;
     fn query(&self, path: &str) -> Result<String, String>;
     fn broadcast(&self, tx: &[u8]) -> Result<String, String>;
+    /// The BFT block time of ZC block `height` (unix seconds): consensus data every node
+    /// agrees on, which the redeem planner uses as the deterministic anchor of the BTC
+    /// lock it funds (bridge/swap audit 2026-10 H5). Default: unsupported.
+    fn block_time(&self, _height: i64) -> Result<u64, String> {
+        Err("block_time not supported by this node client".to_string())
+    }
+    /// Whether the Bitcoin outpoint `txid:vout` (txid in INTERNAL byte order, as
+    /// `MintProof::funding_txid` returns it) is in the consensus CLAIMED set, i.e. a zBTC mint
+    /// was settled against it. Unlike the escrow record, which is pruned after
+    /// `ESCROW_RETENTION_BLOCKS`, this set is permanent (it is what prevents a second mint
+    /// from the same deposit), so it is the operator's durable proof-of-mint (audit H3).
+    fn spv_claimed(&self, txid: &[u8; 32], vout: u32) -> Result<bool, String> {
+        let s = self.query(&format!("/spv/claimed/{}:{vout}", hex::encode(txid)))?;
+        match s.trim() {
+            "1" => Ok(true),
+            "0" => Ok(false),
+            other => Err(format!("/spv/claimed: unexpected answer {other:?}")),
+        }
+    }
 }
 
 impl ZcNode for Zcrypt {
@@ -62,6 +81,53 @@ impl ZcNode for Zcrypt {
     fn broadcast(&self, tx: &[u8]) -> Result<String, String> {
         Zcrypt::broadcast(self, tx)
     }
+    fn block_time(&self, height: i64) -> Result<u64, String> {
+        Zcrypt::block_time(self, height)
+    }
+}
+
+/// Parse an RFC 3339 UTC timestamp as CometBFT prints it (`2026-10-17T12:34:56.123456789Z`)
+/// into unix seconds. Fractional seconds are dropped; a numeric offset is honoured.
+pub fn parse_rfc3339_secs(s: &str) -> Result<u64, String> {
+    let s = s.trim();
+    let bad = || format!("bad RFC 3339 time {s:?}");
+    if s.len() < 19 {
+        return Err(bad());
+    }
+    let num = |a: usize, b: usize| -> Result<i64, String> { s.get(a..b).and_then(|x| x.parse::<i64>().ok()).ok_or_else(bad) };
+    let (y, mo, d) = (num(0, 4)?, num(5, 7)?, num(8, 10)?);
+    let (hh, mm, ss) = (num(11, 13)?, num(14, 16)?, num(17, 19)?);
+    if &s[4..5] != "-" || &s[7..8] != "-" || !matches!(&s[10..11], "T" | "t" | " ") || &s[13..14] != ":" || &s[16..17] != ":" {
+        return Err(bad());
+    }
+    // Skip fractional seconds, then read the zone.
+    let mut rest = &s[19..];
+    if rest.starts_with('.') {
+        let end = rest[1..].find(|c: char| !c.is_ascii_digit()).map(|i| i + 1).unwrap_or(rest.len());
+        rest = &rest[end..];
+    }
+    let offset_secs: i64 = match rest {
+        "Z" | "z" | "" => 0,
+        r if r.len() == 6 && (r.starts_with('+') || r.starts_with('-')) => {
+            let sign = if r.starts_with('-') { -1 } else { 1 };
+            let oh: i64 = r[1..3].parse().map_err(|_| bad())?;
+            let om: i64 = r[4..6].parse().map_err(|_| bad())?;
+            sign * (oh * 3600 + om * 60)
+        }
+        _ => return Err(bad()),
+    };
+    if !(1..=12).contains(&mo) || !(1..=31).contains(&d) || hh > 23 || mm > 59 || ss > 60 {
+        return Err(bad());
+    }
+    // Days from civil (Howard Hinnant's algorithm).
+    let (y2, m2) = if mo <= 2 { (y - 1, mo + 9) } else { (y, mo - 3) };
+    let era = if y2 >= 0 { y2 } else { y2 - 399 } / 400;
+    let yoe = y2 - era * 400;
+    let doy = (153 * m2 + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    let secs = days * 86_400 + hh * 3600 + mm * 60 + ss - offset_secs;
+    u64::try_from(secs).map_err(|_| bad())
 }
 
 const B64: base64::engine::general_purpose::GeneralPurpose = base64::engine::general_purpose::STANDARD;
@@ -188,6 +254,20 @@ impl Zcrypt {
             .collect())
     }
 
+    /// The BFT time (unix seconds) of ZC block `height`, from the CometBFT block header.
+    pub fn block_time(&self, height: i64) -> Result<u64, String> {
+        let u = format!("{}/block?height={}", self.url, height);
+        let b: Value = self
+            .agent()
+            .get(&u)
+            .call()
+            .map_err(|e| format!("block {height}: {e}"))?
+            .into_json()
+            .map_err(|e| format!("block {height} json: {e}"))?;
+        let t = b["result"]["block"]["header"]["time"].as_str().ok_or_else(|| format!("block {height}: no header time"))?;
+        parse_rfc3339_secs(t)
+    }
+
     /// All commitment-tree leaves in order (the shield decoy pool).
     /// All commitment leaves in tree order. The node serves them in PAGES
     /// (`/commit/leaves/<from>`, each at most `/commit/leaf_page` leaves), so keep paging
@@ -234,5 +314,21 @@ impl Zcrypt {
             }
         }
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_rfc3339_secs;
+
+    #[test]
+    fn rfc3339_parses_cometbft_header_times() {
+        assert_eq!(parse_rfc3339_secs("1970-01-01T00:00:00Z").unwrap(), 0);
+        assert_eq!(parse_rfc3339_secs("2026-10-17T12:34:56.123456789Z").unwrap(), 1_792_240_496);
+        assert_eq!(parse_rfc3339_secs("2026-10-17T12:34:56Z").unwrap(), 1_792_240_496);
+        assert_eq!(parse_rfc3339_secs("2026-10-17T14:34:56+02:00").unwrap(), 1_792_240_496);
+        assert_eq!(parse_rfc3339_secs("2000-02-29T00:00:00Z").unwrap(), 951_782_400);
+        assert!(parse_rfc3339_secs("2026-13-01T00:00:00Z").is_err());
+        assert!(parse_rfc3339_secs("garbage").is_err());
     }
 }

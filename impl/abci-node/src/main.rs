@@ -382,9 +382,14 @@ fn rd_blind(b: &[u8], off: usize) -> Option<Blind> {
     Some(blind)
 }
 
-/// Parse an HTLC-open payload into (asset_id, value, hashlock, timeout, claim_pk, capability).
+/// Parse an HTLC-open payload into (asset_id, value, hashlock, timeout, claim_pk,
+/// opening, capability). Layout: the 120-byte header, then one [`CoinOpening`], then
+/// the M-of-N capability. The opening is sliced out before the capability because the
+/// capability decoder consumes its own tail.
 #[allow(clippy::type_complexity)]
-fn parse_htlc_open(b: &[u8]) -> Option<(u64, u64, [u8; 32], u64, [u64; 8], Vec<u8>)> {
+fn parse_htlc_open(
+    b: &[u8],
+) -> Option<(u64, u64, [u8; 32], u64, [u64; 8], zcrypt_core::htlc_shield::CoinOpening, Vec<u8>)> {
     if b.len() < 120 {
         return None;
     }
@@ -394,19 +399,30 @@ fn parse_htlc_open(b: &[u8]) -> Option<(u64, u64, [u8; 32], u64, [u64; 8], Vec<u
     hashlock.copy_from_slice(&b[16..48]);
     let timeout = u64::from_le_bytes(b[48..56].try_into().ok()?);
     let claim_pk = parse_pubkey(&b[56..120])?;
-    let capability = b[120..].to_vec();
-    Some((asset_id, value, hashlock, timeout, claim_pk, capability))
+    let (opening, n) = zcrypt_core::htlc_shield::CoinOpening::decode(&b[120..])?;
+    let capability = b[120 + n..].to_vec();
+    Some((asset_id, value, hashlock, timeout, claim_pk, opening, capability))
 }
 
 /// Parse an SPV-gated HTLC-open payload into (asset_id, value, hashlock, timeout,
-/// claim_pk, open_auth, mint_proof). Layout:
-///   asset(8) ‖ value(8) ‖ hashlock(32) ‖ timeout(8) ‖ claim_pk(64) ‖ open_auth(64) ‖ MintProof
-/// `open_auth` is the depositor's refund-key ECDSA signature binding `claim_pk` to the
-/// deposit (H1 front-run defense).
+/// claim_pk, open_auth, opening, mint_proof). Layout:
+///   asset(8) ‖ value(8) ‖ hashlock(32) ‖ timeout(8) ‖ claim_pk(64) ‖ open_auth(64)
+///   ‖ CoinOpening ‖ MintProof
+/// The opening is sliced out before `MintProof::from_bytes`, which consumes its buffer
+/// exactly. `open_auth` binds the claim commitment and the note (H1 / H10).
 #[allow(clippy::type_complexity)]
 fn parse_htlc_open_spv(
     b: &[u8],
-) -> Option<(u64, u64, [u8; 32], u64, [u64; 8], [u8; 64], zcrypt_core::spv::MintProof)> {
+) -> Option<(
+    u64,
+    u64,
+    [u8; 32],
+    u64,
+    [u64; 8],
+    [u8; 64],
+    zcrypt_core::htlc_shield::CoinOpening,
+    zcrypt_core::spv::MintProof,
+)> {
     if b.len() < 184 {
         return None;
     }
@@ -417,8 +433,9 @@ fn parse_htlc_open_spv(
     let timeout = u64::from_le_bytes(b[48..56].try_into().ok()?);
     let claim_pk = parse_pubkey(&b[56..120])?;
     let open_auth: [u8; 64] = b[120..184].try_into().ok()?;
-    let proof = zcrypt_core::spv::MintProof::from_bytes(&b[184..])?;
-    Some((asset_id, value, hashlock, timeout, claim_pk, open_auth, proof))
+    let (opening, n) = zcrypt_core::htlc_shield::CoinOpening::decode(&b[184..])?;
+    let proof = zcrypt_core::spv::MintProof::from_bytes(&b[184 + n..])?;
+    Some((asset_id, value, hashlock, timeout, claim_pk, open_auth, opening, proof))
 }
 
 /// Parse an authority-rotation payload into (asset_id, new_commitment, auth_blob).
@@ -443,11 +460,21 @@ fn parse_escrow_id(b: &[u8]) -> Option<[u8; 32]> {
 }
 
 /// Parse a burn-lock payload into (value, blind, asset_id, hashlock, timeout,
-/// refund_pk, shield_tx).
+/// refund_pk, refund opening, shield_tx). The 184-byte header is followed by one
+/// refund [`CoinOpening`], then the shield spend, which `from_bytes` consumes exactly.
 #[allow(clippy::type_complexity)]
 fn parse_burn_lock(
     b: &[u8],
-) -> Option<(u64, Blind, u64, [u8; 32], u64, [u64; 8], zcrypt_core::shield_tx::ShieldTx)> {
+) -> Option<(
+    u64,
+    Blind,
+    u64,
+    [u8; 32],
+    u64,
+    [u64; 8],
+    zcrypt_core::htlc_shield::CoinOpening,
+    zcrypt_core::shield_tx::ShieldTx,
+)> {
     // value(8) + blind(64) + asset(8) + hashlock(32) + timeout(8) + refund_pk(64) = 184
     const A: usize = 8 + BB; // asset
     const H: usize = A + 8; // hashlock
@@ -464,14 +491,16 @@ fn parse_burn_lock(
     hashlock.copy_from_slice(&b[H..H + 32]);
     let timeout = u64::from_le_bytes(b[T..T + 8].try_into().ok()?);
     let refund_pk = parse_pubkey(&b[R..END])?;
-    let tx = zcrypt_core::shield_tx::from_bytes(&b[END..])?;
-    Some((value, blind, asset_id, hashlock, timeout, refund_pk, tx))
+    let (opening, n) = zcrypt_core::htlc_shield::CoinOpening::decode(&b[END..])?;
+    let tx = zcrypt_core::shield_tx::from_bytes(&b[END + n..])?;
+    Some((value, blind, asset_id, hashlock, timeout, refund_pk, opening, tx))
 }
 
 /// Parse a swap-lock payload into (value, blind, asset_id, hashlock, timeout,
-/// counterparty_pk, refund_pk, gas_blind, gas_tx, shield_tx). The 216-byte header is the
-/// same shape as before. After it, the transfer gas prefix (`gas_blind ‖ gas_len ‖ gas_tx`)
-/// and then the asset spend. The asset spend has fee 0; `gas_tx` burns 0.01 ZCRYPT.
+/// counterparty_pk, refund_pk, claim opening, refund opening, gas_blind, gas_tx,
+/// shield_tx). After the 248-byte header come the claim opening, the refund opening,
+/// the transfer gas prefix (`gas_blind ‖ gas_len ‖ gas_tx`), and the asset spend.
+/// The asset spend has fee 0; `gas_tx` burns 0.01 ZCRYPT.
 #[allow(clippy::type_complexity)]
 fn parse_swap_lock(
     b: &[u8],
@@ -483,6 +512,8 @@ fn parse_swap_lock(
     u64,
     [u64; 8],
     [u64; 8],
+    zcrypt_core::htlc_shield::CoinOpening,
+    zcrypt_core::htlc_shield::CoinOpening,
     Blind,
     zcrypt_core::shield_tx::ShieldTx,
     zcrypt_core::shield_tx::ShieldTx,
@@ -505,7 +536,9 @@ fn parse_swap_lock(
     let timeout = u64::from_le_bytes(b[T..T + 8].try_into().ok()?);
     let counterparty_pk = parse_pubkey(&b[C..R])?;
     let refund_pk = parse_pubkey(&b[R..END])?;
-    let (gas_blind, gas_tx, rest) = parse_gas_prefix(&b[END..])?;
+    let (claim, n1) = zcrypt_core::htlc_shield::CoinOpening::decode(&b[END..])?;
+    let (refund_open, n2) = zcrypt_core::htlc_shield::CoinOpening::decode(&b[END + n1..])?;
+    let (gas_blind, gas_tx, rest) = parse_gas_prefix(&b[END + n1 + n2..])?;
     let tx = zcrypt_core::shield_tx::from_bytes(rest)?;
     Some((
         value,
@@ -515,6 +548,8 @@ fn parse_swap_lock(
         timeout,
         counterparty_pk,
         refund_pk,
+        claim,
+        refund_open,
         gas_blind,
         gas_tx,
         tx,
@@ -1425,12 +1460,17 @@ impl ZcryptApp {
             match parse_gas_prefix(&tx[1..]) {
                 None => Err("malformed htlc-open tx (needs a ZCRYPT gas note prefix)".to_string()),
                 Some((gas_blind, gas_tx, rest)) => match parse_htlc_open(rest) {
-                    Some((asset, value, lock, timeout, claim_pk, auth)) => {
+                    Some((asset, value, lock, timeout, claim_pk, opening, auth)) => {
                         let Some((keyset, sigs)) = zcrypt_core::mint_auth::decode_auth(&auth) else {
                             return (Err("malformed htlc-open auth".into()), deferred);
                         };
-                        let msg = zcrypt_core::mint_auth::mint_message(chain_id, asset, value, &lock, timeout, &claim_pk);
-                        if !zcrypt_core::asset_registry::asset_id_ok(asset) {
+                        let msg = zcrypt_core::mint_auth::mint_message(
+                            chain_id, asset, value, &lock, timeout, &claim_pk,
+                            &opening.coin.commitment, &opening.coin.note_bind(),
+                        );
+                        if let Err(e) = opening.verify(&claim_pk, value, asset) {
+                            Err(e)
+                        } else if !zcrypt_core::asset_registry::asset_id_ok(asset) {
                             Err("asset id is not a canonical field element".to_string())
                         } else if !zcrypt_core::mint_auth::verify_threshold(&keyset, &msg, &sigs) {
                             Err("htlc-open: mint authorization invalid".to_string())
@@ -1479,7 +1519,15 @@ impl ZcryptApp {
             s.node.spv().precheck_headers(&tx[1..])
         } else if tx.first() == Some(&HTLC_OPEN_SPV_TAG) {
             match parse_htlc_open_spv(&tx[1..]) {
-                Some((asset, value, lock, timeout, claim_pk, open_auth, proof)) => {
+                Some((asset, value, lock, timeout, claim_pk, open_auth, opening, proof)) => {
+                    // The claim coin is the net of the bridge fee. Checked here so a
+                    // substituted commitment never reaches a block.
+                    let net = value - zcrypt_core::emission::bridge_fee(value);
+                    if net == 0 {
+                        Err("SPV mint net of the bridge fee is zero".to_string())
+                    } else if let Err(e) = opening.verify(&claim_pk, net, asset) {
+                        Err(e)
+                    } else {
                     // Same reserve history (current + retired keys) and tip-freshness rule as
                     // delivery, so admission and block execution agree.
                     let reserve = s.node.asset_meta(asset).and_then(|m| m.reserve_auth());
@@ -1499,11 +1547,18 @@ impl ZcryptApp {
                                     value,
                                     hashlock: &lock,
                                     timeout_height: timeout,
+                                    claim_commitment: &opening.coin.commitment,
+                                    note_bind: &opening.coin.note_bind(),
                                 };
                                 zcrypt_core::spv::verify_open_auth(&proof.refund_pk, &a, &open_auth)
                             })
-                            .and_then(|()| s.node.btc_tip_fresh("SPV mint open")),
+                            .and_then(|()| s.node.btc_tip_fresh("SPV mint open"))
+                            // Delivery-only parameter rules mirrored here (audit 2026-10 M5):
+                            // claim-window horizon, value cap, headroom, id + settlement
+                            // freshness. Otherwise a real deposit yields unlimited free variants.
+                            .and_then(|()| s.node.precheck_open_spv_params(asset, value, &lock, timeout, &claim_pk, &opening.coin.commitment)),
                         None => Err("asset not registered / no mint authority".to_string()),
+                    }
                     }
                 }
                 None => Err("malformed SPV htlc-open tx".to_string()),
@@ -1512,31 +1567,28 @@ impl ZcryptApp {
             match zcrypt_core::spv::MintProof::from_bytes(&tx[1..]) {
                 // CheckTx mirrors DeliverTx: an immature mint for this deposit must exist, or
                 // 12 MB re-anchor payloads for nonexistent deposits fill blocks for free (M2).
-                Some(proof) => match proof.funding_txid() {
-                    Some(txid) if s.node.has_immature_deposit(&txid, proof.vout) => Ok(()),
-                    Some(_) => Err("re-anchor: no immature mint for this deposit outpoint".to_string()),
-                    None => Err("re-anchor: bad funding tx".to_string()),
-                },
+                // ...and the proof itself is verified at admission (audit 2026-10 M5 / 09-14 M3),
+                // so garbage merkle blocks for a real txid no longer ride into blocks for free.
+                Some(proof) => s.node.precheck_reanchor(&proof),
                 None => Err("malformed BTC re-anchor tx".to_string()),
             }
         } else if tx.first() == Some(&HTLC_CLAIM_TAG) {
+            // Exact wire length (audit 2026-10 M4): tag ‖ id(32) ‖ preimage(32). Trailing bytes
+            // used to make unlimited distinct copies of one claim fill blocks for free.
             match parse_escrow_id(&tx[1..]) {
-                Some(id) if tx.len() > 33 => {
+                Some(id) if tx.len() == 1 + 32 + zcrypt_core::htlc_shield::HTLC_PREIMAGE_LEN => {
                     let preimage = &tx[33..];
                     match s.node.htlc_escrow(&id) {
                         Some(e) if e.state == zcrypt_core::htlc_shield::EscrowState::Open => {
-                            if s.node.height() >= e.timeout_height {
-                                Err("escrow has timed out: expire/refund only".to_string())
-                            } else if preimage.len() != zcrypt_core::htlc_shield::HTLC_PREIMAGE_LEN {
-                                Err("preimage must be exactly 32 bytes".to_string())
-                            } else if zcrypt_core::nullifier::htlc_hashlock(preimage) != e.hashlock {
+                            if zcrypt_core::nullifier::htlc_hashlock(preimage) != e.hashlock {
                                 Err("preimage does not match the hashlock".to_string())
-                            } else if e.spv_deposit.is_some() {
-                                // SPV mint claims need a fresh consensus Bitcoin tip (parity
-                                // with `Node::htlc_claim`).
-                                s.node.btc_tip_fresh("SPV mint claim")
                             } else {
-                                Ok(())
+                                // Evaluated at the height the claim can first execute (H6), and
+                                // with the SPV sweep-margin deadline + tip freshness (M5), so a
+                                // claim doomed at delivery never publishes its preimage in a block.
+                                s.node
+                                    .claim_timeout_ok_next_block(&id)
+                                    .and_then(|()| s.node.precheck_spv_claim_deadline(&id))
                             }
                         }
                         Some(_) => Err("escrow is not open".to_string()),
@@ -1547,7 +1599,7 @@ impl ZcryptApp {
             }
         } else if tx.first() == Some(&HTLC_EXPIRE_TAG) {
             match parse_escrow_id(&tx[1..]) {
-                Some(id) => match s.node.htlc_escrow(&id) {
+                Some(id) if tx.len() == 1 + 32 => match s.node.htlc_escrow(&id) {
                     Some(e) if e.state == zcrypt_core::htlc_shield::EscrowState::Open => {
                         if s.node.height() < e.timeout_height {
                             Err("escrow has not yet timed out".to_string())
@@ -1558,13 +1610,15 @@ impl ZcryptApp {
                     Some(_) => Err("escrow is not open".to_string()),
                     None => Err("no such escrow".to_string()),
                 },
-                None => Err("malformed htlc expire tx".to_string()),
+                _ => Err("malformed htlc expire tx".to_string()),
             }
         } else if tx.first() == Some(&HTLC_BURN_LOCK_TAG) {
             match parse_burn_lock(&tx[1..]) {
-                Some((value, blind, asset, lock, timeout, refund, stx)) => {
+                Some((value, blind, asset, lock, timeout, refund, opening, stx)) => {
                     if !s.node.asset_is_registered(asset) {
                         Err("asset not registered".to_string())
+                    } else if let Err(e) = opening.verify(&refund, value, asset) {
+                        Err(e)
                     } else {
                         let expected = zcrypt_shield::commit_asset(
                             value, &blind, &zcrypt_core::htlc_shield::BURN_PK, asset,
@@ -1577,11 +1631,13 @@ impl ZcryptApp {
                             let env = zcrypt_core::htlc_shield::lock_envelope(
                                 zcrypt_core::htlc_shield::ENV_BURN_LOCK,
                                 asset, value, &lock, timeout, &refund, &refund, &[],
+                                std::slice::from_ref(&opening.coin),
                             );
                             // Mirror the delivery-time admission rules that would otherwise
                             // only fail AFTER the pledge is applied: value bound and escrow id.
-                            zcrypt_core::node::lock_value_ok(value)
-                                .and_then(|()| s.node.escrow_id_available(asset, value, &lock, timeout, &refund))
+                            s.node
+                                .precheck_lock_params(zcrypt_core::htlc_shield::EscrowKind::Burn, asset, value, timeout, stx.fee, &[])
+                                .and_then(|()| s.node.escrow_id_available(zcrypt_core::htlc_shield::EscrowKind::Burn, asset, value, &lock, timeout, &refund, &refund, &[opening.coin.commitment]))
                                 .and_then(|()| s.node.precheck_shield(&stx))
                                 .map(|()| deferred.push((stx, env)))
                         }
@@ -1595,9 +1651,11 @@ impl ZcryptApp {
             } else {
                 let btc_claim_pk = &tx[1..1 + 33];
                 match parse_burn_lock(&tx[1 + 33..]) {
-                    Some((value, blind, asset, lock, timeout, refund, stx)) => {
+                    Some((value, blind, asset, lock, timeout, refund, opening, stx)) => {
                         if !s.node.asset_is_registered(asset) {
                             Err("asset not registered".to_string())
+                        } else if let Err(e) = opening.verify(&refund, value, asset) {
+                            Err(e)
                         } else {
                             let expected = zcrypt_shield::commit_asset(
                                 value, &blind, &zcrypt_core::htlc_shield::BURN_PK, asset,
@@ -1608,9 +1666,11 @@ impl ZcryptApp {
                                 let env = zcrypt_core::htlc_shield::lock_envelope(
                                     zcrypt_core::htlc_shield::ENV_BURN_LOCK_BTC,
                                     asset, value, &lock, timeout, &refund, &refund, btc_claim_pk,
+                                    std::slice::from_ref(&opening.coin),
                                 );
-                                zcrypt_core::node::lock_value_ok(value)
-                                    .and_then(|()| s.node.escrow_id_available(asset, value, &lock, timeout, &refund))
+                                s.node
+                                    .precheck_lock_params(zcrypt_core::htlc_shield::EscrowKind::Burn, asset, value, timeout, stx.fee, btc_claim_pk)
+                                    .and_then(|()| s.node.escrow_id_available(zcrypt_core::htlc_shield::EscrowKind::Burn, asset, value, &lock, timeout, &refund, &refund, &[opening.coin.commitment]))
                                     .and_then(|()| s.node.precheck_shield(&stx))
                                     .map(|()| deferred.push((stx, env)))
                             }
@@ -1621,7 +1681,7 @@ impl ZcryptApp {
             }
         } else if tx.first() == Some(&SWAP_LOCK_TAG) {
             match parse_swap_lock(&tx[1..]) {
-                Some((value, blind, asset, lock, timeout, cp, refund, gas_blind, gas_tx, stx)) => {
+                Some((value, blind, asset, lock, timeout, cp, refund, claim_open, refund_open, gas_blind, gas_tx, stx)) => {
                     if !s.node.asset_is_registered(asset) {
                         Err("asset not registered".to_string())
                     } else if stx.fee != 0 {
@@ -1629,6 +1689,10 @@ impl ZcryptApp {
                             "swap-lock: asset spend must have fee 0 (gas is the ZCRYPT note); got {}",
                             stx.fee
                         ))
+                    } else if let Err(e) = claim_open.verify(&cp, value, asset) {
+                        Err(e)
+                    } else if let Err(e) = refund_open.verify(&refund, value, asset) {
+                        Err(e)
                     } else {
                         let expected = zcrypt_shield::commit_asset(
                             value, &blind, &zcrypt_core::htlc_shield::BURN_PK, asset,
@@ -1639,13 +1703,15 @@ impl ZcryptApp {
                             let env = zcrypt_core::htlc_shield::lock_envelope(
                                 zcrypt_core::htlc_shield::ENV_SWAP_LOCK,
                                 asset, value, &lock, timeout, &cp, &refund, &[],
+                                &[claim_open.coin.clone(), refund_open.coin.clone()],
                             );
                             // Same admission as delivery: value bound, escrow id, fee 0, the
                             // ZCRYPT gas burn coin, both anchors, and disjoint nullifiers.
                             // Both proofs are deferred so a bad lock is rejected before it
                             // can burn the gas.
-                            zcrypt_core::node::lock_value_ok(value)
-                                .and_then(|()| s.node.escrow_id_available(asset, value, &lock, timeout, &cp))
+                            s.node
+                                .precheck_lock_params(zcrypt_core::htlc_shield::EscrowKind::Swap, asset, value, timeout, stx.fee, &[])
+                                .and_then(|()| s.node.escrow_id_available(zcrypt_core::htlc_shield::EscrowKind::Swap, asset, value, &lock, timeout, &cp, &refund, &[claim_open.coin.commitment, refund_open.coin.commitment]))
                                 .and_then(|()| s.node.precheck_transfer(&stx, &gas_tx, gas_blind))
                                 .map(|()| {
                                     let gas_env = zcrypt_core::shield_tx::gas_pay_envelope(
@@ -1931,16 +1997,16 @@ impl ZcryptApp {
                 match parse_gas_prefix(&bytes[1..]) {
                     None => Err("malformed htlc-open tx (needs a ZCRYPT gas note prefix)".to_string()),
                     Some((gas_blind, gas_tx, rest)) => match parse_htlc_open(rest)
-                        .and_then(|(asset, value, lock, timeout, pk, auth)| {
+                        .and_then(|(asset, value, lock, timeout, pk, opening, auth)| {
                             // The trailing bytes are the M-of-N mint authorization (key set +
                             // threshold ML-DSA signatures); decode before gating the mint.
                             zcrypt_core::mint_auth::decode_auth(&auth)
-                                .map(|(ks, sigs)| (asset, value, lock, timeout, pk, ks, sigs))
+                                .map(|(ks, sigs)| (asset, value, lock, timeout, pk, opening, ks, sigs))
                         }) {
-                        Some((asset, value, lock, timeout, pk, keyset, sigs)) => {
+                        Some((asset, value, lock, timeout, pk, opening, keyset, sigs)) => {
                             match s.node.submit_gas_note(chain_id, &gas_tx, gas_blind, rest).and_then(|_| {
                                 s.node
-                                    .htlc_open(chain_id, asset, value, lock, timeout, pk, &keyset, &sigs)
+                                    .htlc_open(chain_id, asset, value, lock, timeout, pk, &opening, &keyset, &sigs)
                                     .map_err(|e| format!("{e} (gas consumed)"))
                             }) {
                                 Ok(id) => {
@@ -2011,9 +2077,9 @@ impl ZcryptApp {
                 }
             } else if bytes.first() == Some(&HTLC_BURN_LOCK_TAG) {
                 match parse_burn_lock(&bytes[1..]) {
-                    Some((value, blind, asset, lock, timeout, refund_pk, stx)) => {
+                    Some((value, blind, asset, lock, timeout, refund_pk, opening, stx)) => {
                         match s.node.htlc_burn_lock(
-                            chain_id, &stx, value, blind, asset, lock, timeout, refund_pk, &[],
+                            chain_id, &stx, value, blind, asset, lock, timeout, refund_pk, &[], &opening,
                         ) {
                             Ok(id) => {
                                 let data =
@@ -2040,10 +2106,10 @@ impl ZcryptApp {
                 } else {
                     let btc_claim_pk = bytes[1..1 + 33].to_vec();
                     match parse_burn_lock(&bytes[1 + 33..]) {
-                        Some((value, blind, asset, lock, timeout, refund_pk, stx)) => {
+                        Some((value, blind, asset, lock, timeout, refund_pk, opening, stx)) => {
                             match s.node.htlc_burn_lock(
                                 chain_id, &stx, value, blind, asset, lock, timeout, refund_pk,
-                                &btc_claim_pk,
+                                &btc_claim_pk, &opening,
                             ) {
                                 Ok(id) => {
                                     let data =
@@ -2063,10 +2129,10 @@ impl ZcryptApp {
                 }
             } else if bytes.first() == Some(&SWAP_LOCK_TAG) {
                 match parse_swap_lock(&bytes[1..]) {
-                    Some((value, blind, asset, lock, timeout, counterparty_pk, refund_pk, gas_blind, gas_tx, stx)) => {
+                    Some((value, blind, asset, lock, timeout, counterparty_pk, refund_pk, claim_open, refund_open, gas_blind, gas_tx, stx)) => {
                         match s.node.swap_lock(
                             chain_id, &stx, &gas_tx, gas_blind, value, blind, asset, lock, timeout,
-                            counterparty_pk, refund_pk,
+                            counterparty_pk, refund_pk, &claim_open, &refund_open,
                         ) {
                             Ok(id) => {
                                 let data =
@@ -2111,8 +2177,8 @@ impl ZcryptApp {
                 }
             } else if bytes.first() == Some(&HTLC_OPEN_SPV_TAG) {
                 match parse_htlc_open_spv(&bytes[1..]) {
-                    Some((asset, value, lock, timeout, pk, open_auth, proof)) => {
-                        match s.node.htlc_open_spv(chain_id, asset, value, lock, timeout, pk, &proof, &open_auth) {
+                    Some((asset, value, lock, timeout, pk, open_auth, opening, proof)) => {
+                        match s.node.htlc_open_spv(chain_id, asset, value, lock, timeout, pk, &proof, &open_auth, &opening) {
                             Ok(id) => {
                                 let data =
                                     serde_json::json!({ "escrow_id": hex::encode(id) }).to_string();
@@ -2147,7 +2213,7 @@ impl ZcryptApp {
                 }
             } else if bytes.first() == Some(&HTLC_CLAIM_TAG) {
                 match parse_escrow_id(&bytes[1..]) {
-                    Some(id) => match s.node.htlc_claim(&id, &bytes[33..]) {
+                    Some(id) if bytes.len() == 1 + 32 + zcrypt_core::htlc_shield::HTLC_PREIMAGE_LEN => match s.node.htlc_claim(&id, &bytes[33..]) {
                         Ok(coin) => {
                             // Some(commitment) for a mint escrow; None for a burn.
                             let coin_hex = coin.map(|c| {
@@ -2167,11 +2233,11 @@ impl ZcryptApp {
                         }
                         Err(e) => Err(e),
                     },
-                    None => Err("malformed htlc-claim tx".to_string()),
+                    _ => Err("malformed htlc-claim tx".to_string()),
                 }
             } else if bytes.first() == Some(&HTLC_EXPIRE_TAG) {
                 match parse_escrow_id(&bytes[1..]) {
-                    Some(id) => match s.node.htlc_expire(&id) {
+                    Some(id) if bytes.len() == 1 + 32 => match s.node.htlc_expire(&id) {
                         Ok(refund) => {
                             let coin_hex = refund.map(|c| {
                                 let mut cb = Vec::new();
@@ -2191,7 +2257,7 @@ impl ZcryptApp {
                         }
                         Err(e) => Err(e),
                     },
-                    None => Err("malformed htlc-expire tx".to_string()),
+                    _ => Err("malformed htlc-expire tx".to_string()),
                 }
             } else {
                 Err(CLASSICAL_DISABLED.to_string()) // classical native path removed
@@ -2398,6 +2464,30 @@ impl ZcryptApp {
             "/app/hash" => hex::encode(s.app_hash).into_bytes(),
             // ---- Bitcoin SPV chain (the trustless zBTC mint gate) ----
             "/spv/height" => s.node.btc_tip().0.to_string().into_bytes(),
+            // Whether a Bitcoin deposit outpoint has minted (consensus claimed set). The bridge
+            // operator uses this as proof-of-mint for sweeps instead of escrow presence, which
+            // is pruned after retention (audit 2026-10 H3). Path: /spv/claimed/<txid_hex>:<vout>.
+            p if p.starts_with("/spv/claimed/") => {
+                let rest = &p["/spv/claimed/".len()..];
+                let parsed = rest.split_once(':').and_then(|(t, v)| {
+                    let txid = hex::decode(t).ok().filter(|b| b.len() == 32)?;
+                    let vout: u32 = v.parse().ok()?;
+                    let mut op = [0u8; 36];
+                    op[..32].copy_from_slice(&txid);
+                    op[32..].copy_from_slice(&vout.to_le_bytes());
+                    Some(op)
+                });
+                match parsed {
+                    Some(op) => (if s.node.spv().is_claimed(&op) { "1" } else { "0" }).as_bytes().to_vec(),
+                    None => {
+                        return ResponseQuery {
+                            code: 1,
+                            log: "bad outpoint: expect <txid_hex>:<vout>".to_string(),
+                            ..Default::default()
+                        }
+                    }
+                }
+            }
             "/spv/tip" => {
                 let (h, hash) = s.node.btc_tip();
                 // Display hash big-endian like every Bitcoin explorer.
@@ -2509,6 +2599,21 @@ impl ZcryptApp {
                                 // block txs: a failed duplicate lock in the same block can carry a
                                 // different key and would otherwise get its own funded HTLC.
                                 "btc_claim_pk": hex::encode(&e.btc_claim_pk),
+                                // The settlement coins. The commitment is the leaf consensus
+                                // appends; the note carries the hidden blind, encrypted to the
+                                // beneficiary. Empty when this kind has no coin on that side.
+                                "claim_commitment": e.claim_coin.as_ref().map(|c| {
+                                    let mut b = Vec::with_capacity(64);
+                                    for x in &c.commitment { b.extend_from_slice(&x.to_le_bytes()); }
+                                    hex::encode(b)
+                                }).unwrap_or_default(),
+                                "claim_enc_note": e.claim_coin.as_ref().map(|c| hex::encode(&c.enc_note)).unwrap_or_default(),
+                                "refund_commitment": e.refund_coin.as_ref().map(|c| {
+                                    let mut b = Vec::with_capacity(64);
+                                    for x in &c.commitment { b.extend_from_slice(&x.to_le_bytes()); }
+                                    hex::encode(b)
+                                }).unwrap_or_default(),
+                                "refund_enc_note": e.refund_coin.as_ref().map(|c| hex::encode(&c.enc_note)).unwrap_or_default(),
                             })
                             .to_string()
                             .into_bytes(),

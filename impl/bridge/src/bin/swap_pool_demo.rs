@@ -1,8 +1,10 @@
 //! End-to-end **in-pool private swap** (shielded DEX / OTC) against a live ZCrypt chain.
 //!
 //! Alice swaps asset AAAA for Bob's BBBB via two hashlock-linked swap escrows — one shared
-//! SHA-256 preimage settles both legs atomically. Amounts, asset ids and identities stay
-//! hidden; only the HTLC structure is public. This drives the real `swap_in_pool_progress`
+//! SHA-256 preimage settles both legs atomically. The coins' history stays private (shielded
+//! spends in, fresh leaves out), but in the current design each escrow is transparent: its
+//! value, asset id, hashlock, timeout and both party keys are public on-chain, and the shared
+//! hashlock links the two legs. This drives the real `swap_in_pool_progress`
 //! orchestration + the ABCI `SWAP_LOCK` (0x62) / `HTLC_CLAIM` path, so a GREEN run proves a
 //! private asset↔asset swap works over the wire, not just in unit tests.
 //!
@@ -71,7 +73,7 @@ fn main() {
 
     // TAKER: lock A for the maker.
     let (give_escrow, give_change, give_timeout) =
-        swap::taker_lock_give(&zc, &alice, &[alice_a], &quote, &bob.pubkey(), &lock, &alice_gas).expect("taker lock");
+        swap::taker_lock_give(&zc, &alice, &[alice_a], &quote, &bob.normal_address(), &lock, &alice_gas).expect("taker lock");
     assert_eq!(give_change.value, 400_000, "taker change is the unspent asset; gas is ZCRYPT");
     println!("  [taker] locked {} AAAA, escrow {}, expires at {give_timeout}", quote.give_amount, hex::encode(give_escrow));
 
@@ -81,7 +83,8 @@ fn main() {
         .expect("scan")
         .expect("maker finds the taker's confirmed lock");
     assert_eq!(taker_lock.escrow_id, give_escrow);
-    let (take_escrow, maker_change) = swap::maker_lock_take(&zc, &bob, &[bob_b], &quote, &taker_lock, &bob_gas).expect("maker lock");
+    let (take_escrow, maker_change) =
+        swap::maker_lock_take(&zc, &bob, &[bob_b], &quote, &taker_lock, &alice.normal_address(), &bob_gas).expect("maker lock");
     assert_eq!(maker_change.value, 380_000, "maker change is the unspent asset; gas is ZCRYPT");
     let take_info = swap::query_escrow(&zc, &take_escrow).unwrap().expect("maker escrow open");
     assert!(swap::maker_lock_is_safe(taker_lock.timeout, take_info.timeout_height));
@@ -93,7 +96,8 @@ fn main() {
         .expect("taker finds the maker's confirmed lock");
     assert_eq!(maker_lock.escrow_id, take_escrow);
     zc.broadcast(&swap::claim_tx(&take_escrow, &preimage)).expect("taker claim");
-    let received = alice.htlc_coin(quote.take_amount, asset_b, &take_escrow);
+    let take_note = swap::query_escrow(&zc, &take_escrow).expect("take escrow query").expect("take escrow");
+    let received = swap::coin_from_note(&alice, &take_note.claim_enc_note).expect("decrypt taker claim note");
     println!("  [taker] claimed {} BBBB (preimage now public)", received.value);
 
     // MAKER: read the preimage from the taker's claim and settle the A side.
@@ -102,7 +106,8 @@ fn main() {
         .expect("maker sees the preimage");
     assert_eq!(revealed, preimage);
     zc.broadcast(&swap::claim_tx(&give_escrow, &revealed)).expect("maker claim");
-    let bob_got = bob.htlc_coin(quote.give_amount, asset_a, &give_escrow);
+    let give_note = swap::query_escrow(&zc, &give_escrow).expect("give escrow query").expect("give escrow");
+    let bob_got = swap::coin_from_note(&bob, &give_note.claim_enc_note).expect("decrypt maker claim note");
     println!("  [maker] read preimage at height {at}, claimed {} AAAA", bob_got.value);
 
     assert_eq!(received.asset_id, asset_b);

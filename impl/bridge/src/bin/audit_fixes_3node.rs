@@ -17,7 +17,7 @@ use zcrypt_bridge::swap;
 use zcrypt_bridge::watcher::{watcher_tick, WatcherState};
 use zcrypt_bridge::zcrypt::Zcrypt;
 use zcrypt_bridge::{htlc_script, Btc, Key};
-use zcrypt_core::htlc_shield::{escrow_id, lock_envelope, BURN_PK, ENV_BURN_LOCK, ENV_BURN_LOCK_BTC};
+use zcrypt_core::htlc_shield::{escrow_id, lock_envelope, EscrowKind, BURN_PK, ENV_BURN_LOCK, ENV_BURN_LOCK_BTC};
 use zcrypt_core::keys::{self, Account, Coin};
 use zcrypt_core::nullifier::htlc_hashlock;
 use zcrypt_core::{kem, shield_tx};
@@ -46,16 +46,30 @@ fn burn_lock_zcrypt(
     lock: &[u8; 32],
     timeout: u64,
 ) -> Result<(String, [u8; 32]), String> {
+    // The refund opening is what consensus verifies against `declared`. An aliased
+    // value is outside the coin range and fails here, before any coins are spent.
+    let (_refund_blind, refund_open) =
+        zcrypt_core::htlc_shield::CoinOpening::create(&user.normal_address(), declared, 0)?;
     let burn_blind = keys::random_blind();
     let change_blind = keys::random_blind();
     let change = coin.value - value - FEE;
     let burn_out: OutCoin = (value, burn_blind, BURN_PK, 0);
     let change_out: OutCoin = (change, change_blind, user.pubkey(), 0);
     let note = kem::ciphertext_to_bytes(&keys::encrypt_note(&user.normal_address(), change, change_blind));
-    let env = lock_envelope(ENV_BURN_LOCK, 0, declared, lock, timeout, &user.pubkey(), &user.pubkey(), &[]);
+    let env = lock_envelope(
+        ENV_BURN_LOCK,
+        0,
+        declared,
+        lock,
+        timeout,
+        &user.pubkey(),
+        &user.pubkey(),
+        &[],
+        std::slice::from_ref(&refund_open.coin),
+    );
     let stx = swap::build_shield_spend_bound(zc, &[coin], &[burn_out, change_out], FEE, vec![keys::cover_note_bytes(), note], &env)?;
-    let eid = escrow_id(0, declared, lock, timeout, &user.pubkey());
-    zc.broadcast(&swap::burn_lock_tx(declared, &burn_blind, 0, lock, timeout, &user.pubkey(), &stx)).map(|d| (d, eid))
+    let eid = escrow_id(EscrowKind::Burn, 0, declared, lock, timeout, &user.pubkey(), &user.pubkey());
+    zc.broadcast(&swap::burn_lock_tx(declared, &burn_blind, 0, lock, timeout, &user.pubkey(), &stx, &refund_open)).map(|d| (d, eid))
 }
 
 /// A zBTC burn-for-BTC lock (0x67) as raw bytes plus its change coin, NOT broadcast.
@@ -70,6 +84,8 @@ fn build_burn_lock_btc(
     timeout: u64,
     btc_pk: &bitcoin::PublicKey,
 ) -> Result<(Vec<u8>, Coin), String> {
+    let (_refund_blind, refund_open) =
+        zcrypt_core::htlc_shield::CoinOpening::create(&user.normal_address(), value, asset)?;
     let burn_blind = keys::random_blind();
     let change_blind = keys::random_blind();
     let change = coin.value - value - FEE;
@@ -77,11 +93,19 @@ fn build_burn_lock_btc(
     let change_out: OutCoin = (change, change_blind, user.pubkey(), asset);
     let note = kem::ciphertext_to_bytes(&keys::encrypt_note_asset(&user.normal_address(), change, change_blind, asset));
     let env = lock_envelope(
-        ENV_BURN_LOCK_BTC, asset, value, lock, timeout, &user.pubkey(), &user.pubkey(), &btc_pk.inner.serialize(),
+        ENV_BURN_LOCK_BTC,
+        asset,
+        value,
+        lock,
+        timeout,
+        &user.pubkey(),
+        &user.pubkey(),
+        &btc_pk.inner.serialize(),
+        std::slice::from_ref(&refund_open.coin),
     );
     let stx: shield_tx::ShieldTx =
         swap::build_shield_spend_bound(zc, &[coin], &[burn_out, change_out], FEE, vec![keys::cover_note_bytes(), note], &env)?;
-    let tx = swap::burn_lock_btc_tx(btc_pk, value, &burn_blind, asset, lock, timeout, &user.pubkey(), &stx);
+    let tx = swap::burn_lock_btc_tx(btc_pk, value, &burn_blind, asset, lock, timeout, &user.pubkey(), &stx, &refund_open);
     Ok((tx, user.own_asset_coin(change, change_blind, asset)))
 }
 
@@ -133,7 +157,10 @@ fn main() {
             "setup: the aliased value really shares the commitment"
         );
         let err = burn_lock_zcrypt(&zc, &user, c1, value, aliased, &lock_a, timeout).expect_err("aliased value must be refused");
-        assert!(err.contains("maximum coin value"), "refused for the value bound: {err}");
+        assert!(
+            err.contains("maximum coin value") || err.contains("outside the coin range"),
+            "refused for the value bound: {err}"
+        );
         println!("[PASS] [1] M1: aliased declared value refused at admission ({err})");
         pass += 1;
         // The honest lock with the SAME coin (nothing was burned by the refusal) is accepted.
@@ -197,7 +224,7 @@ fn main() {
     let redeem_preimage = swap::fresh_preimage();
     let redeem_lock = htlc_hashlock(&redeem_preimage);
     let redeem_timeout = zc.height().unwrap() as u64 + swap::ZC_REDEEM_TIMEOUT_BLOCKS;
-    let eid = escrow_id(asset, redeem_value, &redeem_lock, redeem_timeout, &user.pubkey());
+    let eid = escrow_id(EscrowKind::Burn, asset, redeem_value, &redeem_lock, redeem_timeout, &user.pubkey(), &user.pubkey());
     let (tx1, change1) = build_burn_lock_btc(&zc, &user, zcoins[0], asset, redeem_value, &redeem_lock, redeem_timeout, &k1.pk).unwrap();
     let (tx2, _change2) = build_burn_lock_btc(&zc, &user, zcoins[1], asset, redeem_value, &redeem_lock, redeem_timeout, &k2.pk).unwrap();
     // Both pass CheckTx against the SAME committed state (neither escrow exists yet) and race
@@ -318,5 +345,5 @@ fn main() {
 }
 
 fn eid_for(asset: u64, value: u64, lock: &[u8; 32], timeout: u64, user: &Account) -> [u8; 32] {
-    escrow_id(asset, value, lock, timeout, &user.pubkey())
+    escrow_id(EscrowKind::Burn, asset, value, lock, timeout, &user.pubkey(), &user.pubkey())
 }

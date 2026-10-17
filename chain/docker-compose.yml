@@ -143,6 +143,13 @@ services:
       # redeem that names them has been swept/refunded; then drop them. Empty = none.
       ZCRYPT_RESERVE_PREV_KEY_FILES: ${ZCRYPT_RESERVE_PREV_KEY_FILES:-}
       WATCHER_STATE: /data/bridge-watcher-state.json
+      # A FRESH watcher (no state file in the volume) starts scanning at this ZC height
+      # instead of genesis. Ignored once the state file has a cursor.
+      WATCHER_CURSOR_SEED: ${WATCHER_CURSOR_SEED:-}
+      # A fresh watcher whose operator wallet already shows P2WSH (HTLC) sends is refused as
+      # a probably LOST state file (it would fund every open redeem again). Set to 1 only
+      # when that wallet history belongs to a previous, fully settled deployment.
+      ZCRYPT_WATCHER_FRESH_STATE: ${ZCRYPT_WATCHER_FRESH_STATE:-0}
       WATCHER_POLL_SECS: ${WATCHER_POLL_SECS:-10}
       # ZCrypt blocks a redeem escrow must have left before the operator locks BTC.
       # Must exceed the BTC HTLC lock the watcher funds (3.5 days on mainnet) plus a claim
@@ -155,6 +162,8 @@ services:
       BTC_USER: ${BTC_USER:-}
       BTC_PASS: ${BTC_PASS:-}
       BTC_NETWORK: ${BTC_NETWORK:-bitcoin}
+      # The operator wallet must have RBF enabled (bitcoind -walletrbf=1, the default on
+      # recent Core): stale redeem fundings are fee-bumped with `bumpfee`.
       BTC_WALLET: ${BTC_WALLET:-operator}
     volumes:
       - watcher-data:/data

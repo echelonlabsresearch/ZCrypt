@@ -92,14 +92,26 @@ atomic swap with no custodian signature on the settlement path:
 
 * **BTC to zBTC**: fund a P2WSH HTLC on Bitcoin; a mint escrow opens on ZCrypt
   under the same hashlock; claiming either side reveals the preimage that
-  settles the other. The zBTC mints directly into a shielded commitment.
+  settles the other. The zBTC mints into a commitment in the shielded pool. The
+  owner key, value and asset are public at mint time. The beneficiary chooses
+  the blind; an opening proof shows the commitment opens to that public value,
+  asset, and their spend key, and the blind travels only in the encrypted note.
+  While the escrow is retained the record names the settlement commitment, and
+  the blind is never public. After prune a tree-only observer cannot recompute
+  the leaf from the escrow id, but the open transaction still contains the
+  commitment, so block history links the open to the leaf. The coin's later
+  spend is unlinkable like any other coin.
 * **zBTC to BTC**: lock zBTC into a burn escrow; the BTC side pays out against
   the same preimage; the claim records the burn, conserving supply 1:1.
 
 The in-pool swap (`0x62`) reuses this machinery with two ZCrypt legs: two
 parties lock two different assets under one hashlock and one preimage settles
-both, atomically, privately, with no on-chain order book. Pricing happens
-off-chain (RFQ); the chain only ever sees two escrows and a reveal.
+both, atomically, with no on-chain order book. Pricing happens off-chain (RFQ).
+The chain sees two escrows and a reveal, and today those escrows are public:
+asset ids, amounts, hashlock, timeouts and both parties' keys are on chain, so the
+swap is atomic but not yet private (committed-value swaps are the planned fix; the
+wallet already uses fresh stealth keys per swap so the parties are not their
+payment addresses).
 
 Bridge status: protocol proven live in both directions against regtest;
 mainnet-Bitcoin hardening (watcher, confirmations, fee estimation, staggered

@@ -112,10 +112,11 @@ fn main() {
     println!("    relayed A1(deposit)+A2 → chain BTC tip = {}", q(&nodes, "/spv/tip"));
 
     let zc_timeout = nodes[0].height().unwrap() as u64 + 100_000;
+    let (_blind, opening) = swap::spv_claim_opening(&alice.normal_address(), value, asset).expect("claim opening");
     nodes[0]
-        .broadcast(&swap::open_spv_tx(asset, value, &lock, zc_timeout, &alice.pubkey(), &proof, &refund_key))
+        .broadcast(&swap::open_spv_tx(asset, value, &lock, zc_timeout, &alice.pubkey(), &proof, &refund_key, &opening))
         .expect("SPV mint escrow opens");
-    let escrow = htlc_shield::escrow_id(asset, value, &lock, zc_timeout, &alice.pubkey());
+    let escrow = htlc_shield::escrow_id(htlc_shield::EscrowKind::Mint, asset, value, &lock, zc_timeout, &alice.pubkey(), &alice.pubkey());
     nodes[0].broadcast(&swap::claim_tx(&escrow, x)).expect("claim mints (immature) zBTC");
     // Let a block tick so maturity processing has run at least once.
     wait_until(&nodes, "/spv/pending", "1:100000");
@@ -182,10 +183,11 @@ fn main() {
     );
     nodes[0].broadcast(&swap::headers_tx(&cat(&[d1]))).expect("relay small honest deposit");
     let zc_timeout2 = nodes[0].height().unwrap() as u64 + 100_000;
+    let (_blind2, opening2) = swap::spv_claim_opening(&alice.normal_address(), small, asset).expect("claim opening");
     nodes[0]
-        .broadcast(&swap::open_spv_tx(asset, small, &lock2, zc_timeout2, &alice.pubkey(), &proof2, &refund_key))
+        .broadcast(&swap::open_spv_tx(asset, small, &lock2, zc_timeout2, &alice.pubkey(), &proof2, &refund_key, &opening2))
         .expect("small SPV mint escrow");
-    let escrow2 = htlc_shield::escrow_id(asset, small, &lock2, zc_timeout2, &alice.pubkey());
+    let escrow2 = htlc_shield::escrow_id(htlc_shield::EscrowKind::Mint, asset, small, &lock2, zc_timeout2, &alice.pubkey(), &alice.pubkey());
     nodes[0].broadcast(&swap::claim_tx(&escrow2, x2)).expect("small claim");
     // At depth 1 the small mint is already at its value-scaled maturity → matures next sweep.
     let matured = wait_until(&nodes, "/spv/pending", "0:0");

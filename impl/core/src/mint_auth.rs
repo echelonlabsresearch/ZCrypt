@@ -95,9 +95,20 @@ pub struct SignerSig {
 /// different asset, amount, hashlock, timeout, or recipient. The chain id is bound too:
 /// asset ids are chain-independent by design, so without it a testnet mint signature
 /// would replay on mainnet whenever the same key set is registered on both.
-pub fn mint_message(chain_id: &[u8], asset_id: u64, value: u64, hashlock: &Hash, timeout: u64, claim_pk: &PubKey) -> Vec<u8> {
-    let mut m = Vec::with_capacity(16 + 4 + chain_id.len() + 8 + 8 + 32 + 8 + 64);
-    m.extend_from_slice(b"ZC-MINT-AUTH-v2-");
+pub fn mint_message(
+    chain_id: &[u8],
+    asset_id: u64,
+    value: u64,
+    hashlock: &Hash,
+    timeout: u64,
+    claim_pk: &PubKey,
+    claim_commitment: &zcrypt_shield::Commitment,
+    note_bind: &Hash,
+) -> Vec<u8> {
+    // v3 binds the beneficiary's hidden-blind commitment and the note that carries
+    // the blind. A signature that omits them (v2) does not verify.
+    let mut m = Vec::with_capacity(16 + 4 + chain_id.len() + 8 + 8 + 32 + 8 + 64 + 64 + 32);
+    m.extend_from_slice(b"ZC-MINT-AUTH-v3-");
     m.extend_from_slice(&(chain_id.len() as u32).to_le_bytes());
     m.extend_from_slice(chain_id);
     m.extend_from_slice(&asset_id.to_le_bytes());
@@ -107,6 +118,10 @@ pub fn mint_message(chain_id: &[u8], asset_id: u64, value: u64, hashlock: &Hash,
     for x in claim_pk {
         m.extend_from_slice(&x.to_le_bytes());
     }
+    for x in claim_commitment {
+        m.extend_from_slice(&x.to_le_bytes());
+    }
+    m.extend_from_slice(note_bind);
     m
 }
 
@@ -305,7 +320,7 @@ mod tests {
     use super::*;
 
     fn msg_a() -> Vec<u8> {
-        mint_message(b"zcrypt-test", 0xB7C, 50_000, &[7u8; 32], 100, &[3u64; 8])
+        mint_message(b"zcrypt-test", 0xB7C, 50_000, &[7u8; 32], 100, &[3u64; 8], &[1u64; 8], &[2u8; 32])
     }
 
     #[test]
@@ -352,7 +367,7 @@ mod tests {
         // Signatures are bound to the exact mint params — swapping the message must fail.
         let (ks, signers) = derive_keyset(b"treasury-master", 3, 2);
         let sigs = authorize(&ks, &signers, &msg_a());
-        let other = mint_message(b"zcrypt-test", 0xB7C, 50_001, &[7u8; 32], 100, &[3u64; 8]); // value off by one
+        let other = mint_message(b"zcrypt-test", 0xB7C, 50_001, &[7u8; 32], 100, &[3u64; 8], &[1u64; 8], &[2u8; 32]); // value off by one
         assert!(!verify_threshold(&ks, &other, &sigs));
     }
 

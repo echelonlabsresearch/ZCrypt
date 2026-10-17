@@ -19,7 +19,7 @@ use crate::node::{ImmatureMint, Node, NodeSnapshot, Sentinel};
 /// On-disk schema for this module. Bump when key layout changes; older DBs
 /// refuse to open (re-migrate from postcard backup or relaunch) rather than
 /// silently misparse.
-pub const STATE_DB_SCHEMA: u32 = 4;
+pub const STATE_DB_SCHEMA: u32 = 5;
 
 // ---- key layout (default column family) ------------------------------------
 // meta/schema        -> u32 LE

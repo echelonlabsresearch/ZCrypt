@@ -278,18 +278,29 @@ fn main() {
     let preimage = b"gold-mint-preimage-3node-32byte!"; // exactly 32 bytes (consensus rule)
     let lock = zcrypt_core::nullifier::htlc_hashlock(preimage);
     let timeout = zc.height().unwrap() as u64 + 100;
-    let escrow = zcrypt_core::htlc_shield::escrow_id(gold, 500_000, &lock, timeout, &alice.pubkey());
-    let gold_msg = zcrypt_core::mint_auth::mint_message(swap::CHAIN, gold, 500_000, &lock, timeout, &alice.pubkey());
+    let escrow = zcrypt_core::htlc_shield::escrow_id(zcrypt_core::htlc_shield::EscrowKind::Mint, gold, 500_000, &lock, timeout, &alice.pubkey(), &alice.pubkey());
+    let (gold_blind, gold_open) =
+        zcrypt_core::htlc_shield::CoinOpening::create(&alice.normal_address(), 500_000, gold).expect("gold opening");
+    let gold_msg = zcrypt_core::mint_auth::mint_message(
+        swap::CHAIN,
+        gold,
+        500_000,
+        &lock,
+        timeout,
+        &alice.pubkey(),
+        &gold_open.coin.commitment,
+        &gold_open.coin.note_bind(),
+    );
     let gold_auth = zcrypt_core::mint_auth::encode_auth(
         &gold_ks,
         &zcrypt_core::mint_auth::authorize(&gold_ks, &gold_signers, &gold_msg),
     );
     let og = gas_for(&zc, &alice);
-    let open_body = swap::open_body(gold, 500_000, &lock, timeout, &alice.pubkey(), &gold_auth);
+    let open_body = swap::open_body(gold, 500_000, &lock, timeout, &alice.pubkey(), &gold_open, &gold_auth);
     let ogp = swap::build_gas_prefix(&zc, &alice, &og, &open_body).expect("open gas");
-    zc.broadcast(&swap::open_tx(gold, 500_000, &lock, timeout, &alice.pubkey(), &gold_auth, &ogp)).expect("htlc open");
+    zc.broadcast(&swap::open_tx(gold, 500_000, &lock, timeout, &alice.pubkey(), &gold_open, &gold_auth, &ogp)).expect("htlc open");
     zc.broadcast(&swap::claim_tx(&escrow, preimage)).expect("htlc claim mints GOLD");
-    let gold_coin = alice.htlc_coin(500_000, gold, &escrow);
+    let gold_coin = alice.htlc_coin(500_000, gold, gold_blind);
     let (g0, gn0) = pay_asset(&bob.normal_address(), 300_000, keys::random_blind(), gold);
     let (g1, gn1) = pay_asset(&alice.normal_address(), 500_000 - 300_000, keys::random_blind(), gold);
     // A GOLD transfer pays its gas in ZCRYPT (the moved asset is never burned).
@@ -493,7 +504,7 @@ fn main() {
     let lock = zcrypt_core::nullifier::htlc_hashlock(&preimage);
     let alice_gas = gas_for(&zc, &alice);
     let (give_escrow, give_change, _give_timeout) =
-        swap::taker_lock_give(&zc, &alice, &[alice_a], &quote, &bob.pubkey(), &lock, &alice_gas)
+        swap::taker_lock_give(&zc, &alice, &[alice_a], &quote, &bob.normal_address(), &lock, &alice_gas)
             .expect("taker lock");
     assert_eq!(give_change.value, 400_000, "taker change is the unspent asset; gas is ZCRYPT");
     let taker_lock = swap::find_swap_lock(
@@ -504,17 +515,20 @@ fn main() {
     assert_eq!(taker_lock.escrow_id, give_escrow);
     let bob_gas = gas_for(&zc, &bob);
     let (take_escrow, maker_change) =
-        swap::maker_lock_take(&zc, &bob, &[bob_b], &quote, &taker_lock, &bob_gas).expect("maker lock");
+        swap::maker_lock_take(&zc, &bob, &[bob_b], &quote, &taker_lock, &alice.normal_address(), &bob_gas).expect("maker lock");
     assert_eq!(maker_change.value, 380_000, "maker change is the unspent asset; gas is ZCRYPT");
     zc.broadcast(&swap::claim_tx(&take_escrow, &preimage)).expect("taker claim");
-    let received = alice.htlc_coin(quote.take_amount, asset_b, &take_escrow);
+    let take_info = swap::query_escrow(&zc, &take_escrow).expect("take escrow query").expect("take escrow");
+    let received = swap::coin_from_note(&alice, &take_info.claim_enc_note).expect("decrypt taker claim note");
     let (revealed, _) = swap::find_claim_preimage(&zc, scan_from, zc.height().unwrap(), &take_escrow, &lock)
         .expect("scan")
         .expect("maker sees the preimage");
     assert_eq!(revealed, preimage);
     zc.broadcast(&swap::claim_tx(&give_escrow, &revealed)).expect("maker claim");
     assert_eq!(received.value, 120_000);
-    assert_eq!(bob.htlc_coin(quote.give_amount, asset_a, &give_escrow).value, 100_000);
+    let give_info = swap::query_escrow(&zc, &give_escrow).expect("give escrow query").expect("give escrow");
+    let bob_got = swap::coin_from_note(&bob, &give_info.claim_enc_note).expect("decrypt maker claim note");
+    assert_eq!(bob_got.value, 100_000);
     println!(
         "[7] in-pool swap settled: each lock burned 0.01 ZCRYPT; Alice change {} AAAA, received {} BBBB; Bob change {} BBBB",
         give_change.value, received.value, maker_change.value

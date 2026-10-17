@@ -11,7 +11,7 @@
 use crate::esplora::WalletUtxo;
 use crate::hdwallet::HdWallet;
 use bitcoin::hashes::Hash as _;
-use bitcoin::secp256k1::{Message, Secp256k1};
+use bitcoin::secp256k1::{Message, Secp256k1, SecretKey};
 use bitcoin::sighash::{EcdsaSighashType, SighashCache};
 use bitcoin::{Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid, Witness};
 use std::str::FromStr;
@@ -28,6 +28,7 @@ const VB_OUTPUT: u64 = 43;
 const VB_OVERHEAD: u64 = 11;
 
 /// A signed, ready-to-broadcast transaction.
+#[derive(Debug, Clone)]
 pub struct SignedTx {
     pub txid: Txid,
     pub hex: String,
@@ -40,6 +41,11 @@ pub struct SignedTx {
 fn est_fee(n_in: usize, n_out: usize, fee_rate_sat_vb: f64) -> u64 {
     let vsize = VB_OVERHEAD + VB_INPUT * n_in as u64 + VB_OUTPUT * n_out as u64;
     (vsize as f64 * fee_rate_sat_vb).ceil() as u64
+}
+
+/// `amount + fee` without wrapping (an absurd amount is an error, not a tiny target).
+fn need(amount: u64, fee: u64) -> Result<u64, String> {
+    amount.checked_add(fee).ok_or_else(|| "amount + fee overflows u64".to_string())
 }
 
 /// Build + sign a transaction paying `amount` to `dest_spk`, funded from the wallet's
@@ -71,35 +77,38 @@ pub fn build_and_sign(
     let mut in_total: u64 = 0;
     for u in &avail {
         chosen.push(u);
-        in_total += u.utxo.value;
+        // Values come from untrusted Esplora JSON: never let a lying endpoint wrap the sum.
+        in_total = in_total
+            .checked_add(u.utxo.value)
+            .ok_or("utxo values overflow u64: refusing to build from this coin set")?;
         let fee = est_fee(chosen.len(), 2, fee_rate_sat_vb);
-        if in_total >= amount + fee {
+        if in_total >= need(amount, fee)? {
             break;
         }
     }
     let fee_two_out = est_fee(chosen.len(), 2, fee_rate_sat_vb);
-    if in_total < amount + fee_two_out {
+    let need_two_out = need(amount, fee_two_out)?;
+    if in_total < need_two_out {
         let have = in_total;
         return Err(format!(
-            "insufficient funds: need ~{} sat (amount {amount} + fee), confirmed balance {have} sat across {} coin(s)",
-            amount + fee_two_out,
+            "insufficient funds: need ~{need_two_out} sat (amount {amount} + fee), confirmed balance {have} sat across {} coin(s)",
             chosen.len()
         ));
     }
 
     // Decide change: if the change output would be dust, drop it (add to fee, 1 output).
-    let mut change = in_total - amount - fee_two_out;
+    let change = in_total - amount - fee_two_out;
     let mut outputs = vec![TxOut { value: Amount::from_sat(amount), script_pubkey: dest_spk }];
     let fee = if change > DUST {
         outputs.push(TxOut { value: Amount::from_sat(change), script_pubkey: change_spk });
         fee_two_out
     } else {
-        // No change output: recompute fee for a single output; the remainder is the fee.
-        let fee_one_out = est_fee(chosen.len(), 1, fee_rate_sat_vb);
-        change = 0;
-        in_total - amount - if in_total >= amount + fee_one_out { fee_one_out } else { fee_two_out }
+        // No change output: everything above `amount` IS the fee the network collects, so
+        // report exactly that (bridge M10). The M4 cap below then runs on the real fee, not
+        // on a smaller estimate that hid the dust folded into it.
+        in_total - amount
     };
-    let _ = change;
+    debug_assert_eq!(in_total, outputs.iter().map(|o| o.value.to_sat()).sum::<u64>() + fee);
     // Bridge M4: refuse to pay more than a quarter of the amount in fees (the relay floor for
     // a 1-in/2-out P2WPKH tx at 1 sat/vB is the only exception, for dust-level amounts).
     let floor = est_fee(chosen.len(), 2, 1.0);
@@ -137,15 +146,18 @@ pub fn build_and_sign(
     let mut cache = SighashCache::new(&tx);
     let mut witnesses = Vec::with_capacity(chosen.len());
     for (i, u) in chosen.iter().enumerate() {
-        let sk = wallet.signing_key(u.change, u.index)?;
-        let pk = sk.public_key(&secp); // compressed
-        let wpkh = pk.wpubkey_hash().map_err(|e| format!("uncompressed key: {e}"))?;
-        let spk = ScriptBuf::new_p2wpkh(&wpkh); // the P2WPKH output being spent
+        // The per-input key lives only for this iteration: the 32 bytes come in a zeroizing
+        // buffer and the transient `SecretKey` is erased after signing (bridge L6).
+        let secret = wallet.signing_secret(u.change, u.index)?;
+        let mut sk = SecretKey::from_slice(secret.as_ref()).map_err(|e| format!("derived key: {e}"))?;
+        let pk = bitcoin::CompressedPublicKey(sk.public_key(&secp));
+        let spk = ScriptBuf::new_p2wpkh(&pk.wpubkey_hash()); // the P2WPKH output being spent
         let sighash = cache
             .p2wpkh_signature_hash(i, &spk, Amount::from_sat(u.utxo.value), EcdsaSighashType::All)
             .map_err(|e| e.to_string())?;
         let msg = Message::from_digest(sighash.to_byte_array());
-        let sig = secp.sign_ecdsa(&msg, &sk.inner);
+        let sig = secp.sign_ecdsa(&msg, &sk);
+        sk.non_secure_erase();
         let mut ser = sig.serialize_der().to_vec();
         ser.push(EcdsaSighashType::All as u8);
         let mut w = Witness::new();
@@ -242,6 +254,60 @@ mod tests {
         let out_total: u64 = tx.output.iter().map(|o| o.value.to_sat()).sum();
         // inputs (100_000) == outputs + fee, exactly (no value created or lost).
         assert_eq!(100_000, out_total + signed.fee);
+    }
+
+    #[test]
+    fn dust_change_is_folded_into_the_reported_fee() {
+        // Bridge M10: pick an input so the leftover after amount + 2-output fee is under DUST.
+        // The tx then has ONE output and the whole remainder is the fee; `SignedTx.fee` must
+        // say so (it used to under-report by the folded dust, so the M4 cap ran on the wrong
+        // number).
+        let w = HdWallet::from_mnemonic(MN, "", Network::Signet).unwrap();
+        let rate = 2.0;
+        let fee_two_out = est_fee(1, 2, rate);
+        let amount = 50_000;
+        let in_value = amount + fee_two_out + 100; // 100 sat leftover: dust, no change output
+        let utxos = vec![wu(0, 0, in_value, 0xe5)];
+        let dest = w.receive_address(1).unwrap().script_pubkey();
+        let change = w.change_address(0).unwrap().script_pubkey();
+        let signed = build_and_sign(&w, &utxos, dest, amount, change, rate).unwrap();
+        let raw = hex::decode(&signed.hex).unwrap();
+        let tx: Transaction = bitcoin::consensus::encode::deserialize(&raw).unwrap();
+        assert_eq!(tx.output.len(), 1, "dust change must be dropped");
+        let out_total: u64 = tx.output.iter().map(|o| o.value.to_sat()).sum();
+        assert_eq!(in_value, out_total + signed.fee, "inputs == outputs + reported fee");
+        assert_eq!(signed.fee, fee_two_out + 100, "the folded dust is part of the fee");
+    }
+
+    #[test]
+    fn dust_change_fee_is_subject_to_the_quarter_cap() {
+        // With the real fee reported, a dust-fold that pushes the fee over amount/4 is refused.
+        let w = HdWallet::from_mnemonic(MN, "", Network::Signet).unwrap();
+        let rate = 1.0;
+        let fee_two_out = est_fee(1, 2, rate);
+        let amount = 1_000;
+        // Leftover 300 is below DUST (330) so it folds into the fee: 300 + fee > 250 = amount/4.
+        let utxos = vec![wu(0, 0, amount + fee_two_out + 300, 0xe6)];
+        let dest = w.receive_address(1).unwrap().script_pubkey();
+        let change = w.change_address(0).unwrap().script_pubkey();
+        let err = build_and_sign(&w, &utxos, dest, amount, change, rate).unwrap_err();
+        assert!(err.contains("exceeds a quarter"), "{err}");
+    }
+
+    #[test]
+    fn utxo_value_overflow_is_an_error_not_a_wrap() {
+        let w = HdWallet::from_mnemonic(MN, "", Network::Signet).unwrap();
+        let dest = w.receive_address(1).unwrap().script_pubkey();
+        let change = w.change_address(0).unwrap().script_pubkey();
+        // First coin is short of amount + fee (165 sat at 1 sat/vB for 1-in/2-out), so the
+        // second is added and the sum wraps: must be a clean error, not a wrapped total.
+        let utxos = vec![wu(0, 0, u64::MAX - 1_000, 0xe7), wu(0, 1, 2_000, 0xe8)];
+        let err = build_and_sign(&w, &utxos, dest.clone(), u64::MAX - 500, change.clone(), 1.0).unwrap_err();
+        assert!(err.contains("overflow"), "{err}");
+        // amount + fee itself wrapping is also an error.
+        let utxos = vec![wu(0, 0, u64::MAX, 0xe9)];
+        let err = build_and_sign(&w, &utxos, dest, u64::MAX - 5, change, 1.0).unwrap_err();
+        assert!(err.contains("overflow"), "{err}");
     }
 
     #[test]

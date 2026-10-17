@@ -252,8 +252,11 @@ mod tests {
             node.register_asset("GOLD", 8, Some(keyset.commitment()), 21_000_000 * 100_000_000).unwrap();
         let lock = htlc_hashlock(b"x");
         let (value, timeout, pk) = (100u64, 50u64, account.pubkey());
+        let (_, opening) = crate::htlc_shield::CoinOpening::create(&account.normal_address(), value, asset).unwrap();
         let authority = node.asset_meta(asset).and_then(|m| m.authority);
-        let msg = mint_auth::mint_message(b"zcrypt-test", asset, value, &lock, timeout, &pk);
+        let msg = mint_auth::mint_message(
+            b"zcrypt-test", asset, value, &lock, timeout, &pk, &opening.coin.commitment, &opening.coin.note_bind(),
+        );
 
         // valid M-of-N authorization: VM and node agree it is accepted.
         let sigs = mint_auth::authorize(&keyset, &signers, &msg);
@@ -264,7 +267,7 @@ mod tests {
             mint_sigs: sigs.clone(),
             ..Default::default()
         };
-        let node_ok = node.htlc_open(b"zcrypt-test", asset, value, lock, timeout, pk, &keyset, &sigs).is_ok();
+        let node_ok = node.htlc_open(b"zcrypt-test", asset, value, lock, timeout, pk, &opening, &keyset, &sigs).is_ok();
         assert!(node_ok);
         assert_eq!(evaluate(HTLC_OPEN, &ctx).accept, node_ok);
 
@@ -278,7 +281,7 @@ mod tests {
             mint_sigs: bad_sigs.clone(),
             ..Default::default()
         };
-        let node_bad = node.htlc_open(b"zcrypt-test", asset, value, lock, timeout, pk, &bad_keyset, &bad_sigs).is_ok();
+        let node_bad = node.htlc_open(b"zcrypt-test", asset, value, lock, timeout, pk, &opening, &bad_keyset, &bad_sigs).is_ok();
         assert_eq!(evaluate(HTLC_OPEN, &ctx_bad).accept, node_bad);
         assert!(!evaluate(HTLC_OPEN, &ctx_bad).accept);
     }
@@ -298,9 +301,12 @@ mod tests {
         // Open a mint escrow with a valid M-of-N authorization over the exact params.
         let open = |node: &mut Node, value: u64, lock: [u8; 32], timeout: u64| {
             let pk = account.pubkey();
-            let msg = mint_auth::mint_message(b"zcrypt-test", asset, value, &lock, timeout, &pk);
+            let (_, opening) = crate::htlc_shield::CoinOpening::create(&account.normal_address(), value, asset).unwrap();
+            let msg = mint_auth::mint_message(
+                b"zcrypt-test", asset, value, &lock, timeout, &pk, &opening.coin.commitment, &opening.coin.note_bind(),
+            );
             let sigs = mint_auth::authorize(&keyset, &signers, &msg);
-            node.htlc_open(b"zcrypt-test", asset, value, lock, timeout, pk, &keyset, &sigs)
+            node.htlc_open(b"zcrypt-test", asset, value, lock, timeout, pk, &opening, &keyset, &sigs)
         };
         let id = open(&mut node, 100, lock, 100).unwrap();
 

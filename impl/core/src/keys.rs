@@ -423,15 +423,11 @@ impl Account {
         }
     }
 
-    /// Reconstruct the HTLC settlement coin you claimed (`value` of `asset_id`
-    /// under `escrow_id`) — a normal spendable coin bound to your spend key.
-    pub fn htlc_coin(&self, value: u64, asset_id: u64, escrow_id: &Hash) -> Coin {
-        Coin {
-            value,
-            blind: htlc_blind(&self.pubkey(), escrow_id),
-            spend_secret: self.spend_secret,
-            asset_id,
-        }
+    /// Reconstruct the HTLC settlement coin you were paid (`value` of `asset_id`
+    /// under the blind you chose, or decrypted from the escrow's note). The blind
+    /// is not a function of the escrow id.
+    pub fn htlc_coin(&self, value: u64, asset_id: u64, blind: Blind) -> Coin {
+        self.own_asset_coin(value, blind, asset_id)
     }
 
     /// Reconstruct the `index`-th bridge-fee coin of `value` in `asset_id` you claimed
@@ -626,19 +622,15 @@ pub fn claim_chunks(amount: u64, first_claim: bool) -> Vec<u64> {
     out
 }
 
-/// Deterministic public blind for an HTLC settlement coin — keyed by the unique
-/// `escrow_id` so it can never collide with a reward coin's blind.
+/// Retired public settlement blind. Settlement coins no longer use it: the
+/// beneficiary samples a hidden blind and proves the opening. Kept so a leaf built
+/// the old way can still be recognized, and so it is not reused by accident for a
+/// new escrow.
+#[allow(dead_code)]
 pub fn htlc_blind(pk: &PubKey, escrow_id: &Hash) -> Blind {
     let d0 = h(b"ZC-HTLC-BLIND", &[&pk_bytes(pk), escrow_id]);
     let d1 = h(b"ZC-HTLC-BLN2", &[&pk_bytes(pk), escrow_id]);
     blind_from_digests(&d0, &d1)
-}
-
-/// The coinbase commitment the node mints to settle an HTLC claim: `value` of
-/// `asset_id` bound to the claimer's `pk` under `escrow_id`. The claimer
-/// reconstructs the spendable coin with [`Account::htlc_coin`].
-pub fn htlc_commitment(pk: &PubKey, value: u64, asset_id: u64, escrow_id: &Hash) -> Commitment {
-    zcrypt_shield::commit_asset(value, &htlc_blind(pk, escrow_id), pk, asset_id)
 }
 
 /// Encrypt an on-chain note carrying `(value, blind)` to a recipient address

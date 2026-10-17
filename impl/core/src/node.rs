@@ -245,7 +245,10 @@ pub struct NodeSnapshot {
 /// so older state refuses to load (the chain relaunches fresh with these consensus changes).
 /// v12: `AssetMeta::{reserve_pk, retired_reserves}` (SPV reserve-key rotation).
 /// v14: `ws_passed`, the weak-subjectivity record. Older state refuses to load.
-const SNAPSHOT_VERSION: u32 = 14;
+/// v16: each escrow stores the beneficiary's hidden settlement coin (commitment +
+/// encrypted note) instead of a public blind. Positional layout change, so older
+/// state refuses to load.
+const SNAPSHOT_VERSION: u32 = 16;
 /// Public mirror of the postcard snapshot format version (for `state_db` restore).
 pub const SNAPSHOT_VERSION_PUB: u32 = SNAPSHOT_VERSION;
 
@@ -319,6 +322,66 @@ impl Node {
             if !batch.insert(c) || self.commitment_tree.contains(&c) {
                 return Err("duplicate commitment: this opening is already in the tree".into());
             }
+            // Audit 2026-10 C1: the settlement coin of an open escrow, or of a mint awaiting
+            // Bitcoin maturity, is a public function of public data. Refuse it as an output so
+            // nobody can pre-insert it and make the settlement (or the maturity sweep) collide.
+            if self.htlc.is_reserved(&c) {
+                return Err("duplicate commitment: this opening is reserved for an open escrow".into());
+            }
+            if self.immature.iter().any(|m| m.commitment == c) {
+                return Err("duplicate commitment: this opening is an immature SPV mint".into());
+            }
+        }
+        Ok(())
+    }
+
+    /// Refuse to create an escrow whose id is taken or whose settlement coins already
+    /// exist (as leaves, reserved by another escrow, or immature). Run BEFORE a lock's
+    /// spend is applied or a deposit outpoint is burned, so a pre-inserted coin can
+    /// only make the open fail cleanly. The coins are the beneficiary's openings, not
+    /// a public function of the escrow id.
+    #[allow(clippy::too_many_arguments)]
+    fn settlement_fresh(
+        &self,
+        kind: crate::htlc_shield::EscrowKind,
+        asset_id: u64,
+        value: u64,
+        hashlock: &Hash,
+        timeout_height: u64,
+        party_pk: &zcrypt_shield::PubKey,
+        refund_pk: &zcrypt_shield::PubKey,
+        coins: &[zcrypt_shield::Commitment],
+    ) -> Result<Hash, String> {
+        let id = crate::htlc_shield::escrow_id(
+            kind, asset_id, value, hashlock, timeout_height, party_pk, refund_pk,
+        );
+        self.htlc.id_available(&id, timeout_height)?;
+        if coins.is_empty() {
+            return Err("escrow settlement coin missing".into());
+        }
+        let mut seen = std::collections::HashSet::new();
+        for c in coins {
+            if !seen.insert(*c) {
+                return Err("escrow settlement coins must be distinct".into());
+            }
+        }
+        self.note_outputs_fresh(coins.iter().copied()).map_err(|e| format!("escrow settlement coin: {e}"))?;
+        Ok(id)
+    }
+
+    /// The settlement coin must be appendable BEFORE the escrow flips, or a duplicate
+    /// leaf / full tree would leave it settled with nothing appended (audit L14).
+    /// The escrow's own reservation is not a conflict: this coin is that reservation.
+    /// An SPV mint goes to the immature queue, so a full tree does not block it.
+    fn guard_settlement_append(&self, c: &zcrypt_shield::Commitment, hold_immature: bool) -> Result<(), String> {
+        if self.commitment_tree.contains(c) {
+            return Err("settlement refused: the coin is already a tree leaf".into());
+        }
+        if self.immature.iter().any(|m| m.commitment == *c) {
+            return Err("settlement refused: the coin is already an immature mint".into());
+        }
+        if !hold_immature && self.commitment_tree.len() >= (1usize << zcrypt_shield::tree::DEPTH) {
+            return Err("commitment tree is full: no further coins can be created".into());
         }
         Ok(())
     }
@@ -337,6 +400,7 @@ impl Node {
     /// transaction and the maturity sweep: records the block-boundary anchor root and prunes
     /// settled escrows past their retention. Deterministic in committed state.
     pub fn end_block(&mut self) {
+        self.expire_due_escrows();
         let root = self.commitment_tree.root();
         if self.block_roots.back() != Some(&root) {
             self.block_roots.push_back(root);
@@ -345,6 +409,25 @@ impl Node {
             }
         }
         self.htlc.prune_settled(self.current_height);
+    }
+
+    /// Expire every open escrow whose timeout has been reached (audit 2026-10, M3): the
+    /// locker's refund coin is appended and an unclaimed SPV mint releases its deposit
+    /// outpoint. Deterministic in committed state, so every validator does the same work in
+    /// the same block. A `0x5C` sent for one of these afterwards simply finds it settled.
+    /// Returns the ids expired this block.
+    pub fn expire_due_escrows(&mut self) -> Vec<Hash> {
+        let due = self.htlc.due_open_ids(self.current_height);
+        let mut done = Vec::with_capacity(due.len());
+        for id in due {
+            match self.htlc_expire(&id) {
+                Ok(_) => done.push(id),
+                // Only reachable if a settlement coin is somehow already a leaf despite the
+                // reservation; leave the escrow for the next block rather than halting.
+                Err(_) => {}
+            }
+        }
+        done
     }
 
     /// Capture all consensus state as a serializable snapshot at `height`.
@@ -601,6 +684,7 @@ impl Node {
         hashlock: Hash,
         timeout_height: u64,
         claim_pk: zcrypt_shield::PubKey,
+        opening: &crate::htlc_shield::CoinOpening,
         keyset: &crate::mint_auth::MintKeySet,
         sigs: &[crate::mint_auth::SignerSig],
     ) -> Result<Hash, String> {
@@ -609,14 +693,20 @@ impl Node {
         }
         self.check_timeout_horizon(timeout_height, crate::htlc_shield::MAX_ESCROW_HORIZON_BLOCKS)?;
         lock_value_ok(value)?;
+        opening.verify(&claim_pk, value, asset_id)?;
         // VM gate: HTLC_OPEN = [CHECK_ASSET_HAS_AUTHORITY, CHECK_THRESHOLD_SIG]. The mint
         // message is derived HERE from the actual escrow parameters (and the chain id), so
         // the M-of-N signatures authorize exactly this asset/value/hashlock/timeout/recipient
-        // on this chain: a captured signature can't be replayed onto a different mint.
+        // AND this claim coin on this chain: a captured signature can't be replayed onto a
+        // different mint, and a front-runner can't substitute a commitment the beneficiary
+        // cannot open.
         let ctx = zvm::Ctx {
             authority: self.assets.meta(asset_id).and_then(|m| m.authority),
             mint_keyset: Some(keyset.clone()),
-            mint_msg: crate::mint_auth::mint_message(chain_id, asset_id, value, &hashlock, timeout_height, &claim_pk),
+            mint_msg: crate::mint_auth::mint_message(
+                chain_id, asset_id, value, &hashlock, timeout_height, &claim_pk,
+                &opening.coin.commitment, &opening.coin.note_bind(),
+            ),
             mint_sigs: sigs.to_vec(),
             ..Default::default()
         };
@@ -645,7 +735,11 @@ impl Node {
         }
         // Personal / M-of-N minted assets are not SPV-backed, so no maturity: mint
         // immediately on claim (spv_deposit = None).
-        self.htlc.open(asset_id, value, hashlock, timeout_height, claim_pk, None)
+        self.settlement_fresh(
+            crate::htlc_shield::EscrowKind::Mint, asset_id, value, &hashlock, timeout_height, &claim_pk, &claim_pk,
+            &[opening.coin.commitment],
+        )?;
+        self.htlc.open(asset_id, value, hashlock, timeout_height, claim_pk, None, opening.coin.clone())
     }
 
     /// Submit a batch of raw Bitcoin headers (concatenated 80-byte headers) to the
@@ -674,6 +768,7 @@ impl Node {
         claim_pk: zcrypt_shield::PubKey,
         proof: &crate::spv::MintProof,
         open_auth: &[u8],
+        opening: &crate::htlc_shield::CoinOpening,
     ) -> Result<Hash, String> {
         if !crate::asset_registry::asset_id_ok(asset_id) {
             return Err("asset id is not a canonical field element".to_string());
@@ -682,6 +777,14 @@ impl Node {
         // lock (see the claim gate in `htlc_claim`).
         self.check_timeout_horizon(timeout_height, MAX_SPV_CLAIM_WINDOW)?;
         lock_value_ok(value)?;
+        // The claim coin is the recipient's net of the bridge fee. The opening proves
+        // that amount, not the gross deposit.
+        let fee = crate::emission::bridge_fee(value);
+        let net = value - fee;
+        if net == 0 {
+            return Err("SPV mint net of the bridge fee is zero".to_string());
+        }
+        opening.verify(&claim_pk, net, asset_id)?;
         let meta = self.assets.meta(asset_id);
         let authority = meta.and_then(|m| m.authority);
         // Verify the deposit against the consensus header chain FIRST (pure read),
@@ -712,6 +815,8 @@ impl Node {
             value,
             hashlock: &hashlock,
             timeout_height,
+            claim_commitment: &opening.coin.commitment,
+            note_bind: &opening.coin.note_bind(),
         };
         crate::spv::verify_open_auth(&proof.refund_pk, &auth, open_auth)?;
         // The locktime window above was measured from the known tip; that tip must be fresh.
@@ -734,7 +839,13 @@ impl Node {
             vout,
             btc_locktime: proof.btc_locktime,
         };
-        let id = self.htlc.open(asset_id, value, hashlock, timeout_height, claim_pk, Some(deposit))?;
+        self.settlement_fresh(
+            crate::htlc_shield::EscrowKind::Mint, asset_id, value, &hashlock, timeout_height, &claim_pk, &claim_pk,
+            &[opening.coin.commitment],
+        )?;
+        let id = self.htlc.open(
+            asset_id, value, hashlock, timeout_height, claim_pk, Some(deposit), opening.coin.clone(),
+        )?;
         // Only after the escrow exists: burn the deposit outpoint so it can never
         // authorize a second mint.
         self.spv.claim_outpoint(outpoint);
@@ -769,6 +880,12 @@ impl Node {
 
     /// Public form of [`Self::require_fresh_btc_tip`] for mempool admission parity.
     pub fn btc_tip_fresh(&self, what: &str) -> Result<(), String> {
+        // Audit 2026-10 L13: between a restart and the first FinalizeBlock the node has no
+        // block clock, and delivery treats that as "no check". The mempool must not: without
+        // a clock the tip's freshness is unknown, so refuse until the first block lands.
+        if self.current_block_time == 0 {
+            return Err(format!("{what} refused: no block clock yet (node just started); retry after the next block"));
+        }
         self.require_fresh_btc_tip(what)
     }
 
@@ -824,12 +941,39 @@ impl Node {
                 }
                 // On the best chain and buried to its value-scaled depth → MATURE.
                 Some(conf) if conf >= self.spv.maturity_for(m.value) => {
-                    self.append_and_record(m.commitment)
-                        .expect("commitment tree full while maturing a mint: halting rather than dropping a backed coin");
-                    // Skim the bridge fee to stakers now that the mint is reorg-safe (a
-                    // voided mint never reaches here, so it never yields a fee).
-                    self.staking.accrue_bridge_fee(m.asset_id, m.fee);
-                    report.matured.push(m.commitment);
+                    match self.commitment_tree.append(m.commitment) {
+                        Ok(_) => {
+                            let root = self.commitment_tree.root();
+                            if self.recent_roots.back() != Some(&root) {
+                                self.recent_roots.push_back(root);
+                                while self.recent_roots.len() > INTRA_BLOCK_ROOT_WINDOW {
+                                    self.recent_roots.pop_front();
+                                }
+                            }
+                            // Skim the bridge fee to stakers now that the mint is reorg-safe (a
+                            // voided mint never reaches here, so it never yields a fee).
+                            self.staking.accrue_bridge_fee(m.asset_id, m.fee);
+                            report.matured.push(m.commitment);
+                        }
+                        // Audit 2026-10 C1: the coin is reserved while immature, so this is
+                        // unreachable through transactions; if it ever happens, void the mint
+                        // deterministically (burn the supply back, free the deposit) instead of
+                        // panicking inside FinalizeBlock on every validator.
+                        Err(AppendError::Duplicate) => {
+                            let _ = self.assets.record_burn(m.asset_id, m.value);
+                            let mut op = [0u8; 36];
+                            op[..32].copy_from_slice(&m.deposit_txid);
+                            op[32..].copy_from_slice(&m.deposit_vout.to_le_bytes());
+                            self.spv.release_outpoint(&op);
+                            report.voided.push(m.commitment);
+                            report.voided_value += m.value;
+                        }
+                        Err(AppendError::Full) => {
+                            // Keep waiting: a full tree is a chain-wide condition every
+                            // validator sees identically; the coin stays backed and pending.
+                            still_pending.push(m);
+                        }
+                    }
                 }
                 // On the best chain but not yet deep enough → keep waiting (and clear any
                 // stale orphan mark: the deposit is canonical again, e.g. after re-anchor).
@@ -852,6 +996,37 @@ impl Node {
     /// resumes maturing. Fails if no immature mint matches the proof's txid, or the proof
     /// doesn't validate on the best chain — so a genuine double-spend (tx absent) can
     /// never be re-anchored and will be voided when its grace elapses.
+    /// Read-only mirror of [`Self::reanchor_deposit`] for mempool admission (audit 2026-10
+    /// M5): the full SPV re-verification plus the "must change something" rule, so a re-anchor
+    /// that would fail at delivery never occupies block space.
+    pub fn precheck_reanchor(&self, proof: &crate::spv::MintProof) -> Result<(), String> {
+        let txid = proof.funding_txid().ok_or("reanchor: bad funding tx")?;
+        let m = self
+            .immature
+            .iter()
+            .find(|m| m.deposit_txid == txid && m.deposit_vout == proof.vout)
+            .ok_or("reanchor: no immature mint for this deposit outpoint")?;
+        let reserve = self
+            .assets
+            .meta(m.asset_id)
+            .and_then(|a| a.reserve_auth())
+            .ok_or("reanchor: asset has no SPV authority")?;
+        let (op, new_block) = self.spv.verify_reanchor_with(&reserve, m.value, &m.hashlock, proof)?;
+        let mut expected_op = [0u8; 36];
+        expected_op[..32].copy_from_slice(&m.deposit_txid);
+        expected_op[32..].copy_from_slice(&m.deposit_vout.to_le_bytes());
+        if op != expected_op {
+            return Err("reanchor: proof outpoint does not match the immature mint's deposit".to_string());
+        }
+        if !self.spv.is_claimed(&op) {
+            return Err("reanchor: deposit outpoint is not in the claimed set".to_string());
+        }
+        if m.orphaned_at_btc.is_none() && m.deposit_block == new_block {
+            return Err("reanchor: deposit is already anchored to that block".to_string());
+        }
+        Ok(())
+    }
+
     pub fn reanchor_deposit(&mut self, proof: &crate::spv::MintProof) -> Result<Hash, String> {
         let txid = proof.funding_txid().ok_or("reanchor: bad funding tx")?;
         // Match the full outpoint (txid ‖ vout) so multi-output deposits cannot re-anchor
@@ -982,6 +1157,7 @@ impl Node {
         // plain `0x5D` burn-lock. Bound into the proof either way, so the operator's watcher
         // reads a payout key the coin's owner actually authorized.
         btc_claim_pk: &[u8],
+        refund: &crate::htlc_shield::CoinOpening,
     ) -> Result<Hash, String> {
         if !crate::asset_registry::asset_id_ok(asset_id) {
             return Err("asset id is not a canonical field element".to_string());
@@ -1018,14 +1194,19 @@ impl Node {
             bitcoin::secp256k1::PublicKey::from_slice(btc_claim_pk)
                 .map_err(|e| format!("burn-lock: malformed btc_claim_pk: {e}"))?;
         }
-        // Escrow id is deterministic; refuse before burning coins if it already exists.
-        let eid = crate::htlc_shield::escrow_id(asset_id, value, &hashlock, timeout_height, &refund_pk);
-        // Same rule the book applies at insert (live OR retired id): checked BEFORE the spend is
-        // applied, so a rejected id can never burn the locker's coins without an escrow.
-        self.htlc.id_available(&eid, timeout_height)?;
-        // Bind every plaintext lock parameter to the proof. Without this a mempool observer can
-        // keep the proof and nullifiers and rewrite the hashlock, timeout, refund key or payout
-        // key to redirect the funds to themselves (see `lock_envelope`).
+        // The refund coin's blind is the locker's. Checked before the spend so a bad
+        // opening never burns the coins.
+        refund.verify(&refund_pk, value, asset_id)?;
+        // Escrow id is deterministic; refuse before burning coins if it already exists (live OR
+        // retired), and refuse if its refund coin already exists anywhere (audit 2026-10 C1).
+        // Both checked BEFORE the spend is applied, so a rejected lock never burns coins.
+        self.settlement_fresh(
+            crate::htlc_shield::EscrowKind::Burn, asset_id, value, &hashlock, timeout_height, &refund_pk, &refund_pk,
+            &[refund.coin.commitment],
+        )?;
+        // Bind every plaintext lock parameter, including the refund coin, to the proof.
+        // Without this a mempool observer can keep the proof and nullifiers and rewrite
+        // the hashlock, timeout, refund key, payout key, or settlement note.
         let kind = if btc_claim_pk.is_empty() {
             crate::htlc_shield::ENV_BURN_LOCK
         } else {
@@ -1033,10 +1214,11 @@ impl Node {
         };
         let envelope = crate::htlc_shield::lock_envelope(
             kind, asset_id, value, &hashlock, timeout_height, &refund_pk, &refund_pk, btc_claim_pk,
+            std::slice::from_ref(&refund.coin),
         );
         // Verify + apply the shield spend (records nullifiers, appends outputs).
         self.submit_shield_bound(chain_id, shield_tx, &envelope)?;
-        self.htlc.lock_burn(asset_id, value, hashlock, timeout_height, refund_pk, btc_claim_pk)
+        self.htlc.lock_burn(asset_id, value, hashlock, timeout_height, refund_pk, btc_claim_pk, refund.coin.clone())
     }
 
     /// Lock existing coins of `asset_id` into a **swap** escrow (in-pool asset↔asset). Like
@@ -1061,6 +1243,8 @@ impl Node {
         timeout_height: u64,
         counterparty_pk: zcrypt_shield::PubKey,
         refund_pk: zcrypt_shield::PubKey,
+        claim: &crate::htlc_shield::CoinOpening,
+        refund: &crate::htlc_shield::CoinOpening,
     ) -> Result<Hash, String> {
         if !crate::asset_registry::asset_id_ok(asset_id) {
             return Err("asset id is not a canonical field element".to_string());
@@ -1090,17 +1274,23 @@ impl Node {
         if gas_tx.output_commitments.first() != Some(&Self::gas_burn_coin(&gas_blind)) {
             return Err("swap-lock: gas note output[0] is not the 0.01 ZCRYPT burn coin".to_string());
         }
-        // Escrow id is keyed by counterparty (party_pk); pre-check before burning.
-        let eid =
-            crate::htlc_shield::escrow_id(asset_id, value, &hashlock, timeout_height, &counterparty_pk);
-        // Live OR retired id, checked before the spend is applied (see `htlc_burn_lock`).
-        self.htlc.id_available(&eid, timeout_height)?;
+        // Claim coin opens to the counterparty; refund coin opens to the locker. Both
+        // notes are bound into the envelope the asset proof is made against.
+        claim.verify(&counterparty_pk, value, asset_id)?;
+        refund.verify(&refund_pk, value, asset_id)?;
+        // Escrow id is keyed by counterparty (party_pk) AND refund key; pre-check the id (live
+        // OR retired) and both settlement coins before burning (see `htlc_burn_lock`).
+        self.settlement_fresh(
+            crate::htlc_shield::EscrowKind::Swap, asset_id, value, &hashlock, timeout_height, &counterparty_pk, &refund_pk,
+            &[claim.coin.commitment, refund.coin.commitment],
+        )?;
         // Bind the lock parameters to the proof: a swap lock names BOTH the counterparty who
-        // claims and the locker who is refunded, so leaving them unbound would let a front-runner
-        // redirect either leg of the trade to themselves (see `lock_envelope`).
+        // claims and the locker who is refunded, and both of their coins, so leaving them
+        // unbound would let a front-runner redirect either leg (see `lock_envelope`).
         let envelope = crate::htlc_shield::lock_envelope(
             crate::htlc_shield::ENV_SWAP_LOCK,
             asset_id, value, &hashlock, timeout_height, &counterparty_pk, &refund_pk, &[],
+            &[claim.coin.clone(), refund.coin.clone()],
         );
         if !self.root_is_known(&gas_tx.root) {
             return Err("swap-lock: gas note anchors on an unknown/expired root".to_string());
@@ -1142,7 +1332,10 @@ impl Node {
         for oc in &shield_tx.output_commitments {
             self.append_and_record(*oc)?;
         }
-        self.htlc.lock_swap(asset_id, value, hashlock, timeout_height, counterparty_pk, refund_pk)
+        self.htlc.lock_swap(
+            asset_id, value, hashlock, timeout_height, counterparty_pk, refund_pk,
+            claim.coin.clone(), refund.coin.clone(),
+        )
     }
 
     /// Claim an escrow with a preimage (before timeout). For a **mint** escrow this
@@ -1202,6 +1395,13 @@ impl Node {
                 }
             }
         }
+        // Audit 2026-10 L14: the settlement coin must be appendable BEFORE the escrow flips to
+        // Claimed, or a duplicate leaf / full tree would leave it settled with no coin.
+        if let Some(e) = self.htlc.get(escrow_id) {
+            if let Some(c) = e.coin_on_claim() {
+                self.guard_settlement_append(&c, e.spv_deposit.is_some())?;
+            }
+        }
         let cl = self.htlc.claim(escrow_id, preimage, height)?;
         match cl.kind {
             crate::htlc_shield::EscrowKind::Mint => {
@@ -1222,8 +1422,7 @@ impl Node {
                     // when it is voided). This tethers bridge volume to the token.
                     Some(deposit) => {
                         let fee = crate::emission::bridge_fee(cl.value);
-                        let net = cl.value - fee;
-                        let c_net = crate::keys::htlc_commitment(&cl.party_pk, net, cl.asset_id, escrow_id);
+                        let c_net = cl.coin.ok_or("SPV mint has no claim coin")?;
                         self.immature.push(ImmatureMint {
                             commitment: c_net,
                             value: cl.value, // full, backed 1:1 (net to recipient + fee to stakers)
@@ -1240,7 +1439,7 @@ impl Node {
                     }
                     // Non-SPV (personal/M-of-N) mint: spendable immediately, no bridge fee.
                     None => {
-                        let c = crate::keys::htlc_commitment(&cl.party_pk, cl.value, cl.asset_id, escrow_id);
+                        let c = cl.coin.ok_or("mint has no claim coin")?;
                         self.append_and_record(c)?;
                         Ok(Some(c))
                     }
@@ -1252,9 +1451,8 @@ impl Node {
             }
             crate::htlc_shield::EscrowKind::Swap => {
                 // Supply-neutral: the locker's coins were destroyed at lock; re-materialize
-                // an equal coin to the COUNTERPARTY (party_pk). No record_mint/burn — no net
-                // issuance, so no mint authority is needed (this moves existing coins).
-                let c = crate::keys::htlc_commitment(&cl.party_pk, cl.value, cl.asset_id, escrow_id);
+                // the counterparty's claim coin. No record_mint/burn — no net issuance.
+                let c = cl.coin.ok_or("swap has no claim coin")?;
                 self.append_and_record(c)?;
                 Ok(Some(c))
             }
@@ -1276,18 +1474,33 @@ impl Node {
             }
         };
         gate(zvm::HTLC_EXPIRE, &ctx)?;
+        if let Some(e) = self.htlc.get(escrow_id) {
+            if let Some(c) = e.coin_on_expire() {
+                self.guard_settlement_append(&c, false)?;
+            }
+        }
         let cl = self.htlc.expire(escrow_id, height)?;
         match cl.kind {
-            crate::htlc_shield::EscrowKind::Mint => Ok(None),
+            crate::htlc_shield::EscrowKind::Mint => {
+                // Audit 2026-10 L1: an unclaimed SPV mint never minted anything, so its deposit
+                // outpoint is free again; the depositor may re-open (new timeout) while the
+                // Bitcoin lock allows, instead of losing the deposit to a dead escrow.
+                if let Some(d) = cl.spv_deposit {
+                    let mut op = [0u8; 36];
+                    op[..32].copy_from_slice(&d.txid);
+                    op[32..].copy_from_slice(&d.vout.to_le_bytes());
+                    self.spv.release_outpoint(&op);
+                }
+                Ok(None)
+            }
             crate::htlc_shield::EscrowKind::Burn => {
-                // Refund: mint the zBTC back to Alice (keyed by escrow id).
-                let c = crate::keys::htlc_commitment(&cl.party_pk, cl.value, cl.asset_id, escrow_id);
+                let c = cl.coin.ok_or("burn has no refund coin")?;
                 self.append_and_record(c)?;
                 Ok(Some(c))
             }
             crate::htlc_shield::EscrowKind::Swap => {
-                // Refund the locked coin to the LOCKER (refund_pk) — the swap didn't happen.
-                let c = crate::keys::htlc_commitment(&cl.refund_pk, cl.value, cl.asset_id, escrow_id);
+                // Refund the locker's coin — the swap didn't happen.
+                let c = cl.coin.ok_or("swap has no refund coin")?;
                 self.append_and_record(c)?;
                 Ok(Some(c))
             }
@@ -2366,16 +2579,131 @@ pub fn lock_value_ok(value: u64) -> Result<(), String> {
 
 impl Node {
     /// Mempool mirror of the escrow-id admission rule used by the lock paths: live OR retired.
+    #[allow(clippy::too_many_arguments)]
     pub fn escrow_id_available(
         &self,
+        kind: crate::htlc_shield::EscrowKind,
         asset_id: u64,
         value: u64,
         hashlock: &Hash,
         timeout_height: u64,
         party_pk: &zcrypt_shield::PubKey,
+        refund_pk: &zcrypt_shield::PubKey,
+        coins: &[zcrypt_shield::Commitment],
     ) -> Result<(), String> {
-        let eid = crate::htlc_shield::escrow_id(asset_id, value, hashlock, timeout_height, party_pk);
-        self.htlc.id_available(&eid, timeout_height)
+        self.settlement_fresh(kind, asset_id, value, hashlock, timeout_height, party_pk, refund_pk, coins)
+            .map(|_| ())
+    }
+
+    /// Mempool mirror of every delivery-only precondition of a lock (`0x5D`/`0x67`/`0x62`)
+    /// that does not need the proof: horizon, canonical asset id, value cap, positive value,
+    /// fee rule and payout-key shape (audit 2026-10, M5). Keeps a valid STARK whose plaintext
+    /// parameters would be refused at delivery out of blocks.
+    #[allow(clippy::too_many_arguments)]
+    pub fn precheck_lock_params(
+        &self,
+        kind: crate::htlc_shield::EscrowKind,
+        asset_id: u64,
+        value: u64,
+        timeout_height: u64,
+        fee: u64,
+        btc_claim_pk: &[u8],
+    ) -> Result<(), String> {
+        if !crate::asset_registry::asset_id_ok(asset_id) {
+            return Err("asset id is not a canonical field element".to_string());
+        }
+        if !self.assets.is_registered(asset_id) {
+            return Err("asset is not registered".to_string());
+        }
+        self.check_timeout_horizon(timeout_height, crate::htlc_shield::MAX_ESCROW_HORIZON_BLOCKS)?;
+        if value == 0 {
+            return Err("escrow value must be positive".to_string());
+        }
+        lock_value_ok(value)?;
+        match kind {
+            crate::htlc_shield::EscrowKind::Burn => {
+                if fee < crate::emission::MIN_FEE {
+                    return Err(format!(
+                        "burn-lock: spend must burn ≥ MIN_FEE ({}) gas; got {fee}",
+                        crate::emission::MIN_FEE
+                    ));
+                }
+                if !btc_claim_pk.is_empty() {
+                    if btc_claim_pk.len() != 33 {
+                        return Err("burn-lock: btc_claim_pk must be 33 bytes (compressed)".to_string());
+                    }
+                    bitcoin::secp256k1::PublicKey::from_slice(btc_claim_pk)
+                        .map_err(|e| format!("burn-lock: malformed btc_claim_pk: {e}"))?;
+                }
+            }
+            crate::htlc_shield::EscrowKind::Swap => {
+                if fee != 0 {
+                    return Err(format!("swap-lock: asset spend must have fee 0 (gas is the ZCRYPT note); got {fee}"));
+                }
+            }
+            crate::htlc_shield::EscrowKind::Mint => {}
+        }
+        Ok(())
+    }
+
+    /// Mempool mirror of the delivery-only preconditions of an SPV mint open (`0x64`) that
+    /// the proof check does not cover: claim-window horizon, canonical asset id, value cap,
+    /// supply headroom and id/settlement freshness (audit 2026-10, M5). Call AFTER the proof
+    /// and open-auth checks so a bad proof still reports its own reason.
+    #[allow(clippy::too_many_arguments)]
+    pub fn precheck_open_spv_params(
+        &self,
+        asset_id: u64,
+        value: u64,
+        hashlock: &Hash,
+        timeout_height: u64,
+        claim_pk: &zcrypt_shield::PubKey,
+        claim_commitment: &zcrypt_shield::Commitment,
+    ) -> Result<(), String> {
+        if !crate::asset_registry::asset_id_ok(asset_id) {
+            return Err("asset id is not a canonical field element".to_string());
+        }
+        self.check_timeout_horizon(timeout_height, MAX_SPV_CLAIM_WINDOW)?;
+        lock_value_ok(value)?;
+        if value > self.assets.mint_headroom(asset_id) {
+            return Err(format!(
+                "htlc-open would exceed asset {asset_id} supply cap (headroom {})",
+                self.assets.mint_headroom(asset_id)
+            ));
+        }
+        self.settlement_fresh(
+            crate::htlc_shield::EscrowKind::Mint, asset_id, value, hashlock, timeout_height, claim_pk, claim_pk,
+            std::slice::from_ref(claim_commitment),
+        )
+        .map(|_| ())
+    }
+
+    /// Mempool mirror of the SPV sweep-margin deadline the claim path enforces at delivery
+    /// (audit 2026-10, M5): a claim for a deposit whose Bitcoin refund lock is within the
+    /// reserve's margin is refused before it reaches a block.
+    pub fn precheck_spv_claim_deadline(&self, escrow_id: &Hash) -> Result<(), String> {
+        let Some(e) = self.htlc.get(escrow_id) else { return Ok(()) };
+        if let Some(d) = e.spv_deposit {
+            self.require_fresh_btc_tip("SPV mint claim")?;
+            let deadline = u64::from(d.btc_locktime);
+            let now = self.spv.tip_height() + self.spv.locktime_margin();
+            if now >= deadline {
+                return Err("SPV mint claim refused: Bitcoin tip plus sweep margin reaches the deposit refund lock".to_string());
+            }
+        }
+        Ok(())
+    }
+
+    /// Mempool-side view of a claim's timeout rule evaluated at the height the transaction
+    /// can FIRST execute (the next block), not the last committed one (audit 2026-10, H6):
+    /// a claim admitted at `T-1` that lands at `T` fails at delivery but still publishes
+    /// its preimage in the block. Refusing it here keeps a doomed claim out of blocks.
+    pub fn claim_timeout_ok_next_block(&self, escrow_id: &Hash) -> Result<(), String> {
+        let Some(e) = self.htlc.get(escrow_id) else { return Ok(()) };
+        if self.current_height + 1 >= e.timeout_height {
+            return Err("escrow times out before this claim could execute: expire/refund only".to_string());
+        }
+        Ok(())
     }
 
     // Read-only views used by the incremental state store (no cloning of the big sets).
@@ -2404,6 +2732,17 @@ fn hex8(h: &Hash) -> String {
 mod tests {
     use super::*;
     use crate::hash::h;
+
+    /// An opening bound to `pk`. The note is encrypted to a throwaway key; these
+    /// tests keep the commitment and do not spend the coin.
+    fn test_opening(pk: zcrypt_shield::PubKey, value: u64, asset: u64) -> crate::htlc_shield::CoinOpening {
+        let (holder, _) = crate::keys::new_account();
+        crate::htlc_shield::CoinOpening::prove(
+            &holder.normal_address(), &pk, value, asset, crate::keys::random_blind(),
+        )
+        .expect("opening proof")
+        .1
+    }
 
     #[test]
     fn sentinel_power_always_exceeds_two_thirds_and_never_halts() {
@@ -2513,9 +2852,12 @@ mod tests {
             .register_asset("GOLD", 8, Some(keyset.commitment()), 21_000_000 * 100_000_000)
             .unwrap();
         let (value, lock, timeout, claim_pk) = (1_000u64, [1u8; 32], 100u64, [2u64; 8]);
-        let msg = crate::mint_auth::mint_message(b"zcrypt-test", asset, value, &lock, timeout, &claim_pk);
+        let opening = test_opening(claim_pk, value, asset);
+        let msg = crate::mint_auth::mint_message(
+            b"zcrypt-test", asset, value, &lock, timeout, &claim_pk, &opening.coin.commitment, &opening.coin.note_bind(),
+        );
         let sigs = crate::mint_auth::authorize(&keyset, &signers, &msg);
-        node.htlc_open(b"zcrypt-test", asset, value, lock, timeout, claim_pk, &keyset, &sigs).unwrap();
+        node.htlc_open(b"zcrypt-test", asset, value, lock, timeout, claim_pk, &opening, &keyset, &sigs).unwrap();
 
         let saved_root = node.state_root();
         let saved_registry = node.registry_root();
@@ -2534,6 +2876,121 @@ mod tests {
         assert_eq!(restored.block_roots(), node.block_roots());
         // Double-spend memory survives: an already-inserted nullifier is still seen.
         assert!(restored.smt.contains(&h(b"NF", &[b"x"])));
+    }
+
+    /// Audit 2026-10 C1: an open escrow's settlement coin is a public function of public data.
+    /// It must be refused as a transfer output while the escrow is open (so nobody can make the
+    /// settlement collide), refused at open if someone pre-inserted it, and after the claim it
+    /// is an ordinary leaf (refused as a duplicate the usual way).
+    #[test]
+    fn settlement_coin_is_reserved_until_the_escrow_settles() {
+        let (keyset, signers) = crate::mint_auth::derive_keyset(b"test-treasury", 3, 2);
+        let setup = || {
+            let mut node = Node::new();
+            node.mint_foundation([0xF0; 32]);
+            node.set_height(7);
+            let asset = node
+                .register_asset("GOLD", 8, Some(keyset.commitment()), 21_000_000 * 100_000_000)
+                .unwrap();
+            (node, asset)
+        };
+        let (mut node, asset) = setup();
+        let preimage = *b"preimage-of-exactly-32-bytes!!!!";
+        let lock = crate::nullifier::htlc_hashlock(&preimage);
+        let (value, timeout, claim_pk) = (1_000u64, 100u64, [2u64; 8]);
+        let opening = test_opening(claim_pk, value, asset);
+        let coin = opening.coin.commitment;
+        let planned_id = crate::htlc_shield::escrow_id(
+            crate::htlc_shield::EscrowKind::Mint, asset, value, &lock, timeout, &claim_pk, &claim_pk,
+        );
+        let open = |node: &mut Node, timeout: u64| {
+            let msg = crate::mint_auth::mint_message(
+                b"zcrypt-test", asset, value, &lock, timeout, &claim_pk, &opening.coin.commitment, &opening.coin.note_bind(),
+            );
+            let sigs = crate::mint_auth::authorize(&keyset, &signers, &msg);
+            node.htlc_open(b"zcrypt-test", asset, value, lock, timeout, claim_pk, &opening, &keyset, &sigs)
+        };
+        // Pre-inserted settlement coin: the open fails cleanly (griefing only, nothing burned).
+        let (mut poisoned, _) = setup();
+        poisoned.seed_coin(coin);
+        let err = open(&mut poisoned, timeout).unwrap_err();
+        assert!(err.contains("settlement coin"), "{err}");
+        assert_eq!(poisoned.htlc_book().count(), 0);
+
+        // Honest open: the coin is reserved, so a transfer output equal to it is refused.
+        let id = open(&mut node, timeout).unwrap();
+        assert_eq!(id, planned_id);
+        assert!(node.htlc_book().is_reserved(&coin));
+        let err = node.note_outputs_fresh([coin]).unwrap_err();
+        assert!(err.contains("reserved"), "{err}");
+        // Mempool mirror agrees.
+        assert!(node.escrow_id_available(crate::htlc_shield::EscrowKind::Mint, asset, value, &lock, timeout, &claim_pk, &claim_pk, &[coin]).is_err());
+
+        // Claim: the coin becomes a leaf, the reservation is released, and the leaf itself now
+        // guards against a duplicate.
+        let minted = node.htlc_claim(&id, &preimage).unwrap().expect("mint coin");
+        assert_eq!(minted, coin);
+        assert!(!node.htlc_book().is_reserved(&coin));
+        assert!(node.commitment_tree.contains(&coin));
+        assert!(node.note_outputs_fresh([coin]).unwrap_err().contains("already in the tree"));
+        // A second claim or an expire is refused (settled), never a duplicate-leaf panic.
+        assert!(node.htlc_claim(&id, &preimage).is_err());
+        node.set_height(timeout);
+        assert!(node.htlc_expire(&id).is_err());
+    }
+
+    /// Audit 2026-10 M3: an open escrow whose timeout is reached is expired by the node at the
+    /// end of that block, without anyone sending a `0x5C`.
+    #[test]
+    fn open_escrows_auto_expire_at_end_block() {
+        let mut node = Node::new();
+        node.mint_foundation([0xF0; 32]);
+        node.set_height(7);
+        let (keyset, signers) = crate::mint_auth::derive_keyset(b"test-treasury", 3, 2);
+        let asset = node
+            .register_asset("GOLD", 8, Some(keyset.commitment()), 21_000_000 * 100_000_000)
+            .unwrap();
+        let (value, lock, claim_pk) = (1_000u64, [1u8; 32], [2u64; 8]);
+        let mut ids = Vec::new();
+        for timeout in [50u64, 60] {
+            // Each escrow reserves its own coin. A fresh blind keeps the commitments apart.
+            let opening = test_opening(claim_pk, value, asset);
+            let msg = crate::mint_auth::mint_message(
+                b"zcrypt-test", asset, value, &lock, timeout, &claim_pk, &opening.coin.commitment, &opening.coin.note_bind(),
+            );
+            let sigs = crate::mint_auth::authorize(&keyset, &signers, &msg);
+            ids.push(node.htlc_open(b"zcrypt-test", asset, value, lock, timeout, claim_pk, &opening, &keyset, &sigs).unwrap());
+        }
+        node.set_height(49);
+        node.end_block();
+        assert!(ids.iter().all(|id| node.htlc_escrow(id).unwrap().state == crate::htlc_shield::EscrowState::Open));
+        node.set_height(50);
+        node.end_block();
+        assert_eq!(node.htlc_escrow(&ids[0]).unwrap().state, crate::htlc_shield::EscrowState::Expired);
+        assert_eq!(node.htlc_escrow(&ids[1]).unwrap().state, crate::htlc_shield::EscrowState::Open);
+        assert_eq!(node.htlc_book().reserved_len(), 1, "only the live escrow keeps a reservation");
+        // The claim timeout mirror refuses a claim that could only execute at/after the timeout.
+        assert!(node.claim_timeout_ok_next_block(&ids[1]).is_ok());
+        node.set_height(59);
+        assert!(node.claim_timeout_ok_next_block(&ids[1]).is_err());
+    }
+
+    /// Audit 2026-10 M5: lock parameter rules the mempool mirrors.
+    #[test]
+    fn precheck_lock_params_mirrors_delivery_rules() {
+        use crate::htlc_shield::EscrowKind;
+        let mut node = Node::new();
+        node.set_height(10);
+        let asset = node.register_asset("GOLD", 8, None, 1_000_000).unwrap();
+        let fee = crate::emission::MIN_FEE;
+        assert!(node.precheck_lock_params(EscrowKind::Burn, asset, 5, 100, fee, &[]).is_ok());
+        assert!(node.precheck_lock_params(EscrowKind::Burn, asset, 5, 10, fee, &[]).is_err(), "timeout not after now");
+        assert!(node.precheck_lock_params(EscrowKind::Burn, asset, 0, 100, fee, &[]).is_err(), "zero value");
+        assert!(node.precheck_lock_params(EscrowKind::Burn, asset, 5, 100, 0, &[]).is_err(), "fee below MIN_FEE");
+        assert!(node.precheck_lock_params(EscrowKind::Burn, asset, 5, 100, fee, &[1u8; 33]).is_err(), "bad payout key");
+        assert!(node.precheck_lock_params(EscrowKind::Burn, asset + 1, 5, 100, fee, &[]).is_err(), "unregistered");
+        assert!(node.precheck_lock_params(EscrowKind::Swap, asset, 5, 100, 0, &[]).is_ok());
+        assert!(node.precheck_lock_params(EscrowKind::Swap, asset, 5, 100, fee, &[]).is_err(), "swap fee must be 0");
     }
 
     #[test]

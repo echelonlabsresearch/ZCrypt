@@ -46,8 +46,8 @@ fn main() {
     let mut escrow_id = [0u8; 32];
     hex::decode_to_slice(escrow_hex.trim(), &mut escrow_id).expect("bad ESCROW hex");
 
-    // 1. Expire the timed-out burn escrow → refunds `locked` zBTC to Alice as a coin
-    // she can reconstruct deterministically from her key + the escrow id.
+    // 1. Expire the timed-out burn escrow → refunds `locked` zBTC to Alice. The
+    // coin's blind is inside the escrow's refund note, not a function of the id.
     println!("\n[1] expiring the timed-out burn escrow to recover Alice's zBTC…");
     match zc.broadcast(&swap::expire_tx(&escrow_id)) {
         Ok(_) => println!("    escrow expired — zBTC refunded to Alice"),
@@ -62,7 +62,10 @@ fn main() {
         }
         Err(e) => panic!("expire failed: {e}"),
     }
-    let coin = alice.htlc_coin(locked, asset, &escrow_id);
+    let info = swap::query_escrow(&zc, &escrow_id)
+        .expect("query escrow")
+        .expect("timed-out escrow still recorded (refund note)");
+    let coin = swap::coin_from_note(&alice, &info.refund_enc_note).expect("decrypt refund note");
     println!("    recovered zBTC coin: {} base units", coin.value);
 
     // 2. Redeem with the FIXED escrow window (swap.rs ZC_HTLC_TIMEOUT_BLOCKS = 172_800).

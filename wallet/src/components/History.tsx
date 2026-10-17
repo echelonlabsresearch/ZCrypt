@@ -21,6 +21,9 @@ const ICON: Record<string, string> = {
   reward: "🏆",
   shield: "₿",
   redeem: "₿",
+  fee: "🧾",
+  swap: "🔁",
+  escrow: "🔓",
 };
 
 export default function History({ active }: { active: boolean }) {

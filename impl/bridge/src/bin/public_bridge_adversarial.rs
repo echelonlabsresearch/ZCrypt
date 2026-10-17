@@ -69,7 +69,11 @@ fn main() {
         )
         .unwrap();
         let zc_timeout = zc.height().unwrap() as u64 + swap::ZC_HTLC_TIMEOUT_BLOCKS;
-        let res = zc.broadcast(&swap::open_spv_tx(asset, btc_amt.to_sat(), &lock, zc_timeout, &user.pubkey(), &proof, &user_btc_key));
+        let (_blind, opening) =
+            swap::spv_claim_opening(&user.normal_address(), btc_amt.to_sat(), asset).expect("claim opening");
+        let res = zc.broadcast(&swap::open_spv_tx(
+            asset, btc_amt.to_sat(), &lock, zc_timeout, &user.pubkey(), &proof, &user_btc_key, &opening,
+        ));
         assert!(res.is_err(), "ATTACK 1 FAILED: wrong-key mint was ACCEPTED (unbacked zBTC!)");
         println!("[PASS] ATTACK 1: wrong-reserve-key mint rejected — {}", res.unwrap_err());
         pass += 1;

@@ -104,7 +104,9 @@ as "one operator key", not "a committee".
 Bitcoin SPV gate (every validator verifies the Bitcoin headers, the merkle inclusion
 proof, and that the deposit output is an HTLC claimable only by the reserve key), and
 the reserve key is fixed in the genesis `app_state` (`zbtc_reserve_pk`), not claimed by
-whoever registers first.
+whoever registers first. The reserve key is a custody and soundness anchor, not a
+privacy one: it is public on both chains, so the bridge reserve is a clusterable
+Bitcoin address set and rotation publishes the old-to-new link.
 
 ## Hardening already done
 
@@ -113,7 +115,11 @@ place: commitment/spend-key binding, canonical nullifier derivation, anchor
 root windowing, arity-leak elimination, RNG audit (ChaCha20), state
 persistence with fail-loud recovery, minimum-fee enforcement across every
 value-moving path, supply-cap invariant tests grinding thousands of epochs,
-and differential VM/circuit testing. The full product surface runs as an
+differential VM/circuit testing, and (October 2026) a bridge and swap pass:
+escrow settlement coins are reserved while an escrow is open so a predictable
+leaf cannot be pre-inserted to stall settlement or the maturity sweep, escrow
+ids bind the escrow kind and refund key, timed-out escrows expire in consensus,
+and every escrow transaction's delivery rules are mirrored at mempool admission. The full product surface runs as an
 end-to-end test against a live 3-validator network in CI.
 
 ## Audit history and how to report

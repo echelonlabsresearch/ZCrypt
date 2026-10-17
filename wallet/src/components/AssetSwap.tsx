@@ -15,6 +15,19 @@ interface Offer {
   my_timeout: number;
 }
 
+interface Preview {
+  receive_ticker: string;
+  receive_amount: string;
+  receive_decimals: number;
+  pay_ticker: string;
+  pay_amount: string;
+  pay_decimals: number;
+  their_timeout: number;
+  blocks_left: number;
+  my_timeout: number;
+  pay_balance: string;
+}
+
 interface Pending {
   role: string;
   give_ticker: string;
@@ -44,6 +57,8 @@ export default function AssetSwap({ active }: { active: boolean }) {
   const [takeAmt, setTakeAmt] = useState("");
   const [maker, setMaker] = useState("");
   const [offerText, setOfferText] = useState("");
+  const [preview, setPreview] = useState<Preview | null>(null);
+  const [previewOf, setPreviewOf] = useState("");
   const [ticket, setTicket] = useState("");
   const [pending, setPending] = useState<Pending[]>([]);
   const [busy, setBusy] = useState("");
@@ -51,15 +66,13 @@ export default function AssetSwap({ active }: { active: boolean }) {
   const [note, setNote] = useState("");
 
   const load = useCallback(async () => {
-    const [h, listedAssets, addr, open] = await Promise.all([
+    const [h, listedAssets, open] = await Promise.all([
       call<HeldAsset[]>("held_assets"),
       call<Listed[]>("registered_assets"),
-      call<string>("get_address"),
       call<Pending[]>("list_pending_swaps"),
     ]);
     setHeld(h);
     setListed(listedAssets);
-    setAddress(addr);
     setPending(open);
     setGiveId((cur) => (h.some((a) => a.asset_id === cur) ? cur : h[0]?.asset_id ?? "0"));
     setTakeId((cur) => (listedAssets.some((a) => a.asset_id === cur) ? cur : listedAssets.find((a) => a.asset_id !== (h[0]?.asset_id ?? "0"))?.asset_id ?? listedAssets[0]?.asset_id ?? ""));
@@ -69,6 +82,21 @@ export default function AssetSwap({ active }: { active: boolean }) {
     if (!active) return;
     load().catch((e) => setErr(String(e)));
   }, [active, load]);
+
+  // A fresh per-swap key for the other side to address its offer to (never the reusable
+  // payment address). One per visit to this tab; "New" rotates it again.
+  async function newSwapAddress() {
+    try {
+      setAddress(await call<string>("swap_receive_address"));
+    } catch (e) {
+      setErr(String(e));
+    }
+  }
+  useEffect(() => {
+    if (!active || address) return;
+    newSwapAddress();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [active]);
 
   // Finish a swap whose other side has locked, without asking the user to do it.
   useEffect(() => {
@@ -125,15 +153,36 @@ export default function AssetSwap({ active }: { active: boolean }) {
     }
   }
 
+  // Step 1: decode and show the terms. Nothing is locked until the user confirms them.
+  async function review() {
+    setErr("");
+    setNote("");
+    setPreview(null);
+    if (!offerText.trim()) return setErr("Paste the offer they sent you.");
+    setBusy("preview");
+    try {
+      const p = await call<Preview>("swap_asset_preview", { ticket: offerText.trim() });
+      setPreview(p);
+      setPreviewOf(offerText.trim());
+    } catch (e) {
+      setErr(String(e));
+    } finally {
+      setBusy("");
+    }
+  }
+
+  // Step 2: lock exactly the reviewed offer.
   async function accept() {
     setErr("");
     setNote("");
-    if (!offerText.trim()) return setErr("Paste the offer they sent you.");
+    if (!preview || previewOf !== offerText.trim()) return setErr("Review the offer first.");
     setBusy("accept");
     try {
-      const msg = await call<string>("swap_asset_accept", { ticket: offerText.trim() });
+      const msg = await call<string>("swap_asset_accept", { ticket: previewOf });
       setNote(msg);
       setOfferText("");
+      setPreview(null);
+      setPreviewOf("");
       await load();
     } catch (e) {
       setErr(String(e));
@@ -162,10 +211,11 @@ export default function AssetSwap({ active }: { active: boolean }) {
         theirs, and both sides finish or both get a refund. The fee is 0.01 ZCRYPT, taken from this wallet.
       </p>
       <div className="field">
-        <label>Your address — they put this in their offer</label>
+        <label>Your swap address — they put this in their offer (a fresh one-time key, not your payment address)</label>
         <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
           <code style={{ fontSize: "0.72rem", wordBreak: "break-all", flex: 1 }}>{address || "…"}</code>
           <CopyButton text={address} />
+          <button className="btn-link" disabled={busy !== ""} onClick={newSwapAddress}>New</button>
         </div>
       </div>
 
@@ -221,11 +271,44 @@ export default function AssetSwap({ active }: { active: boolean }) {
         <>
           <div className="field" style={{ marginTop: "1rem" }}>
             <label>Their offer</label>
-            <textarea value={offerText} onChange={(e) => setOfferText(e.target.value)} rows={4} placeholder="zcswap1.…" style={{ width: "100%", fontFamily: "monospace", fontSize: "0.72rem" }} />
+            <textarea
+              value={offerText}
+              onChange={(e) => { setOfferText(e.target.value); setPreview(null); }}
+              rows={4}
+              placeholder="zcswap1.…"
+              style={{ width: "100%", fontFamily: "monospace", fontSize: "0.72rem" }}
+            />
           </div>
-          <button className="btn-primary btn-block" disabled={busy !== ""} onClick={accept}>
-            {busy === "accept" ? "Locking your side…" : "Lock my side"}
-          </button>
+          {!preview || previewOf !== offerText.trim() ? (
+            <button className="btn-primary btn-block" disabled={busy !== ""} onClick={review}>
+              {busy === "preview" ? "Reading the offer…" : "Review the offer"}
+            </button>
+          ) : (
+            <>
+              <div className="card" style={{ padding: "0.8rem 0.9rem", marginBottom: "0.7rem", borderLeft: "3px solid var(--color-amber, #d99a00)" }}>
+                <div style={{ fontWeight: 700, marginBottom: 6 }}>Check these terms before locking</div>
+                <div style={{ fontSize: "0.9rem" }}>
+                  You pay <b>{fmtAsset(Number(preview.pay_amount), preview.pay_decimals)} {preview.pay_ticker}</b>
+                </div>
+                <div style={{ fontSize: "0.9rem" }}>
+                  You receive <b>{fmtAsset(Number(preview.receive_amount), preview.receive_decimals)} {preview.receive_ticker}</b>
+                </div>
+                <div style={{ fontSize: "0.76rem", opacity: 0.7, marginTop: 6 }}>
+                  Spendable {preview.pay_ticker}: {fmtAsset(Number(preview.pay_balance), preview.pay_decimals)}. Their lock expires at block{" "}
+                  {preview.their_timeout} ({preview.blocks_left} blocks from now); yours would expire at block {preview.my_timeout}.
+                  Once they claim, this wallet collects on its own while it is unlocked.
+                </div>
+                {Number(preview.pay_amount) > Number(preview.pay_balance) && (
+                  <div className="msg err" style={{ marginTop: 6 }}>This is more {preview.pay_ticker} than this wallet can spend.</div>
+                )}
+              </div>
+              <button className="btn-primary btn-block" disabled={busy !== ""} onClick={accept}>
+                {busy === "accept"
+                  ? "Locking your side…"
+                  : `Confirm: lock ${fmtAsset(Number(preview.pay_amount), preview.pay_decimals)} ${preview.pay_ticker}`}
+              </button>
+            </>
+          )}
         </>
       )}
 

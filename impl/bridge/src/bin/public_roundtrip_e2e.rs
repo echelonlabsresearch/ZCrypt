@@ -105,7 +105,16 @@ fn main() {
     for (eid, e) in &rr.rejected {
         eprintln!("  [redeem-watcher] rejected {}: {e}", hex::encode(eid));
     }
-    assert_eq!(rr.locked.len(), 1, "operator's watcher locked exactly one redeem");
+    for (eid, e) in &rr.errors {
+        eprintln!("  [redeem-watcher] error {}: {e}", hex::encode(eid));
+    }
+    assert_eq!(
+        rr.locked.len(),
+        1,
+        "operator's watcher locked exactly one redeem (rejected={:?} errors={:?})",
+        rr.rejected,
+        rr.errors
+    );
     let lock = &rr.locked[0];
     assert_eq!(lock.escrow_id, escrow_id, "watcher locked for the right escrow");
     println!("[operator] watcher read on-chain btc key + locked {:.4} reserve BTC autonomously", redeem_btc.to_btc());

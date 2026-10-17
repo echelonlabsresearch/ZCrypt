@@ -16,7 +16,7 @@ use crate::{htlc_address, HtlcUtxo, Key};
 use bitcoin::hashes::Hash as _;
 use bitcoin::secp256k1::{Message, Secp256k1};
 use bitcoin::sighash::{EcdsaSighashType, SighashCache};
-use bitcoin::{Address, Amount, Network, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid, Witness};
+use bitcoin::{Address, Amount, Network, ScriptBuf, Transaction, TxIn, TxOut, Txid, Witness};
 use std::str::FromStr;
 
 pub struct SelfCustodyBtc {
@@ -99,15 +99,16 @@ impl SelfCustodyBtc {
 
     /// A FRESH (never used) receiving address. Reusing one Bitcoin address for every
     /// bridge deposit lets an observer cluster all of a user's activity; rotate instead
-    /// (privacy H3). Falls back to index 0 only if the endpoint cannot be reached.
+    /// (privacy H3). If the endpoint cannot be reached the error is returned: silently
+    /// falling back to index 0 would reuse the most-used address (bridge L7).
     pub fn fresh_receive_address(&self) -> Result<Address, String> {
-        let i = self.first_unused_index(0).unwrap_or(0);
+        let i = self.first_unused_index(0)?;
         self.hd.receive_address(i)
     }
 
     /// A FRESH change address (see [`Self::fresh_receive_address`]).
     pub fn fresh_change_address(&self) -> Result<Address, String> {
-        let i = self.first_unused_index(1).unwrap_or(0);
+        let i = self.first_unused_index(1)?;
         self.hd.change_address(i)
     }
 
@@ -245,11 +246,9 @@ impl SelfCustodyBtc {
         if fee >= utxo.value {
             return Err("HTLC fee exceeds the locked value".into());
         }
-        let sequence = if locktime == bitcoin::absolute::LockTime::ZERO {
-            Sequence::ENABLE_RBF_NO_LOCKTIME
-        } else {
-            Sequence::ENABLE_LOCKTIME_NO_RBF
-        };
+        // 0xFFFFFFFD on both branches: non-final (CLTV enforced on the refund) and
+        // BIP-125 RBF-signalling, so a stuck claim or refund can be fee-bumped (bridge L4).
+        let sequence = crate::HTLC_SPEND_SEQUENCE;
         let mut tx = Transaction {
             version: bitcoin::transaction::Version::TWO,
             lock_time: locktime,
@@ -276,23 +275,50 @@ impl SelfCustodyBtc {
         Txid::from_str(&txid).map_err(|e| e.to_string())
     }
 
-    /// The preimage revealed in a claim tx (witness item 1), read via Esplora.
-    /// Returns `None` for refund spends (empty witness item 1) so callers do not
-    /// treat a refund as a successful claim.
+    /// The preimage revealed in a claim tx (witness item 1), read via Esplora. Only a txid
+    /// is known here, so the first input whose item 1 is exactly 32 bytes is taken (the
+    /// caller checks it against the hashlock). A refund (empty item 1) or any other shape
+    /// gives `None`, so a refund is never mistaken for a claim (bridge M11). With the HTLC
+    /// outpoint in hand use [`Self::htlc_spend_in_tx`], which matches the input by prevout.
     pub fn preimage_from_claim(&self, txid: &Txid) -> Option<Vec<u8>> {
         let v = self.esplora.tx_json(&txid.to_string()).ok()?;
-        let wit = v["vin"][0]["witness"].as_array()?;
-        let raw = hex::decode(wit.get(1)?.as_str()?).ok()?;
-        if raw.is_empty() {
-            None // refund branch: OP_IF selector false, empty preimage slot
-        } else {
-            Some(raw)
-        }
+        v["vin"].as_array()?.iter().find_map(|vin| {
+            let raw = hex::decode(vin["witness"].as_array()?.get(1)?.as_str()?).ok()?;
+            (raw.len() == crate::HTLC_PREIMAGE_LEN).then_some(raw)
+        })
+    }
+
+    /// How `spend_txid` spends the HTLC `outpoint`, read via Esplora: the input is selected
+    /// by its prevout (never by position, a claim can be batched with other inputs), and its
+    /// witness item 1 is classified by [`crate::classify_htlc_witness_item`]. Errors when no
+    /// input of the tx spends `outpoint` (bridge M11).
+    pub fn htlc_spend_in_tx(&self, spend_txid: &Txid, outpoint: &bitcoin::OutPoint) -> Result<crate::HtlcSpend, String> {
+        let v = self.esplora.tx_json(&spend_txid.to_string())?;
+        htlc_spend_from_tx_json(&v, outpoint)
     }
 
     pub fn network(&self) -> Network {
         self.network
     }
+}
+
+/// Classify how an Esplora `/tx` JSON body spends `outpoint`: find the vin whose
+/// (`txid`, `vout`) equals the outpoint, then classify its witness item 1. Pure so the
+/// vin selection is unit-tested offline.
+fn htlc_spend_from_tx_json(v: &serde_json::Value, outpoint: &bitcoin::OutPoint) -> Result<crate::HtlcSpend, String> {
+    let want_txid = outpoint.txid.to_string();
+    let vins = v["vin"].as_array().ok_or("esplora: tx has no vin array")?;
+    let vin = vins
+        .iter()
+        .find(|vin| vin["txid"].as_str() == Some(want_txid.as_str()) && vin["vout"].as_u64() == Some(outpoint.vout as u64))
+        .ok_or_else(|| format!("tx does not spend HTLC outpoint {outpoint}"))?;
+    let item_hex = vin["witness"]
+        .as_array()
+        .and_then(|w| w.get(1))
+        .and_then(|x| x.as_str())
+        .ok_or("HTLC spend input has no witness item 1")?;
+    let item = hex::decode(item_hex).map_err(|e| format!("witness item 1: {e}"))?;
+    crate::classify_htlc_witness_item(&item)
 }
 
 impl crate::BtcBackend for SelfCustodyBtc {
@@ -326,27 +352,36 @@ impl crate::BtcBackend for SelfCustodyBtc {
     fn refund(&self, utxo: &HtlcUtxo, key: &Key, locktime: u32, dest: &Address, fee: Amount) -> Result<Txid, String> {
         SelfCustodyBtc::refund(self, utxo, key, locktime, dest, fee)
     }
+    fn fresh_payout_address(&self) -> Result<Address, String> {
+        self.fresh_receive_address()
+    }
     fn tx_block_hash(&self, txid: &Txid) -> Result<Option<[u8; 32]>, String> {
         SelfCustodyBtc::tx_block_hash(self, txid)
     }
     fn tx_confirmations(&self, txid: &Txid) -> Result<u64, String> {
         Ok(self.esplora.confirmations(&txid.to_string())? as u64)
     }
+    /// `Some(true)`: unspent. `Some(false)`: a CONFIRMED spend exists. `None`: a spend is in
+    /// the mempool only, which can still be replaced or dropped, so neither answer is safe
+    /// (bridge M12).
     fn utxo_unspent(&self, utxo: &HtlcUtxo) -> Result<Option<bool>, String> {
-        Ok(Some(self.esplora.outspend(&utxo.outpoint.txid.to_string(), utxo.outpoint.vout)?.is_none()))
+        Ok(match self.esplora.outspend_status(&utxo.outpoint.txid.to_string(), utxo.outpoint.vout)? {
+            None => Some(true),
+            Some(s) if s.confirmed => Some(false),
+            Some(_) => None,
+        })
     }
+    /// Esplora exposes the spender directly, so no block scan is needed. Only a CONFIRMED
+    /// spend counts, matching the node backend's block scan (a mempool spend reads as
+    /// `Unspent` until it confirms). The spending input is matched by outpoint and its
+    /// witness item 1 must be exactly 32 bytes to be a claim (bridge M11, M12).
     fn find_htlc_spend(&self, utxo: &HtlcUtxo, _since_height: u64) -> Result<crate::HtlcSpend, String> {
-        // Esplora exposes the spender directly — no block scan needed. A spend with an empty
-        // witness slot 1 took the refund branch.
-        match self.esplora.outspend(&utxo.outpoint.txid.to_string(), utxo.outpoint.vout)? {
-            Some(spend_txid) => {
-                let txid = Txid::from_str(&spend_txid).map_err(|e| e.to_string())?;
-                Ok(match self.preimage_from_claim(&txid) {
-                    Some(pre) => crate::HtlcSpend::Claimed(pre),
-                    None => crate::HtlcSpend::Refunded,
-                })
+        match self.esplora.outspend_status(&utxo.outpoint.txid.to_string(), utxo.outpoint.vout)? {
+            Some(spend) if spend.confirmed => {
+                let txid = Txid::from_str(&spend.txid).map_err(|e| e.to_string())?;
+                self.htlc_spend_in_tx(&txid, &utxo.outpoint)
             }
-            None => Ok(crate::HtlcSpend::Unspent),
+            _ => Ok(crate::HtlcSpend::Unspent),
         }
     }
     fn block_header(&self, height: u64) -> Result<[u8; 80], String> {
@@ -368,6 +403,34 @@ mod tests {
     use super::*;
 
     const MN: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+
+    #[test]
+    fn htlc_spend_matches_vin_by_outpoint_not_position() {
+        use crate::HtlcSpend;
+        let fund = Txid::from_str("1111111111111111111111111111111111111111111111111111111111111111").unwrap();
+        let other = "2222222222222222222222222222222222222222222222222222222222222222";
+        let op = bitcoin::OutPoint { txid: fund, vout: 1 };
+        let pre = hex::encode([0x42u8; 32]);
+        // vin 0 is some unrelated input (its item 1 is a 32-byte lookalike); vin 1 is the HTLC claim.
+        let claim = serde_json::json!({ "vin": [
+            { "txid": other, "vout": 0, "witness": ["00", hex::encode([0x99u8; 32]), "01", "aa"] },
+            { "txid": fund.to_string(), "vout": 1, "witness": ["00", pre, "01", "aa"] },
+        ]});
+        assert_eq!(htlc_spend_from_tx_json(&claim, &op).unwrap(), HtlcSpend::Claimed(vec![0x42u8; 32]));
+        // Refund: empty item 1 on the matching vin.
+        let refund = serde_json::json!({ "vin": [
+            { "txid": fund.to_string(), "vout": 1, "witness": ["00", "", "aa"] },
+        ]});
+        assert_eq!(htlc_spend_from_tx_json(&refund, &op).unwrap(), HtlcSpend::Refunded);
+        // Wrong vout / no matching vin: an error, not Refunded.
+        let wrong = bitcoin::OutPoint { txid: fund, vout: 0 };
+        assert!(htlc_spend_from_tx_json(&refund, &wrong).is_err());
+        // A non-32-byte, non-empty item 1 is neither branch.
+        let odd = serde_json::json!({ "vin": [
+            { "txid": fund.to_string(), "vout": 1, "witness": ["00", "abcd", "01", "aa"] },
+        ]});
+        assert!(htlc_spend_from_tx_json(&odd, &op).is_err());
+    }
 
     #[test]
     fn address_is_seed_derived_and_restorable() {

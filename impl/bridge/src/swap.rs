@@ -182,7 +182,13 @@ pub fn redeem_btc_locktime_for(
     let by_sla = remaining_secs.saturating_sub(sla) / slow_block;
     let by_fraction = remaining_secs / (slow_block + BTC_BLOCK_TIME_SECS / SLACK_FRACTION_DEN);
     let max_lock = by_sla.min(by_fraction);
-    let lock = btc_redeem_lock_blocks(network).min(max_lock);
+    // Regtest adds a constant clock-lead allowance so the lock still clears the tip after a
+    // `generatetoaddress` burst. Capped by `max_lock`, so it can never outlive the escrow.
+    let mut wanted = btc_redeem_lock_blocks(network);
+    if network == bitcoin::Network::Regtest {
+        wanted = wanted.saturating_add(REGTEST_REDEEM_CLOCK_LEAD_BLOCKS);
+    }
+    let lock = wanted.min(max_lock);
     let min_lock = min_user_claim_blocks(network);
     if lock < min_lock {
         return Err(format!(
@@ -197,6 +203,144 @@ pub fn redeem_btc_locktime_for(
     );
     let lt = btc_tip.checked_add(lock).ok_or("btc tip + lock overflow")?;
     u32::try_from(lt).map_err(|_| "btc locktime overflow".to_string())
+}
+
+// ---- Deterministic redeem locks (bridge/swap audit 2026-10 H5) ----
+//
+// The BTC HTLC the operator funds is a P2WSH whose script commits to the CLTV. If that CLTV
+// were derived from the Bitcoin tip at PLANNING time, a daemon that lost or rolled back its
+// state file (or a second instance) would re-plan every open burn escrow with a different
+// locktime, hence a different address, and `find_funded_htlc` could not see the funding
+// already made: every redeem would be funded twice. The lock is therefore anchored to
+// CONSENSUS data only: the ZC block the burn-lock was included in (its BFT time, which every
+// node agrees on) mapped to a Bitcoin height through Bitcoin's own median-time-past. A replan
+// at any later time reproduces the same script byte for byte.
+
+/// How far behind the ZC block time the Bitcoin anchor is taken (seconds). Median-time-past
+/// trails wall time by about an hour and varies with block luck; anchoring six hours back
+/// guarantees that, when the daemon first plans (seconds after the burn), the anchor block is
+/// already buried and can never move as more Bitcoin blocks arrive.
+pub const REDEEM_ANCHOR_LAG_SECS: u64 = 6 * 3600;
+/// How many Bitcoin blocks below the tip the anchor search looks (four weeks): a burn older
+/// than that cannot have a live redeem escrow anyway.
+pub const REDEEM_ANCHOR_LOOKBACK_BLOCKS: u64 = 4032;
+
+fn header_time(hdr: &[u8; 80]) -> u64 {
+    u32::from_le_bytes([hdr[68], hdr[69], hdr[70], hdr[71]]) as u64
+}
+
+/// Bitcoin median-time-past of block `h` (the median of the 11 timestamps ending at `h`;
+/// fewer near genesis), fetching headers through `btc` with a per-call cache.
+fn median_time_past(
+    btc: &dyn BtcBackend,
+    h: u64,
+    cache: &mut std::collections::HashMap<u64, u64>,
+) -> Result<u64, String> {
+    let lo = h.saturating_sub(10);
+    let mut ts = Vec::with_capacity(11);
+    for x in lo..=h {
+        let t = match cache.get(&x) {
+            Some(t) => *t,
+            None => {
+                let t = header_time(&btc.block_header(x).map_err(|e| format!("header {x}: {e}"))?);
+                cache.insert(x, t);
+                t
+            }
+        };
+        ts.push(t);
+    }
+    ts.sort_unstable();
+    Ok(ts[ts.len() / 2])
+}
+
+/// The Bitcoin height anchored to unix time `t`: the HIGHEST block at or below `btc_tip`
+/// whose median-time-past is `<= t - REDEEM_ANCHOR_LAG_SECS` (floored at the lookback window).
+/// Deterministic in the confirmed Bitcoin chain and `t`; monotone in `t`.
+pub fn btc_anchor_height(btc: &dyn BtcBackend, btc_tip: u64, t: u64) -> Result<u64, String> {
+    btc_anchor_height_with_lag(btc, btc_tip, t, REDEEM_ANCHOR_LAG_SECS)
+}
+
+fn btc_anchor_height_with_lag(
+    btc: &dyn BtcBackend,
+    btc_tip: u64,
+    t: u64,
+    lag_secs: u64,
+) -> Result<u64, String> {
+    let target = t.saturating_sub(lag_secs);
+    let mut cache = std::collections::HashMap::new();
+    let mut lo = btc_tip.saturating_sub(REDEEM_ANCHOR_LOOKBACK_BLOCKS);
+    let mut hi = btc_tip;
+    if median_time_past(btc, lo, &mut cache)? > target {
+        return Ok(lo);
+    }
+    // Invariant: mtp(lo) <= target. Find the greatest such height in [lo, hi].
+    while lo < hi {
+        let mid = lo + (hi - lo).div_ceil(2);
+        if median_time_past(btc, mid, &mut cache)? <= target {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    Ok(lo)
+}
+
+/// The deterministic Bitcoin anchor for the burn-lock included in ZC block `lock_height`:
+/// the ZC block's BFT time mapped through the median-time-past search. Production networks
+/// lag [`REDEEM_ANCHOR_LAG_SECS`] so the anchor is already buried. Regtest uses lag 0 (the
+/// burn's own BFT time): a 6h lag on a young regtest chain lands the CLTV in the past.
+/// A lag of 0 still sits behind the tip when `generatetoaddress` has run the median time
+/// ahead of wall clock; [`REGTEST_REDEEM_CLOCK_LEAD_BLOCKS`] covers that gap. The anchor
+/// is never a pure function of the ZC height.
+pub fn redeem_anchor_for_block(
+    zc: &dyn ZcNode,
+    btc: &dyn BtcBackend,
+    lock_height: i64,
+    btc_tip: u64,
+) -> Result<u64, String> {
+    let t = zc.block_time(lock_height).map_err(|e| format!("zc block time {lock_height}: {e}"))?;
+    let lag = if btc.network() == bitcoin::Network::Regtest { 0 } else { REDEEM_ANCHOR_LAG_SECS };
+    btc_anchor_height_with_lag(btc, btc_tip, t, lag)
+}
+
+/// The BTC refund locktime for a redeem escrow, DETERMINISTIC per escrow: sized by
+/// [`redeem_btc_locktime_for`] from the burn's inclusion point (`anchor_btc`, `lock_height`)
+/// rather than from the current tips, then RE-VALIDATED against the current tips with the same
+/// rule, so every safety property holds for the funding actually made now:
+///
+/// * the user still has at least [`min_user_claim_blocks`] of Bitcoin blocks to claim, and
+/// * the lock, at half-speed Bitcoin plus its slack, still expires before the ZC escrow.
+///
+/// Both checks only ever fail when the daemon plans long after the burn (an outage) or when
+/// Bitcoin ran slower than the slowdown factor since the burn; the refusal is permanent and
+/// safe (the user's zBTC refunds at expiry; nothing was locked).
+pub fn redeem_btc_locktime_deterministic(
+    network: bitcoin::Network,
+    anchor_btc: u64,
+    lock_height: u64,
+    btc_tip: u64,
+    zc_tip: u64,
+    timeout_height: u64,
+) -> Result<u32, String> {
+    let lt = redeem_btc_locktime_for(network, anchor_btc, lock_height, timeout_height)?;
+    let lock_now = (lt as u64).saturating_sub(btc_tip);
+    let min_lock = min_user_claim_blocks(network);
+    if lock_now < min_lock {
+        return Err(format!(
+            "redeem: deterministic lock {lt} (anchor {anchor_btc}, burn at ZC {lock_height}) leaves the user only \
+             {lock_now} Bitcoin blocks from tip {btc_tip}, below the {min_lock}-block minimum claim window: refusing \
+             to lock reserve BTC (planned too long after the burn; the user's zBTC refunds at the escrow expiry)"
+        ));
+    }
+    let remaining_secs = timeout_height.saturating_sub(zc_tip) * ZC_BLOCK_TIME_SECS;
+    let need = lock_now * BTC_BLOCK_TIME_SECS * BTC_SLOWDOWN_FACTOR + redeem_slack_secs(network, lock_now);
+    if need > remaining_secs {
+        return Err(format!(
+            "redeem: deterministic lock {lt} needs {need}s at half-speed Bitcoin but the escrow has {remaining_secs}s \
+             left (tip {zc_tip}, timeout {timeout_height}): refusing to lock reserve BTC"
+        ));
+    }
+    Ok(lt)
 }
 
 /// The daemon's DEFAULT finalize margin (ZC blocks a redeem escrow must have left before the
@@ -214,12 +358,15 @@ pub fn min_redeem_sats(network: bitcoin::Network) -> u64 {
     zcrypt_core::spv::min_deposit_sats(spv_net(network))
 }
 
-/// Map a bitcoin crate network to the consensus SPV network enum.
+/// Map a bitcoin crate network to the consensus SPV network enum. Testnet (3 and 4) take the
+/// SIGNET profile (a real, public test network: real confirmation floors and sweep depths),
+/// never the regtest one, whose instant-mining assumptions only hold for a private chain
+/// (audit 2026-10 L15). Only `Regtest` itself maps to `Regtest`.
 pub fn spv_net(network: bitcoin::Network) -> zcrypt_core::spv::BtcNet {
     match network {
         bitcoin::Network::Bitcoin => zcrypt_core::spv::BtcNet::Mainnet,
-        bitcoin::Network::Signet => zcrypt_core::spv::BtcNet::Signet,
-        _ => zcrypt_core::spv::BtcNet::Regtest,
+        bitcoin::Network::Regtest => zcrypt_core::spv::BtcNet::Regtest,
+        _ => zcrypt_core::spv::BtcNet::Signet,
     }
 }
 
@@ -250,6 +397,21 @@ pub fn btc_redeem_lock_blocks(network: bitcoin::Network) -> u64 {
         _ => 50,
     }
 }
+
+/// Extra blocks added to a **regtest** redeem lock, on top of [`btc_redeem_lock_blocks`].
+///
+/// `generatetoaddress` stamps each block at `max(median-time-past + 1, wall clock)`. A burst
+/// therefore finishes with its tip time ahead of wall clock, and ahead of the ZC burn's BFT
+/// time. The lag-0 anchor (highest block whose median-time-past is still `<=` that BFT time)
+/// then sits the whole burst behind the tip — a hundred blocks or more after the shields and
+/// maturity mines in a live test. The nominal 50-block regtest lock does not reach back over
+/// that lead, so a burn that was just included looks "planned too late" and the watcher
+/// refuses to fund it.
+///
+/// The allowance is a constant, still capped by the escrow's half-speed budget inside
+/// [`redeem_btc_locktime_for`], so a replan reproduces the same CLTV. Mainnet and signet do
+/// not need it: their six-hour anchor lag is ~36 blocks and their locks are 504 and 288.
+const REGTEST_REDEEM_CLOCK_LEAD_BLOCKS: u64 = 288;
 
 /// Minimum BTC lock length that keeps the race safe on `network` (worst-case late claim
 /// + max safe_sweep deferral + operator SLA). Open paths must use ≥ this.
@@ -428,20 +590,24 @@ pub fn register_spv_body(decimals: u8, ticker: &str, max_supply: u64, reserve_pk
 }
 
 /// Transparent body of an HTLC_OPEN tx: the bytes that follow the gas prefix.
+/// 120-byte header, then the claim [`CoinOpening`], then the M-of-N capability.
 pub fn open_body(
     asset: u64,
     value: u64,
     lock: &[u8; 32],
     timeout: u64,
     claim_pk: &PubKey,
+    opening: &zcrypt_core::htlc_shield::CoinOpening,
     auth: &[u8],
 ) -> Vec<u8> {
-    let mut t = Vec::with_capacity(8 + 8 + 32 + 8 + 64 + auth.len());
+    let enc = opening.encode();
+    let mut t = Vec::with_capacity(8 + 8 + 32 + 8 + 64 + enc.len() + auth.len());
     t.extend_from_slice(&asset.to_le_bytes());
     t.extend_from_slice(&value.to_le_bytes());
     t.extend_from_slice(lock);
     t.extend_from_slice(&timeout.to_le_bytes());
     t.extend_from_slice(&pk_bytes(claim_pk));
+    t.extend_from_slice(&enc);
     t.extend_from_slice(auth);
     t
 }
@@ -621,6 +787,7 @@ pub fn open_spv_tx(
     claim_pk: &PubKey,
     proof: &zcrypt_core::spv::MintProof,
     refund: &Key,
+    opening: &zcrypt_core::htlc_shield::CoinOpening,
 ) -> Vec<u8> {
     let mut t = vec![0x64u8];
     t.extend_from_slice(&asset.to_le_bytes());
@@ -628,9 +795,11 @@ pub fn open_spv_tx(
     t.extend_from_slice(lock);
     t.extend_from_slice(&timeout.to_le_bytes());
     t.extend_from_slice(&pk_bytes(claim_pk));
-    // Recipient binding, extended to EVERY open parameter: the refund key signs the chain,
-    // outpoint, claim_pk, asset, value, hashlock and timeout, so a mempool front-runner can
-    // neither redirect the mint nor open it as a 1-sat / already-expired escrow.
+    // Recipient binding, extended to EVERY open parameter including the claim coin:
+    // the refund key signs the chain, outpoint, claim_pk, asset, value, hashlock,
+    // timeout, claim commitment and note bind, so a mempool front-runner can neither
+    // redirect the mint nor swap the note for one the beneficiary cannot decrypt.
+    // `value` here is the GROSS deposit; the opening itself is the net of the bridge fee.
     let txid = proof.funding_txid().expect("open_spv_tx: proof carries a valid funding tx");
     let mut op = [0u8; 36];
     op[..32].copy_from_slice(&txid);
@@ -643,9 +812,12 @@ pub fn open_spv_tx(
         value,
         hashlock: lock,
         timeout_height: timeout,
+        claim_commitment: &opening.coin.commitment,
+        note_bind: &opening.coin.note_bind(),
     };
     let auth = zcrypt_core::spv::sign_open_auth(&refund.sk, &a);
     t.extend_from_slice(&auth);
+    t.extend_from_slice(&opening.encode());
     t.extend_from_slice(&proof.to_bytes());
     t
 }
@@ -714,10 +886,19 @@ pub fn relay_btc_headers(zc: &dyn ZcNode, btc: &dyn crate::BtcBackend) -> Result
 /// (key set + threshold ML-DSA signatures over these exact params) from
 /// [`zcrypt_core::mint_auth::encode_auth`] — no secret is ever placed on-chain.
 /// `gas` is the encoded gas prefix from [`build_gas_prefix`].
-pub fn open_tx(asset: u64, value: u64, lock: &[u8; 32], timeout: u64, claim_pk: &PubKey, auth: &[u8], gas: &[u8]) -> Vec<u8> {
+pub fn open_tx(
+    asset: u64,
+    value: u64,
+    lock: &[u8; 32],
+    timeout: u64,
+    claim_pk: &PubKey,
+    opening: &zcrypt_core::htlc_shield::CoinOpening,
+    auth: &[u8],
+    gas: &[u8],
+) -> Vec<u8> {
     let mut t = vec![0x5Au8];
     t.extend_from_slice(gas);
-    t.extend_from_slice(&open_body(asset, value, lock, timeout, claim_pk, auth));
+    t.extend_from_slice(&open_body(asset, value, lock, timeout, claim_pk, opening, auth));
     t
 }
 
@@ -741,8 +922,9 @@ pub fn claim_tx(escrow_id: &[u8; 32], preimage: &[u8]) -> Vec<u8> {
 }
 
 /// Build an HTLC-expire tx (0x5C): close a timed-out escrow. A timed-out **burn**
-/// escrow refunds its locked zBTC back to the owner (reconstruct the refunded coin
-/// with `Account::htlc_coin(value, asset, escrow_id)`).
+/// escrow refunds its locked zBTC back to the owner. Recover that coin by decrypting
+/// the escrow's refund note (`refund_enc_note` from [`query_escrow`]), not with
+/// `htlc_coin(value, asset, escrow_id)` — the blind is not a function of the escrow id.
 pub fn expire_tx(escrow_id: &[u8; 32]) -> Vec<u8> {
     let mut t = vec![0x5Cu8];
     t.extend_from_slice(escrow_id);
@@ -773,6 +955,7 @@ pub fn burn_lock_tx(
     timeout: u64,
     refund_pk: &PubKey,
     stx: &shield_tx::ShieldTx,
+    refund: &zcrypt_core::htlc_shield::CoinOpening,
 ) -> Vec<u8> {
     let mut t = vec![0x5Du8];
     t.extend_from_slice(&value.to_le_bytes());
@@ -783,6 +966,7 @@ pub fn burn_lock_tx(
     t.extend_from_slice(lock);
     t.extend_from_slice(&timeout.to_le_bytes());
     t.extend_from_slice(&pk_bytes(refund_pk));
+    t.extend_from_slice(&refund.encode());
     t.extend_from_slice(&shield_tx::to_bytes(stx));
     t
 }
@@ -801,25 +985,20 @@ pub fn burn_lock_btc_tx(
     timeout: u64,
     refund_pk: &PubKey,
     stx: &shield_tx::ShieldTx,
+    refund: &zcrypt_core::htlc_shield::CoinOpening,
 ) -> Vec<u8> {
     let mut t = vec![0x67u8];
     t.extend_from_slice(&btc_claim_pk.inner.serialize()); // 33 bytes, compressed secp256k1
-    // The 0x5D burn-lock body (everything after its tag), byte-identical.
-    t.extend_from_slice(&value.to_le_bytes());
-    for limb in blind {
-        t.extend_from_slice(&limb.to_le_bytes());
-    }
-    t.extend_from_slice(&asset.to_le_bytes());
-    t.extend_from_slice(lock);
-    t.extend_from_slice(&timeout.to_le_bytes());
-    t.extend_from_slice(&pk_bytes(refund_pk));
-    t.extend_from_slice(&shield_tx::to_bytes(stx));
+    // The 0x5D burn-lock body (header + refund opening + shield tx), byte-identical.
+    let body = burn_lock_tx(value, blind, asset, lock, timeout, refund_pk, stx, refund);
+    t.extend_from_slice(&body[1..]);
     t
 }
 
 /// Parse a `0x67` burn-lock-with-btc-key tx body (bytes AFTER the tag) into the fields the redeem
 /// watcher needs: the user's BTC claim pubkey (33B), asset, value, hashlock, timeout, refund_pk.
-/// (The trailing shield_tx isn't needed operator-side.) Fail-closed on malformed input.
+/// Header only (`len >= HEAD`): a refund opening and the shield tx may follow and are not parsed.
+/// Fail-closed on a short header.
 pub fn parse_burn_lock_btc(payload: &[u8]) -> Option<([u8; 33], u64, u64, [u8; 32], u64, PubKey)> {
     // btc_claim_pk(33) ‖ value(8) ‖ blind(BLIND_BYTES) ‖ asset(8) ‖ hashlock(32) ‖ timeout(8) ‖ refund_pk(64) ‖ stx
     const BB: usize = zcrypt_shield::BLIND_BYTES;
@@ -848,8 +1027,9 @@ pub fn parse_burn_lock_btc(payload: &[u8]) -> Option<([u8; 33], u64, u64, [u8; 3
 /// but with TWO keys — `counterparty_pk` (claims with the preimage) and `refund_pk` (the
 /// locker, refunded on timeout). Two of these across two assets, one hashlock, = an atomic
 /// in-pool swap. `stx`'s output[0] must be `commit_asset(value, blind, BURN_PK, asset)` and
-/// its fee is 0. Gas is `gas_tx`, appended after the 216-byte header as the same prefix a
-/// transfer uses (`gas_blind ‖ gas_len ‖ gas_tx`), and its output[0] burns 0.01 ZCRYPT.
+/// its fee is 0. After the 248-byte header come the claim opening, the refund opening,
+/// then the ZCRYPT gas prefix (`gas_blind ‖ gas_len ‖ gas_tx`), then the asset spend.
+/// The gas note's output[0] burns 0.01 ZCRYPT. Wire order is claim then refund.
 #[allow(clippy::too_many_arguments)]
 pub fn swap_lock_tx(
     value: u64,
@@ -862,6 +1042,8 @@ pub fn swap_lock_tx(
     gas_blind: &Blind,
     gas_tx: &shield_tx::ShieldTx,
     stx: &shield_tx::ShieldTx,
+    claim: &zcrypt_core::htlc_shield::CoinOpening,
+    refund: &zcrypt_core::htlc_shield::CoinOpening,
 ) -> Vec<u8> {
     let mut t = vec![0x62u8];
     t.extend_from_slice(&value.to_le_bytes());
@@ -873,6 +1055,8 @@ pub fn swap_lock_tx(
     t.extend_from_slice(&timeout.to_le_bytes());
     t.extend_from_slice(&pk_bytes(counterparty_pk));
     t.extend_from_slice(&pk_bytes(refund_pk));
+    t.extend_from_slice(&claim.encode());
+    t.extend_from_slice(&refund.encode());
     let gas_bytes = shield_tx::to_bytes(gas_tx);
     for limb in gas_blind {
         t.extend_from_slice(&limb.to_le_bytes());
@@ -883,11 +1067,11 @@ pub fn swap_lock_tx(
     t
 }
 
-/// Parse the 216-byte header of a SWAP_LOCK (`0x62`) payload (the bytes after the tag):
-/// `value(8) ‖ blind(32) ‖ asset(8) ‖ hashlock(32) ‖ timeout(8) ‖ counterparty_pk(64) ‖
-/// refund_pk(64)`. A ZCRYPT gas prefix and the asset spend follow that header; both are
-/// left to consensus. Returns `(value, blind, asset, hashlock, timeout, counterparty_pk,
-/// refund_pk)`.
+/// Parse the 248-byte header of a SWAP_LOCK (`0x62`) payload (the bytes after the tag):
+/// `value(8) ‖ blind(BLIND_BYTES) ‖ asset(8) ‖ hashlock(32) ‖ timeout(8) ‖ counterparty_pk(64) ‖
+/// refund_pk(64)`. The claim and refund openings, a ZCRYPT gas prefix and the asset spend
+/// follow that header; this parser does not read them (a longer payload still succeeds).
+/// Returns `(value, blind, asset, hashlock, timeout, counterparty_pk, refund_pk)`.
 #[allow(clippy::type_complexity)]
 pub fn parse_swap_lock(payload: &[u8]) -> Option<(u64, Blind, u64, [u8; 32], u64, PubKey, PubKey)> {
     const BB: usize = zcrypt_shield::BLIND_BYTES;
@@ -993,8 +1177,10 @@ pub fn escrow_id_from(data: &str) -> Result<[u8; 32], String> {
     let v: serde_json::Value = serde_json::from_str(data).map_err(|e| e.to_string())?;
     let hexs = v["escrow_id"].as_str().ok_or("no escrow_id in tx result")?;
     let raw = hex::decode(hexs).map_err(|e| e.to_string())?;
-    let mut id = [0u8; 32];
-    id.copy_from_slice(&raw);
+    let id: [u8; 32] = raw
+        .as_slice()
+        .try_into()
+        .map_err(|_| format!("escrow_id in tx result is {} bytes, want 32", raw.len()))?;
     Ok(id)
 }
 
@@ -1129,6 +1315,40 @@ pub fn parse_transfer_payload(b: &[u8]) -> Option<(shield_tx::ShieldTx, shield_t
     Some((gas_tx, main_tx))
 }
 
+/// Prove the SPV claim coin: net of the bridge fee, encrypted to `to`. The open tx
+/// header still carries the gross deposit. Returns the blind the beneficiary spends with.
+pub fn spv_claim_opening(
+    to: &zcrypt_core::keys::Address,
+    gross: u64,
+    asset: u64,
+) -> Result<(Blind, zcrypt_core::htlc_shield::CoinOpening), String> {
+    let fee = zcrypt_core::emission::bridge_fee(gross);
+    let net = gross.checked_sub(fee).ok_or("SPV mint value underflow")?;
+    if net == 0 {
+        return Err("SPV mint net of the bridge fee is zero".into());
+    }
+    zcrypt_core::htlc_shield::CoinOpening::create(to, net, asset)
+}
+
+/// An opening that parses (`commitment` canonical, note the wire length, proof non-empty)
+/// but does not prove. Unit tests and header fixtures only — never broadcast.
+#[cfg(test)]
+pub(crate) fn dummy_opening() -> zcrypt_core::htlc_shield::CoinOpening {
+    zcrypt_core::htlc_shield::CoinOpening {
+        coin: zcrypt_core::htlc_shield::HiddenCoin {
+            commitment: [1u64; 8],
+            enc_note: vec![0u8; zcrypt_core::kem::NOTE_WIRE_LEN],
+        },
+        proof: vec![1],
+    }
+}
+
+/// Decrypt a settlement note the counterparty encrypted to `account`.
+pub fn coin_from_note(account: &Account, note: &[u8]) -> Result<Coin, String> {
+    let ct = zcrypt_core::kem::ciphertext_from_bytes(note).ok_or("settlement note is not a ciphertext")?;
+    account.receive(&ct).ok_or_else(|| "could not decrypt the settlement note".to_string())
+}
+
 pub struct BtcParams<'a> {
     /// Alice's Bitcoin backend (the user). Any [`BtcBackend`] — a node-free self-custody
     /// wallet on an Esplora API in production, or a local node for regtest/dev.
@@ -1209,8 +1429,10 @@ pub fn btc_to_zbtc_progress(
         utxo.outpoint.vout,
         &utxo.outpoint.txid,
     )?;
+    // The claim coin is the net of the bridge fee. The open header still carries the gross.
+    let (blind, opening) = spv_claim_opening(&alice.normal_address(), zbtc_value, asset)?;
     let data =
-        zc.broadcast(&open_spv_tx(asset, zbtc_value, &lock, zc_timeout, &alice.pubkey(), &proof, b.alice_key))?;
+        zc.broadcast(&open_spv_tx(asset, zbtc_value, &lock, zc_timeout, &alice.pubkey(), &proof, b.alice_key, &opening))?;
     let escrow_id = escrow_id_from(&data)?;
     println!("  [zc]  SPV-verified deposit opened zBTC escrow {}", hex::encode(escrow_id));
 
@@ -1219,9 +1441,10 @@ pub fn btc_to_zbtc_progress(
     let h0 = zc.height()?;
     zc.broadcast(&claim_tx(&escrow_id, preimage))?;
     // The mint skims a small protocol bridge fee to stakers, so the recipient's coin is
-    // `zbtc_value - fee` (both node and wallet compute the same fee).
+    // `zbtc_value - fee` (both node and wallet compute the same fee). The blind is the one
+    // `CoinOpening::create` sampled; it is not a function of the escrow id.
     let net = zbtc_value - zcrypt_core::emission::bridge_fee(zbtc_value);
-    let coin = alice.htlc_coin(net, asset, &escrow_id);
+    let coin = alice.htlc_coin(net, asset, blind);
     println!("  [zc]  Alice claimed {net} zBTC (of {zbtc_value}; {} to stakers as bridge fee)",
         zcrypt_core::emission::bridge_fee(zbtc_value));
 
@@ -1382,8 +1605,9 @@ pub fn resume_public_shield(
         utxo.outpoint.vout,
         &utxo.outpoint.txid,
     )?;
+    let (blind, opening) = spv_claim_opening(&user.normal_address(), zbtc_value, asset)?;
     let data =
-        zc.broadcast(&open_spv_tx(asset, zbtc_value, &lock, zc_timeout, &user.pubkey(), &proof, user_refund))?;
+        zc.broadcast(&open_spv_tx(asset, zbtc_value, &lock, zc_timeout, &user.pubkey(), &proof, user_refund, &opening))?;
     let escrow_id = escrow_id_from(&data)?;
 
     // 3. Claim the zBTC, revealing the preimage on ZCrypt (this is what lets the operator
@@ -1410,7 +1634,7 @@ pub fn resume_public_shield(
         );
     }
     let net = zbtc_value - zcrypt_core::emission::bridge_fee(zbtc_value);
-    let coin = user.htlc_coin(net, asset, &escrow_id);
+    let coin = user.htlc_coin(net, asset, blind);
     progress(
         100,
         "Done — zBTC is minting/maturing. Operator must sweep the BTC HTLC before CLTV refund.",
@@ -1423,8 +1647,8 @@ pub fn resume_public_shield(
 /// recover each deposit's HTLC parameters AND recompute its escrow id (which needs `claim_pk`)
 /// so it can confirm the deposit was consensus-accepted. Fail-closed on any malformed input.
 pub fn parse_open_spv(payload: &[u8]) -> Option<(u64, u64, [u8; 32], u64, PubKey, MintProof)> {
-    // asset(8) ‖ value(8) ‖ lock(32) ‖ timeout(8) ‖ claim_pk(64) ‖ open_auth(64) ‖ MintProof
-    // The watcher does not need the open_auth signature, so it is skipped (bytes [120..184]).
+    // asset(8) ‖ value(8) ‖ lock(32) ‖ timeout(8) ‖ claim_pk(64) ‖ open_auth(64)
+    // ‖ CoinOpening ‖ MintProof. The opening is dropped; a failed decode is a failed parse.
     const HEAD: usize = 8 + 8 + 32 + 8 + 64 + 64;
     if payload.len() < HEAD {
         return None;
@@ -1437,7 +1661,8 @@ pub fn parse_open_spv(payload: &[u8]) -> Option<(u64, u64, [u8; 32], u64, PubKey
     for (i, limb) in claim_pk.iter_mut().enumerate() {
         *limb = u64::from_le_bytes(payload[56 + i * 8..64 + i * 8].try_into().ok()?);
     }
-    let proof = MintProof::from_bytes(&payload[HEAD..])?;
+    let (_opening, n) = zcrypt_core::htlc_shield::CoinOpening::decode(&payload[HEAD..])?;
+    let proof = MintProof::from_bytes(&payload[HEAD + n..])?;
     Some((asset, value, lock, timeout, claim_pk, proof))
 }
 
@@ -1459,6 +1684,12 @@ pub struct EscrowInfo {
     pub btc_claim_pk: Vec<u8>,
     pub party_pk: Vec<u8>,
     pub refund_pk: Vec<u8>,
+    /// Settlement coins from `/htlc/<id>`. Empty when the node omits the field or this
+    /// side has no coin (a burn has no claim coin; a mint has no refund coin).
+    pub claim_commitment: Vec<u8>,
+    pub claim_enc_note: Vec<u8>,
+    pub refund_commitment: Vec<u8>,
+    pub refund_enc_note: Vec<u8>,
 }
 
 /// Query one escrow by id; `Ok(None)` if consensus has no such escrow (rejected/garbage tx).
@@ -1488,7 +1719,33 @@ pub fn query_escrow(zc: &dyn ZcNode, escrow_id: &[u8; 32]) -> Result<Option<Escr
         btc_claim_pk: hex_field("btc_claim_pk"),
         party_pk: hex_field("party_pk"),
         refund_pk: hex_field("refund_pk"),
+        claim_commitment: hex_field("claim_commitment"),
+        claim_enc_note: hex_field("claim_enc_note"),
+        refund_commitment: hex_field("refund_commitment"),
+        refund_enc_note: hex_field("refund_enc_note"),
     }))
+}
+
+impl EscrowInfo {
+    /// Whether `pk` is the escrow's consensus-committed claim recipient.
+    pub fn party_is(&self, pk: &PubKey) -> bool {
+        self.party_pk == pk_bytes(pk)
+    }
+    /// Whether `pk` is the escrow's consensus-committed refund (expire) recipient.
+    pub fn refund_is(&self, pk: &PubKey) -> bool {
+        self.refund_pk == pk_bytes(pk)
+    }
+    /// The consensus-committed refund key as a `PubKey`, if the node reported one.
+    pub fn refund_pubkey(&self) -> Option<PubKey> {
+        if self.refund_pk.len() != 64 {
+            return None;
+        }
+        let mut pk = [0u64; 8];
+        for (i, limb) in pk.iter_mut().enumerate() {
+            *limb = u64::from_le_bytes(self.refund_pk[i * 8..i * 8 + 8].try_into().ok()?);
+        }
+        Some(pk)
+    }
 }
 
 /// Reconstruct the BTC HTLC UTXO a shield deposit funded, from that deposit's on-chain
@@ -1753,41 +2010,69 @@ pub fn index_reserve_deposits(
     from: i64,
     to: i64,
 ) -> Result<(Vec<TrackedDeposit>, Vec<([u8; 32], String)>), String> {
-    use zcrypt_core::htlc_shield::escrow_id as derive_escrow_id;
     let mut found = Vec::new();
     let mut errors = Vec::new();
     for h in from..=to {
-        for tx in zc.block_txs(h)? {
-            if tx.first() != Some(&0x64) {
-                continue;
-            }
-            let Some((asset, value, lock, timeout, claim_pk, proof)) = parse_open_spv(&tx[1..]) else {
-                continue;
-            };
-            // Deposits to the current key AND to retired keys this operator still holds.
-            if keys.key_for(&proof.reserve_pk).is_none() {
-                continue;
-            }
-            let eid = derive_escrow_id(asset, value, &lock, timeout, &claim_pk);
-            match query_escrow(zc, &eid) {
-                Ok(Some(info)) if info.hashlock == lock => {
-                    let Some(bh) = proof.deposit_block_hash() else { continue };
-                    found.push(TrackedDeposit {
-                        escrow_id: hex::encode(eid),
-                        proof_hex: hex::encode(proof.to_bytes()),
-                        deposit_block: hex::encode(bh),
-                        value,
-                        btc_locktime: proof.btc_locktime,
-                        hashlock: hex::encode(lock),
-                        claimed: info.state == "claimed",
-                    });
-                }
-                Ok(_) => {} // rejected / garbage / mismatched: ignore
-                Err(e) => errors.push((eid, format!("escrow query: {e}"))),
-            }
-        }
+        let (f, e) = index_reserve_deposits_in(zc, keys, &zc.block_txs(h)?);
+        found.extend(f);
+        errors.extend(e);
     }
     Ok((found, errors))
+}
+
+/// [`index_reserve_deposits`] for ONE block whose raw txs the caller already fetched (the
+/// daemon fetches each block once and dispatches it to every scanner, audit M9). Errors are
+/// TRANSIENT (an escrow or claimed-set query failed): the caller must re-scan this block
+/// later rather than advance past it (audit H4). A `0x64` whose escrow consensus no longer
+/// holds (pruned after retention) but whose Bitcoin outpoint is in the consensus CLAIMED set
+/// is indexed as claimed (audit H3): the mint happened, the sweep is still owed.
+pub fn index_reserve_deposits_in(
+    zc: &dyn ZcNode,
+    keys: &ReserveKeys<'_>,
+    txs: &[Vec<u8>],
+) -> (Vec<TrackedDeposit>, Vec<([u8; 32], String)>) {
+    use zcrypt_core::htlc_shield::{escrow_id as derive_escrow_id, EscrowKind};
+    let mut found = Vec::new();
+    let mut errors = Vec::new();
+    for tx in txs {
+        if tx.first() != Some(&0x64) {
+            continue;
+        }
+        let Some((asset, value, lock, timeout, claim_pk, proof)) = parse_open_spv(&tx[1..]) else {
+            continue;
+        };
+        // Deposits to the current key AND to retired keys this operator still holds.
+        if keys.key_for(&proof.reserve_pk).is_none() {
+            continue;
+        }
+        let eid = derive_escrow_id(EscrowKind::Mint, asset, value, &lock, timeout, &claim_pk, &claim_pk);
+        let Some(bh) = proof.deposit_block_hash() else { continue };
+        let tracked = |claimed: bool| TrackedDeposit {
+            escrow_id: hex::encode(eid),
+            proof_hex: hex::encode(proof.to_bytes()),
+            deposit_block: hex::encode(bh),
+            value,
+            btc_locktime: proof.btc_locktime,
+            hashlock: hex::encode(lock),
+            claimed,
+        };
+        match query_escrow(zc, &eid) {
+            Ok(Some(info)) if info.hashlock == lock => found.push(tracked(info.state == "claimed")),
+            Ok(Some(_)) => {} // an escrow with this id but another hashlock: not this deposit
+            Ok(None) => {
+                // No escrow: rejected/garbage, OR settled and pruned while we were away. The
+                // claimed set is permanent and tells the two apart.
+                let Some(txid) = proof.funding_txid() else { continue };
+                match zc.spv_claimed(&txid, proof.vout) {
+                    Ok(true) => found.push(tracked(true)),
+                    Ok(false) => {}
+                    Err(e) => errors.push((eid, format!("claimed-set query: {e}"))),
+                }
+            }
+            Err(e) => errors.push((eid, format!("escrow query: {e}"))),
+        }
+    }
+    (found, errors)
 }
 
 /// Collect every `0x5B` claim in ZC blocks `from..=to` that opens one of `known` deposits
@@ -1802,20 +2087,71 @@ pub fn collect_reserve_claims(
 ) -> Result<Vec<(TrackedDeposit, Vec<u8>, i64)>, String> {
     let mut out = Vec::new();
     for h in from..=to {
-        for tx in zc.block_txs(h)? {
-            if tx.first() != Some(&0x5B) || tx.len() <= 33 {
-                continue;
-            }
-            let Ok(eid): Result<[u8; 32], _> = tx[1..33].try_into() else { continue };
-            let Some(dep) = known.get(&eid) else { continue };
-            let preimage = &tx[33..];
-            if dep.hashlock_bytes() != Some(htlc_hashlock(preimage)) {
-                continue; // this preimage does not open our escrow
-            }
-            out.push((dep.clone(), preimage.to_vec(), h));
-        }
+        out.extend(collect_reserve_claims_in(&zc.block_txs(h)?, h, known));
     }
     Ok(out)
+}
+
+/// [`collect_reserve_claims`] for ONE block whose raw txs the caller already fetched.
+pub fn collect_reserve_claims_in(
+    txs: &[Vec<u8>],
+    height: i64,
+    known: &std::collections::HashMap<[u8; 32], TrackedDeposit>,
+) -> Vec<(TrackedDeposit, Vec<u8>, i64)> {
+    let mut out = Vec::new();
+    for tx in txs {
+        if tx.first() != Some(&0x5B) || tx.len() <= 33 {
+            continue;
+        }
+        let Ok(eid): Result<[u8; 32], _> = tx[1..33].try_into() else { continue };
+        let Some(dep) = known.get(&eid) else { continue };
+        let preimage = &tx[33..];
+        if dep.hashlock_bytes() != Some(htlc_hashlock(preimage)) {
+            continue; // this preimage does not open our escrow
+        }
+        out.push((dep.clone(), preimage.to_vec(), height));
+    }
+    out
+}
+
+/// Whether a tracked deposit's zBTC mint exists, from every durable source consensus offers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MintStatus {
+    /// The mint settled (escrow claimed, or the outpoint is in the permanent claimed set):
+    /// the BTC is owed to the reserve.
+    Claimed,
+    /// The escrow is still open: a claim may yet land.
+    Open,
+    /// No mint exists and none ever will (expired, or pruned without a claim): the depositor
+    /// keeps the refund path; never sweep.
+    Never(String),
+}
+
+/// Resolve [`MintStatus`] for `dep`: a persisted `claimed` flag is trusted (it was set from
+/// consensus and the escrow may since have been pruned, audit H3); otherwise the escrow
+/// record, and when that is gone, the consensus claimed-outpoint set. `Err` is transient.
+pub fn mint_status(zc: &dyn ZcNode, dep: &TrackedDeposit) -> Result<MintStatus, String> {
+    if dep.claimed {
+        return Ok(MintStatus::Claimed);
+    }
+    let (Some(eid), Some(lock)) = (dep.escrow_id_bytes(), dep.hashlock_bytes()) else {
+        return Err("corrupt tracked deposit".to_string());
+    };
+    match query_escrow(zc, &eid)? {
+        Some(info) if info.hashlock != lock => Ok(MintStatus::Never("escrow hashlock differs from the deposit".to_string())),
+        Some(info) if info.state == "claimed" => Ok(MintStatus::Claimed),
+        Some(info) if info.state == "open" => Ok(MintStatus::Open),
+        Some(info) => Ok(MintStatus::Never(format!("escrow state is '{}'", info.state))),
+        None => {
+            let txid = dep.proof().and_then(|p| p.funding_txid()).ok_or("corrupt tracked deposit proof")?;
+            let vout = dep.proof().map(|p| p.vout).unwrap_or(0);
+            if zc.spv_claimed(&txid, vout)? {
+                Ok(MintStatus::Claimed)
+            } else {
+                Ok(MintStatus::Never("escrow unknown to consensus and outpoint not in the claimed set".to_string()))
+            }
+        }
+    }
 }
 
 /// What one sweep attempt did.
@@ -1825,9 +2161,10 @@ pub enum SweepOutcome {
     Swept(bitcoin::Txid),
     /// The deposit is not buried past maturity + reorg grace yet: retry later.
     Deferred { confs: u64, need: u64 },
-    /// Consensus does not show the escrow as claimed (a leaked preimage without a mint):
-    /// never sweep, the depositor keeps the refund path.
-    NotClaimed(String),
+    /// Consensus does not show a mint for this deposit (a leaked preimage without a mint, or
+    /// a claim still settling): the status says whether to keep waiting or to stop. Never
+    /// sweep: the depositor keeps the refund path.
+    NotClaimed(MintStatus),
     /// A per-deposit failure (RPC, fees, broadcast): retry next tick.
     Failed(String),
 }
@@ -1858,18 +2195,15 @@ pub fn sweep_deposit(
             hex::encode(proof.reserve_pk)
         ));
     };
-    // Require a consensus-accepted claim (minted / immature) before taking BTC.
-    match query_escrow(zc, &eid) {
-        Ok(Some(info)) if info.state == "claimed" && info.hashlock == lock => {}
-        Ok(Some(info)) => {
-            return SweepOutcome::NotClaimed(format!(
-                "preimage on-chain but escrow state is '{}' (not claimed); refusing BTC sweep",
-                info.state
-            ))
-        }
-        Ok(None) => return SweepOutcome::NotClaimed("escrow unknown to consensus".to_string()),
+    // Require a consensus-accepted claim (minted / immature) before taking BTC. Escrow
+    // presence is NOT the only proof: a persisted claimed flag or the permanent claimed
+    // outpoint set also count, since settled escrows are pruned after retention (audit H3).
+    match mint_status(zc, dep) {
+        Ok(MintStatus::Claimed) => {}
+        Ok(status @ (MintStatus::Open | MintStatus::Never(_))) => return SweepOutcome::NotClaimed(status),
         Err(e) => return SweepOutcome::Failed(format!("escrow query before sweep: {e}")),
     }
+    let _ = eid;
     // Defer until the deposit is buried past the mint's maturity + reorg-void grace, so a
     // benign reorg that voids the still-immature mint can never strand a swept deposit.
     let need = zcrypt_core::spv::safe_sweep_conf(net, dep.value);
@@ -1880,10 +2214,17 @@ pub fn sweep_deposit(
         }
     }
     let effective_fee_target = if refund_proximity(dep.btc_locktime, btc_tip) != RefundProximity::Ok { 1 } else { fee_target };
+    // One fresh address per sweep. "not supported" keeps the caller's destination
+    // (sim / mock backends). A real `new_address` failure is retried next tick.
+    let pay = match operator_btc.fresh_payout_address() {
+        Ok(a) => a,
+        Err(e) if e.contains("not supported") => dest.clone(),
+        Err(e) => return SweepOutcome::Failed(e),
+    };
     let outcome = (|| -> Result<bitcoin::Txid, String> {
         let utxo = htlc_utxo_from_proof(&proof, &lock)?;
         let fee = htlc_spend_fee_for(operator_btc, effective_fee_target, utxo.value.to_sat())?;
-        let txid = operator_btc.claim(&utxo, preimage, reserve, dest, fee)?;
+        let txid = operator_btc.claim(&utxo, preimage, reserve, &pay, fee)?;
         if operator_btc.network() == bitcoin::Network::Regtest {
             operator_btc.confirm(&txid)?; // instant self-mine; real networks are polled per tick
         }
@@ -1933,7 +2274,7 @@ pub fn reserve_claim_revealed(
                 report.swept.push((eid, txid));
             }
             SweepOutcome::Deferred { .. } => report.deferred.push(eid),
-            SweepOutcome::NotClaimed(why) => report.errors.push((eid, why)),
+            SweepOutcome::NotClaimed(status) => report.errors.push((eid, format!("not claimed: {status:?}; refusing BTC sweep"))),
             SweepOutcome::Failed(e) => {
                 if prox != RefundProximity::Ok {
                     report.pause_new_shields = true;
@@ -2064,6 +2405,10 @@ pub fn redeem_user_burn(
         change_blind,
         asset,
     ));
+    // The refund coin's blind is hidden. Create it before the envelope so the proof
+    // binds the commitment the user can spend on expire (by decrypting the note).
+    let (_refund_blind, refund_open) =
+        zcrypt_core::htlc_shield::CoinOpening::create(&user.normal_address(), zbtc_value, asset)?;
     // The timeout is part of the bound envelope, so it must be fixed BEFORE proving.
     let zc_timeout = zc.height()? as u64 + ZC_REDEEM_TIMEOUT_BLOCKS;
     let envelope = zcrypt_core::htlc_shield::lock_envelope(
@@ -2075,6 +2420,7 @@ pub fn redeem_user_burn(
         &user.pubkey(),
         &user.pubkey(),
         &btc_claim_pk.inner.serialize(),
+        std::slice::from_ref(&refund_open.coin),
     );
     let stx = build_shield_spend_bound(
         zc,
@@ -2084,7 +2430,9 @@ pub fn redeem_user_burn(
         vec![zcrypt_core::keys::cover_note_bytes(), change_note],
         &envelope,
     )?;
-    let data = zc.broadcast(&burn_lock_btc_tx(btc_claim_pk, zbtc_value, &burn_blind, asset, hashlock, zc_timeout, &user.pubkey(), &stx))?;
+    let data = zc.broadcast(&burn_lock_btc_tx(
+        btc_claim_pk, zbtc_value, &burn_blind, asset, hashlock, zc_timeout, &user.pubkey(), &stx, &refund_open,
+    ))?;
     let escrow_id = escrow_id_from(&data)?;
     Ok((escrow_id, change_value, change_blind))
 }
@@ -2251,6 +2599,8 @@ pub struct RedeemPlan {
     pub value: u64,
     pub script: ScriptBuf,
     pub btc_locktime: u32,
+    /// The ZC escrow's expiry height (drives the unconfirmed-funding deadline, audit M6).
+    pub zc_timeout: u64,
 }
 
 /// Outcome of a planning pass over a block range.
@@ -2283,112 +2633,201 @@ pub fn plan_redeems(
     min_finalize_margin: u64,
     skip: &std::collections::HashSet<[u8; 32]>,
 ) -> Result<RedeemPlanReport, String> {
-    use zcrypt_core::htlc_shield::escrow_id as derive_escrow_id;
-    let zc_tip = zc.height()? as u64;
-    let net = operator_btc.network();
-    let btc_tip = operator_btc.height()?;
-    let margin = min_finalize_margin.max(min_redeem_margin_blocks(net));
+    let tips = PlanTips::read(zc, operator_btc)?;
     let mut report = RedeemPlanReport::default();
-    // One plan per escrow id per pass. A block can carry two 0x67 txs with identical lock
-    // parameters (same id) where only the first succeeded at delivery; without this the
-    // second, failed copy would get its own funded HTLC (bridge C1).
     let mut planned_ids: std::collections::HashSet<[u8; 32]> = std::collections::HashSet::new();
     for h in from..=to {
         let txs = zc.block_txs(h)?;
-        for tx in txs {
-            if tx.first() != Some(&0x67) {
+        plan_redeems_in(zc, operator_btc, reserve, h, &txs, zbtc_asset, min_finalize_margin, skip, &tips, &mut planned_ids, &mut report);
+    }
+    Ok(report)
+}
+
+/// The chain tips one planning pass is evaluated against (read once per tick).
+#[derive(Clone, Copy, Debug)]
+pub struct PlanTips {
+    pub zc_tip: u64,
+    pub btc_tip: u64,
+}
+
+impl PlanTips {
+    pub fn read(zc: &dyn ZcNode, operator_btc: &dyn BtcBackend) -> Result<Self, String> {
+        Ok(PlanTips { zc_tip: zc.height()? as u64, btc_tip: operator_btc.height()? })
+    }
+}
+
+/// [`plan_redeems`] for ONE block whose raw txs the caller already fetched (audit M9).
+/// `planned_ids` carries the one-plan-per-escrow-id guard across the blocks of a pass
+/// (bridge C1). Entries in `report.errors` are TRANSIENT (an escrow query or the anchor
+/// lookup failed): the caller must re-scan this block later instead of advancing past it
+/// (audit H4); `report.rejected` is permanent.
+#[allow(clippy::too_many_arguments)]
+pub fn plan_redeems_in(
+    zc: &dyn ZcNode,
+    operator_btc: &dyn BtcBackend,
+    reserve: &Key,
+    height: i64,
+    txs: &[Vec<u8>],
+    zbtc_asset: u64,
+    min_finalize_margin: u64,
+    skip: &std::collections::HashSet<[u8; 32]>,
+    tips: &PlanTips,
+    planned_ids: &mut std::collections::HashSet<[u8; 32]>,
+    report: &mut RedeemPlanReport,
+) {
+    use zcrypt_core::htlc_shield::{escrow_id as derive_escrow_id, EscrowKind};
+    let PlanTips { zc_tip, btc_tip } = *tips;
+    let net = operator_btc.network();
+    let margin = min_finalize_margin.max(min_redeem_margin_blocks(net));
+    // The deterministic Bitcoin anchor of this ZC block (audit H5), resolved lazily: only a
+    // block that carries a servable burn-lock pays for the lookup.
+    let mut anchor: Option<u64> = None;
+    for tx in txs {
+        if tx.first() != Some(&0x67) {
+            continue;
+        }
+        let Some((tx_btc_pk, asset, value, hashlock, timeout, refund_pk)) = parse_burn_lock_btc(&tx[1..]) else {
+            continue;
+        };
+        let eid = derive_escrow_id(EscrowKind::Burn, asset, value, &hashlock, timeout, &refund_pk, &refund_pk);
+        if skip.contains(&eid) {
+            report.skipped += 1;
+            continue;
+        }
+        // One plan per escrow id per pass. A block can carry two 0x67 txs with identical lock
+        // parameters (same id) where only the first succeeded at delivery; without this the
+        // second, failed copy would get its own funded HTLC (bridge C1).
+        if !planned_ids.insert(eid) {
+            report.rejected.push((eid, format!(
+                "duplicate burn-lock for an escrow already planned this pass (tx payout key {})",
+                hex::encode(tx_btc_pk)
+            )));
+            continue;
+        }
+        let info = match query_escrow(zc, &eid) {
+            Ok(Some(i)) => i,
+            Ok(None) => continue, // consensus rejected this burn-lock: nothing to serve
+            Err(e) => {
+                planned_ids.remove(&eid); // let the re-scan plan it
+                report.errors.push((eid, format!("escrow query: {e}")));
                 continue;
             }
-            let Some((tx_btc_pk, asset, value, hashlock, timeout, refund_pk)) = parse_burn_lock_btc(&tx[1..]) else {
-                continue;
-            };
-            let eid = derive_escrow_id(asset, value, &hashlock, timeout, &refund_pk);
-            if skip.contains(&eid) {
-                report.skipped += 1;
-                continue;
-            }
-            if !planned_ids.insert(eid) {
-                report.rejected.push((eid, format!(
-                    "duplicate burn-lock for an escrow already planned this pass (tx payout key {})",
-                    hex::encode(tx_btc_pk)
-                )));
-                continue;
-            }
-            let info = match query_escrow(zc, &eid) {
-                Ok(Some(i)) => i,
-                Ok(None) => continue, // consensus rejected this burn-lock — nothing to serve
+        };
+        // Validate every peg-critical property BEFORE committing reserve BTC.
+        let reject = if info.state != "open" {
+            Some(format!("escrow not open (state={})", info.state))
+        } else if info.kind != "burn" {
+            Some(format!("escrow kind '{}' is not a burn escrow", info.kind))
+        } else if info.btc_claim_pk.len() != 33 {
+            Some(format!(
+                "consensus committed no 33-byte payout key for this escrow ({} bytes); the key in the raw tx is not trusted",
+                info.btc_claim_pk.len()
+            ))
+        } else if info.asset_id != zbtc_asset {
+            Some(format!("escrow asset {} is not zBTC ({zbtc_asset})", info.asset_id))
+        } else if info.hashlock != hashlock {
+            Some("burn-lock hashlock disagrees with the escrow".to_string())
+        } else if info.value != value {
+            Some(format!("burn-lock value {value} disagrees with the escrow {}", info.value))
+        } else if info.value < min_redeem_sats(net) {
+            Some(format!("value {} below the {}-sat minimum redeem", info.value, min_redeem_sats(net)))
+        } else if info.timeout_height < zc_tip + margin {
+            // Deliberately PERMANENT (bridge N15): an escrow's remaining life only shrinks,
+            // so a "too soon" verdict can never flip to acceptable later. Refusing is the
+            // safe choice: the user's zBTC refunds at expiry and they can burn-lock again
+            // with a fresh timeout; locking reserve BTC against a short escrow is what
+            // enables the H1 theft.
+            Some(format!(
+                "escrow timeout {} too soon (tip {zc_tip} + margin {margin}); permanent: the user's zBTC \
+                 refunds at expiry, re-lock with a fresh timeout",
+                info.timeout_height
+            ))
+        } else {
+            None
+        };
+        if let Some(r) = reject {
+            report.rejected.push((eid, r));
+            continue;
+        }
+        let anchor_btc = match anchor {
+            Some(a) => a,
+            None => match redeem_anchor_for_block(zc, operator_btc, height, btc_tip) {
+                Ok(a) => {
+                    anchor = Some(a);
+                    a
+                }
                 Err(e) => {
-                    report.errors.push((eid, format!("escrow query: {e}")));
+                    planned_ids.remove(&eid);
+                    report.errors.push((eid, format!("redeem anchor: {e}")));
                     continue;
                 }
-            };
-            // Validate every peg-critical property BEFORE committing reserve BTC.
-            let reject = if info.state != "open" {
-                Some(format!("escrow not open (state={})", info.state))
-            } else if info.kind != "burn" {
-                Some(format!("escrow kind '{}' is not a burn escrow", info.kind))
-            } else if info.btc_claim_pk.len() != 33 {
-                Some(format!(
-                    "consensus committed no 33-byte payout key for this escrow ({} bytes); the key in the raw tx is not trusted",
-                    info.btc_claim_pk.len()
-                ))
-            } else if info.asset_id != zbtc_asset {
-                Some(format!("escrow asset {} is not zBTC ({zbtc_asset})", info.asset_id))
-            } else if info.hashlock != hashlock {
-                Some("burn-lock hashlock disagrees with the escrow".to_string())
-            } else if info.value != value {
-                Some(format!("burn-lock value {value} disagrees with the escrow {}", info.value))
-            } else if info.value < min_redeem_sats(net) {
-                Some(format!("value {} below the {}-sat minimum redeem", info.value, min_redeem_sats(net)))
-            } else if info.timeout_height < zc_tip + margin {
-                // Deliberately PERMANENT (bridge N15): an escrow's remaining life only shrinks,
-                // so a "too soon" verdict can never flip to acceptable later. Refusing is the
-                // safe choice: the user's zBTC refunds at expiry and they can burn-lock again
-                // with a fresh timeout; locking reserve BTC against a short escrow is what
-                // enables the H1 theft.
-                Some(format!(
-                    "escrow timeout {} too soon (tip {zc_tip} + margin {margin}); permanent: the user's zBTC \
-                     refunds at expiry, re-lock with a fresh timeout",
-                    info.timeout_height
-                ))
-            } else {
-                None
-            };
-            if let Some(r) = reject {
-                report.rejected.push((eid, r));
-                continue;
-            }
-            let btc_locktime = match redeem_btc_locktime_for(net, btc_tip, zc_tip, info.timeout_height) {
+            },
+        };
+        // Always the burn-time script. A later tip must rediscover the same CLTV so an
+        // existing funding is found; refusing a too-short window is fund_redeem_plan's job
+        // and only applies when nothing is funded yet.
+        let btc_locktime =
+            match redeem_btc_locktime_for(net, anchor_btc, height.max(0) as u64, info.timeout_height) {
                 Ok(lt) => lt,
                 Err(e) => {
                     report.rejected.push((eid, e));
                     continue;
                 }
             };
-            // Payout key from CONSENSUS STATE (the escrow the successful tx created), not from
-            // whichever raw tx we happened to parse.
-            let btc_pk = match PublicKey::from_slice(&info.btc_claim_pk) {
-                Ok(pk) => pk,
-                Err(e) => {
-                    report.rejected.push((eid, format!("bad user btc key in consensus escrow: {e}")));
-                    continue;
-                }
-            };
-            let script = htlc_script(&info.hashlock, &btc_pk, &reserve.pk, btc_locktime);
-            report.plans.push(RedeemPlan { escrow_id: eid, hashlock, value: info.value, script, btc_locktime });
-        }
+        // Payout key from CONSENSUS STATE (the escrow the successful tx created), not from
+        // whichever raw tx we happened to parse.
+        let btc_pk = match PublicKey::from_slice(&info.btc_claim_pk) {
+            Ok(pk) => pk,
+            Err(e) => {
+                report.rejected.push((eid, format!("bad user btc key in consensus escrow: {e}")));
+                continue;
+            }
+        };
+        let script = htlc_script(&info.hashlock, &btc_pk, &reserve.pk, btc_locktime);
+        report.plans.push(RedeemPlan { escrow_id: eid, hashlock, value: info.value, script, btc_locktime, zc_timeout: info.timeout_height });
     }
-    Ok(report)
 }
 
 /// OPERATOR redeem watcher, funding half: lock reserve BTC for one [`RedeemPlan`]. Looks
 /// for an EXISTING funding of the same HTLC first (a previous attempt that broadcast but
-/// was not recorded) and reuses it instead of funding again (bridge H2). Returns the UTXO,
-/// still UNCONFIRMED, plus whether it was reused; the caller persists the txid, then waits
-/// for confirmations with `confirm`.
-pub fn fund_redeem_plan(operator_btc: &dyn BtcBackend, plan: &RedeemPlan) -> Result<(HtlcUtxo, bool), String> {
+/// was not recorded) and reuses it instead of funding again (bridge H2), even if the
+/// claim window has since closed. A NEW funding is refused when the user would have
+/// fewer than [`min_user_claim_blocks`] left, or when the ZC escrow's remaining life
+/// cannot cover the lock at half-speed Bitcoin. `zc_tip` is the current ZC height.
+/// Returns the UTXO, still UNCONFIRMED, plus whether it was reused; the caller persists
+/// the txid, then waits for confirmations with `confirm`.
+pub fn fund_redeem_plan(
+    operator_btc: &dyn BtcBackend,
+    plan: &RedeemPlan,
+    zc_tip: u64,
+) -> Result<(HtlcUtxo, bool), String> {
     if let Some(existing) = find_funded_htlc(operator_btc, &plan.script, Amount::from_sat(plan.value))? {
         return Ok((existing, true));
+    }
+    let net = operator_btc.network();
+    let btc_tip = operator_btc.height()?;
+    let lock_now = (plan.btc_locktime as u64).saturating_sub(btc_tip);
+    let min_lock = min_user_claim_blocks(net);
+    if lock_now < min_lock {
+        return Err(format!(
+            "redeem: deterministic lock {} (btc tip {btc_tip}) leaves the user only {lock_now} Bitcoin blocks, \
+             below the {min_lock}-block minimum claim window: refusing to lock reserve BTC \
+             (planned too long after the burn; the user's zBTC refunds at the escrow expiry)",
+            plan.btc_locktime
+        ));
+    }
+    // `zc_timeout == 0` is an intent saved before the field existed. Those files have no
+    // ZC deadline on record, so only the Bitcoin window above applies (FundingIntent).
+    if plan.zc_timeout > 0 {
+        let remaining = plan.zc_timeout.saturating_sub(zc_tip) * ZC_BLOCK_TIME_SECS;
+        let need = lock_now * BTC_BLOCK_TIME_SECS * BTC_SLOWDOWN_FACTOR + redeem_slack_secs(net, lock_now);
+        if need > remaining {
+            return Err(format!(
+                "redeem: deterministic lock {} needs {need}s at half-speed Bitcoin but the escrow has {remaining}s \
+                 left (tip {zc_tip}, timeout {}): refusing to lock reserve BTC",
+                plan.btc_locktime, plan.zc_timeout
+            ));
+        }
     }
     let utxo = operator_btc.fund_htlc_unconfirmed(&plan.script, Amount::from_sat(plan.value))?;
     Ok((utxo, false))
@@ -2409,6 +2848,7 @@ pub fn reserve_serve_redeems(
     already_funded: &mut std::collections::HashSet<[u8; 32]>,
 ) -> Result<RedeemReport, String> {
     let planned = plan_redeems(zc, operator_btc, reserve, from, to, zbtc_asset, min_finalize_margin, already_funded)?;
+    let zc_tip = zc.height()? as u64;
     let mut report = RedeemReport {
         already_funded: planned.skipped,
         rejected: planned.rejected,
@@ -2418,7 +2858,7 @@ pub fn reserve_serve_redeems(
     for plan in planned.plans {
         // Claim the funding slot BEFORE broadcast; release it only if nothing was sent.
         already_funded.insert(plan.escrow_id);
-        let outcome = fund_redeem_plan(operator_btc, &plan).and_then(|(utxo, _reused)| {
+        let outcome = fund_redeem_plan(operator_btc, &plan, zc_tip).and_then(|(utxo, _reused)| {
             operator_btc.confirm(&utxo.outpoint.txid)?;
             Ok(utxo)
         });
@@ -2510,6 +2950,9 @@ pub fn zbtc_to_btc_progress(
         asset,
     ));
     let net = b.bridge.network();
+    // Refund coin first, then the envelope, then the proof bound to that envelope.
+    let (_refund_blind, refund_open) =
+        zcrypt_core::htlc_shield::CoinOpening::create(&alice.normal_address(), zbtc_value, asset)?;
     // The timeout is part of the bound envelope, so it must be fixed BEFORE proving.
     let zc_timeout = zc.height()? as u64 + zc_redeem_timeout_blocks(net);
     let envelope = zcrypt_core::htlc_shield::lock_envelope(
@@ -2521,6 +2964,7 @@ pub fn zbtc_to_btc_progress(
         &alice.pubkey(),
         &alice.pubkey(),
         &[],
+        std::slice::from_ref(&refund_open.coin),
     );
     let stx = build_shield_spend_bound(
         zc,
@@ -2530,7 +2974,9 @@ pub fn zbtc_to_btc_progress(
         vec![zcrypt_core::keys::cover_note_bytes(), change_note],
         &envelope,
     )?;
-    let data = zc.broadcast(&burn_lock_tx(zbtc_value, &burn_blind, asset, &lock, zc_timeout, &alice.pubkey(), &stx))?;
+    let data = zc.broadcast(&burn_lock_tx(
+        zbtc_value, &burn_blind, asset, &lock, zc_timeout, &alice.pubkey(), &stx, &refund_open,
+    ))?;
     let escrow_id = escrow_id_from(&data)?;
     println!("  [zc]  Alice locked {} zBTC in burn escrow {}", zbtc_value, hex::encode(escrow_id));
 
@@ -2586,7 +3032,9 @@ pub struct SwapQuote {
 /// lock) and the expiry of the leg the maker claims (the taker's lock). The taker reveals the
 /// preimage by claiming the maker's lock, possibly in its last block; the maker then needs
 /// time to see the preimage and land its own claim before the taker's lock can be refunded.
-pub const SWAP_MAKER_CLAIM_MARGIN_BLOCKS: u64 = 600;
+/// Two hours at 1 s blocks (audit 2026-10 H9): the maker's wallet polls while its Bridge tab
+/// is open, so a ten-minute window was lost to any ordinary interruption.
+pub const SWAP_MAKER_CLAIM_MARGIN_BLOCKS: u64 = 7_200;
 
 /// The two swap-escrow timeouts for a quote, as `(give_timeout, take_timeout)`: the TAKER's
 /// lock (`give`, claimable by the maker) and the MAKER's lock (`take`, claimable by the taker).
@@ -2631,12 +3079,80 @@ pub struct SwapLock {
     pub height: i64,
 }
 
+/// ZC blocks of life a counterparty's swap lock must have left before this side acts on it
+/// (locks against it, or claims it and thereby PUBLISHES the preimage). A claim whose escrow
+/// expires within a block or two can pass CheckTx and still fail at delivery, with the
+/// preimage in the block for the other side to use (bridge/swap audit 2026-10 H6).
+pub const SWAP_CLAIM_SAFETY_BLOCKS: u64 = 30;
+
+/// Consensus-side checks a party runs on the counterparty's lock BEFORE acting on it (audit
+/// H6): the escrow is `open`, is a `swap` (not a burn or mint squatting the id), pays `me`
+/// on claim, refunds `locker` on expiry, carries exactly the agreed asset, value and hashlock,
+/// and has more than [`SWAP_CLAIM_SAFETY_BLOCKS`] of life past `zc_tip`. Nothing from the raw
+/// transaction is trusted: every field comes from the `/htlc/<id>` record.
+#[allow(clippy::too_many_arguments)]
+pub fn check_counter_escrow(
+    info: &EscrowInfo,
+    me: &PubKey,
+    locker: &PubKey,
+    asset: u64,
+    value: u64,
+    hashlock: &[u8; 32],
+    zc_tip: u64,
+) -> Result<(), String> {
+    if info.state != "open" {
+        return Err(format!("counter-escrow is not open (state '{}')", info.state));
+    }
+    if info.kind != "swap" {
+        return Err(format!("counter-escrow kind is '{}', not 'swap'", info.kind));
+    }
+    if !info.party_is(me) {
+        return Err("counter-escrow does not pay this wallet on claim".to_string());
+    }
+    if !info.refund_is(locker) {
+        return Err("counter-escrow is not refundable to the expected counterparty".to_string());
+    }
+    if info.asset_id != asset || info.value != value || info.hashlock != *hashlock {
+        return Err(format!(
+            "counter-escrow locks {} of asset {} (expected {value} of {asset}) or another hashlock",
+            info.value, info.asset_id
+        ));
+    }
+    if info.timeout_height <= zc_tip.saturating_add(SWAP_CLAIM_SAFETY_BLOCKS) {
+        return Err(format!(
+            "counter-escrow expires at {} with the tip at {zc_tip}: fewer than {SWAP_CLAIM_SAFETY_BLOCKS} blocks \
+             of life, a claim could fail at delivery and still publish the preimage; let it expire",
+            info.timeout_height
+        ));
+    }
+    Ok(())
+}
+
+/// TAKER side, before claiming the maker's lock `escrow_id`: fetch the consensus record and
+/// run [`check_counter_escrow`] against the current tip. Returns the record on success.
+pub fn swap_claim_check(
+    zc: &dyn ZcNode,
+    escrow_id: &[u8; 32],
+    me: &PubKey,
+    maker: &PubKey,
+    asset: u64,
+    value: u64,
+    hashlock: &[u8; 32],
+) -> Result<EscrowInfo, String> {
+    let zc_tip = zc.height()? as u64;
+    let info = query_escrow(zc, escrow_id)?.ok_or("swap: the counter-escrow does not exist in consensus")?;
+    check_counter_escrow(&info, me, maker, asset, value, hashlock, zc_tip)?;
+    Ok(info)
+}
+
 /// Scan ZC blocks `from..=to` for a SWAP_LOCK whose hashlock is `hashlock`, whose claimant is
 /// `claimant_pk`, and which locks exactly `value` of `asset`, then confirm with consensus that
-/// the escrow exists and is `open` with those parameters. The escrow id binds the claimant
-/// key, so deriving it with `claimant_pk` and finding it open is proof that the lock really
-/// pays this claimant; nothing in the raw transaction is trusted on its own. Returns the
-/// first confirmed match.
+/// the escrow exists, is an `open` SWAP escrow with those parameters, pays `claimant_pk` on
+/// claim, and has more than [`SWAP_CLAIM_SAFETY_BLOCKS`] of life left ([`check_counter_escrow`],
+/// audit H6). The escrow id binds the kind, the claimant and the refund key, so deriving it
+/// from the wire fields and finding the record is proof the lock really pays this claimant;
+/// the locker key is then taken from CONSENSUS, never from the raw tx. Returns the first
+/// confirmed match.
 pub fn find_swap_lock(
     zc: &dyn ZcNode,
     from: i64,
@@ -2646,7 +3162,8 @@ pub fn find_swap_lock(
     asset: u64,
     value: u64,
 ) -> Result<Option<SwapLock>, String> {
-    use zcrypt_core::htlc_shield::escrow_id as derive_escrow_id;
+    use zcrypt_core::htlc_shield::{escrow_id as derive_escrow_id, EscrowKind};
+    let zc_tip = zc.height()? as u64;
     for h in from..=to {
         for tx in zc.block_txs(h)? {
             if tx.first() != Some(&0x62) {
@@ -2658,19 +3175,13 @@ pub fn find_swap_lock(
             if lock != *hashlock || counterparty != *claimant_pk || a != asset || v != value {
                 continue;
             }
-            let eid = derive_escrow_id(a, v, &lock, timeout, claimant_pk);
-            match query_escrow(zc, &eid)? {
-                Some(info)
-                    if info.state == "open"
-                        && info.asset_id == a
-                        && info.value == v
-                        && info.hashlock == lock
-                        && info.timeout_height == timeout =>
-                {
-                    return Ok(Some(SwapLock { escrow_id: eid, asset: a, value: v, hashlock: lock, timeout, locker_pk: refund, height: h }));
-                }
-                _ => continue, // rejected by consensus, already settled, or parameters differ
+            let eid = derive_escrow_id(EscrowKind::Swap, a, v, &lock, timeout, claimant_pk, &refund);
+            let Some(info) = query_escrow(zc, &eid)? else { continue }; // rejected by consensus
+            if info.timeout_height != timeout || check_counter_escrow(&info, claimant_pk, &refund, a, v, &lock, zc_tip).is_err() {
+                continue; // settled, squatted by another kind, too short-lived, or parameters differ
             }
+            let Some(locker_pk) = info.refund_pubkey() else { continue };
+            return Ok(Some(SwapLock { escrow_id: eid, asset: a, value: v, hashlock: lock, timeout, locker_pk, height: h }));
         }
     }
     Ok(None)
@@ -2702,14 +3213,14 @@ pub fn taker_lock_give(
     taker: &Account,
     coins: &[Coin],
     quote: &SwapQuote,
-    maker_pk: &PubKey,
+    maker: &zcrypt_core::keys::Address,
     hashlock: &[u8; 32],
     gas_coin: &Coin,
 ) -> Result<([u8; 32], Coin, u64), String> {
     let base = zc.height()? as u64;
     let (give_timeout, _take_timeout) = swap_timeouts(base, quote.timeout_blocks);
-    let (eid, change) = send_swap_lock(
-        zc, taker, quote.give_asset, quote.give_amount, coins, hashlock, give_timeout, maker_pk, gas_coin,
+    let (eid, change, _claim_note) = send_swap_lock(
+        zc, taker, quote.give_asset, quote.give_amount, coins, hashlock, give_timeout, maker, gas_coin,
     )?;
     Ok((eid, change, give_timeout))
 }
@@ -2724,6 +3235,7 @@ pub fn maker_lock_take(
     coins: &[Coin],
     quote: &SwapQuote,
     taker_lock: &SwapLock,
+    taker: &zcrypt_core::keys::Address,
     gas_coin: &Coin,
 ) -> Result<([u8; 32], Coin), String> {
     if taker_lock.asset != quote.give_asset || taker_lock.value != quote.give_amount {
@@ -2737,10 +3249,13 @@ pub fn maker_lock_take(
     if !maker_lock_is_safe(taker_lock.timeout, take_timeout) {
         return Err("swap: maker lock would not expire safely before the taker's lock; refusing".to_string());
     }
-    send_swap_lock(
-        zc, maker, quote.take_asset, quote.take_amount, coins, &taker_lock.hashlock, take_timeout,
-        &taker_lock.locker_pk, gas_coin,
-    )
+    if taker.pubkey() != taker_lock.locker_pk {
+        return Err("swap: taker address does not match the locker's spend key".to_string());
+    }
+    let (eid, change, _claim_note) = send_swap_lock(
+        zc, maker, quote.take_asset, quote.take_amount, coins, &taker_lock.hashlock, take_timeout, taker, gas_coin,
+    )?;
+    Ok((eid, change))
 }
 
 /// Scan ZC blocks `from..=to` for an HTLC_CLAIM (`0x5B`) of `escrow_id` whose preimage opens
@@ -2776,9 +3291,12 @@ pub struct SwapResult {
 }
 
 /// Lock `value` of `asset` from `locker`'s `coins` into a **swap escrow** claimable by
-/// `counterparty_pk` (refund to the locker on timeout). Broadcasts the lock and returns
-/// `(escrow_id, change_coin)`. The asset spend has fee 0, so change is `inputs − value`.
-/// Gas is `gas_coin` (ZCRYPT owned by the locker): a separate proof burns 0.01 ZCRYPT.
+/// `counterparty` (refund to the locker on timeout). The claim note is encrypted to
+/// `counterparty` (it carries the ML-KEM key; a bare spend key is not enough) and the
+/// refund note to the locker. Broadcasts the lock and returns
+/// `(escrow_id, change_coin, claim_enc_note)`. The asset spend has fee 0, so change is
+/// `inputs − value`. Gas is `gas_coin` (ZCRYPT owned by the locker): a separate proof
+/// burns 0.01 ZCRYPT.
 #[allow(clippy::too_many_arguments)]
 fn send_swap_lock(
     zc: &Zcrypt,
@@ -2788,9 +3306,9 @@ fn send_swap_lock(
     coins: &[Coin],
     hashlock: &[u8; 32],
     timeout: u64,
-    counterparty_pk: &PubKey,
+    counterparty: &zcrypt_core::keys::Address,
     gas_coin: &Coin,
-) -> Result<([u8; 32], Coin), String> {
+) -> Result<([u8; 32], Coin, Vec<u8>), String> {
     let in_total: u64 = coins.iter().map(|c| c.value).sum();
     if value > in_total {
         return Err("lock value exceeds the locker's coins".to_string());
@@ -2813,15 +3331,23 @@ fn send_swap_lock(
         change_blind,
         asset,
     ));
+    // Claim note to the counterparty, refund note to the locker. Both exist before the
+    // envelope, and the asset proof is bound to that envelope.
+    let (_claim_blind, claim_open) = zcrypt_core::htlc_shield::CoinOpening::create(counterparty, value, asset)?;
+    let (_refund_blind, refund_open) =
+        zcrypt_core::htlc_shield::CoinOpening::create(&locker.normal_address(), value, asset)?;
+    let counterparty_pk = counterparty.pubkey();
+    let settlements = [claim_open.coin.clone(), refund_open.coin.clone()];
     let envelope = zcrypt_core::htlc_shield::lock_envelope(
         zcrypt_core::htlc_shield::ENV_SWAP_LOCK,
         asset,
         value,
         hashlock,
         timeout,
-        counterparty_pk,
+        &counterparty_pk,
         &locker.pubkey(),
         &[],
+        &settlements,
     );
     let stx = build_shield_spend_bound(
         zc,
@@ -2864,22 +3390,28 @@ fn send_swap_lock(
         asset,
         hashlock,
         timeout,
-        counterparty_pk,
+        &counterparty_pk,
         &locker.pubkey(),
         &gas_blind,
         &gas_tx,
         &stx,
+        &claim_open,
+        &refund_open,
     ))?;
     let escrow = escrow_id_from(&data)?;
-    Ok((escrow, locker.own_asset_coin(change_value, change_blind, asset)))
+    Ok((escrow, locker.own_asset_coin(change_value, change_blind, asset), claim_open.coin.enc_note))
 }
 
 /// Run a **private in-pool atomic swap** between two shielded assets, per an agreed
 /// [`SwapQuote`]. Two swap escrows share one hashlock: the taker locks `give`, the maker
 /// locks `take`, the taker claims `take` (revealing the preimage), the maker reads it from
-/// the chain and claims `give`. Amounts, asset ids and identities stay hidden; only the HTLC
-/// structure is visible. Returns the taker's received coin + change. (The single-wallet demo
-/// supplies both `taker` and `maker`, exactly like the BTC bridge plays Alice + LP.)
+/// the chain and claims `give`. What is PRIVATE is the coins' history: the locked coins are
+/// spent out of the shielded pool with a membership proof, and the settlement coins are fresh
+/// leaves. The escrows themselves are transparent in the current design: each lock publishes
+/// its value, asset id, hashlock, timeout and BOTH party keys (claimant and refund), so an
+/// observer can read the trade's terms and link the two legs through the shared hashlock.
+/// Returns the taker's received coin + change. (The single-wallet demo supplies both `taker`
+/// and `maker`, exactly like the BTC bridge plays Alice + LP.)
 #[allow(clippy::too_many_arguments)]
 pub fn swap_in_pool_progress(
     zc: &Zcrypt,
@@ -2906,9 +3438,9 @@ pub fn swap_in_pool_progress(
     debug_assert!(maker_lock_is_safe(give_timeout, take_timeout));
 
     progress(15, "Locking your side of the swap…");
-    let (give_escrow, give_change) = send_swap_lock(
-        zc, taker, quote.give_asset, quote.give_amount, taker_give_coins, &lock, give_timeout, &maker.pubkey(),
-        taker_gas,
+    let (give_escrow, give_change, give_claim_note) = send_swap_lock(
+        zc, taker, quote.give_asset, quote.give_amount, taker_give_coins, &lock, give_timeout,
+        &maker.normal_address(), taker_gas,
     )?;
 
     progress(40, "Maker locking their side…");
@@ -2916,14 +3448,20 @@ pub fn swap_in_pool_progress(
     if !maker_lock_is_safe(give_timeout, take_timeout) {
         return Err("swap: maker lock would not expire safely before the taker's lock; refusing".to_string());
     }
-    let (take_escrow, _maker_change) = send_swap_lock(
-        zc, maker, quote.take_asset, quote.take_amount, maker_take_coins, &lock, take_timeout, &taker.pubkey(),
-        maker_gas,
+    let (take_escrow, _maker_change, take_claim_note) = send_swap_lock(
+        zc, maker, quote.take_asset, quote.take_amount, maker_take_coins, &lock, take_timeout,
+        &taker.normal_address(), maker_gas,
     )?;
 
     progress(65, "Claiming what you receive (revealing the preimage)…");
+    // Never publish the preimage against a lock that is not a live swap escrow paying us with
+    // enough life left for the claim to settle (audit H6).
+    swap_claim_check(zc, &take_escrow, &taker.pubkey(), &maker.pubkey(), quote.take_asset, quote.take_amount, &lock)?;
     zc.broadcast(&claim_tx(&take_escrow, preimage))?;
-    let received = taker.htlc_coin(quote.take_amount, quote.take_asset, &take_escrow);
+    // The maker chose the claim blind. The taker learns the coin by decrypting the note,
+    // and the maker does the same for the taker's claim note.
+    let received = coin_from_note(taker, &take_claim_note)?;
+    let _maker_received = coin_from_note(maker, &give_claim_note)?;
 
     progress(85, "Maker settling their side…");
     // The maker reads the now-public preimage from the chain and claims the give leg.
@@ -3018,7 +3556,7 @@ mod public_shield_tests {
             coinbase_raw: vec![],
         };
         let claim_pk: PubKey = [1, 2, 3, 4, 5, 6, 7, 8];
-        let payload = open_spv_tx(0xABCD, 555_000, &lock, 42, &claim_pk, &proof, &refund);
+        let payload = open_spv_tx(0xABCD, 555_000, &lock, 42, &claim_pk, &proof, &refund, &dummy_opening());
         assert_eq!(payload[0], 0x64, "tag");
 
         let (asset, value, plock, timeout, pclaim, pproof) =
@@ -3031,8 +3569,9 @@ mod public_shield_tests {
         assert_eq!(pproof, proof, "MintProof survives the open-tx round trip");
         // And the parsed fields recompute the SAME escrow id consensus used — the watcher's
         // acceptance check depends on this.
-        let eid = zcrypt_core::htlc_shield::escrow_id(asset, value, &plock, timeout, &pclaim);
-        let eid2 = zcrypt_core::htlc_shield::escrow_id(0xABCD, 555_000, &lock, 42, &claim_pk);
+        use zcrypt_core::htlc_shield::EscrowKind;
+        let eid = zcrypt_core::htlc_shield::escrow_id(EscrowKind::Mint, asset, value, &plock, timeout, &pclaim, &pclaim);
+        let eid2 = zcrypt_core::htlc_shield::escrow_id(EscrowKind::Mint, 0xABCD, 555_000, &lock, 42, &claim_pk, &claim_pk);
         assert_eq!(eid, eid2, "escrow id is deterministic from the parsed open-tx fields");
     }
 
@@ -3150,6 +3689,34 @@ mod public_shield_tests {
         assert!(default_finalize_margin(Network::Bitcoin) >= lock * 600 * BTC_SLOWDOWN_FACTOR + redeem_slack_secs(Network::Bitcoin, lock));
     }
 
+    /// Regtest `generatetoaddress` runs Bitcoin's median time ahead of the burn's BFT time, so
+    /// the lag-0 anchor sits a whole burst behind the tip. A wallet burn (the long
+    /// `ZC_REDEEM_TIMEOUT_BLOCKS` escrow `redeem_user_burn` uses on every network) must still
+    /// leave the user [`min_user_claim_blocks`] after a 200-block lead, and the CLTV must be a
+    /// function of the anchor alone so a later replan does not move it. Mainnet does not gain
+    /// the regtest allowance.
+    #[test]
+    fn regtest_redeem_lock_covers_generatetoaddress_clock_lead() {
+        let anchor = 1_000u64;
+        let burn_height = 50u64;
+        let timeout = burn_height + ZC_REDEEM_TIMEOUT_BLOCKS;
+        let lt = redeem_btc_locktime_for(Network::Regtest, anchor, burn_height, timeout).expect("regtest funds");
+        let lead = 200u64;
+        let btc_tip = anchor + lead;
+        let lock_now = (lt as u64).saturating_sub(btc_tip);
+        assert!(
+            lock_now >= min_user_claim_blocks(Network::Regtest),
+            "lock {lt} from anchor {anchor} leaves only {lock_now} blocks above tip {btc_tip}"
+        );
+        let remaining = timeout.saturating_sub(burn_height) * ZC_BLOCK_TIME_SECS;
+        let need = lock_now * BTC_BLOCK_TIME_SECS * BTC_SLOWDOWN_FACTOR + redeem_slack_secs(Network::Regtest, lock_now);
+        assert!(need <= remaining, "half-speed need {need}s exceeds the escrow's {remaining}s");
+        assert_eq!(redeem_btc_locktime_for(Network::Regtest, anchor, burn_height, timeout).unwrap(), lt);
+        let main = redeem_btc_locktime_for(Network::Bitcoin, anchor, burn_height, timeout).unwrap();
+        assert!(main as u64 - anchor <= btc_redeem_lock_blocks(Network::Bitcoin));
+        assert!(lt as u64 - anchor > btc_redeem_lock_blocks(Network::Regtest));
+    }
+
     #[test]
     fn fee_caps_bound_a_lying_oracle() {
         assert_eq!(crate::cap_fee_rate(1_000_000.0), crate::MAX_FEE_RATE_SAT_VB);
@@ -3163,10 +3730,18 @@ mod public_shield_tests {
         assert!(crate::cap_fee_for_value(5_000, 400, 500).is_err());
     }
 
+    /// An 80-byte Bitcoin header whose only meaningful field is the timestamp.
+    fn synthetic_header(ts: u32) -> [u8; 80] {
+        let mut h = [0u8; 80];
+        h[68..72].copy_from_slice(&ts.to_le_bytes());
+        h
+    }
+
     /// A backend that only answers the funding-discovery questions, counting broadcasts.
     struct MockBtc {
         existing: Vec<HtlcUtxo>,
         broadcasts: std::cell::Cell<u32>,
+        tip: u64,
     }
     impl crate::BtcBackend for MockBtc {
         fn fund_htlc(&self, script: &ScriptBuf, amount: Amount) -> Result<HtlcUtxo, String> {
@@ -3183,7 +3758,7 @@ mod public_shield_tests {
             Err("mock".into())
         }
         fn height(&self) -> Result<u64, String> {
-            Ok(800_000)
+            Ok(self.tip)
         }
         fn network(&self) -> Network {
             Network::Bitcoin
@@ -3200,8 +3775,9 @@ mod public_shield_tests {
         fn find_htlc_spend(&self, _: &HtlcUtxo, _: u64) -> Result<crate::HtlcSpend, String> {
             Ok(crate::HtlcSpend::Unspent)
         }
-        fn block_header(&self, _: u64) -> Result<[u8; 80], String> {
-            Err("mock".into())
+        fn block_header(&self, h: u64) -> Result<[u8; 80], String> {
+            // Synthetic chain: one block every 600 s from the epoch.
+            Ok(synthetic_header((h * 600) as u32))
         }
         fn raw_tx(&self, _: &bitcoin::Txid) -> Result<Vec<u8>, String> {
             Err("mock".into())
@@ -3216,12 +3792,14 @@ mod public_shield_tests {
         let reserve = Key::from_bytes(&[7u8; 32]);
         let user = Key::from_bytes(&[9u8; 32]);
         let lock = htlc_hashlock(&[3u8; 32]);
-        let script = htlc_script(&lock, &user.pk, &reserve.pk, 800_100);
-        let plan = RedeemPlan { escrow_id: [1u8; 32], hashlock: lock, value: 50_000, script: script.clone(), btc_locktime: 800_100 };
+        // Locktime leaves more than the 144-block claim window above tip 800_000, and
+        // zc_timeout covers that lock at half-speed Bitcoin, so a fresh backend may fund.
+        let script = htlc_script(&lock, &user.pk, &reserve.pk, 800_200);
+        let plan = RedeemPlan { escrow_id: [1u8; 32], hashlock: lock, value: 50_000, script: script.clone(), btc_locktime: 800_200, zc_timeout: 1_000_000 };
 
         // Nothing on the address yet: exactly one broadcast.
-        let fresh = MockBtc { existing: vec![], broadcasts: std::cell::Cell::new(0) };
-        let (utxo, reused) = fund_redeem_plan(&fresh, &plan).unwrap();
+        let fresh = MockBtc { existing: vec![], broadcasts: std::cell::Cell::new(0), tip: MOCK_BTC_TIP };
+        let (utxo, reused) = fund_redeem_plan(&fresh, &plan, 0).unwrap();
         assert!(!reused);
         assert_eq!(fresh.broadcasts.get(), 1);
         assert_eq!(utxo.value, Amount::from_sat(50_000));
@@ -3230,19 +3808,21 @@ mod public_shield_tests {
         let funded = MockBtc {
             existing: vec![HtlcUtxo { outpoint: OutPoint::null(), value: Amount::from_sat(50_000), script: script.clone() }],
             broadcasts: std::cell::Cell::new(0),
+            tip: MOCK_BTC_TIP,
         };
-        let (_utxo, reused) = fund_redeem_plan(&funded, &plan).unwrap();
+        let (_utxo, reused) = fund_redeem_plan(&funded, &plan, 0).unwrap();
         assert!(reused, "existing funding is reused");
         assert_eq!(funded.broadcasts.get(), 0, "never funds the same escrow twice");
 
         // An underfunded stray output does not count; a different script is not ours.
-        let other = htlc_script(&lock, &user.pk, &reserve.pk, 800_200);
+        let other = htlc_script(&lock, &user.pk, &reserve.pk, 800_300);
         let strays = MockBtc {
             existing: vec![
                 HtlcUtxo { outpoint: OutPoint::null(), value: Amount::from_sat(1), script: script.clone() },
                 HtlcUtxo { outpoint: OutPoint::null(), value: Amount::from_sat(50_000), script: other },
             ],
             broadcasts: std::cell::Cell::new(0),
+            tip: MOCK_BTC_TIP,
         };
         assert!(find_funded_htlc(&strays, &script, Amount::from_sat(50_000)).unwrap().is_none());
         // ...and a resume lookup finds a real funding by script (bridge L3).
@@ -3256,6 +3836,10 @@ mod public_shield_tests {
         escrows: std::collections::HashMap<[u8; 32], (u64, u64, [u8; 32], u64, &'static str)>,
         /// Consensus-committed payout key per burn escrow (what `/htlc/<id>` reports).
         btc_keys: std::collections::HashMap<[u8; 32], Vec<u8>>,
+        /// Consensus-committed `(party_pk, refund_pk)` per escrow (swap tests).
+        parties: std::collections::HashMap<[u8; 32], (PubKey, PubKey)>,
+        /// BFT time of block 1; each block is one second later.
+        base_time: u64,
     }
     impl ZcNode for SwapFakeZc {
         fn height(&self) -> Result<i64, String> {
@@ -3264,6 +3848,9 @@ mod public_shield_tests {
         fn block_txs(&self, height: i64) -> Result<Vec<Vec<u8>>, String> {
             Ok(self.blocks.get((height - 1).max(0) as usize).cloned().unwrap_or_default())
         }
+        fn block_time(&self, height: i64) -> Result<u64, String> {
+            Ok(self.base_time + height.max(0) as u64)
+        }
         fn query(&self, path: &str) -> Result<String, String> {
             let Some(h) = path.strip_prefix("/htlc/") else { return Err(format!("unexpected query {path}")) };
             let raw = hex::decode(h).map_err(|e| e.to_string())?;
@@ -3271,10 +3858,13 @@ mod public_shield_tests {
             match self.escrows.get(&eid) {
                 Some((a, v, l, t, s)) => {
                     let key = self.btc_keys.get(&eid).cloned().unwrap_or_default();
+                    let (party, refund) = self.parties.get(&eid).map(|(p, r)| (pk_bytes(p), pk_bytes(r))).unwrap_or_default();
                     Ok(serde_json::json!({
                         "asset_id": a, "value": v, "hashlock": hex::encode(l), "timeout_height": t, "state": s,
                         "kind": if key.is_empty() { "swap" } else { "burn" },
                         "btc_claim_pk": hex::encode(&key),
+                        "party_pk": hex::encode(party),
+                        "refund_pk": hex::encode(refund),
                     })
                     .to_string())
                 }
@@ -3303,13 +3893,13 @@ mod public_shield_tests {
 
     #[test]
     fn maker_finds_only_a_consensus_confirmed_lock_that_pays_it() {
-        use zcrypt_core::htlc_shield::escrow_id;
+        use zcrypt_core::htlc_shield::{escrow_id, EscrowKind};
         let maker: PubKey = [11; 8];
         let taker: PubKey = [22; 8];
         let other: PubKey = [33; 8];
         let preimage = [7u8; 32];
         let lock = htlc_hashlock(&preimage);
-        let (asset, value, timeout) = (5u64, 100_000u64, 2_000u64);
+        let (asset, value, timeout) = (5u64, 100_000u64, 20_000u64);
         let good = raw_swap_lock(value, asset, &lock, timeout, &maker, &taker);
         let wrong_claimant = raw_swap_lock(value, asset, &lock, timeout, &other, &taker);
         let wrong_value = raw_swap_lock(value - 1, asset, &lock, timeout, &maker, &taker);
@@ -3318,22 +3908,39 @@ mod public_shield_tests {
         // is already settled.
         let unconfirmed = raw_swap_lock(value, asset, &lock, timeout + 1, &maker, &taker);
         let settled = raw_swap_lock(value, asset, &lock, timeout + 2, &maker, &taker);
+        // A swap-looking lock whose consensus record is a BURN squatting the id space (H6/H7),
+        // and one with too little life left for a safe claim.
+        let squat = raw_swap_lock(value, asset, &lock, timeout + 3, &maker, &taker);
+        let short = raw_swap_lock(value, asset, &lock, 4 + SWAP_CLAIM_SAFETY_BLOCKS, &maker, &taker);
+        let sid = |t: u64, v: u64| escrow_id(EscrowKind::Swap, asset, v, &lock, t, &maker, &taker);
         let mut escrows = std::collections::HashMap::new();
-        escrows.insert(escrow_id(asset, value, &lock, timeout, &maker), (asset, value, lock, timeout, "open"));
-        escrows.insert(escrow_id(asset, value - 1, &lock, timeout, &maker), (asset, value - 1, lock, timeout, "open"));
-        escrows.insert(escrow_id(asset, value, &lock, timeout + 2, &maker), (asset, value, lock, timeout + 2, "claimed"));
+        let mut parties = std::collections::HashMap::new();
+        for (t, v, s) in [(timeout, value, "open"), (timeout, value - 1, "open"), (timeout + 2, value, "claimed"), (timeout + 3, value, "open"), (4 + SWAP_CLAIM_SAFETY_BLOCKS, value, "open")] {
+            escrows.insert(sid(t, v), (asset, v, lock, t, s));
+            parties.insert(sid(t, v), (maker, taker));
+        }
+        let mut btc_keys = std::collections::HashMap::new();
+        btc_keys.insert(sid(timeout + 3, value), vec![2u8; 33]); // reported as kind "burn"
         let zc = SwapFakeZc {
-            blocks: vec![vec![wrong_claimant, wrong_value], vec![wrong_lock, unconfirmed, settled], vec![good]],
+            blocks: vec![vec![wrong_claimant, wrong_value], vec![wrong_lock, unconfirmed, settled, squat, short], vec![good], vec![]],
             escrows,
-            btc_keys: Default::default(),
+            btc_keys,
+            parties,
+            base_time: 0,
         };
         let found = find_swap_lock(&zc, 1, 3, &lock, &maker, asset, value).unwrap().expect("the good lock is found");
         assert_eq!(found.height, 3);
         assert_eq!(found.timeout, timeout);
-        assert_eq!(found.locker_pk, taker);
-        assert_eq!(found.escrow_id, escrow_id(asset, value, &lock, timeout, &maker));
+        assert_eq!(found.locker_pk, taker, "locker key comes from consensus");
+        assert_eq!(found.escrow_id, sid(timeout, value));
         // Scanning only the blocks with decoys finds nothing.
         assert!(find_swap_lock(&zc, 1, 2, &lock, &maker, asset, value).unwrap().is_none());
+        // The taker-side claim gate agrees: only the good lock may be claimed against.
+        assert!(swap_claim_check(&zc, &sid(timeout, value), &maker, &taker, asset, value, &lock).is_ok());
+        assert!(swap_claim_check(&zc, &sid(timeout + 3, value), &maker, &taker, asset, value, &lock).unwrap_err().contains("not 'swap'"));
+        assert!(swap_claim_check(&zc, &sid(4 + SWAP_CLAIM_SAFETY_BLOCKS, value), &maker, &taker, asset, value, &lock).unwrap_err().contains("let it expire"));
+        assert!(swap_claim_check(&zc, &sid(timeout, value), &other, &taker, asset, value, &lock).unwrap_err().contains("does not pay"));
+        assert!(swap_claim_check(&zc, &sid(timeout, value), &maker, &other, asset, value, &lock).unwrap_err().contains("not refundable"));
         // The maker's own timeout undercuts the taker's by the margin, and is refused when the
         // taker's lock is too short to leave a claim window.
         assert_eq!(maker_take_timeout_for(&found, 100).unwrap(), timeout - SWAP_MAKER_CLAIM_MARGIN_BLOCKS);
@@ -3355,6 +3962,8 @@ mod public_shield_tests {
             ],
             escrows: Default::default(),
             btc_keys: Default::default(),
+            parties: Default::default(),
+            base_time: 0,
         };
         assert!(find_claim_preimage(&zc, 1, 2, &eid, &lock).unwrap().is_none());
         let (p, h) = find_claim_preimage(&zc, 1, 3, &eid, &lock).unwrap().expect("found");
@@ -3383,7 +3992,7 @@ mod public_shield_tests {
     /// never the key parsed from whichever raw tx came first.
     #[test]
     fn planner_funds_one_htlc_per_escrow_using_the_consensus_payout_key() {
-        use zcrypt_core::htlc_shield::escrow_id;
+        use zcrypt_core::htlc_shield::{escrow_id, EscrowKind};
         let reserve = Key::from_bytes(&[9u8; 32]);
         let k_real = Key::from_bytes(&[1u8; 32]).pk.inner.serialize();
         let k_dup = Key::from_bytes(&[2u8; 32]).pk.inner.serialize();
@@ -3393,7 +4002,7 @@ mod public_shield_tests {
         let (asset, value) = (5u64, 200_000u64);
         let zc_tip = 2u64; // two blocks below
         let timeout = zc_tip + zc_redeem_timeout_blocks(Network::Bitcoin);
-        let eid = escrow_id(asset, value, &lock, timeout, &refund);
+        let eid = escrow_id(EscrowKind::Burn, asset, value, &lock, timeout, &refund, &refund);
         let mut escrows = std::collections::HashMap::new();
         escrows.insert(eid, (asset, value, lock, timeout, "open"));
         let mut btc_keys = std::collections::HashMap::new();
@@ -3409,8 +4018,10 @@ mod public_shield_tests {
             ],
             escrows,
             btc_keys,
+            parties: Default::default(),
+            base_time: MOCK_BTC_TIP * 600, // the burn lands at Bitcoin's wall time
         };
-        let btc = MockBtc { existing: vec![], broadcasts: std::cell::Cell::new(0) };
+        let btc = MockBtc { existing: vec![], broadcasts: std::cell::Cell::new(0), tip: MOCK_BTC_TIP };
         let skip = std::collections::HashSet::new();
         let report = plan_redeems(&zc, &btc, &reserve, 1, 2, asset, 0, &skip).unwrap();
         assert_eq!(report.plans.len(), 1, "exactly one plan per escrow id per pass");
@@ -3433,10 +4044,190 @@ mod public_shield_tests {
                 e
             },
             btc_keys: Default::default(),
+            parties: Default::default(),
+            base_time: MOCK_BTC_TIP * 600,
         };
         let report = plan_redeems(&zc_nokey, &btc, &reserve, 1, 1, asset, 0, &skip).unwrap();
         assert!(report.plans.is_empty(), "no consensus payout key means no funding");
         assert_eq!(report.rejected.len(), 1);
+    }
+
+    /// Audit 2026-10 design note: the wallet burns with the fixed `ZC_REDEEM_TIMEOUT_BLOCKS`
+    /// while the daemon's default margin is `default_finalize_margin(Bitcoin)`. A burn built
+    /// at tip T and planned at T+1 with the default margin MUST be accepted; if the two
+    /// constants ever converge (or invert) this test fails before a release rejects every
+    /// honest redeem.
+    #[test]
+    fn honest_wallet_burn_is_planned_at_the_default_margin() {
+        use zcrypt_core::htlc_shield::{escrow_id, EscrowKind};
+        let reserve = Key::from_bytes(&[9u8; 32]);
+        let k_user = Key::from_bytes(&[1u8; 32]).pk.inner.serialize();
+        let refund: PubKey = [7; 8];
+        let lock = htlc_hashlock(&[3u8; 32]);
+        let (asset, value) = (5u64, 200_000u64);
+        let burn_tip = 1u64; // the wallet reads tip T = 1 and burns into block 2
+        let timeout = burn_tip + ZC_REDEEM_TIMEOUT_BLOCKS;
+        let eid = escrow_id(EscrowKind::Burn, asset, value, &lock, timeout, &refund, &refund);
+        let mut escrows = std::collections::HashMap::new();
+        escrows.insert(eid, (asset, value, lock, timeout, "open"));
+        let mut btc_keys = std::collections::HashMap::new();
+        btc_keys.insert(eid, k_user.to_vec());
+        let zc = SwapFakeZc {
+            blocks: vec![vec![], vec![raw_burn_lock_btc(&k_user, value, asset, &lock, timeout, &refund)]], // planned at tip 2 = T+1
+            escrows,
+            btc_keys,
+            parties: Default::default(),
+            base_time: MOCK_BTC_TIP * 600,
+        };
+        let btc = MockBtc { existing: vec![], broadcasts: std::cell::Cell::new(0), tip: MOCK_BTC_TIP };
+        let margin = default_finalize_margin(Network::Bitcoin);
+        let report = plan_redeems(&zc, &btc, &reserve, 1, 2, asset, margin, &std::collections::HashSet::new()).unwrap();
+        assert!(report.rejected.is_empty(), "honest burn rejected: {:?}", report.rejected);
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert_eq!(report.plans.len(), 1, "the honest wallet redeem is planned at the default margin");
+        let plan = &report.plans[0];
+        assert_eq!(plan.zc_timeout, timeout);
+        let lock_blocks = plan.btc_locktime as u64 - MOCK_BTC_TIP;
+        assert!(lock_blocks >= min_user_claim_blocks(Network::Bitcoin), "lock {lock_blocks}");
+        assert!(ZC_REDEEM_TIMEOUT_BLOCKS > margin, "the wallet's burn window must exceed the daemon's margin");
+    }
+
+    /// Audit 2026-10 H5: the BTC lock is a function of consensus data (the burn's ZC block
+    /// time mapped through Bitcoin's median-time-past), so a replan hours later, after the
+    /// state file is gone and Bitcoin has moved on, reproduces the IDENTICAL script and the
+    /// funding-reuse check can see the earlier funding.
+    #[test]
+    fn redeem_lock_is_deterministic_across_a_replan() {
+        use zcrypt_core::htlc_shield::{escrow_id, EscrowKind};
+        let reserve = Key::from_bytes(&[9u8; 32]);
+        let k_user = Key::from_bytes(&[1u8; 32]).pk.inner.serialize();
+        let refund: PubKey = [7; 8];
+        let lock = htlc_hashlock(&[3u8; 32]);
+        let (asset, value) = (5u64, 200_000u64);
+        let timeout = 1 + zc_redeem_timeout_blocks(Network::Bitcoin);
+        let eid = escrow_id(EscrowKind::Burn, asset, value, &lock, timeout, &refund, &refund);
+        let mut escrows = std::collections::HashMap::new();
+        escrows.insert(eid, (asset, value, lock, timeout, "open"));
+        let mut btc_keys = std::collections::HashMap::new();
+        btc_keys.insert(eid, k_user.to_vec());
+        let mut zc = SwapFakeZc {
+            blocks: vec![vec![raw_burn_lock_btc(&k_user, value, asset, &lock, timeout, &refund)]],
+            escrows,
+            btc_keys,
+            parties: Default::default(),
+            base_time: MOCK_BTC_TIP * 600,
+        };
+        let btc = MockBtc { existing: vec![], broadcasts: std::cell::Cell::new(0), tip: MOCK_BTC_TIP };
+        let skip = std::collections::HashSet::new();
+        let first = plan_redeems(&zc, &btc, &reserve, 1, 1, asset, 0, &skip).unwrap();
+        assert_eq!(first.plans.len(), 1, "{:?} {:?}", first.rejected, first.errors);
+        // The anchor sits REDEEM_ANCHOR_LAG_SECS behind the burn: strictly below the tip.
+        let anchor = btc_anchor_height(&btc, MOCK_BTC_TIP, zc.base_time + 1).unwrap();
+        assert!(anchor < MOCK_BTC_TIP && anchor >= MOCK_BTC_TIP - REDEEM_ANCHOR_LAG_SECS / 600 - 11, "anchor {anchor}");
+        let lt = first.plans[0].btc_locktime as u64;
+        assert!(lt > anchor && lt - anchor <= btc_redeem_lock_blocks(Network::Bitcoin), "lock {lt} anchored at {anchor}");
+
+        // Hours later: 40 more ZC blocks (empty) and a Bitcoin tip 40 blocks higher.
+        for _ in 0..40 {
+            zc.blocks.push(vec![]);
+        }
+        let later = MockBtcAt { tip: MOCK_BTC_TIP + 40 };
+        let again = plan_redeems(&zc, &later, &reserve, 1, 1, asset, 0, &skip).unwrap();
+        assert_eq!(again.plans.len(), 1, "{:?} {:?}", again.rejected, again.errors);
+        assert_eq!(again.plans[0].script, first.plans[0].script, "identical script after the replan");
+        assert_eq!(again.plans[0].btc_locktime, first.plans[0].btc_locktime);
+        // ...so the funding made the first time is REUSED, never duplicated.
+        let zc_tip = zc.height().unwrap() as u64;
+        let funded = MockBtc {
+            existing: vec![HtlcUtxo { outpoint: OutPoint::null(), value: Amount::from_sat(value), script: first.plans[0].script.clone() }],
+            broadcasts: std::cell::Cell::new(0),
+            tip: MOCK_BTC_TIP,
+        };
+        let (_u, reused) = fund_redeem_plan(&funded, &again.plans[0], zc_tip).unwrap();
+        assert!(reused);
+        assert_eq!(funded.broadcasts.get(), 0);
+
+        // A very late Bitcoin tip still PRODUCES the same plan and script, so an existing
+        // funding is found. Refusing a new funding whose claim window has closed is
+        // fund_redeem_plan's job, and only when nothing is funded yet.
+        let late_tip = first.plans[0].btc_locktime as u64 - min_user_claim_blocks(Network::Bitcoin) + 1;
+        let very_late = MockBtcAt { tip: late_tip };
+        let late = plan_redeems(&zc, &very_late, &reserve, 1, 1, asset, 0, &skip).unwrap();
+        assert_eq!(late.plans.len(), 1, "{:?} {:?}", late.rejected, late.errors);
+        assert_eq!(late.plans[0].script, first.plans[0].script, "identical script after a late replan");
+        assert_eq!(late.plans[0].btc_locktime, first.plans[0].btc_locktime);
+        let funded_late = MockBtc {
+            existing: vec![HtlcUtxo { outpoint: OutPoint::null(), value: Amount::from_sat(value), script: first.plans[0].script.clone() }],
+            broadcasts: std::cell::Cell::new(0),
+            tip: late_tip,
+        };
+        let (_u, reused) = fund_redeem_plan(&funded_late, &late.plans[0], zc_tip).unwrap();
+        assert!(reused, "an existing funding is reused after the claim window has closed");
+        assert_eq!(funded_late.broadcasts.get(), 0);
+        let fresh_late = MockBtc { existing: vec![], broadcasts: std::cell::Cell::new(0), tip: late_tip };
+        let err = fund_redeem_plan(&fresh_late, &late.plans[0], zc_tip).unwrap_err();
+        assert!(err.contains("minimum claim window"), "{err}");
+        assert_eq!(fresh_late.broadcasts.get(), 0, "a closed window never broadcasts a new funding");
+    }
+
+    /// The anchor search is monotone in time and stable once the target sits below the tip.
+    #[test]
+    fn btc_anchor_is_monotone_and_stable_under_tip_growth() {
+        let btc = MockBtc { existing: vec![], broadcasts: std::cell::Cell::new(0), tip: MOCK_BTC_TIP };
+        let t = MOCK_BTC_TIP * 600;
+        let a = btc_anchor_height(&btc, MOCK_BTC_TIP, t).unwrap();
+        let b = btc_anchor_height(&btc, MOCK_BTC_TIP, t + 600).unwrap();
+        assert!(b >= a);
+        for extra in [1u64, 10, 100, 1000] {
+            assert_eq!(btc_anchor_height(&MockBtcAt { tip: MOCK_BTC_TIP + extra }, MOCK_BTC_TIP + extra, t).unwrap(), a, "tip +{extra}");
+        }
+        // Far in the past: floored at the lookback window, never an error.
+        assert_eq!(btc_anchor_height(&btc, MOCK_BTC_TIP, 0).unwrap(), MOCK_BTC_TIP - REDEEM_ANCHOR_LOOKBACK_BLOCKS);
+    }
+
+    const MOCK_BTC_TIP: u64 = 800_000;
+
+    /// `MockBtc` at another tip (same synthetic header chain).
+    struct MockBtcAt {
+        tip: u64,
+    }
+    impl crate::BtcBackend for MockBtcAt {
+        fn fund_htlc(&self, script: &ScriptBuf, amount: Amount) -> Result<HtlcUtxo, String> {
+            Ok(HtlcUtxo { outpoint: OutPoint::null(), value: amount, script: script.clone() })
+        }
+        fn htlc_utxos(&self, _: &ScriptBuf) -> Result<Vec<HtlcUtxo>, String> {
+            Ok(vec![])
+        }
+        fn claim(&self, _: &HtlcUtxo, _: &[u8], _: &Key, _: &Address, _: Amount) -> Result<bitcoin::Txid, String> {
+            Err("mock".into())
+        }
+        fn height(&self) -> Result<u64, String> {
+            Ok(self.tip)
+        }
+        fn network(&self) -> Network {
+            Network::Bitcoin
+        }
+        fn preimage_from_claim(&self, _: &bitcoin::Txid) -> Option<Vec<u8>> {
+            None
+        }
+        fn confirm(&self, _: &bitcoin::Txid) -> Result<(), String> {
+            Ok(())
+        }
+        fn fee_rate_sat_vb(&self, _: u32) -> Result<f64, String> {
+            Ok(1.0)
+        }
+        fn find_htlc_spend(&self, _: &HtlcUtxo, _: u64) -> Result<crate::HtlcSpend, String> {
+            Ok(crate::HtlcSpend::Unspent)
+        }
+        fn block_header(&self, h: u64) -> Result<[u8; 80], String> {
+            Ok(synthetic_header((h * 600) as u32))
+        }
+        fn raw_tx(&self, _: &bitcoin::Txid) -> Result<Vec<u8>, String> {
+            Err("mock".into())
+        }
+        fn txout_proof(&self, _: &bitcoin::Txid) -> Result<Vec<u8>, String> {
+            Err("mock".into())
+        }
     }
 
     /// Bridge M14: the operator lock is sized for half-speed Bitcoin. A 60% slowdown over the
@@ -3485,7 +4276,7 @@ mod public_shield_tests {
             root: [0u64; 8],
             proof: vec![],
         };
-        let raw = burn_lock_btc_tx(&btc_pk, 42, &blind, 7, &lock, 999, &refund, &stx);
+        let raw = burn_lock_btc_tx(&btc_pk, 42, &blind, 7, &lock, 999, &refund, &stx, &dummy_opening());
         let (pk, a, v, l, t, r) = parse_burn_lock_btc(&raw[1..]).expect("parses");
         assert_eq!(pk, btc_pk.inner.serialize());
         assert_eq!((a, v, l, t, r), (7, 42, lock, 999, refund));
