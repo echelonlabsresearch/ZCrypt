@@ -106,8 +106,8 @@ PY
 
 require_tag() {
   tag="$1"
-  if ! printf '%s' "$tag" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
-    echo "need a tag vX.Y.Z (got '${tag:-<empty>}')" >&2
+  if ! printf '%s' "$tag" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$'; then
+    echo "need a tag vX.Y.Z or vX.Y.Z-prerelease (got '${tag:-<empty>}')" >&2
     exit 1
   fi
 }
