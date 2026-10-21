@@ -998,6 +998,24 @@ pub mod wallet_flows;
 pub mod watcher;
 pub mod zcrypt;
 
+/// A fixed P2WPKH address whose private key nobody uses — mining here burns the
+/// coinbase so confirming swap txs doesn't credit any tracked wallet's balance.
+fn throwaway_address(network: Network) -> Address {
+    let key = Key::from_bytes(&[0xEE; 32]);
+    Address::p2wpkh(&key.compressed(), network)
+}
+
+/// Parse and network-check an address string against `network`.
+pub fn parse_address(s: &str, network: Network) -> Result<Address, String> {
+    Address::from_str(s)
+        .map_err(|e| e.to_string())?
+        .require_network(network)
+        .map_err(|e| e.to_string())
+}
+
+// Silence an unused-import lint for the re-exported sighash-type alias.
+const _: _Sht = _Sht::All;
+
 #[cfg(test)]
 mod key_input_tests {
     use super::*;
@@ -1028,21 +1046,3 @@ mod key_input_tests {
         assert!(HTLC_SPEND_SEQUENCE.is_rbf() && HTLC_SPEND_SEQUENCE.enables_absolute_lock_time());
     }
 }
-
-/// A fixed P2WPKH address whose private key nobody uses — mining here burns the
-/// coinbase so confirming swap txs doesn't credit any tracked wallet's balance.
-fn throwaway_address(network: Network) -> Address {
-    let key = Key::from_bytes(&[0xEE; 32]);
-    Address::p2wpkh(&key.compressed(), network)
-}
-
-/// Parse and network-check an address string against `network`.
-pub fn parse_address(s: &str, network: Network) -> Result<Address, String> {
-    Address::from_str(s)
-        .map_err(|e| e.to_string())?
-        .require_network(network)
-        .map_err(|e| e.to_string())
-}
-
-// Silence an unused-import lint for the re-exported sighash-type alias.
-const _: _Sht = _Sht::All;

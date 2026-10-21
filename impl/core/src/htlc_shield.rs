@@ -984,7 +984,7 @@ mod tests {
         let lock = htlc_hashlock(x);
         let claim = hidden(&pk(7), 500, 0xE71, 11);
         let refund = hidden(&pk(8), 500, 0xE71, 12);
-        let coins = vec![claim.commitment, refund.commitment];
+        let coins = [claim.commitment, refund.commitment];
         let id = b.lock_swap(0xE71, 500, lock, 400, pk(7), pk(8), claim, refund).unwrap();
         assert_eq!(coins.len(), 2);
         assert!(coins.iter().all(|c| b.is_reserved(c)));

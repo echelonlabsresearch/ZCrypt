@@ -397,7 +397,7 @@ enum IntentStep {
     /// The recorded funding is still short of its confirmation target.
     Waiting,
     /// Confirmed: the redeem is now pending the user's claim.
-    Confirmed(PendingRedeem),
+    Confirmed(Box<PendingRedeem>),
 }
 
 /// Insert-or-replace a deferred sweep by escrow id (no duplicates across ticks).
@@ -459,7 +459,7 @@ fn drive_intent(
     if confs < funding_confs_needed(operator_btc) {
         return Ok(if just_recorded { IntentStep::Recorded } else { IntentStep::Waiting });
     }
-    Ok(IntentStep::Confirmed(intent.clone().into_pending(btc_tip)?))
+    Ok(IntentStep::Confirmed(Box::new(intent.clone().into_pending(btc_tip)?)))
 }
 
 /// Whether an UNCONFIRMED funding intent has reached its deadline (audit M6): the Bitcoin
@@ -801,7 +801,7 @@ pub fn watcher_tick_persisting(
         match drive_intent(&mut intent, operator_btc, &mut report, tip.max(0) as u64) {
             Ok(IntentStep::Confirmed(p)) => {
                 funded.insert(hex32(&p.escrow_id).unwrap_or([0u8; 32]));
-                state.pending.push(p);
+                state.pending.push(*p);
                 report.locked += 1;
                 done.push(i);
             }
@@ -1174,7 +1174,9 @@ impl InstanceLock {
     /// until the first guard is dropped.
     pub fn acquire(state_path: &std::path::Path) -> Result<Self, String> {
         let path = Self::path_for(state_path);
-        let file = std::fs::OpenOptions::new().read(true).write(true).create(true).open(&path).map_err(|e| format!("instance lock {}: {e}", path.display()))?;
+        // Keep an existing lock file. The kernel lock is on the open handle, and wiping the
+        // file is not what a second daemon should do when the first one still holds it.
+        let file = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(&path).map_err(|e| format!("instance lock {}: {e}", path.display()))?;
         if let Err(err) = try_lock_exclusive(&file) {
             return Err(format!(
                 "another bridge_watcher holds {}: two daemons on one wallet would fund every open \

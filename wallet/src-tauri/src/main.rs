@@ -8606,14 +8606,13 @@ mod live_3node {
         assert_eq!(bob_open[0].role, "maker");
         assert!(!bob_open[0].can_refund);
         println!("[wallet] {accepted}");
-        let settled = wait_until("both swaps to finish", 300, || {
+        wait_until("both swaps to finish", 300, || {
             let _ = v(swap_asset_settle(alice.st())).ok()?;
             let _ = v(swap_asset_settle(bob.st())).ok()?;
             let a = v(list_pending_swaps(alice.st())).ok()?;
             let b = v(list_pending_swaps(bob.st())).ok()?;
             (a.is_empty() && b.is_empty()).then_some(())
         });
-        let _ = settled;
         wait_until("bob holds the swapped asset", 60, || {
             let held = v(held_assets(bob.st())).ok()?;
             held.into_iter().find(|a| a.asset_id == minted.asset_id && a.balance >= give_amt)
