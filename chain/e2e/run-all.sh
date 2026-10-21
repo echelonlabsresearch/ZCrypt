@@ -38,7 +38,7 @@ say "0/7  Build the RPC test drivers (release)"
     --bin audit_fixes_3node )
 WALLET_DIR="$(cd "$CHAIN_DIR/../wallet/src-tauri" && pwd)"
 say "0b/7 Build the WALLET backend test (release, tauri mock app)"
-( cd "$WALLET_DIR" && cargo test --release --locked --no-run )
+( cd "$WALLET_DIR" && cargo test --release --locked --features devnet --no-run )
 BIN="$IMPL_DIR/target/release"
 # zBTC is bound to its reserve pubkey in GENESIS: derive it from the dev reserve key every
 # regtest driver uses (Key::from_bytes([0xB1; 32])) BEFORE the chain is created.
@@ -101,9 +101,9 @@ ZC_URL="$N0" BTC_URL="$BTC" "$BIN/watcher_daemon_e2e"
 say "8c2/9 AUDIT-FIX regressions: aliased value refused, duplicate escrow id refused before the burn, ONE HTLC per escrow on the consensus payout key, refund-branch spend recognized"
 ZC_URL="$N0" BTC_URL="$BTC" "$BIN/audit_fixes_3node"
 
-say "8d/9 WALLET backend (the real tauri commands) against the live chain: create/fund/send/stealth/bearer/bond/delegate/claim/restore/shield/recover/redeem"
+say "8d/9 WALLET backend (every tauri command) against the live chain: payments, receipts, staking, bridge, session, swap, assets, exports"
 ( cd "$WALLET_DIR" && ZC_E2E_URL="$N0" BTC_URL="$BTC" VALIDATOR_SEED_HEX="$VSEED" \
-    cargo test --release --locked live_3node -- --nocapture --test-threads=1 2>&1 | grep -vE '^\s*(Running|Compiling|Finished)' )
+    cargo test --release --locked --features devnet live_3node -- --nocapture --test-threads=1 2>&1 | grep -vE '^\s*(Running|Compiling|Finished)' )
 
 say "8d2/9 Node RESTART: abci1 reloads the incremental state DB (schema 3) and rejoins consensus"
 $COMPOSE restart abci1 cometbft1 >/dev/null

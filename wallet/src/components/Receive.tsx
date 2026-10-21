@@ -11,7 +11,7 @@ export default function Receive({ onReceived }: { onReceived: (r: ReceivedInfo) 
   const [blob, setBlob] = useState("");
   const [busy, setBusy] = useState(false);
   const [dragging, setDragging] = useState(false);
-  const [state, setState] = useState<"idle" | "ok" | "err">("idle");
+  const [state, setState] = useState<"idle" | "ok" | "err" | "warn">("idle");
   const [msg, setMsg] = useState("");
 
   async function receive(text: string) {
@@ -20,7 +20,16 @@ export default function Receive({ onReceived }: { onReceived: (r: ReceivedInfo) 
     setBusy(true);
     setState("idle");
     try {
-      const isBearer = s.startsWith("zcb1");
+      if (s.startsWith("zcrypt-receipt/1")) {
+        const r = await call<{ on_chain: boolean; names_recipient: boolean; summary: string }>("verify_receipt", { text: s });
+        setState(r.on_chain && r.names_recipient ? "ok" : r.on_chain ? "warn" : "err");
+        setMsg(r.summary);
+        return;
+      }
+      if (s.startsWith("zcb1")) {
+        throw new Error("a bearer coin is a zcrypt-bearer/1 file with a coin line and a gas line");
+      }
+      const isBearer = s.startsWith("zcrypt-bearer/1");
       const cmd = isBearer ? "claim_bearer" : "receive_coin";
       const args = isBearer ? { token: s } : { note: s };
       const r = await call<{ amount: number; coin_id: string; ticker: string; decimals: number }>(cmd, args);
@@ -76,13 +85,15 @@ export default function Receive({ onReceived }: { onReceived: (r: ReceivedInfo) 
             className="mnemonic-input"
             value={blob}
             onChange={(e) => setBlob(e.target.value)}
-            placeholder="paste an encrypted note or a bearer coin (zcb1…)"
+            placeholder="paste an encrypted note, a bearer coin file, or a payment receipt"
             style={{ minHeight: 100 }}
           />
           <button className="btn-primary btn-block" style={{ marginTop: "0.8rem" }} disabled={busy} onClick={() => receive(blob)}>
             {busy ? "Verifying…" : "Receive"}
           </button>
-          {state !== "idle" && !dragging && <div className={`msg ${state === "ok" ? "ok" : "err"}`}>{msg}</div>}
+          {state !== "idle" && !dragging && (
+            <div className={`msg ${state === "ok" ? "ok" : state === "warn" ? "warn" : "err"}`}>{msg}</div>
+          )}
         </div>
       </div>
 
@@ -90,7 +101,8 @@ export default function Receive({ onReceived }: { onReceived: (r: ReceivedInfo) 
         <h2>🔐 How it works</h2>
         <ol style={{ opacity: 0.85, lineHeight: 1.8 }}>
           <li>Coins sent to your <b>address</b> arrive on-chain — just hit <b>Refresh</b> to scan for them.</li>
-          <li>A <b>bearer coin</b> (zcb1…) or an encrypted note can be dropped/pasted here to claim directly.</li>
+          <li>A <b>bearer coin file</b> or an encrypted note can be dropped or pasted here to claim directly.</li>
+          <li>A <b>payment receipt</b> pasted here is checked against the chain. It does not move any coins.</li>
           <li>Only your key can decrypt what's yours; amounts stay hidden on the ledger.</li>
         </ol>
         <div className="warn">Never drop or paste a coin into anything but your own wallet.</div>

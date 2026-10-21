@@ -10,7 +10,7 @@ const BLURB: Record<Deliver, string> = {
   stealth:
     "Off-chain: produces an encrypted file to hand the recipient. Nothing decryptable is left on-chain, and it's invisible to any view key. The recipient needs their stealth key + this file.",
   bearer:
-    "A coin file anyone holding it can claim — like cash. It's a real on-chain-backed coin (spendable, first-to-spend wins). No recipient, invisible to view keys. Protect the token like cash.",
+    "A bearer coin file you can send over any chat. The first person who opens it in a wallet is credited the full amount. The file includes 0.01 ZCRYPT gas, so they need no balance and no wallet beforehand. Until that claim is in a block, anyone with the file can take it.",
 };
 
 const FALLBACK: HeldAsset = { asset_id: "0", ticker: "ZCRYPT", decimals: 6, balance: 0 };
@@ -95,7 +95,7 @@ export default function Send({
       if (deliver === "bearer") {
         const token = await call<string>("create_bearer", { amount: base, assetId: asset.asset_id });
         setFile(token);
-        toast("Bearer coin created", `${pretty} — on-chain, anyone with the token can claim it`);
+        toast("Bearer coin created", `${pretty} — send the file. The receipt is in History`);
       } else {
         // Validate the recipient address kind against the delivery mode BEFORE
         // proving (avoids wasting a proof; the backend enforces this too).
@@ -110,11 +110,11 @@ export default function Send({
         if (deliver === "stealth") {
           const r = await call<{ file: string }>("send_stealth", { recipient: recipient.trim(), amount: base, assetId: asset.asset_id });
           setFile(r.file);
-          toast("Stealth send", `${pretty} — share the coin with the recipient`);
+          toast("Stealth send", `${pretty} — share the note. The receipt is in History`);
         } else {
           await call("send_onchain", { recipient: recipient.trim(), amount: base, assetId: asset.asset_id });
           setOnchainOk(true);
-          toast("Sent on-chain", `${pretty} — hidden amount, anonymous among the whole pool`);
+          toast("Sent on-chain", `${pretty} — receipt saved in History`);
         }
       }
       setAmount("");
@@ -166,7 +166,7 @@ export default function Send({
             <select value={deliver} onChange={(e) => setDeliver(e.target.value as Deliver)}>
               <option value="normal">To a normal address — on-chain, auto-credited</option>
               <option value="stealth">To a stealth address — encrypted file, max privacy</option>
-              <option value="bearer">As a bearer coin — a file anyone can claim</option>
+              <option value="bearer">As a bearer coin — a file anyone can open and be credited</option>
             </select>
             <div style={{ fontSize: "0.8rem", opacity: 0.7, marginTop: "0.5rem" }}>{BLURB[deliver]}</div>
           </div>
@@ -188,10 +188,16 @@ export default function Send({
           <input value={amount} onChange={(e) => setAmount(e.target.value)} placeholder="0.0" inputMode="decimal" />
         </div>
 
-        {!isBtc && (
+        {!isBtc && deliver !== "bearer" && (
           <div style={{ fontSize: "0.76rem", opacity: 0.62, margin: "-0.3rem 0 0.7rem" }}>
             ⛽ A <b>0.01 ZCRYPT</b> gas fee is added automatically. ZCRYPT is the gas for everything —
             so keep a little on hand even to move zBTC or other assets. (Staking is free.)
+          </div>
+        )}
+        {!isBtc && deliver === "bearer" && (
+          <div style={{ fontSize: "0.76rem", opacity: 0.62, margin: "-0.3rem 0 0.7rem" }}>
+            ⛽ The file includes <b>0.01 ZCRYPT</b> gas so the recipient can claim it with an empty
+            wallet. Creating the file also spends <b>0.02 ZCRYPT</b> in gas.
           </div>
         )}
 
@@ -213,7 +219,7 @@ export default function Send({
 
         {onchainOk && (
           <div className="msg ok" style={{ marginTop: "1.2rem" }}>
-            ✓ Settled on-chain — hidden amount, anonymous among the whole shielded pool. <b>No file for an address payment</b> — the
+            ✓ Settled on-chain — hidden amount, anonymous among the whole shielded pool. The receipt is in <b>History</b>. <b>No file for an address payment</b> — the
             recipient's wallet finds it on its next <b>Refresh</b> (paid yourself? Refresh and it returns as change).
           </div>
         )}
@@ -222,13 +228,13 @@ export default function Send({
           <div style={{ marginTop: "1.2rem" }}>
             <div className="msg ok">
               {deliver === "stealth"
-                ? "Stealth note — share it with the recipient (any channel). Only their stealth key can open it, and nothing on-chain reveals the payment."
-                : "Bearer coin — the money itself, backed on-chain. Anyone holding this token can claim it, so treat it like cash."}
+                ? "Stealth note — share it with the recipient (any channel). Only their stealth key can open it, and nothing on-chain reveals the payment. The receipt is in History."
+                : "Bearer coin — send the file like a photo. Opening it credits their wallet the full amount. Until that claim is in a block, anyone who has the file can claim it first. The receipt is in History."}
             </div>
             <div className="mono-box">{file}</div>
             <ShareBar
               text={file}
-              filename={deliver === "stealth" ? "zcrypt-stealth-note.txt" : "zcrypt-bearer-coin.txt"}
+              filename={deliver === "stealth" ? "zcrypt-stealth-note.txt" : "zcrypt-bearer.txt"}
             />
           </div>
         )}

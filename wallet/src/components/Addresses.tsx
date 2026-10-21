@@ -27,8 +27,8 @@ const TYPES = [
     icon: "💵",
     name: "Bearer coin",
     color: "--color-yellow",
-    tag: "zcb1… · digital cash",
-    body: "Not an address — a self-contained coin file that whoever holds it can claim, like a banknote. Hand it off over any channel with no transaction. Anyone with the file can spend it, so protect it like cash. (Create one from the Send tab.)",
+    tag: "file · coin + gas",
+    body: "Not an address — a file from the Send tab. Send it over any chat. Opening it in the wallet credits the full amount, and the file includes 0.01 ZCRYPT gas so a new wallet can claim it. Until that claim is in a block, anyone with the file can take it.",
   },
   {
     icon: "🔎",

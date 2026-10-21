@@ -166,6 +166,35 @@ struct HistItem {
     decimals: u8,
 }
 
+/// A local proof that this wallet created an output. It lives in the encrypted
+/// wallet file. The blind reopens the coin. The recipient's spend secret is not
+/// here, so the receipt cannot move the money. A bearer receipt stores the
+/// nullifier instead of the bearer spend secret.
+#[derive(Clone, Serialize, Deserialize)]
+struct PaymentReceipt {
+    id: String,
+    /// "normal" | "stealth" | "bearer"
+    kind: String,
+    amount: u64,
+    asset_id: u64,
+    decimals: u8,
+    /// Full zc1 address. Empty for a bearer coin.
+    recipient: String,
+    /// Hex of the spend public key bound into the coin.
+    owner_pk: String,
+    /// Hex of the blind.
+    blind: String,
+    /// Hex of the output commitment, the leaf a judge looks up.
+    commitment: String,
+    /// Bearer only. Hex of the nullifier published when the file is swept.
+    #[serde(default)]
+    nullifier: String,
+    /// Stealth only. The zct1 note, so the sender can hand the payment over again.
+    #[serde(default)]
+    note: String,
+    timestamp: u64,
+}
+
 fn default_decimals() -> u8 {
     6
 }
@@ -432,6 +461,8 @@ struct Wallet {
     pending_swaps: Vec<PendingSwap>,
     pending_secrets: Vec<PendingSecret>,
     next_secret_id: u64,
+    /// Payment receipts, newest first. Local to this wallet file.
+    receipts: Vec<PaymentReceipt>,
 }
 
 impl Wallet {
@@ -457,6 +488,7 @@ impl Wallet {
             pending_swaps: vec![],
             pending_secrets: vec![],
             next_secret_id: 1,
+            receipts: vec![],
         }
     }
 
@@ -563,6 +595,40 @@ impl Wallet {
             },
         );
         format!("{kind}-{t}")
+    }
+
+    /// Record the opening of a payment this wallet just created.
+    fn push_receipt(
+        &mut self,
+        kind: &str,
+        amount: u64,
+        asset_id: u64,
+        recipient: &str,
+        owner_pk: &zcrypt_shield::PubKey,
+        blind: &zcrypt_shield::Blind,
+        nullifier: Option<&zcrypt_shield::Commitment>,
+        note: &str,
+    ) {
+        let commitment = zcrypt_shield::commit_asset(amount, blind, owner_pk, asset_id);
+        let t = self.tick();
+        let decimals = if asset_id == zcrypt_shield::ASSET_ZCRYPT { 6 } else { 8 };
+        self.receipts.insert(
+            0,
+            PaymentReceipt {
+                id: format!("receipt-{t}"),
+                kind: kind.into(),
+                amount,
+                asset_id,
+                decimals,
+                recipient: recipient.into(),
+                owner_pk: limbs_hex(owner_pk),
+                blind: limbs_hex(blind),
+                commitment: limbs_hex(&commitment),
+                nullifier: nullifier.map(|n| limbs_hex(n)).unwrap_or_default(),
+                note: note.into(),
+                timestamp: t,
+            },
+        );
     }
 }
 
@@ -729,6 +795,8 @@ struct PersistState {
     pending_secrets: Vec<PendingSecret>,
     #[serde(default)]
     next_secret_id: u64,
+    #[serde(default)]
+    receipts: Vec<PaymentReceipt>,
 }
 
 // Encryption key for the coin store, bound to the account seed (available while
@@ -774,6 +842,7 @@ fn save_state(w: &Wallet, dir: &str) -> Result<(), String> {
         pending_swaps: w.pending_swaps.clone(),
         pending_secrets: w.pending_secrets.clone(),
         next_secret_id: w.next_secret_id,
+        receipts: w.receipts.clone(),
     };
     // The plaintext holds every spend secret: keep it in a zeroizing buffer.
     let json = Zeroizing::new(serde_json::to_vec(&ps).map_err(|e| e.to_string())?);
@@ -844,6 +913,7 @@ fn load_state(w: &mut Wallet, dir: &str) {
     w.pending_swaps = ps.pending_swaps;
     w.pending_secrets = ps.pending_secrets;
     w.next_secret_id = ps.next_secret_id.max(w.pending_secrets.iter().map(|p| p.id + 1).max().unwrap_or(1));
+    w.receipts = ps.receipts;
     // Every logged action index must stay inside the scan window.
     if let Some(m) = w.action_keys.iter().map(|a| a.index).max() {
         if m >= w.next_change {
@@ -1293,62 +1363,264 @@ fn receive_coin(note: String, state: State<AppState>) -> R<Received> {
     .and_then(ok)
 }
 
-/// Create a bearer coin (zcb1… — the money itself) for `asset_id` (0 = ZCRYPT, else
-/// zBTC/…) by spending your coins ON-CHAIN into a bearer-keyed output. The returned
-/// token embeds the fresh spend secret: whoever holds it can spend the real on-chain
-/// coin, with first-to-spend enforced by the canonical nullifier. It is cash —
-/// protect the token, and it stays yours until you hand it off.
-#[tauri::command]
-fn create_bearer(amount: u64, asset_id: String, state: State<AppState>) -> R<String> {
-    let asset_id: u64 = asset_id.parse().map_err(|_| "invalid asset id".to_string())?;
-    let url = node_url(&state)?;
+/// A bearer coin file. Version line, then the value coin, then the ZCRYPT coin that
+/// pays the claim's gas. Both tokens are `zcb1…` bech32m strings. This is the only
+/// handoff a recipient can claim.
+///
+/// ```text
+/// zcrypt-bearer/1
+/// coin zcb1…
+/// gas zcb1…
+/// ```
+#[derive(Debug)]
+struct BearerFile {
+    coin: String,
+    gas: String,
+}
+
+fn format_bearer_file(coin: &str, gas: &str) -> String {
+    format!("zcrypt-bearer/1\ncoin {coin}\ngas {gas}\n")
+}
+
+fn parse_bearer_file(raw: &str) -> Result<BearerFile, String> {
+    let lines: Vec<&str> = raw.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+    if lines.first().copied() != Some("zcrypt-bearer/1") {
+        return Err(
+            "a bearer coin is a zcrypt-bearer/1 file with a coin line and a gas line".into(),
+        );
+    }
+    let mut coin = None;
+    let mut gas = None;
+    for line in &lines[1..] {
+        let mut parts = line.split_whitespace();
+        match (parts.next(), parts.next(), parts.next()) {
+            (Some("coin"), Some(tok), None) if coin.is_none() => coin = Some(tok.to_string()),
+            (Some("gas"), Some(tok), None) if gas.is_none() => gas = Some(tok.to_string()),
+            (Some("coin"), Some(_), None) => return Err("bearer file has two coin lines".into()),
+            (Some("gas"), Some(_), None) => return Err("bearer file has two gas lines".into()),
+            _ => return Err("bearer file has an unreadable line".into()),
+        }
+    }
+    let coin = coin.ok_or("bearer file is missing the coin line")?;
+    let gas = gas.ok_or("bearer file is missing the gas line")?;
+    if !coin.starts_with("zcb1") || !gas.starts_with("zcb1") {
+        return Err("bearer file coin and gas must be zcb1… tokens".into());
+    }
+    Ok(BearerFile { coin, gas })
+}
+
+/// ZCRYPT a bearer file costs the sender, on top of the value: one gas coin of
+/// [`GAS_FEE`] for the recipient, plus one gas coin for each of the two creates.
+const BEARER_OVERHEAD: u64 = GAS_FEE * 3;
+
+fn bearer_budget(asset_id: u64, amount: u64, state: &State<AppState>) -> Result<(), String> {
+    let url = node_url(state)?;
     let leaves = chain::fetch_leaves(&url)?;
-    with_wallet(&state, |w| {
+    let (zcrypt, asset) = {
+        let g = state.wallet.lock().unwrap();
+        let w = g.as_ref().ok_or("wallet is locked")?;
+        (
+            onchain_asset_values(w, &leaves, zcrypt_shield::ASSET_ZCRYPT).iter().sum::<u64>(),
+            onchain_asset_values(w, &leaves, asset_id).iter().sum::<u64>(),
+        )
+    };
+    if asset_id == zcrypt_shield::ASSET_ZCRYPT {
+        if asset < amount.saturating_add(BEARER_OVERHEAD) {
+            return Err(format!(
+                "a bearer coin needs the amount plus 0.03 ZCRYPT (0.01 inside the file for the recipient's gas, and 0.02 gas to create the coins). You have {:.6} ZCRYPT on-chain.",
+                asset as f64 / 1e6
+            ));
+        }
+    } else if asset < amount {
+        return Err("insufficient balance for this bearer coin".into());
+    } else if zcrypt < BEARER_OVERHEAD {
+        return Err(
+            "a bearer coin needs 0.03 ZCRYPT on hand: 0.01 inside the file for the recipient's gas, and 0.02 gas to create the coins."
+                .into(),
+        );
+    }
+    Ok(())
+}
+
+/// Spend `amount` of `asset_id` into a fresh bearer coin. The token is saved before the
+/// spend. The caller turns the value coin and the gas coin into one file afterward.
+fn mint_one_bearer(amount: u64, asset_id: u64, state: &State<AppState>, label: &str) -> Result<String, String> {
+    let url = node_url(state)?;
+    let leaves = chain::fetch_leaves(&url)?;
+    with_wallet(state, |w| {
         let bearer = BearerCoin::create_asset(amount, asset_id);
         let token = bearer.to_bech32();
         // H2: the token is the ONLY spend instrument for these coins. Persist it BEFORE the
         // spend so a failed post-action save can never burn the funds.
-        let sid = w.add_pending_secret("bearer", format!("bearer coin: {amount} base units of asset {asset_id}"), token.clone());
-        save_now(&state, w, "create a bearer coin")?;
-        // Its on-chain output commitment = commit_asset(amount, blind, pk, asset).
-        let bearer_out: zcrypt_shield::OutCoin =
-            (amount, bearer.coin.blind, bearer.coin.pubkey(), asset_id);
-        // Fixed-size cover note on-chain so bearer outputs match normal pays;
-        // the token itself remains the secret spend instrument.
+        let sid = w.add_pending_secret(
+            "bearer",
+            format!("{label}: {amount} base units of asset {asset_id}"),
+            token.clone(),
+        );
+        save_now(state, w, "create a bearer coin")?;
+        let bearer_out: zcrypt_shield::OutCoin = (amount, bearer.coin.blind, bearer.coin.pubkey(), asset_id);
         if let Err(e) = shield_pay(w, &url, &leaves, asset_id, amount, bearer_out, keys::cover_note_bytes()) {
-            w.pending_secrets.retain(|p| p.id != sid); // nothing moved: forget the draft token
-            let _ = save_now(&state, w, "discard an unused bearer token");
+            w.pending_secrets.retain(|p| p.id != sid);
+            let _ = save_now(state, w, "discard an unused bearer token");
             return Err(e);
         }
-        w.push_hist("bearer", -(amount as i64), "bearer coin".into(), asset_id);
+        w.push_hist("bearer", -(amount as i64), label.to_string(), asset_id);
         Ok(token)
+    })
+}
+
+/// Sweep a bearer this wallet just minted back into a normal coin. Called when the
+/// value coin fails after the gas coin is already on-chain. The token has to be one
+/// of this wallet's pending secrets, and gas comes from the wallet. This is not a
+/// handoff: a recipient cannot claim a lone `zcb1…`.
+fn reclaim_pending_bearer(token: &str, state: &State<AppState>) -> Result<(), String> {
+    let url = node_url(state)?;
+    let leaves = chain::fetch_leaves(&url)?;
+    with_wallet(state, |w| {
+        if !w.pending_secrets.iter().any(|p| p.secret == token) {
+            return Err("that coin is not a pending secret of this wallet".into());
+        }
+        let bearer = BearerCoin::from_bech32(token.trim()).ok_or("invalid bearer coin")?;
+        let bcoin = bearer.coin;
+        let idx = chain::find_index(&leaves, &bcoin.commitment())
+            .ok_or("bearer coin not found on chain (never funded, or already spent)")?;
+        let cid = chain_id_for(&url)?;
+        let (ps, pd) = chain::merkle_path(&leaves, idx as usize)
+            .ok_or("bearer coin not in commitment tree")?;
+        let spend = shield_tx::Spend {
+            value: bcoin.value,
+            blind: bcoin.blind,
+            spend_secret: bcoin.spend_secret,
+            asset_id: bcoin.asset_id,
+            path_siblings: ps,
+            path_dirs: pd,
+        };
+        let net = bcoin.value;
+        let self_addr = w.account.normal_address();
+        let blind_a = keys::random_blind();
+        let blind_b = keys::random_blind();
+        let out0 = keys::out_asset_coin(&self_addr, net, blind_a, bcoin.asset_id);
+        let out1 = keys::out_asset_coin(&self_addr, 0, blind_b, bcoin.asset_id);
+        let note0 = kem::ciphertext_to_bytes(&keys::encrypt_note_asset(
+            &self_addr,
+            net,
+            blind_a,
+            bcoin.asset_id,
+        ));
+        let note1 = kem::ciphertext_to_bytes(&keys::encrypt_note_asset(
+            &self_addr,
+            0,
+            blind_b,
+            bcoin.asset_id,
+        ));
+        let main_tx = shield_tx::build(&cid, &[spend], &[out0, out1], 0, vec![note0, note1])
+            .ok_or("failed to build the reclaim proof")?;
+        let gas_env = shield_tx::gas_pay_envelope(&shield_tx::txbind(&cid, &main_tx));
+        let gas_i = pick_gas_coin(w, &leaves, &[])?;
+        let (gas_tx, gas_blind, gchg_rec) = build_gas_note(w, &leaves, gas_i, &cid, &gas_env)?;
+        let raw = bundle_transfer(&gas_blind, &gas_tx, &main_tx);
+        chain::broadcast(&url, &raw).map_err(|e| {
+            if e.contains("spent") || e.contains("nullifier") {
+                "bearer coin already spent (its nullifier is in the registry)".to_string()
+            } else {
+                e
+            }
+        })?;
+        w.coins[gas_i].spent = true;
+        if let Some(mut rec) = gchg_rec {
+            rec.born = tip_or(&url, w);
+            w.coins.push(rec);
+        }
+        let mine = w.account.own_asset_coin(net, blind_a, bcoin.asset_id);
+        w.coins.push(CoinRec::new(mine, tip_or(&url, w)));
+        w.pending_secrets.retain(|p| p.secret != token);
+        w.push_hist("receive", net as i64, "gas coin returned".into(), bcoin.asset_id);
+        Ok(())
+    })
+}
+
+/// Create a bearer coin file for `asset_id` (0 = ZCRYPT, else zBTC/…). Two on-chain
+/// coins: the value, and a 0.01 ZCRYPT gas coin. The file holds both secrets. Whoever
+/// opens it first sweeps the value into their own key and pays gas from the file, so a
+/// brand-new wallet needs no balance. First sweep wins.
+#[tauri::command]
+fn create_bearer(amount: u64, asset_id: String, state: State<AppState>) -> R<String> {
+    let asset_id: u64 = asset_id.parse().map_err(|_| "invalid asset id".to_string())?;
+    if amount == 0 {
+        return Err("amount must be greater than zero".into());
+    }
+    bearer_budget(asset_id, amount, &state)?;
+    ensure_spendable(zcrypt_shield::ASSET_ZCRYPT, GAS_FEE, &state)
+        .map_err(|e| format!("could not fund the gas coin: {e}"))?;
+    let gas_tok = mint_one_bearer(GAS_FEE, zcrypt_shield::ASSET_ZCRYPT, &state, "gas")?;
+    let coin_tok = match (|| {
+        ensure_spendable(asset_id, amount, &state)?;
+        mint_one_bearer(amount, asset_id, &state, "bearer coin")
+    })() {
+        Ok(tok) => tok,
+        Err(e) => {
+            // The gas coin exists and only this wallet's pending secret holds it. Pull it
+            // back so a failed create does not leave 0.01 ZCRYPT stranded.
+            return match reclaim_pending_bearer(&gas_tok, &state) {
+                Ok(()) => Err(format!("{e}. The 0.01 ZCRYPT gas coin was returned to your wallet.")),
+                Err(back) => Err(format!(
+                    "{e}. The 0.01 ZCRYPT gas coin is in your pending secrets and could not be returned ({back})."
+                )),
+            };
+        }
+    };
+    let file = format_bearer_file(&coin_tok, &gas_tok);
+    with_wallet(&state, |w| {
+        let bearer = BearerCoin::from_bech32(&coin_tok).ok_or("bearer coin could not be read back")?;
+        let coin = bearer.coin;
+        let pk = coin.pubkey();
+        let blind = coin.blind;
+        let nf = coin.nullifier();
+        w.pending_secrets.retain(|p| p.secret != coin_tok && p.secret != gas_tok);
+        w.add_pending_secret(
+            "bearer",
+            format!("bearer coin: {amount} base units of asset {asset_id}"),
+            file.clone(),
+        );
+        w.push_receipt("bearer", coin.value, coin.asset_id, "", &pk, &blind, Some(&nf), "");
+        Ok(file)
     })
     .and_then(ok)
 }
 
-/// Claim a bearer coin (zcb1…) SECURELY. Verify it is a real, unspent on-chain coin,
-/// then immediately **sweep** it into a fresh coin only we can spend (a 0x55 spend
-/// that re-keys it to our account) — so the previous holder's embedded secret becomes
-/// useless. You net (value − fee). If someone already spent it, the sweep is rejected.
+/// Claim a bearer coin file. Verify the value coin is on-chain, then sweep it into a
+/// fresh coin only we can spend, paying the 0.01 ZCRYPT gas from the file's gas coin.
+/// The claimer receives the full value. A lone `zcb1…` is not a bearer coin. If someone
+/// already spent the file, the sweep is rejected.
 #[tauri::command]
 fn claim_bearer(token: String, state: State<AppState>) -> R<Received> {
+    let file = parse_bearer_file(&token)?;
     let url = node_url(&state)?;
     let leaves = chain::fetch_leaves(&url)?;
     with_wallet(&state, |w| {
-        let bearer = BearerCoin::from_bech32(token.trim()).ok_or("invalid bearer coin")?;
+        let bearer = BearerCoin::from_bech32(file.coin.trim()).ok_or("invalid bearer coin")?;
         let bcoin = bearer.coin;
         let idx = chain::find_index(&leaves, &bcoin.commitment())
             .ok_or("bearer coin not found on chain (never funded, or already spent)")?;
         // No "is it spent?" query: asking the node about a specific nullifier would tell
         // the operator which coin this session is about to sweep. The sweep itself is the
         // check: a double-spend is rejected atomically (nothing of ours is spent).
-        // The sweep is a transfer, so it pays ZCRYPT gas from a separate ZCRYPT coin.
-        // Reserve that coin first. The gas proof is built after the sweep proof:
-        // consensus binds it to gas_pay_envelope(txbind(main)), which covers the
-        // sweep's proof bytes. You get the FULL bearer value; the 0.01 ZCRYPT gas
-        // comes from the reserved coin.
+        // The gas proof is built after the sweep proof: consensus binds it to
+        // gas_pay_envelope(txbind(main)), which covers the sweep's proof bytes.
         let cid = chain_id_for(&url)?;
-        let gas_i = pick_gas_coin(w, &leaves, &[])?;
+        let gas_bearer = BearerCoin::from_bech32(file.gas.trim()).ok_or("invalid gas coin")?;
+        if gas_bearer.coin.asset_id != zcrypt_shield::ASSET_ZCRYPT {
+            return Err("gas coin must be ZCRYPT".into());
+        }
+        if gas_bearer.coin.value < GAS_FEE {
+            return Err("gas coin is smaller than the 0.01 ZCRYPT gas fee".into());
+        }
+        if gas_bearer.coin.commitment() == bcoin.commitment() {
+            return Err("gas and value are the same coin".into());
+        }
+        let _gas_idx = chain::find_index(&leaves, &gas_bearer.coin.commitment())
+            .ok_or("gas coin not found on chain (never funded, or already spent)")?;
+        let gas_coin = gas_bearer.coin;
         // Sweep: single-input spend of the bearer coin → a fresh coin we own (new
         // secret), plus a 0-value change output (2-output topology). No in-tx fee.
         // Membership proof against the whole shielded pool — no ring selection.
@@ -1373,7 +1645,7 @@ fn claim_bearer(token: String, state: State<AppState>) -> R<Received> {
         let main_tx = shield_tx::build(&cid, &[spend], &[out0, out1], 0, vec![note0, note1])
             .ok_or("failed to build the claim proof")?;
         let gas_env = shield_tx::gas_pay_envelope(&shield_tx::txbind(&cid, &main_tx));
-        let (gas_tx, gas_blind, gchg_rec) = build_gas_note(w, &leaves, gas_i, &cid, &gas_env)?;
+        let (gas_tx, gas_blind, gchg_rec) = build_gas_for_coin(w, &leaves, gas_coin, &cid, &gas_env)?;
         let raw = bundle_transfer(&gas_blind, &gas_tx, &main_tx);
         chain::broadcast(&url, &raw).map_err(|e| {
             if e.contains("spent") || e.contains("nullifier") {
@@ -1382,7 +1654,6 @@ fn claim_bearer(token: String, state: State<AppState>) -> R<Received> {
                 e
             }
         })?;
-        w.coins[gas_i].spent = true;
         if let Some(rec) = gchg_rec {
             w.coins.push(rec);
         }
@@ -1400,6 +1671,288 @@ fn claim_bearer(token: String, state: State<AppState>) -> R<Received> {
 #[tauri::command]
 fn get_history(state: State<AppState>) -> R<Vec<HistItem>> {
     with_wallet(&state, |w| Ok(w.history.clone())).and_then(ok)
+}
+
+fn limbs_hex(limbs: &[u64]) -> String {
+    let mut bytes = Vec::with_capacity(limbs.len() * 8);
+    for limb in limbs {
+        bytes.extend_from_slice(&limb.to_le_bytes());
+    }
+    hex::encode(bytes)
+}
+
+fn hex_to_limbs<const N: usize>(s: &str) -> Result<[u64; N], String> {
+    let bytes = hex::decode(s.trim()).map_err(|_| "receipt field is not hex".to_string())?;
+    if bytes.len() != N * 8 {
+        return Err(format!("receipt field has {} bytes, expected {}", bytes.len(), N * 8));
+    }
+    let mut out = [0u64; N];
+    for i in 0..N {
+        out[i] = u64::from_le_bytes(bytes[i * 8..i * 8 + 8].try_into().unwrap());
+    }
+    Ok(out)
+}
+
+/// The text a judge checks. One field per line.
+fn format_receipt(r: &PaymentReceipt) -> String {
+    let mut s = format!(
+        "zcrypt-receipt/1\nkind {}\namount {}\nasset {}\nrecipient {}\nowner_pk {}\nblind {}\ncommitment {}\n",
+        r.kind, r.amount, r.asset_id, r.recipient, r.owner_pk, r.blind, r.commitment
+    );
+    if !r.nullifier.is_empty() {
+        s.push_str(&format!("nullifier {}\n", r.nullifier));
+    }
+    if !r.note.is_empty() {
+        s.push_str(&format!("note {}\n", r.note));
+    }
+    s
+}
+
+fn parse_receipt(raw: &str) -> Result<PaymentReceipt, String> {
+    let lines: Vec<&str> = raw.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+    if lines.first().copied() != Some("zcrypt-receipt/1") {
+        return Err("a payment receipt starts with zcrypt-receipt/1".into());
+    }
+    let mut map: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+    for line in &lines[1..] {
+        let mut parts = line.split_whitespace();
+        let key = parts.next().ok_or("receipt has an empty line")?;
+        let val = parts.next().unwrap_or("");
+        if parts.next().is_some() {
+            return Err(format!("receipt line {key} has extra fields"));
+        }
+        if map.insert(key.to_string(), val.to_string()).is_some() {
+            return Err(format!("receipt has two {key} lines"));
+        }
+    }
+    for k in map.keys() {
+        match k.as_str() {
+            "kind" | "amount" | "asset" | "recipient" | "owner_pk" | "blind" | "commitment" | "nullifier" | "note" => {}
+            other => return Err(format!("unknown receipt field {other}")),
+        }
+    }
+    let kind = map.get("kind").cloned().ok_or("receipt is missing the kind")?;
+    if kind != "normal" && kind != "stealth" && kind != "bearer" {
+        return Err("receipt kind must be normal, stealth, or bearer".into());
+    }
+    let amount: u64 = map
+        .get("amount")
+        .ok_or("receipt is missing the amount")?
+        .parse()
+        .map_err(|_| "receipt amount is not a number")?;
+    let asset_id: u64 = map
+        .get("asset")
+        .ok_or("receipt is missing the asset")?
+        .parse()
+        .map_err(|_| "receipt asset is not a number")?;
+    let recipient = map.get("recipient").cloned().unwrap_or_default();
+    let owner_pk = map.get("owner_pk").cloned().ok_or("receipt is missing the owner key")?;
+    let blind = map.get("blind").cloned().ok_or("receipt is missing the blind")?;
+    let commitment = map.get("commitment").cloned().ok_or("receipt is missing the commitment")?;
+    let nullifier = map.get("nullifier").cloned().unwrap_or_default();
+    let note = map.get("note").cloned().unwrap_or_default();
+    if kind == "bearer" && nullifier.is_empty() {
+        return Err("a bearer receipt includes the nullifier".into());
+    }
+    if kind == "stealth" && !note.starts_with("zct1") {
+        return Err("a stealth receipt includes the zct1 note".into());
+    }
+    if kind != "bearer" && recipient.is_empty() {
+        return Err("receipt is missing the recipient".into());
+    }
+    let decimals = if asset_id == zcrypt_shield::ASSET_ZCRYPT { 6 } else { 8 };
+    Ok(PaymentReceipt {
+        id: String::new(),
+        kind,
+        amount,
+        asset_id,
+        decimals,
+        recipient,
+        owner_pk,
+        blind,
+        commitment,
+        nullifier,
+        note,
+        timestamp: 0,
+    })
+}
+
+/// Recompute the commitment from the opening and require it to match the leaf in the receipt.
+fn open_receipt(r: &PaymentReceipt) -> Result<zcrypt_shield::Commitment, String> {
+    let pk = hex_to_limbs::<8>(&r.owner_pk)?;
+    let blind = hex_to_limbs::<8>(&r.blind)?;
+    let stored = hex_to_limbs::<8>(&r.commitment)?;
+    let got = zcrypt_shield::commit_asset(r.amount, &blind, &pk, r.asset_id);
+    if got != stored {
+        return Err("receipt opening does not match its commitment".into());
+    }
+    Ok(got)
+}
+
+/// The address a normal or stealth receipt pays, after checking the key inside
+/// that address is the key bound into the coin. A bearer receipt names nobody.
+fn receipt_recipient(r: &PaymentReceipt) -> Result<Option<Address>, String> {
+    if r.kind == "bearer" {
+        if !r.recipient.is_empty() {
+            return Err("a bearer receipt names no recipient".into());
+        }
+        return Ok(None);
+    }
+    let addr = Address::from_bech32(r.recipient.trim()).ok_or("recipient is not a zc1 address")?;
+    let expect = match r.kind.as_str() {
+        "normal" => keys::AddressKind::Normal,
+        "stealth" => keys::AddressKind::Stealth,
+        _ => return Err("receipt kind must be normal, stealth, or bearer".into()),
+    };
+    if addr.kind != expect {
+        return Err("receipt kind does not match the recipient address".into());
+    }
+    let pk = hex_to_limbs::<8>(&r.owner_pk)?;
+    if addr.pubkey() != pk {
+        return Err("owner key does not match the recipient address".into());
+    }
+    Ok(Some(addr))
+}
+
+fn wallet_owns_address(w: &Wallet, addr: &Address) -> bool {
+    let want = addr.to_bech32();
+    if w.account.normal_address().to_bech32() == want {
+        return true;
+    }
+    w.stealth_seeds.iter().any(|seed| Account::from_seed(*seed).stealth_address().to_bech32() == want)
+}
+
+fn format_base_amount(amount: u64, decimals: u8) -> String {
+    let scale = 10u64.saturating_pow(decimals as u32);
+    if scale == 0 {
+        return amount.to_string();
+    }
+    let whole = amount / scale;
+    let frac = amount % scale;
+    if frac == 0 {
+        return whole.to_string();
+    }
+    let mut frac_s = format!("{frac:0width$}", width = decimals as usize);
+    while frac_s.ends_with('0') {
+        frac_s.pop();
+    }
+    format!("{whole}.{frac_s}")
+}
+
+#[derive(Serialize)]
+struct ReceiptView {
+    id: String,
+    kind: String,
+    amount: u64,
+    #[serde(with = "u64_str")]
+    asset_id: u64,
+    decimals: u8,
+    recipient: String,
+    timestamp: u64,
+    text: String,
+}
+
+#[tauri::command]
+fn list_receipts(state: State<AppState>) -> R<Vec<ReceiptView>> {
+    with_wallet(&state, |w| {
+        Ok(w.receipts
+            .iter()
+            .map(|r| ReceiptView {
+                id: r.id.clone(),
+                kind: r.kind.clone(),
+                amount: r.amount,
+                asset_id: r.asset_id,
+                decimals: r.decimals,
+                recipient: r.recipient.clone(),
+                timestamp: r.timestamp,
+                text: format_receipt(r),
+            })
+            .collect())
+    })
+    .and_then(ok)
+}
+
+#[derive(Serialize)]
+struct ReceiptVerdict {
+    /// The opening matches a leaf on this chain.
+    on_chain: bool,
+    /// Normal or stealth, and the owner key is the key inside the recipient address.
+    names_recipient: bool,
+    /// That address belongs to the wallet doing the check.
+    pays_this_wallet: bool,
+    kind: String,
+    amount: u64,
+    #[serde(with = "u64_str")]
+    asset_id: u64,
+    decimals: u8,
+    ticker: String,
+    recipient: String,
+    summary: String,
+}
+
+/// Open a receipt and look its coin up on the chain. Any wallet can run this.
+/// The leaf stays after the recipient spends the coin.
+fn judge_receipt(r: &PaymentReceipt, state: &State<AppState>) -> Result<ReceiptVerdict, String> {
+    let com = open_receipt(r)?;
+    let named = receipt_recipient(r)?;
+    let pays_this_wallet = named
+        .as_ref()
+        .and_then(|addr| with_wallet(state, |w| Ok(wallet_owns_address(w, addr))).ok())
+        .unwrap_or(false);
+    let url = node_url(state)?;
+    let leaves = chain::fetch_leaves(&url)?;
+    let on_chain = chain::find_index(&leaves, &com).is_some();
+    let (ticker, decimals) = asset_label(&url, r.asset_id);
+    let shown = format_base_amount(r.amount, decimals);
+    let who = named.as_ref().map(|a| short(&a.to_bech32())).unwrap_or_default();
+    let summary = match (r.kind.as_str(), on_chain, pays_this_wallet) {
+        ("bearer", true, _) => format!(
+            "This receipt opens a bearer coin of {shown} {ticker} and that coin is on this chain. It names no recipient."
+        ),
+        ("bearer", false, _) => format!(
+            "This receipt opens a bearer coin of {shown} {ticker}, and this chain has no leaf for it."
+        ),
+        (_, true, true) => format!(
+            "Confirmed. {shown} {ticker} was created for an address in this wallet ({who}). The coin is on this chain."
+        ),
+        (_, true, false) => format!(
+            "Confirmed. {shown} {ticker} was created for {who}. The coin is on this chain."
+        ),
+        (_, false, true) => format!(
+            "This receipt opens {shown} {ticker} for an address in this wallet ({who}), and this chain has no leaf for it."
+        ),
+        (_, false, false) => format!(
+            "This receipt opens {shown} {ticker} for {who}, and this chain has no leaf for it."
+        ),
+    };
+    Ok(ReceiptVerdict {
+        on_chain,
+        names_recipient: named.is_some(),
+        pays_this_wallet,
+        kind: r.kind.clone(),
+        amount: r.amount,
+        asset_id: r.asset_id,
+        decimals,
+        ticker,
+        recipient: named.map(|a| a.to_bech32()).unwrap_or_default(),
+        summary,
+    })
+}
+
+/// Check one of this wallet's saved receipts.
+#[tauri::command]
+fn check_receipt(id: String, state: State<AppState>) -> R<ReceiptVerdict> {
+    let receipt = with_wallet(&state, |w| {
+        w.receipts.iter().find(|r| r.id == id).cloned().ok_or_else(|| "receipt not found".to_string())
+    })?;
+    judge_receipt(&receipt, &state).and_then(ok)
+}
+
+/// Check a receipt file. The wallet that runs this does not have to be the sender or the recipient.
+#[tauri::command]
+fn verify_receipt(text: String, state: State<AppState>) -> R<ReceiptVerdict> {
+    let receipt = parse_receipt(&text)?;
+    judge_receipt(&receipt, &state).and_then(ok)
 }
 
 // ---------------------------------------------------------------------------
@@ -1675,6 +2228,102 @@ mod scan_tests {
         // wallet reconstruct later claims at the wrong indices.
         let p2_bug = scan_pass(&blocks, &keys, &leaves, &known, &own_nf, &[], &p1.claim_counters, &p1.fee_claim_counters);
         assert!(p2_bug.claim_counters.get(&key).copied().unwrap() > chunks.len() as u64);
+    }
+}
+
+#[cfg(test)]
+mod bearer_file_tests {
+    use super::*;
+
+    #[test]
+    fn bearer_file_is_the_only_handoff() {
+        let file = format_bearer_file("zcb1coin", "zcb1gas");
+        assert_eq!(file, "zcrypt-bearer/1\ncoin zcb1coin\ngas zcb1gas\n");
+        let parsed = parse_bearer_file(&file).expect("bearer file");
+        assert_eq!(parsed.coin, "zcb1coin");
+        assert_eq!(parsed.gas, "zcb1gas");
+
+        let swapped = parse_bearer_file("zcrypt-bearer/1\ngas zcb1gas\n\ncoin zcb1coin\n").unwrap();
+        assert_eq!((swapped.coin.as_str(), swapped.gas.as_str()), ("zcb1coin", "zcb1gas"));
+
+        let lone = parse_bearer_file("  zcb1only\n").unwrap_err();
+        assert!(lone.contains("zcrypt-bearer/1"), "{lone}");
+        assert!(parse_bearer_file("zcrypt-bearer/1\ncoin zcb1coin\n").unwrap_err().contains("gas"));
+        assert!(parse_bearer_file("zcrypt-gift/1\ngift zcb1coin\npostage zcb1gas\n").is_err());
+        assert!(parse_bearer_file("hello").is_err());
+        assert!(parse_bearer_file("zcrypt-bearer/1\ncoin zcb1coin extra\ngas zcb1gas\n").is_err());
+        assert!(parse_bearer_file("zcrypt-bearer/1\ncoin nota\ngas zcb1gas\n").is_err());
+        assert!(parse_bearer_file("zcrypt-bearer/1\ncoin zcb1a\ncoin zcb1b\ngas zcb1gas\n").is_err());
+        assert_eq!(BEARER_OVERHEAD, GAS_FEE * 3);
+    }
+}
+
+#[cfg(test)]
+mod receipt_tests {
+    use super::*;
+
+    #[test]
+    fn receipt_opens_the_coin_it_records() {
+        let (acct, _m) = keys::new_account();
+        let addr = acct.normal_address();
+        let blind = keys::random_blind();
+        let amount = 1_000_000u64;
+        let pk = addr.pubkey();
+        let com = zcrypt_shield::commit_asset(amount, &blind, &pk, 0);
+        let receipt = PaymentReceipt {
+            id: "receipt-1".into(),
+            kind: "normal".into(),
+            amount,
+            asset_id: 0,
+            decimals: 6,
+            recipient: addr.to_bech32(),
+            owner_pk: limbs_hex(&pk),
+            blind: limbs_hex(&blind),
+            commitment: limbs_hex(&com),
+            nullifier: String::new(),
+            note: String::new(),
+            timestamp: 1,
+        };
+        let text = format_receipt(&receipt);
+        assert!(text.starts_with("zcrypt-receipt/1\n"));
+        let parsed = parse_receipt(&text).expect("receipt");
+        assert_eq!(parsed.recipient, addr.to_bech32());
+        assert_eq!(limbs_hex(&Address::from_bech32(&parsed.recipient).unwrap().pubkey()), parsed.owner_pk);
+        open_receipt(&parsed).expect("opening");
+        let named = receipt_recipient(&parsed).expect("binds the address");
+        assert_eq!(named.unwrap().to_bech32(), addr.to_bech32());
+        let (other, _m2) = keys::new_account();
+        let mut wrong_addr = parsed.clone();
+        wrong_addr.recipient = other.normal_address().to_bech32();
+        assert!(receipt_recipient(&wrong_addr).is_err());
+
+        let mut tampered = parsed.clone();
+        tampered.amount += 1;
+        assert!(open_receipt(&tampered).is_err());
+        assert!(parse_receipt("zcb1only").is_err());
+
+        let coin = acct.own_coin(amount, blind);
+        let bearer = PaymentReceipt {
+            id: "receipt-2".into(),
+            kind: "bearer".into(),
+            amount,
+            asset_id: 0,
+            decimals: 6,
+            recipient: String::new(),
+            owner_pk: limbs_hex(&coin.pubkey()),
+            blind: limbs_hex(&coin.blind),
+            commitment: limbs_hex(&coin.commitment()),
+            nullifier: limbs_hex(&coin.nullifier()),
+            note: String::new(),
+            timestamp: 2,
+        };
+        let bearer_text = format_receipt(&bearer);
+        assert!(bearer_text.contains("\nnullifier "));
+        assert!(!bearer_text.contains("spend"));
+        let parsed_bearer = parse_receipt(&bearer_text).expect("bearer receipt");
+        open_receipt(&parsed_bearer).expect("bearer opening");
+        assert!(receipt_recipient(&parsed_bearer).unwrap().is_none());
+        assert!(parse_receipt("zcrypt-receipt/1\nkind bearer\namount 1\nasset 0\nowner_pk aa\nblind bb\ncommitment cc\n").is_err());
     }
 }
 
@@ -2052,6 +2701,18 @@ fn build_gas_note(
     envelope: &[u8],
 ) -> Result<(shield_tx::ShieldTx, zcrypt_shield::Blind, Option<CoinRec>), String> {
     let gas_coin = w.coins.get(gas_i).ok_or("gas coin is missing")?.coin;
+    build_gas_for_coin(w, leaves, gas_coin, chain_id, envelope)
+}
+
+/// Same gas note as [`build_gas_note`], spending `gas_coin` directly. A bearer file's gas
+/// coin is not in the claimer's wallet, so the claim cannot look it up by index.
+fn build_gas_for_coin(
+    w: &mut Wallet,
+    leaves: &[zcrypt_shield::Commitment],
+    gas_coin: Coin,
+    chain_id: &[u8],
+    envelope: &[u8],
+) -> Result<(shield_tx::ShieldTx, zcrypt_shield::Blind, Option<CoinRec>), String> {
     let gidx = chain::find_index(leaves, &gas_coin.commitment()).ok_or("gas coin not on chain")?;
     let (gps, gpd) = chain::merkle_path(leaves, gidx as usize).ok_or("gas coin not in the tree")?;
     let gas_spend = shield_tx::Spend {
@@ -2538,14 +3199,29 @@ fn do_shield_send_raw(
             }
             return Err(e);
         }
+        let note_file = if stealth {
+            format!("zct1{}", hex::encode(&real_note))
+        } else {
+            String::new()
+        };
         if let Some(com) = reshape_com {
             w.hist_suppress.insert(com);
         } else {
             w.push_hist("send", -(amount as i64), short(recipient), asset_id);
+            w.push_receipt(
+                if stealth { "stealth" } else { "normal" },
+                amount,
+                asset_id,
+                &addr.to_bech32(),
+                &addr.pubkey(),
+                &blind_r,
+                None,
+                &note_file,
+            );
         }
         Ok(SendResult {
             on_chain: true, // commitment always on-chain; stealth note is off-chain
-            file: if stealth { Some(format!("zct1{}", hex::encode(real_note))) } else { None },
+            file: if stealth { Some(note_file) } else { None },
         })
     })
 }
@@ -7390,6 +8066,9 @@ fn main() {
             create_bearer,
             claim_bearer,
             get_history,
+            list_receipts,
+            check_receipt,
+            verify_receipt,
             get_seed_phrase,
             get_settings,
             save_settings,
@@ -7449,8 +8128,12 @@ fn main() {
 /// `ZC_E2E_URL` is set; `chain/e2e/run-all.sh` runs it with `VALIDATOR_SEED_HEX` so the
 /// bond step signs with node0's real consensus key. Covers: create, fund (devnet faucet),
 /// scan, normal send/receive between two wallets, stealth send + out-of-band note receive,
-/// bearer create/claim, bond via the two-step host-signed flow, delegate, reward accrual,
-/// claim, undelegate, and restore-from-mnemonic recovering a second wallet's coins.
+/// bearer create/claim, payment receipts checked by the sender, the recipient, and a
+/// third wallet, bond via the two-step host-signed flow, delegate, reward accrual,
+/// claim, undelegate, restore-from-mnemonic recovering a second wallet's coins, and
+/// every remaining command: session and keys, local readouts, a minted asset, an
+/// in-pool swap through settle, the early-refund refusal, bridge readouts, and the
+/// devnet-only mint_coins / send_coin on a throwaway wallet.
 #[cfg(test)]
 mod live_3node {
     use super::*;
@@ -7537,7 +8220,9 @@ mod live_3node {
 
         // Alice: create, fund from the devnet faucet, scan.
         let alice = W::new(&url, &btc_url);
+        assert!(!v(wallet_exists(alice.st())).unwrap(), "a new data dir has no keystore");
         let created = v(create_wallet(pw.clone(), alice.st())).expect("create");
+        assert!(v(wallet_exists(alice.st())).unwrap(), "create writes the keystore");
         assert!(created.address.starts_with("zc1"));
         let fund = 30_000 * ZC;
         assert_eq!(v(fund_onchain(fund, alice.st())).expect("fund"), 2);
@@ -7561,16 +8246,18 @@ mod live_3node {
         assert_eq!(bob_bal, 2 * ZC, "Bob received exactly the amount");
         println!("[wallet] Alice -> Bob 2 ZCRYPT: received by scanning ({} ZCRYPT)", bob_bal / ZC);
 
-        // Bearer: Alice mints a bearer coin; Bob claims it (the sweep spends it into Bob's own
-        // key, paying gas from Bob's smallest coin), then refreshes.
+        // Bearer: Alice mints a bearer file (value coin + 0.01 ZCRYPT gas). Bob claims it.
+        // The sweep re-keys the coin into Bob's wallet and pays gas from the file, so his
+        // existing balance is not charged.
         let token = v(create_bearer(ZC, "0".into(), alice.st())).expect("bearer");
-        assert!(token.starts_with("zcb1"));
+        assert!(token.starts_with("zcrypt-bearer/1"), "bearer file, got {token}");
+        assert!(token.contains("\ncoin zcb1") && token.contains("\ngas zcb1"));
         let claimed = wait_until("bearer claim", 60, || v(claim_bearer(token.clone(), bob.st())).ok());
         assert_eq!(claimed.amount, ZC);
         assert!(v(claim_bearer(token.clone(), bob.st())).is_err(), "a bearer coin claims once");
         v(scan_onchain(bob.st())).expect("scan bob after the sweep");
         let after_sweep = v(get_balance(bob.st())).unwrap().total;
-        assert_eq!(after_sweep, 3 * ZC - GAS_FEE, "2 received + 1 swept, minus the sweep's gas");
+        assert_eq!(after_sweep, 3 * ZC, "2 received + 1 swept; the file's gas paid the fee");
         println!("[wallet] bearer coin created by Alice, claimed by Bob, double-claim rejected; Bob holds {} base units", after_sweep);
 
         // Stealth: Bob makes a stealth address; Alice sends; the note travels out of band.
@@ -7585,6 +8272,52 @@ mod live_3node {
         v(scan_onchain(bob.st())).expect("scan");
         assert_eq!(v(get_balance(bob.st())).unwrap().total, after_sweep + ZC);
         println!("[wallet] Alice -> Bob stealth 1 ZCRYPT via out-of-band note: received");
+
+        // Receipts. Alice stored one per payment. She checks her own. Bob checks the
+        // same files and the normal and stealth ones name an address in his wallet.
+        // Charles is a third wallet: he confirms the payment to Bob and does not own it.
+        let receipts = v(list_receipts(alice.st())).expect("alice receipts");
+        assert_eq!(receipts.len(), 3, "one receipt each for normal, bearer, and stealth");
+        let normal = receipts.iter().find(|r| r.kind == "normal").expect("normal receipt");
+        let bearer_r = receipts.iter().find(|r| r.kind == "bearer").expect("bearer receipt");
+        let stealth_r = receipts.iter().find(|r| r.kind == "stealth").expect("stealth receipt");
+        assert_eq!(normal.amount, 2 * ZC);
+        assert_eq!(bearer_r.amount, ZC);
+        assert_eq!(stealth_r.amount, ZC);
+        assert!(normal.text.starts_with("zcrypt-receipt/1\n"));
+        assert!(stealth_r.text.contains("\nnote zct1"));
+        assert!(bearer_r.text.contains("\nnullifier "));
+
+        let charles = W::new(&url, &btc_url);
+        v(create_wallet(pw.clone(), charles.st())).expect("create charles");
+
+        let alice_view = v(check_receipt(normal.id.clone(), alice.st())).expect("alice checks her receipt");
+        assert!(alice_view.on_chain && alice_view.names_recipient && !alice_view.pays_this_wallet, "{}", alice_view.summary);
+        println!("[wallet] Alice checked her own receipt: {}", alice_view.summary);
+
+        let bob_view = wait_until("bob confirms the receipt", 60, || {
+            let got = v(verify_receipt(normal.text.clone(), bob.st())).ok()?;
+            (got.on_chain && got.names_recipient && got.pays_this_wallet).then_some(got)
+        });
+        println!("[wallet] Bob checked the receipt for his address: {}", bob_view.summary);
+
+        let charles_view = v(verify_receipt(normal.text.clone(), charles.st())).expect("charles checks");
+        assert!(charles_view.on_chain && charles_view.names_recipient && !charles_view.pays_this_wallet, "{}", charles_view.summary);
+        println!("[wallet] Charles checked Alice's receipt: {}", charles_view.summary);
+
+        let tampered = normal.text.replacen(&format!("\namount {}\n", 2 * ZC), "\namount 1\n", 1);
+        assert!(v(verify_receipt(tampered, charles.st())).is_err(), "a changed amount must not open");
+
+        let bearer_view = v(verify_receipt(bearer_r.text.clone(), charles.st())).expect("bearer receipt");
+        assert!(bearer_view.on_chain && !bearer_view.names_recipient, "{}", bearer_view.summary);
+        println!("[wallet] Charles checked the bearer receipt: {}", bearer_view.summary);
+
+        let stealth_view = v(verify_receipt(stealth_r.text.clone(), bob.st())).expect("bob stealth receipt");
+        assert!(stealth_view.on_chain && stealth_view.names_recipient && stealth_view.pays_this_wallet, "{}", stealth_view.summary);
+        let charles_stealth = v(verify_receipt(stealth_r.text.clone(), charles.st())).expect("charles stealth");
+        assert!(charles_stealth.on_chain && charles_stealth.names_recipient && !charles_stealth.pays_this_wallet);
+        println!("[wallet] Bob and Charles checked the stealth receipt: {}", stealth_view.summary);
+
         let skip_staking = std::env::var("ZC_E2E_SKIP_STAKING").is_ok();
 
         // Bond node0 through the two-step flow: the wallet prepares, the HOST signs.
@@ -7717,7 +8450,223 @@ mod live_3node {
             let st3 = v(bridge_status(false, carol.st())).expect("status");
             assert_eq!(st3.zbtc_balance, net_mint - 5_000_000 - zcrypt_core::emission::MIN_FEE, "change minus the in-asset fee stays spendable");
             println!("[wallet] redeemed 0.05 zBTC through the operator watcher; BTC claimed; {} sats zBTC left", st3.zbtc_balance);
+
+            // The shield and redeem above call the command bodies directly. These are the
+            // other bridge commands: init and mature hit the chain, the Bitcoin wallet
+            // sends a real (tiny) withdrawal, and the two resume commands are asked for a
+            // record that was never created.
+            let zbtc_id = v(bridge_init(carol.st())).expect("bridge init");
+            assert_eq!(zbtc_id, st3.zbtc_asset, "genesis zBTC is the asset bridge_init returns");
+            let mature = v(bridge_mature(carol.st())).expect("bridge mature");
+            assert!(mature.contains(':'), "spv pending is count:value, got {mature}");
+            // The claim closes the wallet's redeem record, then the scan above rebuilds it:
+            // the burn escrow is still open on chain until its timeout, and the scan treats
+            // a missing record for that escrow as a restore. Retry runs the resume against
+            // that rebuilt record. A missing index is still refused.
+            let redeems = v(list_pending_redeems(carol.st())).expect("pending redeems");
+            if let Some(r) = redeems.iter().find(|r| r.value_sats == redeemed) {
+                let note = v(bridge_retry_redeem_claim(r.index, carol.st())).expect("retry the rebuilt redeem");
+                println!("[wallet] pending redeem #{} ({} sats) is the open burn the scan rebuilt; retry: {note}", r.index, r.value_sats);
+            } else {
+                assert!(redeems.is_empty(), "{} pending redeem(s) and none is the 0.05 claim", redeems.len());
+                println!("[wallet] list_pending_redeems is empty after the claim");
+            }
+            let retry = v(bridge_retry_redeem_claim(999, carol.st())).unwrap_err();
+            assert!(retry.contains("no such pending redeem"), "{retry}");
+            let no_dep = v(bridge_refund_deposit(999, carol.st())).unwrap_err();
+            assert!(no_dep.contains("no such pending deposit"), "{no_dep}");
+            let btcw = v(btc_wallet_info(carol.st())).expect("btc wallet");
+            assert!(btcw.connected, "regtest bitcoind is the wallet backend");
+            assert!(!btcw.deposit_address.is_empty(), "bitcoind issued a deposit address");
+            assert!(btcw.balance > 0.01, "carol's bitcoind balance {}", btcw.balance);
+            let txid = v(withdraw_btc(btcw.deposit_address, "0.001".into(), carol.st())).expect("withdraw btc");
+            assert_eq!(txid.len(), 64, "bitcoin txid, got {txid}");
+            println!(
+                "[wallet] bridge_init {zbtc_id}, mature {mature}, {} BTC in the bitcoind wallet, withdrew 0.001 ({txid})",
+                btcw.balance
+            );
+            println!("[wallet] retry of redeem 999: {retry}");
+            println!("[wallet] refund of deposit 999: {no_dep}");
         }
+
+        // Every command the payment, receipt, staking, and bridge sections did not call.
+        // The pin file is written into the data dir that was current at the first signature.
+        // Alice's send runs after Bob's wallet is created, so that file is in Bob's dir.
+        chain::set_pin_dir(bob._dir.to_string_lossy().to_string());
+
+        let settings = v(get_settings(alice.st())).expect("settings");
+        assert_eq!(settings.node_url, url);
+        assert!(!settings.tor_enabled);
+        let hist = v(get_history(alice.st())).expect("history");
+        assert!(hist.iter().any(|h| h.kind == "send" && h.amount < 0), "alice's sends are in history");
+        let node = v(node_status(alice.st())).expect("node status");
+        assert!(node.connected && node.height > 0 && node.error.is_empty(), "node {} @ {}", node.app, node.height);
+        let tor = v(tor_status(alice.st())).expect("tor");
+        assert!(!tor.enabled && !tor.node_routed && tor.detail.contains("Tor is off"), "{}", tor.detail);
+        let view = v(get_view_key(alice.st())).expect("view key");
+        assert_eq!(view, v(get_view_key(alice.st())).unwrap());
+        let view_raw = hex::decode(&view).expect("view key hex");
+        assert!(zcrypt_core::keys::ViewKey::from_bytes(&view_raw).is_some(), "view key decodes");
+        let phrase = v(get_seed_phrase(pw.clone(), alice.st())).expect("seed phrase");
+        assert_eq!(phrase.0.as_str(), created.seed_phrase.as_str());
+        match v(get_seed_phrase("not-the-password".into(), alice.st())) {
+            Err(e) => assert!(e.contains("wrong password"), "{e}"),
+            Ok(_) => panic!("a wrong password must not reveal the phrase"),
+        }
+        let pin = v(chain_pin()).expect("chain pin");
+        assert!(pin.as_ref().is_some_and(|p| !p.is_empty()), "a signature pinned the chain id");
+        let held = v(held_assets(alice.st())).expect("held");
+        let zc_held = held.iter().find(|a| a.asset_id == 0).expect("ZCRYPT is always listed");
+        assert_eq!((zc_held.ticker.as_str(), zc_held.decimals), ("ZCRYPT", 6));
+        assert!(zc_held.balance > 0);
+        println!("[wallet] session and readouts: history {}, node height {}, view key {} bytes, pin {}", hist.len(), node.height, view_raw.len(), pin.unwrap());
+
+        let export_name = format!("zcrypt-e2e-{}-{}.txt", std::process::id(), rand::random::<u32>());
+        let export_body = "zcrypt e2e export\n";
+        let export_path = v(save_export(export_name, export_body.into())).expect("save export");
+        assert_eq!(std::fs::read_to_string(&export_path).unwrap(), export_body);
+        std::fs::remove_file(&export_path).unwrap();
+        let empty_open = v(open_external(String::new())).unwrap_err();
+        assert!(empty_open.contains("nothing to open"), "{empty_open}");
+        let refused = v(open_external("file:///bin/ls".into())).unwrap_err();
+        assert!(refused.contains("refused to open"), "{refused}");
+        println!("[wallet] save_export wrote then removed {export_path}; open_external refused a local program");
+
+        let listed = v(list_stealth_addresses(bob.st())).expect("stealth list");
+        assert!(listed.iter().any(|e| e.index == stealth.index && e.address == stealth.address));
+        let bad_backup = v(reveal_stealth_backup(stealth.index, "not-the-password".into(), bob.st())).unwrap_err();
+        assert!(bad_backup.contains("wrong password"), "{bad_backup}");
+        let backup = hex::decode(v(reveal_stealth_backup(stealth.index, pw.clone(), bob.st())).unwrap()).unwrap();
+        assert_eq!(backup.len(), 32);
+        let backup_seed: [u8; 32] = backup.try_into().unwrap();
+        assert_eq!(
+            zcrypt_core::keys::Account::from_seed(backup_seed).stealth_address().to_bech32(),
+            stealth.address
+        );
+        println!("[wallet] Bob's stealth list matches the address, and the backup seed opens it");
+
+        // A personal asset, then a real swap of a slice of it for Bob's ZCRYPT.
+        // Each lock is a shield proof. The refund command cannot succeed here: a swap
+        // lock lives for hours, so the test checks the two refusals (unknown lock, and
+        // a live lock that has not reached its timeout).
+        let ticker = format!("E{:08X}", rand::random::<u32>());
+        let mint_amt = 1_000_000u64;
+        let asset_id = v(mint_asset(ticker.clone(), mint_amt, 6, 100_000_000, alice.st())).expect("mint asset");
+        let minted = wait_until("minted asset on chain", 90, || {
+            let mine = v(my_assets(alice.st())).ok()?;
+            mine.into_iter().find(|a| a.ticker.eq_ignore_ascii_case(&ticker) && a.balance >= mint_amt)
+        });
+        assert_eq!(minted.asset_id.to_string(), asset_id);
+        assert_eq!(minted.minted, mint_amt);
+        let regs = v(registered_assets(alice.st())).expect("registered assets");
+        assert!(regs.iter().any(|a| a.asset_id == 0 && a.ticker == "ZCRYPT"));
+        assert!(regs.iter().any(|a| a.asset_id == minted.asset_id));
+        let held_after = v(held_assets(alice.st())).unwrap();
+        assert!(held_after.iter().any(|a| a.asset_id == minted.asset_id && a.balance >= mint_amt));
+        println!("[wallet] minted {mint_amt} {ticker} (asset {asset_id}); my_assets and held_assets see it");
+
+        let fees = v(claimable_fees(alice.st())).expect("claimable fees");
+        if let Some(fee) = fees.iter().find(|f| f.amount > 0) {
+            let got = v(claim_fees(fee.asset_id.to_string(), alice.st())).expect("claim fees");
+            assert!(got > 0);
+            println!("[wallet] claimed {got} base units of {} bridge fees", fee.ticker);
+        } else {
+            let fee_asset = regs
+                .iter()
+                .find(|a| a.ticker.eq_ignore_ascii_case("zBTC"))
+                .map(|a| a.asset_id.to_string())
+                .unwrap_or_else(|| "1".into());
+            let none = v(claim_fees(fee_asset, alice.st())).unwrap_err();
+            assert!(none.contains("no bridge-fee yield"), "{none}");
+            println!("[wallet] claimable_fees is empty; claim_fees refuses: {none}");
+        }
+
+        let give_amt = 100_000u64;
+        let take_amt = 50_000u64;
+        let maker = v(swap_receive_address(bob.st())).expect("swap address");
+        assert!(maker.starts_with("zc1"));
+        let offer = v(swap_asset_start(asset_id.clone(), give_amt, "0".into(), take_amt, maker, alice.st())).expect("swap start");
+        assert_eq!(offer.give_ticker.to_ascii_uppercase(), ticker.to_ascii_uppercase());
+        assert_eq!(offer.take_ticker, "ZCRYPT");
+        let alice_open = v(list_pending_swaps(alice.st())).unwrap();
+        assert_eq!(alice_open.len(), 1);
+        assert_eq!(alice_open[0].role, "taker");
+        assert!(!alice_open[0].can_refund);
+        assert_eq!(alice_open[0].give_amount, give_amt);
+        let preview = wait_until("swap offer on chain", 90, || v(swap_asset_preview(offer.ticket.clone(), bob.st())).ok());
+        assert_eq!(preview.receive_amount, give_amt);
+        assert_eq!(preview.pay_amount, take_amt);
+        assert_eq!(preview.pay_ticker, "ZCRYPT");
+        assert!(preview.pay_balance >= take_amt, "bob can pay the offer");
+        assert!(preview.my_timeout < preview.their_timeout, "the maker's lock expires first");
+        assert!(preview.blocks_left > 0);
+        let accepted = v(swap_asset_accept(offer.ticket.clone(), bob.st())).expect("swap accept");
+        let bob_open = v(list_pending_swaps(bob.st())).unwrap();
+        assert_eq!(bob_open.len(), 1);
+        assert_eq!(bob_open[0].role, "maker");
+        assert!(!bob_open[0].can_refund);
+        println!("[wallet] {accepted}");
+        let settled = wait_until("both swaps to finish", 300, || {
+            let _ = v(swap_asset_settle(alice.st())).ok()?;
+            let _ = v(swap_asset_settle(bob.st())).ok()?;
+            let a = v(list_pending_swaps(alice.st())).ok()?;
+            let b = v(list_pending_swaps(bob.st())).ok()?;
+            (a.is_empty() && b.is_empty()).then_some(())
+        });
+        let _ = settled;
+        wait_until("bob holds the swapped asset", 60, || {
+            let held = v(held_assets(bob.st())).ok()?;
+            held.into_iter().find(|a| a.asset_id == minted.asset_id && a.balance >= give_amt)
+        });
+        println!("[wallet] swap settled: Bob holds {give_amt} {ticker}, both pending lists are empty");
+
+        let unknown = v(swap_asset_refund("00".repeat(32), alice.st())).unwrap_err();
+        assert!(unknown.contains("no swap with that lock"), "{unknown}");
+        wait_until("alice's asset change is spendable", 60, || {
+            let held = v(held_assets(alice.st())).ok()?;
+            held.into_iter().find(|a| a.asset_id == minted.asset_id && a.balance >= 50_000)
+        });
+        let maker2 = v(swap_receive_address(bob.st())).expect("second swap address");
+        let offer2 = v(swap_asset_start(asset_id, 50_000, "0".into(), 20_000, maker2, alice.st())).expect("second swap");
+        let early = v(list_pending_swaps(alice.st())).unwrap();
+        assert_eq!(early.len(), 1);
+        assert!(!early[0].can_refund);
+        let too_soon = v(swap_asset_refund(early[0].my_escrow_hex.clone(), alice.st())).unwrap_err();
+        assert!(too_soon.contains("refunds itself at block"), "{too_soon}");
+        assert_eq!(v(list_pending_swaps(alice.st())).unwrap().len(), 1, "a refused refund leaves the lock pending");
+        assert!(v(list_pending_swaps(bob.st())).unwrap().is_empty(), "bob never accepted the second offer");
+        println!("[wallet] swap_asset_refund unknown lock: {unknown}");
+        println!("[wallet] swap_asset_refund before the timeout (offer still open, {}): {too_soon}", offer2.my_timeout);
+
+        // Charles is idle. Lock drops his keys; the wrong password is refused; unlock restores him.
+        let charles_addr = v(get_address(charles.st())).unwrap();
+        assert!(v(lock_wallet(charles.st())).unwrap());
+        let locked = v(get_address(charles.st())).unwrap_err();
+        assert!(locked.contains("wallet is locked"), "{locked}");
+        let bad_unlock = v(unlock_wallet("not-the-password".into(), charles.st())).unwrap_err();
+        assert!(bad_unlock.contains("wrong password"), "{bad_unlock}");
+        assert!(v(unlock_wallet(pw.clone(), charles.st())).unwrap());
+        assert_eq!(v(get_address(charles.st())).unwrap(), charles_addr);
+        println!("[wallet] Charles locked, rejected a wrong password, and unlocked");
+
+        // mint_coins and send_coin credit and mark coins with no transaction. They exist only
+        // in a devnet build and run here on a wallet that never spends on chain.
+        #[cfg(feature = "devnet")]
+        {
+            let demo = W::new(&url, &btc_url);
+            assert!(!v(wallet_exists(demo.st())).unwrap());
+            v(create_wallet(pw.clone(), demo.st())).expect("devnet wallet");
+            let coined = v(mint_coins(ZC, demo.st())).expect("mint_coins");
+            assert!(!coined.is_empty());
+            assert_eq!(v(get_balance(demo.st())).unwrap().total, ZC);
+            let demo_addr = v(get_address(demo.st())).unwrap();
+            let off = v(send_coin(demo_addr, ZC / 2, demo.st())).expect("send_coin");
+            assert!(!off.note.is_empty() && !off.commitment.is_empty());
+            assert_eq!(v(get_balance(demo.st())).unwrap().total, ZC / 2);
+            println!("[wallet] devnet mint_coins and send_coin on a throwaway wallet (no chain transaction)");
+        }
+        #[cfg(not(feature = "devnet"))]
+        println!("[wallet] mint_coins and send_coin need --features devnet; this binary does not include them");
 
         // Restore Bob from his phrase into a fresh wallet: same address, coins recovered.
         let bob2 = W::new(&url, &btc_url);

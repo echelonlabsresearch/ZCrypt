@@ -523,6 +523,10 @@ label {
   border: 1px solid var(--color-red);
   color: var(--color-red);
 }
+.msg.warn {
+  border: 1px solid var(--color-yellow);
+  color: var(--color-yellow);
+}
 .empty {
   text-align: center;
   opacity: 0.5;
