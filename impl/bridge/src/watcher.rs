@@ -1024,22 +1024,141 @@ pub fn watcher_tick_persisting(
 
 /// An exclusive single-instance lock next to the state file. Two daemons sharing one wallet
 /// but not one state file would each fund every open redeem; the lock makes the second one
-/// refuse to start. The guard holds an `flock` on the lock fd for its whole life. The kernel
-/// releases that lock when the process crashes or the fd closes, so a stale lock file left
-/// by a dead process (no holder) is taken over.
+/// refuse to start. The guard holds the lock for its whole life. The kernel releases it when
+/// the process crashes or the file closes, so a stale lock file left by a dead process (no
+/// holder) is taken over.
 #[derive(Debug)]
 pub struct InstanceLock {
-    /// Kept open so the `flock` is held until [`Drop`].
+    /// Kept open so the lock is held until [`Drop`].
     file: std::fs::File,
 }
 
-// `flock(2)` advisory lock. The op values are the same on macOS and Linux.
-extern "C" {
-    fn flock(fd: i32, op: i32) -> i32;
+/// Non-blocking exclusive lock. Unix uses `flock(2)` (per open-file description). Windows
+/// uses `LockFileEx` on the first byte (per process). Either way a second acquire in this
+/// process fails until the first guard is dropped, and closing the handle releases it.
+fn try_lock_exclusive(file: &std::fs::File) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        // The op values are the same on macOS and Linux.
+        extern "C" {
+            fn flock(fd: i32, op: i32) -> i32;
+        }
+        const LOCK_EX: i32 = 2;
+        const LOCK_NB: i32 = 4;
+        let rc = unsafe { flock(file.as_raw_fd(), LOCK_EX | LOCK_NB) };
+        if rc == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        #[repr(C)]
+        struct Overlapped {
+            internal: usize,
+            internal_high: usize,
+            offset: u32,
+            offset_high: u32,
+            event: *mut std::ffi::c_void,
+        }
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn LockFileEx(
+                file: *mut std::ffi::c_void,
+                flags: u32,
+                reserved: u32,
+                bytes_low: u32,
+                bytes_high: u32,
+                overlapped: *mut Overlapped,
+            ) -> i32;
+        }
+        const LOCKFILE_FAIL_IMMEDIATELY: u32 = 0x0000_0001;
+        const LOCKFILE_EXCLUSIVE_LOCK: u32 = 0x0000_0002;
+        let mut overlapped = Overlapped {
+            internal: 0,
+            internal_high: 0,
+            offset: 0,
+            offset_high: 0,
+            event: std::ptr::null_mut(),
+        };
+        let ok = unsafe {
+            LockFileEx(
+                file.as_raw_handle(),
+                LOCKFILE_FAIL_IMMEDIATELY | LOCKFILE_EXCLUSIVE_LOCK,
+                0,
+                1,
+                0,
+                &mut overlapped,
+            )
+        };
+        if ok != 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = file;
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "bridge_watcher instance lock is implemented for unix and windows",
+        ))
+    }
 }
-const LOCK_EX: i32 = 2;
-const LOCK_NB: i32 = 4;
-const LOCK_UN: i32 = 8;
+
+fn unlock_exclusive(file: &std::fs::File) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        extern "C" {
+            fn flock(fd: i32, op: i32) -> i32;
+        }
+        const LOCK_UN: i32 = 8;
+        unsafe {
+            flock(file.as_raw_fd(), LOCK_UN);
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        #[repr(C)]
+        struct Overlapped {
+            internal: usize,
+            internal_high: usize,
+            offset: u32,
+            offset_high: u32,
+            event: *mut std::ffi::c_void,
+        }
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn UnlockFileEx(
+                file: *mut std::ffi::c_void,
+                reserved: u32,
+                bytes_low: u32,
+                bytes_high: u32,
+                overlapped: *mut Overlapped,
+            ) -> i32;
+        }
+        let mut overlapped = Overlapped {
+            internal: 0,
+            internal_high: 0,
+            offset: 0,
+            offset_high: 0,
+            event: std::ptr::null_mut(),
+        };
+        unsafe {
+            UnlockFileEx(file.as_raw_handle(), 0, 1, 0, &mut overlapped);
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = file;
+    }
+}
 
 impl InstanceLock {
     /// The lock path for a state file: `<state>.lock`.
@@ -1051,15 +1170,12 @@ impl InstanceLock {
 
     /// Take the lock, or explain that another daemon already holds it.
     ///
-    /// Does not treat `pid == self` as ownership. BSD `flock` is per open-file description,
-    /// so a second acquire in this process fails until the first guard is dropped.
+    /// Does not treat `pid == self` as ownership. A second acquire in this process fails
+    /// until the first guard is dropped.
     pub fn acquire(state_path: &std::path::Path) -> Result<Self, String> {
-        use std::os::unix::io::AsRawFd as _;
         let path = Self::path_for(state_path);
         let file = std::fs::OpenOptions::new().read(true).write(true).create(true).open(&path).map_err(|e| format!("instance lock {}: {e}", path.display()))?;
-        let rc = unsafe { flock(file.as_raw_fd(), LOCK_EX | LOCK_NB) };
-        if rc != 0 {
-            let err = std::io::Error::last_os_error();
+        if let Err(err) = try_lock_exclusive(&file) {
             return Err(format!(
                 "another bridge_watcher holds {}: two daemons on one wallet would fund every open \
                  redeem twice. Stop it first ({err}).",
@@ -1072,10 +1188,7 @@ impl InstanceLock {
 
 impl Drop for InstanceLock {
     fn drop(&mut self) {
-        use std::os::unix::io::AsRawFd as _;
-        unsafe {
-            flock(self.file.as_raw_fd(), LOCK_UN);
-        }
+        unlock_exclusive(&self.file);
         // `file` closes as this guard drops, which also releases the lock if unlock failed.
     }
 }
@@ -2331,8 +2444,8 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("zcrypt-watcher-lock-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("state.json");
-        // flock is per open-file description: a second acquire fails while the first guard
-        // is alive, succeeds after drop, and a leftover lock file with no holder is taken.
+        // A second acquire fails while the first guard is alive, succeeds after drop, and a
+        // leftover lock file with no holder is taken.
         let lock = InstanceLock::acquire(&path).unwrap();
         assert!(InstanceLock::path_for(&path).exists());
         assert!(InstanceLock::acquire(&path).is_err(), "second acquire while the first is held fails");
