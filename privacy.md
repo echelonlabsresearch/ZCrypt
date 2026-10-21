@@ -60,11 +60,12 @@ conservation so hiding the type never permits alchemy between types.
 * **Stealth**: a fresh account from fresh randomness (with deterministic
   sub-accounts when you want scanning). Unlinkable to your identity and opaque
   even to your own main view key.
-* **Bearer**: the spend secret is embedded in the coin itself. No recipient, no
-  encryption, no transaction: hand over the coin (a QR code, a string, a piece
-  of paper) and value has moved **off chain**. The receiver sweeps it on-chain
-  into their own coin whenever they choose; until then, possession is ownership,
-  and no view key anywhere can see it.
+* **Bearer**: a text file, `zcrypt-bearer/1`, with a `coin` line and a `gas`
+  line. Creating the file is two on-chain mints. Handing the file over is the
+  payment: there is no recipient and no encrypted note. The first sweep spends
+  it. A copy kept by the sender, or by anyone else, can still spend the coin
+  until that sweep is in a block. The phrase does not restore the file, and no
+  view key can see it.
 
 ## Selective disclosure, not backdoors
 
@@ -133,8 +134,9 @@ nodes outside regtest.
   math holds but the crowd is small; the guarantees mature as the pool grows.
 * Timing correlation is not magic-proofed: if you are the only actor in a quiet
   hour, patterns exist. Standard operational hygiene applies.
-* Bearer coins are cash-like in every sense, including this one: whoever holds
-  the secret owns the money. Treat the string like a banknote.
+* A bearer file is a copyable secret. Whoever holds a copy can spend it until
+  the first sweep is in a block. Treat the file like a banknote that can be
+  photographed.
 * Encrypted notes use ML-KEM-768 precisely so that ciphertexts harvested today
   cannot be opened by a future quantum adversary ("harvest now, decrypt later"
   is the attack this kills).
