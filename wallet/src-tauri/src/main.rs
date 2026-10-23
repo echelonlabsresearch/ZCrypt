@@ -932,13 +932,13 @@ struct CreateResult {
 }
 
 #[tauri::command]
-fn wallet_exists(state: State<AppState>) -> R<bool> {
+async fn wallet_exists(state: State<'_, AppState>) -> R<bool> {
     let dir = state.data_dir.lock().unwrap().clone();
     ok(keystore_path(&dir).exists())
 }
 
 #[tauri::command]
-fn create_wallet(password: String, state: State<AppState>) -> R<CreateResult> {
+async fn create_wallet(password: String, state: State<'_, AppState>) -> R<CreateResult> {
     if password.len() < 8 {
         return Err("password must be at least 8 characters".into());
     }
@@ -960,7 +960,7 @@ fn create_wallet(password: String, state: State<AppState>) -> R<CreateResult> {
 }
 
 #[tauri::command]
-fn restore_wallet(password: String, mnemonic: String, state: State<AppState>) -> R<CreateResult> {
+async fn restore_wallet(password: String, mnemonic: String, state: State<'_, AppState>) -> R<CreateResult> {
     let mnemonic = Zeroizing::new(mnemonic);
     if password.len() < 8 {
         return Err("password must be at least 8 characters".into());
@@ -987,7 +987,7 @@ fn restore_wallet(password: String, mnemonic: String, state: State<AppState>) ->
 }
 
 #[tauri::command]
-fn unlock_wallet(password: String, state: State<AppState>) -> R<bool> {
+async fn unlock_wallet(password: String, state: State<'_, AppState>) -> R<bool> {
     let dir = state.data_dir.lock().unwrap().clone();
     let raw = std::fs::read_to_string(keystore_path(&dir)).map_err(|_| "no wallet on disk")?;
     let ks: Keystore = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
@@ -1024,7 +1024,7 @@ fn wallet_has_settle_work(w: &Wallet) -> bool {
 }
 
 #[tauri::command]
-fn lock_wallet(state: State<AppState>) -> R<bool> {
+async fn lock_wallet(state: State<'_, AppState>) -> R<bool> {
     // wallet then settler. Pending work moves to the settler; the UI sees a locked wallet.
     let mut wallet = state.wallet.lock().unwrap();
     let mut settler = state.settler.lock().unwrap();
@@ -1109,7 +1109,7 @@ fn save_now(state: &State<AppState>, w: &Wallet, why: &str) -> Result<(), String
 }
 
 #[tauri::command]
-fn get_address(state: State<AppState>) -> R<String> {
+async fn get_address(state: State<'_, AppState>) -> R<String> {
     with_wallet(&state, |w| Ok(w.account.normal_address().to_bech32())).and_then(ok)
 }
 
@@ -1128,7 +1128,7 @@ struct StealthInfo {
 /// alone must not be able to exfiltrate spend keys). Reveal it one at a time, behind a
 /// fresh password check, via [`reveal_stealth_backup`].
 #[tauri::command]
-fn new_stealth_address(state: State<AppState>) -> R<StealthInfo> {
+async fn new_stealth_address(state: State<'_, AppState>) -> R<StealthInfo> {
     with_wallet(&state, |w| {
         let seed = keys::random_seed();
         w.stealth_seeds.push(seed);
@@ -1163,7 +1163,7 @@ struct StealthEntry {
 /// webview drain them all. Reveal a single seed, behind a fresh password check, via
 /// [`reveal_stealth_backup`].
 #[tauri::command]
-fn list_stealth_addresses(state: State<AppState>) -> R<Vec<StealthEntry>> {
+async fn list_stealth_addresses(state: State<'_, AppState>) -> R<Vec<StealthEntry>> {
     with_wallet(&state, |w| {
         Ok(w.stealth_seeds
             .iter()
@@ -1186,7 +1186,7 @@ fn list_stealth_addresses(state: State<AppState>) -> R<Vec<StealthEntry>> {
 /// compromised (but unlocked) webview cannot pull every stealth spend key without also
 /// knowing the password. Returns the 32-byte seed (hex) for `index`.
 #[tauri::command]
-fn reveal_stealth_backup(index: u32, password: String, state: State<AppState>) -> R<String> {
+async fn reveal_stealth_backup(index: u32, password: String, state: State<'_, AppState>) -> R<String> {
     // Re-verify the password against the keystore before revealing any spend secret.
     let dir = state.data_dir.lock().unwrap().clone();
     let raw = std::fs::read_to_string(keystore_path(&dir)).map_err(|_| "no wallet")?;
@@ -1207,7 +1207,7 @@ fn reveal_stealth_backup(index: u32, password: String, state: State<AppState>) -
 /// no spend secret (it can never spend), and it cannot see stealth or bearer coins. Hand
 /// it to an auditor to grant read-only visibility of your normal-address receipts.
 #[tauri::command]
-fn get_view_key(state: State<AppState>) -> R<String> {
+async fn get_view_key(state: State<'_, AppState>) -> R<String> {
     with_wallet(&state, |w| Ok(hex::encode(w.account.view_key().to_bytes()))).and_then(ok)
 }
 
@@ -1219,7 +1219,7 @@ struct Balance {
 }
 
 #[tauri::command]
-fn get_balance(state: State<AppState>) -> R<Balance> {
+async fn get_balance(state: State<'_, AppState>) -> R<Balance> {
     with_wallet(&state, |w| {
         Ok(Balance {
             spendable: w.balance(),
@@ -1239,7 +1239,7 @@ fn get_balance(state: State<AppState>) -> R<Balance> {
 /// production build, because it credits coins that do not exist on any chain.
 #[cfg(feature = "devnet")]
 #[tauri::command]
-fn mint_coins(amount: u64, state: State<AppState>) -> R<String> {
+async fn mint_coins(amount: u64, state: State<'_, AppState>) -> R<String> {
     with_wallet(&state, |w| {
         // A coin the wallet owns (its own address).
         let (_commitment, note) = keys::send(&w.account.normal_address(), amount);
@@ -1266,7 +1266,7 @@ struct SentTransfer {
 /// production build, because it marks real on-chain coins spent locally without a spend.
 #[cfg(feature = "devnet")]
 #[tauri::command]
-fn send_coin(recipient: String, amount: u64, state: State<AppState>) -> R<SentTransfer> {
+async fn send_coin(recipient: String, amount: u64, state: State<'_, AppState>) -> R<SentTransfer> {
     with_wallet(&state, |w| {
         let addr = Address::from_bech32(recipient.trim())
             .ok_or("invalid recipient address (expected zc1…)")?;
@@ -1324,7 +1324,7 @@ fn asset_label(url: &str, asset_id: u64) -> (String, u8) {
 /// Receive a coin from an encrypted note — a stealth file (`zct1…`) or any note
 /// blob. Trial-decrypts with the normal account and every stealth sub-account.
 #[tauri::command]
-fn receive_coin(note: String, state: State<AppState>) -> R<Received> {
+async fn receive_coin(note: String, state: State<'_, AppState>) -> R<Received> {
     let url = node_url(&state)?;
     let leaves = chain::fetch_leaves(&url)?;
     with_wallet(&state, |w| {
@@ -1544,7 +1544,7 @@ fn reclaim_pending_bearer(token: &str, state: &State<AppState>) -> Result<(), St
 /// opens it first sweeps the value into their own key and pays gas from the file, so a
 /// brand-new wallet needs no balance. First sweep wins.
 #[tauri::command]
-fn create_bearer(amount: u64, asset_id: String, state: State<AppState>) -> R<String> {
+async fn create_bearer(amount: u64, asset_id: String, state: State<'_, AppState>) -> R<String> {
     let asset_id: u64 = asset_id.parse().map_err(|_| "invalid asset id".to_string())?;
     if amount == 0 {
         return Err("amount must be greater than zero".into());
@@ -1593,7 +1593,7 @@ fn create_bearer(amount: u64, asset_id: String, state: State<AppState>) -> R<Str
 /// The claimer receives the full value. A lone `zcb1…` is not a bearer coin. If someone
 /// already spent the file, the sweep is rejected.
 #[tauri::command]
-fn claim_bearer(token: String, state: State<AppState>) -> R<Received> {
+async fn claim_bearer(token: String, state: State<'_, AppState>) -> R<Received> {
     let file = parse_bearer_file(&token)?;
     let url = node_url(&state)?;
     let leaves = chain::fetch_leaves(&url)?;
@@ -1669,7 +1669,7 @@ fn claim_bearer(token: String, state: State<AppState>) -> R<Received> {
 }
 
 #[tauri::command]
-fn get_history(state: State<AppState>) -> R<Vec<HistItem>> {
+async fn get_history(state: State<'_, AppState>) -> R<Vec<HistItem>> {
     with_wallet(&state, |w| Ok(w.history.clone())).and_then(ok)
 }
 
@@ -1853,7 +1853,7 @@ struct ReceiptView {
 }
 
 #[tauri::command]
-fn list_receipts(state: State<AppState>) -> R<Vec<ReceiptView>> {
+async fn list_receipts(state: State<'_, AppState>) -> R<Vec<ReceiptView>> {
     with_wallet(&state, |w| {
         Ok(w.receipts
             .iter()
@@ -1941,7 +1941,7 @@ fn judge_receipt(r: &PaymentReceipt, state: &State<AppState>) -> Result<ReceiptV
 
 /// Check one of this wallet's saved receipts.
 #[tauri::command]
-fn check_receipt(id: String, state: State<AppState>) -> R<ReceiptVerdict> {
+async fn check_receipt(id: String, state: State<'_, AppState>) -> R<ReceiptVerdict> {
     let receipt = with_wallet(&state, |w| {
         w.receipts.iter().find(|r| r.id == id).cloned().ok_or_else(|| "receipt not found".to_string())
     })?;
@@ -1950,7 +1950,7 @@ fn check_receipt(id: String, state: State<AppState>) -> R<ReceiptVerdict> {
 
 /// Check a receipt file. The wallet that runs this does not have to be the sender or the recipient.
 #[tauri::command]
-fn verify_receipt(text: String, state: State<AppState>) -> R<ReceiptVerdict> {
+async fn verify_receipt(text: String, state: State<'_, AppState>) -> R<ReceiptVerdict> {
     let receipt = parse_receipt(&text)?;
     judge_receipt(&receipt, &state).and_then(ok)
 }
@@ -2453,13 +2453,13 @@ fn apply_transport(s: &Settings) {
 }
 
 #[tauri::command]
-fn get_settings(state: State<AppState>) -> R<Settings> {
+async fn get_settings(state: State<'_, AppState>) -> R<Settings> {
     let dir = state.data_dir.lock().unwrap().clone();
     ok(load_settings(&dir))
 }
 
 #[tauri::command]
-fn save_settings(settings: Settings, state: State<AppState>) -> R<bool> {
+async fn save_settings(settings: Settings, state: State<'_, AppState>) -> R<bool> {
     // Node-URL policy: remote nodes only over https or as a .onion (see chain::check_node_url).
     chain::check_node_url(&settings.node_url)?;
     // Same rule for the Esplora endpoint in self-custody mode.
@@ -2476,7 +2476,7 @@ fn save_settings(settings: Settings, state: State<AppState>) -> R<bool> {
 /// The chain id this wallet's signatures are pinned to (first successful node contact),
 /// so the user can see which network they are bound to. `None` until first contact.
 #[tauri::command]
-fn chain_pin() -> R<Option<String>> {
+async fn chain_pin() -> R<Option<String>> {
     ok(chain::pinned_id())
 }
 
@@ -2520,7 +2520,7 @@ fn socks_reachable(hostport: &str) -> bool {
 /// Live Tor status: whether it is on, whether the proxy is reachable, and whether the current
 /// node RPC and remote bridge traffic are actually being routed through it.
 #[tauri::command]
-fn tor_status(state: State<AppState>) -> R<TorStatus> {
+async fn tor_status(state: State<'_, AppState>) -> R<TorStatus> {
     let dir = state.data_dir.lock().unwrap().clone();
     let s = load_settings(&dir);
     let raw = tor_raw_proxy(&s);
@@ -2567,7 +2567,7 @@ struct NodeStatus {
 
 /// Live connection check against the configured node's CometBFT RPC (`/abci_info`).
 #[tauri::command]
-fn node_status(state: State<AppState>) -> R<NodeStatus> {
+async fn node_status(state: State<'_, AppState>) -> R<NodeStatus> {
     let dir = state.data_dir.lock().unwrap().clone();
     let url = load_settings(&dir).node_url; // also syncs the Tor transport
     let url = url.trim_end_matches('/');
@@ -2618,7 +2618,7 @@ fn node_url(state: &State<AppState>) -> Result<String, String> {
 /// commitment tree via `0x56` seed txs. (A spend now accepts a single input, so
 /// two coins are no longer required — kept for balance flexibility.)
 #[tauri::command]
-fn fund_onchain(amount: u64, state: State<AppState>) -> R<u32> {
+async fn fund_onchain(amount: u64, state: State<'_, AppState>) -> R<u32> {
     let url = node_url(&state)?;
     with_wallet(&state, |w| {
         let a0 = amount / 2;
@@ -3104,7 +3104,7 @@ fn ensure_spendable(asset_id: u64, amount: u64, state: &State<AppState>) -> Resu
             ReshapePlan::SelfSend(s) => {
                 do_shield_send_raw(&self_addr, s, asset_id, state, false, true)?;
                 // Pick up the self-sent coin (its note is on-chain, addressed to us).
-                let _ = scan_onchain(state.clone());
+                let _ = scan_onchain_inner(state.clone());
             }
         }
     }
@@ -3229,7 +3229,7 @@ fn do_shield_send_raw(
 /// Normal send of `asset_id` (0 = ZCRYPT): fully on-chain (recipient auto-credits).
 /// `asset_id` is a STRING (a hash-derived u64 exceeds JS's safe-integer range).
 #[tauri::command]
-fn send_onchain(recipient: String, amount: u64, asset_id: String, state: State<AppState>) -> R<SendResult> {
+async fn send_onchain(recipient: String, amount: u64, asset_id: String, state: State<'_, AppState>) -> R<SendResult> {
     let asset_id: u64 = asset_id.parse().map_err(|_| "invalid asset id".to_string())?;
     do_shield_send(&recipient, amount, asset_id, &state, false).and_then(ok)
 }
@@ -3237,7 +3237,7 @@ fn send_onchain(recipient: String, amount: u64, asset_id: String, state: State<A
 /// Stealth send of `asset_id`: on-chain commitment, but the encrypted note is
 /// returned as a file (no on-chain note). Recipient needs the stealth key + this file.
 #[tauri::command]
-fn send_stealth(recipient: String, amount: u64, asset_id: String, state: State<AppState>) -> R<SendResult> {
+async fn send_stealth(recipient: String, amount: u64, asset_id: String, state: State<'_, AppState>) -> R<SendResult> {
     let asset_id: u64 = asset_id.parse().map_err(|_| "invalid asset id".to_string())?;
     do_shield_send(&recipient, amount, asset_id, &state, true).and_then(ok)
 }
@@ -3245,7 +3245,7 @@ fn send_stealth(recipient: String, amount: u64, asset_id: String, state: State<A
 /// Classify a `zc1…` address as "normal" | "stealth" | "invalid" — so the Send UI
 /// can validate the recipient against the chosen delivery mode before proving.
 #[tauri::command]
-fn address_kind(address: String) -> R<String> {
+async fn address_kind(address: String) -> R<String> {
     let k = match Address::from_bech32(address.trim()) {
         Some(a) => match a.kind {
             keys::AddressKind::Normal => "normal",
@@ -3270,7 +3270,7 @@ fn export_dir() -> Option<std::path::PathBuf> {
 /// Write `content` to a real file in the user's Downloads (fallback ~/.zcrypt/exports)
 /// and return its absolute path. Used to save a bearer coin / stealth note as a file.
 #[tauri::command]
-fn save_export(filename: String, content: String) -> R<String> {
+async fn save_export(filename: String, content: String) -> R<String> {
     let dir = export_dir().ok_or("no HOME")?;
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     // sanitize the filename to a safe basename
@@ -3329,7 +3329,7 @@ fn open_target_allowed(t: &str) -> bool {
 /// allowlist (https/mailto/own-export-dir) so it cannot be abused to execute local
 /// programs or open arbitrary schemes.
 #[tauri::command]
-fn open_external(target: String) -> R<bool> {
+async fn open_external(target: String) -> R<bool> {
     let t = target.trim();
     if t.is_empty() {
         return Err("nothing to open".into());
@@ -4087,8 +4087,14 @@ fn next_scan_height(widen_pending: bool, prev: i64, covered_to: i64) -> i64 {
 /// Scan new blocks for incoming coins (trial-decrypt on-chain notes), reconstruct the
 /// coins our public actions minted (claims, escrows), and mark our coins spent when their
 /// nullifiers appear on-chain. Fully local: the node only ever serves blocks and leaves.
+/// Rescan the chain for this wallet's coins. Async like every other command so the
+/// webview stays responsive; the work itself is synchronous inside.
 #[tauri::command]
-fn scan_onchain(state: State<AppState>) -> R<usize> {
+async fn scan_onchain(state: State<'_, AppState>) -> R<usize> {
+    scan_onchain_inner(state)
+}
+
+fn scan_onchain_inner(state: State<AppState>) -> R<usize> {
     use std::collections::{HashMap, HashSet};
     let url = node_url(&state)?;
     let dir = state.data_dir.lock().unwrap().clone();
@@ -4433,7 +4439,7 @@ struct BondRequest {
 /// Step 1 of bonding from the wallet: allocate a fresh reward key and return the
 /// parameters the validator host signs with its consensus key (see [`bond_message`]).
 #[tauri::command]
-fn bond_request(stake_zcrypt: String, commission_pct: String, state: State<AppState>) -> R<BondRequest> {
+async fn bond_request(stake_zcrypt: String, commission_pct: String, state: State<'_, AppState>) -> R<BondRequest> {
     let (stake, commission_bps) = parse_bond_params(&stake_zcrypt, &commission_pct)?;
     let url = node_url(&state)?;
     let cid = chain_id_for(&url)?;
@@ -4459,14 +4465,14 @@ fn bond_request(stake_zcrypt: String, commission_pct: String, state: State<AppSt
 /// against the bond message, funds the stake pledge from its own coins, and broadcasts.
 /// The consensus PRIVATE key never leaves the validator host.
 #[tauri::command]
-fn bond_validator_signed(
+async fn bond_validator_signed(
     reward_index: u32,
     consensus_pubkey_hex: String,
     nonce: String,
     signature_hex: String,
     stake_zcrypt: String,
     commission_pct: String,
-    state: State<AppState>,
+    state: State<'_, AppState>,
 ) -> R<String> {
     let (stake, commission_bps) = parse_bond_params(&stake_zcrypt, &commission_pct)?;
     let atomic = zcrypt_core::emission::ATOMIC;
@@ -4720,7 +4726,7 @@ struct ValidatorInfo {
 /// The bonded validators you can delegate to, with each one's chosen commission (from
 /// `/staking/validators` = comma-joined "<pubkey_hex>:<stake>:<commission_bps>").
 #[tauri::command]
-fn list_validators(state: State<AppState>) -> R<Vec<ValidatorInfo>> {
+async fn list_validators(state: State<'_, AppState>) -> R<Vec<ValidatorInfo>> {
     let url = node_url(&state)?;
     let raw = chain::query_str(&url, "/staking/validators").unwrap_or_default();
     let mut out = Vec::new();
@@ -4749,7 +4755,7 @@ fn list_validators(state: State<AppState>) -> R<Vec<ValidatorInfo>> {
 /// undelegate). You earn a share of the validator's rewards proportional to your stake, minus
 /// the validator's commission; your share accrues to this wallet's reward address.
 #[tauri::command]
-fn delegate_validator(validator_pubkey_hex: String, stake_zcrypt: String, state: State<AppState>) -> R<String> {
+async fn delegate_validator(validator_pubkey_hex: String, stake_zcrypt: String, state: State<'_, AppState>) -> R<String> {
     let target = validator_target(&validator_pubkey_hex)?;
     let stake_whole: u64 = stake_zcrypt
         .trim()
@@ -4802,7 +4808,7 @@ fn delegate_validator(validator_pubkey_hex: String, stake_zcrypt: String, state:
 /// Undelegate from a validator (by its consensus pubkey hex). Removes your delegated stake
 /// from the validator immediately and starts the 10-day unbonding; the stake returns after.
 #[tauri::command]
-fn undelegate_validator(validator_pubkey_hex: String, state: State<AppState>) -> R<String> {
+async fn undelegate_validator(validator_pubkey_hex: String, state: State<'_, AppState>) -> R<String> {
     let target = validator_target(&validator_pubkey_hex)?;
     let url = node_url(&state)?;
     with_wallet(&state, |w| {
@@ -4852,7 +4858,7 @@ struct UnbondingEntry {
 /// each with when its stake becomes free. Keyed by this wallet's reward address, so it
 /// persists until the 10-day timer elapses — not just a one-time message after the action.
 #[tauri::command]
-fn my_unbonding(state: State<AppState>) -> R<Vec<UnbondingEntry>> {
+async fn my_unbonding(state: State<'_, AppState>) -> R<Vec<UnbondingEntry>> {
     let url = node_url(&state)?;
     let reward_hexes: Vec<String> = {
         let g = state.wallet.lock().unwrap();
@@ -4885,7 +4891,7 @@ fn reward_pk_hexes(state: &State<AppState>) -> Result<Vec<(RewardKey, String)>, 
 
 /// Unclaimed staking rewards (base units) across every reward key of this wallet.
 #[tauri::command]
-fn get_claimable(state: State<AppState>) -> R<u64> {
+async fn get_claimable(state: State<'_, AppState>) -> R<u64> {
     let url = node_url(&state)?;
     let mut total = 0u64;
     for (_, pk_h) in reward_pk_hexes(&state)? {
@@ -4905,7 +4911,7 @@ struct ClaimResult {
 /// so they become spendable. Trustless — the node only mints against the real,
 /// consensus-agreed reward balance.
 #[tauri::command]
-fn claim_rewards(state: State<AppState>) -> R<ClaimResult> {
+async fn claim_rewards(state: State<'_, AppState>) -> R<ClaimResult> {
     let url = node_url(&state)?;
     let mut claimed_total = 0u64;
     let mut coins_total = 0u32;
@@ -4970,7 +4976,7 @@ struct FeeClaimable {
 /// claimed separately; these are asset-denominated, e.g. zBTC). Same reward address as
 /// staking rewards, so a validator AND its delegators accrue here by stake × participation.
 #[tauri::command]
-fn claimable_fees(state: State<AppState>) -> R<Vec<FeeClaimable>> {
+async fn claimable_fees(state: State<'_, AppState>) -> R<Vec<FeeClaimable>> {
     let url = node_url(&state)?;
     let keys = reward_pk_hexes(&state)?;
     let mut out: Vec<FeeClaimable> = Vec::new();
@@ -4991,7 +4997,7 @@ fn claimable_fees(state: State<AppState>) -> R<Vec<FeeClaimable>> {
 /// mints coins of that asset bound to our key), then reconstruct those coins locally so they
 /// become spendable. Mirrors the ZCRYPT reward claim but per bridged asset.
 #[tauri::command]
-fn claim_fees(asset_id: String, state: State<AppState>) -> R<u64> {
+async fn claim_fees(asset_id: String, state: State<'_, AppState>) -> R<u64> {
     let url = node_url(&state)?;
     let asset: u64 = asset_id.trim().parse().map_err(|_| "bad asset id".to_string())?;
     let (ticker, _dec) = asset_label(&url, asset);
@@ -5187,7 +5193,7 @@ struct BridgeStatus {
 /// Register zBTC (SPV-gated, trustless mint) + seed a decoy pool so shield spends
 /// have a ring. Idempotent.
 #[tauri::command]
-fn bridge_init(state: State<AppState>) -> R<u64> {
+async fn bridge_init(state: State<'_, AppState>) -> R<u64> {
     let zc = zc_client(&state)?;
     // zBTC's mint authority is the SPV sentinel over the bridge's Bitcoin RESERVE
     // key: consensus derives `spv_authority(reserve_pk)` itself, and from then on
@@ -5229,7 +5235,7 @@ fn bridge_init(state: State<AppState>) -> R<u64> {
 /// Bitcoin balance is only fetched when the user explicitly asks, because a hosted Esplora
 /// learns the deposit address of every wallet that queries it (privacy M4).
 #[tauri::command]
-fn bridge_status(with_btc: bool, state: State<AppState>) -> R<BridgeStatus> {
+async fn bridge_status(with_btc: bool, state: State<'_, AppState>) -> R<BridgeStatus> {
     let zc = zc_client(&state)?;
     let asset = zbtc_asset(&zc).unwrap_or(0);
     let btc_network = {
@@ -5312,7 +5318,7 @@ struct HeldAsset {
 /// Shielded assets this wallet can spend (on-chain unspent), with balances + tickers
 /// — powers the Send asset picker. ZCRYPT (asset 0) is always present.
 #[tauri::command]
-fn held_assets(state: State<AppState>) -> R<Vec<HeldAsset>> {
+async fn held_assets(state: State<'_, AppState>) -> R<Vec<HeldAsset>> {
     let url = node_url(&state)?;
     let leaves = chain::fetch_leaves(&url).unwrap_or_default();
     let mut bal: std::collections::BTreeMap<u64, u64> = std::collections::BTreeMap::new();
@@ -5910,7 +5916,7 @@ struct RegisteredAsset {
 
 /// Every asset a swap can pay out: ZCRYPT, plus every ticker registered on this chain.
 #[tauri::command]
-fn registered_assets(state: State<AppState>) -> R<Vec<RegisteredAsset>> {
+async fn registered_assets(state: State<'_, AppState>) -> R<Vec<RegisteredAsset>> {
     let url = node_url(&state)?;
     let mut out = vec![RegisteredAsset { asset_id: zcrypt_shield::ASSET_ZCRYPT, ticker: "ZCRYPT".into(), decimals: 6 }];
     for (ticker, id, _) in chain::asset_list(&url) {
@@ -5935,7 +5941,7 @@ struct SwapOffer {
 /// per-swap sub-account key, never the reusable payment address, so repeated counterparties
 /// cannot build a trade graph on a static key.
 #[tauri::command]
-fn swap_receive_address(state: State<AppState>) -> R<String> {
+async fn swap_receive_address(state: State<'_, AppState>) -> R<String> {
     with_wallet(&state, |w| {
         let idx = w.alloc_index();
         w.note_action(idx, "swap", "");
@@ -5946,13 +5952,13 @@ fn swap_receive_address(state: State<AppState>) -> R<String> {
 
 /// Lock `give_amount` of `give_asset` and hand back an offer the other wallet accepts.
 #[tauri::command]
-fn swap_asset_start(
+async fn swap_asset_start(
     give_asset: String,
     give_amount: u64,
     take_asset: String,
     take_amount: u64,
     maker_address: String,
-    state: State<AppState>,
+    state: State<'_, AppState>,
 ) -> R<SwapOffer> {
     let give_asset: u64 = give_asset.parse().map_err(|_| "bad asset".to_string())?;
     let take_asset: u64 = take_asset.parse().map_err(|_| "bad asset".to_string())?;
@@ -6077,7 +6083,7 @@ fn verify_offer_lock(zc: &Zcrypt, t: &SwapTicket) -> Result<(bswap::EscrowInfo, 
 /// get an explicit confirmation before `swap_asset_accept` (wallet H8). Fails when the chain
 /// has no decimals for either asset (wallet L8) rather than guessing a scale.
 #[tauri::command]
-fn swap_asset_preview(ticket: String, state: State<AppState>) -> R<SwapPreview> {
+async fn swap_asset_preview(ticket: String, state: State<'_, AppState>) -> R<SwapPreview> {
     let t = decode_swap_ticket(&ticket)?;
     let url = node_url(&state)?;
     let zc = zc_client(&state)?;
@@ -6121,7 +6127,7 @@ fn swap_asset_preview(ticket: String, state: State<AppState>) -> R<SwapPreview> 
 /// Lock the other side of an offer someone sent you. The UI shows `swap_asset_preview`
 /// first; this re-checks everything against consensus at the moment of locking.
 #[tauri::command]
-fn swap_asset_accept(ticket: String, state: State<AppState>) -> R<String> {
+async fn swap_asset_accept(ticket: String, state: State<'_, AppState>) -> R<String> {
     let t = decode_swap_ticket(&ticket)?;
     let url = node_url(&state)?;
     let zc = zc_client(&state)?;
@@ -6210,7 +6216,7 @@ struct PendingSwapView {
 }
 
 #[tauri::command]
-fn list_pending_swaps(state: State<AppState>) -> R<Vec<PendingSwapView>> {
+async fn list_pending_swaps(state: State<'_, AppState>) -> R<Vec<PendingSwapView>> {
     let url = node_url(&state)?;
     let tip = zc_client(&state).and_then(|z| z.height()).unwrap_or(0) as u64;
     let g = state.wallet.lock().unwrap();
@@ -6246,7 +6252,7 @@ fn list_pending_swaps(state: State<AppState>) -> R<Vec<PendingSwapView>> {
 /// lock has expired. Returns one line per swap that moved. The background worker runs the
 /// same pass while any swap is pending (wallet H9); the two never overlap.
 #[tauri::command]
-fn swap_asset_settle(state: State<AppState>) -> R<Vec<String>> {
+async fn swap_asset_settle(state: State<'_, AppState>) -> R<Vec<String>> {
     settle_all_swaps(&state).and_then(ok)
 }
 
@@ -6454,7 +6460,7 @@ fn refund_swap(
 }
 
 #[tauri::command]
-fn swap_asset_refund(escrow_hex: String, state: State<AppState>) -> R<String> {
+async fn swap_asset_refund(escrow_hex: String, state: State<'_, AppState>) -> R<String> {
     let url = node_url(&state)?;
     let zc = zc_client(&state)?;
     let tip = zc.height()?;
@@ -6490,7 +6496,7 @@ struct BtcWallet {
 /// derived from your mnemonic (BIP-84) and the balance comes from Esplora — no bitcoind,
 /// and the same seed phrase restores it. Regtest keeps using the local bitcoind wallet.
 #[tauri::command]
-fn btc_wallet_info(state: State<AppState>) -> R<BtcWallet> {
+async fn btc_wallet_info(state: State<'_, AppState>) -> R<BtcWallet> {
     ok(btc_wallet_snapshot(&state))
 }
 
@@ -6538,7 +6544,7 @@ fn btc_wallet_snapshot(state: &State<AppState>) -> BtcWallet {
 
 /// Withdraw real BTC from your wallet to an external Bitcoin address.
 #[tauri::command]
-fn withdraw_btc(address: String, btc: String, state: State<AppState>) -> R<String> {
+async fn withdraw_btc(address: String, btc: String, state: State<'_, AppState>) -> R<String> {
     let sats = parse_decimal_units(&btc, 8)?;
     if sats == 0 {
         return Err("enter a BTC amount".into());
@@ -6570,7 +6576,7 @@ struct MinterAsset {
 /// capability derived from this account. These are exactly the tickers you can mint
 /// more of. Powers the "Assets you mint" list + one-click "mint more".
 #[tauri::command]
-fn my_assets(state: State<AppState>) -> R<Vec<MinterAsset>> {
+async fn my_assets(state: State<'_, AppState>) -> R<Vec<MinterAsset>> {
     let url = node_url(&state)?;
     let leaves = chain::fetch_leaves(&url).unwrap_or_default();
     let list = chain::asset_list(&url);
@@ -6604,12 +6610,12 @@ fn my_assets(state: State<AppState>) -> R<Vec<MinterAsset>> {
 /// authority derived from this account, then seeds `amount` base units of the new
 /// asset to the wallet. Returns the new asset id.
 #[tauri::command]
-fn mint_asset(
+async fn mint_asset(
     ticker: String,
     amount: u64,
     decimals: u8,
     max_supply: u64,
-    state: State<AppState>,
+    state: State<'_, AppState>,
 ) -> R<String> {
     let url = node_url(&state)?;
     let t = ticker.trim().to_string();
@@ -6809,7 +6815,7 @@ struct PendingDepositView {
 
 /// The wallet's in-flight BTC→zBTC deposits (for the Bridge tab's pending list).
 #[tauri::command]
-fn list_pending_deposits(state: State<AppState>) -> R<Vec<PendingDepositView>> {
+async fn list_pending_deposits(state: State<'_, AppState>) -> R<Vec<PendingDepositView>> {
     let g = state.wallet.lock().unwrap();
     let w = g.as_ref().ok_or("wallet locked")?;
     ok(w.pending_deposits
@@ -6830,7 +6836,7 @@ fn list_pending_deposits(state: State<AppState>) -> R<Vec<PendingDepositView>> {
 /// Take the BTC of a stuck shield deposit back through the HTLC's refund branch (wallet H1).
 /// Only possible once the Bitcoin tip has passed the deposit's CLTV.
 #[tauri::command]
-fn bridge_refund_deposit(index: u32, state: State<AppState>) -> R<String> {
+async fn bridge_refund_deposit(index: u32, state: State<'_, AppState>) -> R<String> {
     let p = {
         let g = state.wallet.lock().unwrap();
         g.as_ref()
@@ -6882,7 +6888,7 @@ struct PendingSecretView {
 
 /// Secrets the wallet still owes the user (bearer tokens, stealth notes) until dismissed.
 #[tauri::command]
-fn list_pending_secrets(state: State<AppState>) -> R<Vec<PendingSecretView>> {
+async fn list_pending_secrets(state: State<'_, AppState>) -> R<Vec<PendingSecretView>> {
     let g = state.wallet.lock().unwrap();
     let w = g.as_ref().ok_or("wallet locked")?;
     ok(w.pending_secrets
@@ -6892,7 +6898,7 @@ fn list_pending_secrets(state: State<AppState>) -> R<Vec<PendingSecretView>> {
 }
 
 #[tauri::command]
-fn dismiss_pending_secret(id: u64, state: State<AppState>) -> R<bool> {
+async fn dismiss_pending_secret(id: u64, state: State<'_, AppState>) -> R<bool> {
     with_wallet(&state, |w| {
         let before = w.pending_secrets.len();
         w.pending_secrets.retain(|p| p.id != id);
@@ -6912,7 +6918,7 @@ struct WalletHealth {
 /// Persistent-banner state for the UI: a failed save and anything the user still has to act
 /// on (wallet H2).
 #[tauri::command]
-fn wallet_health(state: State<AppState>) -> R<WalletHealth> {
+async fn wallet_health(state: State<'_, AppState>) -> R<WalletHealth> {
     let g = state.wallet.lock().unwrap();
     let (ps, pd, pr) = g
         .as_ref()
@@ -6927,7 +6933,7 @@ fn wallet_health(state: State<AppState>) -> R<WalletHealth> {
 }
 
 #[tauri::command]
-fn swap_shield_btc(zbtc_amount: u64, btc: String, window: tauri::Window, state: State<AppState>) -> R<u64> {
+async fn swap_shield_btc(zbtc_amount: u64, btc: String, window: tauri::Window, state: State<'_, AppState>) -> R<u64> {
     let progress = |pct: u8, phase: &str| {
         let _ = window.emit("swap-progress", serde_json::json!({ "percent": pct, "phase": phase }));
     };
@@ -7064,7 +7070,7 @@ fn swap_shield_btc_impl(
 /// new Bitcoin blocks are confirmed — without it, the chain's Bitcoin view would go
 /// stale and pending coins would never mature. Returns "<pending_count>:<pending_value>".
 #[tauri::command]
-fn bridge_mature(state: State<AppState>) -> R<String> {
+async fn bridge_mature(state: State<'_, AppState>) -> R<String> {
     let _op = BridgeOpGuard::enter();
     let zc = zc_client(&state)?;
     // Relay from the user's Bitcoin backend (untrusted transport — headers self-prove).
@@ -7084,7 +7090,7 @@ fn bridge_mature(state: State<AppState>) -> R<String> {
 /// self-contained atomic swap. Returns the zBTC actually redeemed (which may be a hair
 /// under the request, since every round burns a 0.0001 zBTC fee).
 #[tauri::command]
-fn swap_redeem_btc(btc: String, window: tauri::Window, state: State<AppState>) -> R<u64> {
+async fn swap_redeem_btc(btc: String, window: tauri::Window, state: State<'_, AppState>) -> R<u64> {
     let progress = |pct: u8, phase: &str| {
         let _ = window.emit("swap-progress", serde_json::json!({ "percent": pct, "phase": phase }));
     };
@@ -7770,7 +7776,7 @@ struct PendingRedeemView {
 
 /// The wallet's in-flight zBTC→BTC redeems (for the Bridge tab's pending list).
 #[tauri::command]
-fn list_pending_redeems(state: State<AppState>) -> R<Vec<PendingRedeemView>> {
+async fn list_pending_redeems(state: State<'_, AppState>) -> R<Vec<PendingRedeemView>> {
     let g = state.wallet.lock().unwrap();
     let w = g.as_ref().ok_or("wallet locked")?;
     ok(w.pending_redeems
@@ -7791,7 +7797,7 @@ fn list_pending_redeems(state: State<AppState>) -> R<Vec<PendingRedeemView>> {
 /// Clear a redeem's recorded claim rejection and try the Bitcoin claim again, on the
 /// user's explicit request (wallet L12).
 #[tauri::command]
-fn bridge_retry_redeem_claim(index: u32, state: State<AppState>) -> R<String> {
+async fn bridge_retry_redeem_claim(index: u32, state: State<'_, AppState>) -> R<String> {
     with_wallet(&state, |w| {
         let r = w.pending_redeems.iter_mut().find(|r| r.index == index).ok_or("no such pending redeem")?;
         r.claim_error = None;
@@ -7883,7 +7889,7 @@ const WORKER_FAST_SECS: u64 = 10;
 const WORKER_SLOW_EVERY: u64 = 6;
 
 #[tauri::command]
-fn bridge_recover(state: State<AppState>) -> R<RecoverResult> {
+async fn bridge_recover(state: State<'_, AppState>) -> R<RecoverResult> {
     let _serial = SETTLE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let url = node_url(&state)?;
     let leaves = chain::fetch_leaves(&url)?;
@@ -7987,7 +7993,7 @@ impl Serialize for SecretString {
 }
 
 #[tauri::command]
-fn get_seed_phrase(password: String, state: State<AppState>) -> R<SecretString> {
+async fn get_seed_phrase(password: String, state: State<'_, AppState>) -> R<SecretString> {
     // Re-verify the password against the keystore before revealing.
     let dir = state.data_dir.lock().unwrap().clone();
     let raw = std::fs::read_to_string(keystore_path(&dir)).map_err(|_| "no wallet")?;
@@ -8141,8 +8147,8 @@ mod live_3node {
     const ZC: u64 = 1_000_000; // 1 ZCRYPT in base units
 
     /// Unwrap a command's `Api<T>` envelope the way the frontend does.
-    fn v<T: Serialize>(r: R<T>) -> Result<T, String> {
-        let api = r?;
+    fn v<T: Serialize>(r: impl std::future::Future<Output = R<T>>) -> Result<T, String> {
+        let api = tauri::async_runtime::block_on(r)?;
         if api.success {
             api.data.ok_or_else(|| "success without data".to_string())
         } else {
