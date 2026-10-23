@@ -54,7 +54,7 @@
 	# (zcrypt.rs), the explorer and validator-entrypoint.sh.
 	@allowed {
 		method GET
-		path /status /health /genesis /genesis_chunked /abci_query /block /block_results \
+		path /status /health /abci_info /genesis /genesis_chunked /abci_query /block /block_results \
 		     /blockchain /commit /validators /tx /tx_search /header /header_by_hash \
 		     /consensus_params /broadcast_tx_commit /broadcast_tx_sync /broadcast_tx_async
 	}
