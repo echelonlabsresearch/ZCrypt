@@ -59,6 +59,9 @@ services:
       FOUNDATION_SENTINEL_DECAY: ${FOUNDATION_SENTINEL_DECAY:-1000000}
       # JSON array of allowed browser origins for the raw RPC (default: none).
       RPC_CORS_ORIGINS: ${RPC_CORS_ORIGINS:-[]}
+      # Genesis validator identity from the foundation wallet (Rewards, Run a validator,
+      # Node setup): base64 of priv_validator_key.json. Set BEFORE the first start.
+      VALIDATOR_KEY: ${VALIDATOR_KEY:-}
     volumes:
       - ./docker/cometbft-entrypoint.sh:/entrypoint.sh:ro
       - cometbft-data:/cometbft

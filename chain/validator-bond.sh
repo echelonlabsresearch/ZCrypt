@@ -1,17 +1,18 @@
 #!/bin/sh
-# Bond the running validator into the ACTIVE producing set (become a block producer),
-# with block rewards paid to YOUR wallet. Run once, after the validator has caught up
-# (see docker-compose.validator.yml). Bonding pledges >= 10,000 ZCRYPT as a real burn and
-# does NOT unbond, so the node stays a validator.
+# DEVNET helper: bond the running validator into the ACTIVE producing set from the host,
+# funding the stake with a devnet SEED mint (a production node rejects that). On a real
+# chain use the wallet instead: Rewards, Run a validator, Bond (the node was started with
+# the wallet's VALIDATOR_KEY, see README-validator.md). Bonding pledges >= 10,000 ZCRYPT as
+# a real burn and does NOT unbond, so the node stays a validator.
 #
-#   ZCRYPT_REWARD_ADDR=<64hex> ./validator-bond.sh       # reward address from the wallet (Rewards, Prepare bond)
+#   ZCRYPT_REWARD_ADDR=<64hex> ./validator-bond.sh       # reward address (hex) for the rewards
 #   ./validator-bond.sh                                  # prompts for that reward address, bonds via :56657
 #   ./validator-bond.sh http://localhost:56657 20000     # custom RPC + stake (whole ZCRYPT)
 #
-# The reward address MUST come from the wallet's "Prepare bond" (a fresh stealth key the
-# wallet tracks). Deriving it from the recovery phrase publishes the wallet's reusable
-# Normal key on chain and the wallet only treats such rewards as a legacy key; that path
-# now needs ZCRYPT_REWARD_MNEMONIC_LEGACY=1 and is discouraged.
+# The reward address should be a fresh stealth-derived address the wallet scans for (the
+# wallet's `bond_request` command allocates one). Deriving it from the recovery phrase
+# publishes the wallet's reusable Normal key on chain and the wallet only treats such
+# rewards as a legacy key; that path needs ZCRYPT_REWARD_MNEMONIC_LEGACY=1 and is discouraged.
 set -eu
 
 RPC="${1:-http://localhost:${VALIDATOR_RPC_PORT:-56657}}"
@@ -26,16 +27,16 @@ echo "[bond] reading consensus key from container '$CONTAINER'"
 VSEED=$(docker exec "$CONTAINER" cat /cometbft/config/priv_validator_key.json \
   | python3 -c "import sys,json,base64; print(base64.b64decode(json.load(sys.stdin)['priv_key']['value'])[:32].hex())")
 
-# 2. Reward destination = the reward address the wallet allocated (Rewards, Become a
-#    validator, Prepare bond). Never a recovery phrase: the legacy phrase-derived path is
-#    only honoured with ZCRYPT_REWARD_MNEMONIC_LEGACY=1 and is discouraged (see header).
+# 2. Reward destination = a reward address the wallet allocated (its `bond_request`
+#    command). Never a recovery phrase: the legacy phrase-derived path is only honoured
+#    with ZCRYPT_REWARD_MNEMONIC_LEGACY=1 and is discouraged (see header).
 if [ -n "${ZCRYPT_REWARD_ADDR:-}" ]; then
   export ZCRYPT_REWARD_ADDR
 elif [ -n "${ZCRYPT_REWARD_MNEMONIC:-}" ] && [ "${ZCRYPT_REWARD_MNEMONIC_LEGACY:-}" = "1" ]; then
   echo "[bond] WARNING: legacy phrase-derived reward address (publishes your Normal key)"
   export ZCRYPT_REWARD_MNEMONIC ZCRYPT_REWARD_MNEMONIC_LEGACY
 else
-  printf "[bond] paste the 64-hex reward address shown by the wallet's Prepare bond: "
+  printf "[bond] paste the 64-hex reward address for this validator's rewards: "
   read ZCRYPT_REWARD_ADDR
   case "$ZCRYPT_REWARD_ADDR" in
     *[!0-9a-fA-F]*|"") echo "[bond] ERROR: expected 64 hex characters"; exit 1 ;;

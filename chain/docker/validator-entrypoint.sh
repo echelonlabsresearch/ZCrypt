@@ -1,7 +1,8 @@
 #!/bin/sh
 # Plug-and-play validator join. The operator runs `docker compose up` and does NOTHING
 # else (then bonds). This node:
-#   1. generates its OWN identity (node_key + priv_validator_key), once, on a volume,
+#   1. installs the validator key the operator's wallet created (VALIDATOR_KEY) or, if
+#      none is given, generates its own identity, once, on a volume,
 #   2. DOWNLOADS the chain's genesis.json from GENESIS_URL or the seed RPC (a validator
 #      never edits it) and, when GENESIS_SHA256 is set, refuses any genesis whose
 #      fingerprint differs from the one the foundation published,
@@ -24,14 +25,41 @@ RPC_CORS_ORIGINS="${RPC_CORS_ORIGINS:-[]}"
 GENESIS="$HOME_DIR/config/genesis.json"
 CFG="$HOME_DIR/config/config.toml"
 
+# VALIDATOR_KEY: the validator identity the operator's wallet created (base64 of a
+# priv_validator_key.json). Written before `cometbft init`, which keeps an existing key
+# file instead of generating one, so the node signs with the wallet-owned key and the
+# wallet can bond/unbond it with no further host step. Empty = generate a key here.
+install_validator_key() {
+  [ -n "${VALIDATOR_KEY:-}" ] || return 0
+  KEYF="$1/config/priv_validator_key.json"
+  if [ -f "$KEYF" ]; then
+    echo "[identity] priv_validator_key.json already exists; VALIDATOR_KEY ignored (remove the volume to replace it)"
+    return 0
+  fi
+  mkdir -p "$1/config"
+  if ! ( umask 077; printf '%s' "$VALIDATOR_KEY" | base64 -d > "$KEYF" 2>/dev/null ) \
+     || ! grep -q '"priv_key"' "$KEYF" || ! grep -q 'PrivKeyEd25519' "$KEYF"; then
+    rm -f "$KEYF"
+    echo "[identity] ERROR: VALIDATOR_KEY is not the base64 of a priv_validator_key.json (copy the whole line from the wallet)" >&2
+    exit 1
+  fi
+  # CometBFT only loads an existing key together with its double-sign guard file.
+  mkdir -p "$1/data"
+  [ -f "$1/data/priv_validator_state.json" ] \
+    || printf '{\n  "height": "0",\n  "round": 0,\n  "step": 0\n}\n' > "$1/data/priv_validator_state.json"
+  echo "[identity] installed the wallet-provided validator key"
+}
+
 sha256_of() {
   if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | cut -d' ' -f1
   else openssl dgst -sha256 "$1" | sed 's/.*= //'; fi
 }
 
 if [ ! -f "$GENESIS" ]; then
-  echo "[validator] first boot: generating identity and joining '$CHAIN_ID'"
-  # Identity only (node_key.json + priv_validator_key.json + a default config we tune).
+  echo "[validator] first boot: setting up identity and joining '$CHAIN_ID'"
+  # Identity (node_key.json + priv_validator_key.json + a default config we tune). With
+  # VALIDATOR_KEY set, the signing key is the one the wallet created.
+  install_validator_key "$HOME_DIR"
   CMTHOME="$HOME_DIR" cometbft init >/dev/null
 
   # 1. Genesis: obtain the chain's genesis (this is what makes us the SAME chain, not a

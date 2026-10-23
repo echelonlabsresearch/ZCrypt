@@ -116,14 +116,17 @@ The genesis CometBFT validator produces blocks but earns nothing until bonded.
 2. Restore the FOUNDATION mnemonic into the wallet (trusted machine). Rewards tab
    shows 50,000 claimable (the liquid tranche). Claim it: you now hold spendable
    shielded ZCRYPT and the explorer shows `50k claimed`.
-3. Bond the genesis validator, pledging 10,000 of those coins, with a fresh reward
-   address from your wallet. Bonding is two-step so the consensus key never leaves
-   the node: in the wallet open Rewards, Become a validator, Prepare bond (it shows
-   chain id, reward address, stake, commission, nonce); on the node host run
-   `VALIDATOR_SEED_HEX=<first 32 bytes of priv_validator_key.json, hex> bond_validator sign ...`
-   with those values (chain/README-validator.md, section 3); paste the printed
-   signature into the wallet and submit. The product-flow driver performs the same
-   bond non-interactively (see running.md "Validators").
+3. Bond the genesis validator: Rewards, Run a validator, enter 10,000 and the
+   commission, click Bond. This works with one click because the genesis node was
+   started with `VALIDATOR_KEY` from this same wallet (step 0 below), so the wallet
+   holds the consensus key and signs the BOND itself. The product-flow driver performs
+   the same bond non-interactively (see running.md "Validators").
+
+   Step 0, before the foundation node's FIRST start: open the foundation wallet,
+   Rewards, Run a validator, Node setup, Copy the .env line, and put that
+   `VALIDATOR_KEY=…` line in `chain/.env` on the VPS. The genesis is then created with
+   the wallet's validator identity. A node started without it generates its own key,
+   which the wallet cannot bond without the host-side signer.
 4. Verify: `/staking/validators` lists the validator with its stake, and after
    the first 100-block epoch (about 100 s) `/staking/claimable/<pk>` grows by 14
    ZCRYPT per epoch. The wallet Rewards tab claims it whenever you like.

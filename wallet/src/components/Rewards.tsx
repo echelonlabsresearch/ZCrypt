@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
-import { call, fmt } from "../lib/api";
+import { call, copySensitive, fmt } from "../lib/api";
 
 /** Claim accrued staking block rewards into spendable shield coins. */
 export default function Rewards({
@@ -20,23 +20,23 @@ export default function Rewards({
   // Pending unbonding (validator unbond or undelegate): persists until the 10-day timer ends.
   type Unbonding = { stake: string; release_time: string };
   const [unbonding, setUnbonding] = useState<Unbonding[]>([]);
-  // Become a validator: the consensus PRIVATE key never enters the wallet. Step 1 prepares
-  // the bond parameters (a fresh reward key), the validator host signs them, step 2 submits
-  // the signature together with a stake pledge from this wallet.
-  type BondRequest = {
-    reward_index: number;
-    reward_address_hex: string;
-    chain_id: string;
-    stake_base: string;
-    commission_bps: number;
-    message_layout: string;
+  // Run a validator. The wallet derives the validator's consensus key from the
+  // recovery phrase; the node imports it once at install (one line in its .env). After
+  // that, bonding and unbonding are plain wallet actions: nothing to sign elsewhere.
+  type ValidatorIdentity = {
+    pubkey_hex: string;
+    env_line: string;
+    bonded: boolean;
+    stake: number;
+    commission_pct: number;
+    ever_bonded: boolean;
   };
+  const [ident, setIdent] = useState<ValidatorIdentity | null>(null);
+  const [identErr, setIdentErr] = useState("");
+  const [showSetup, setShowSetup] = useState(false);
+  const [copiedKey, setCopiedKey] = useState(false);
   const [stake, setStake] = useState("10000");
   const [commissionPct, setCommissionPct] = useState("10");
-  const [bondReq, setBondReq] = useState<BondRequest | null>(null);
-  const [vpk, setVpk] = useState("");
-  const [nonce, setNonce] = useState("0");
-  const [sig, setSig] = useState("");
   const [bonding, setBonding] = useState(false);
   const [bondMsg, setBondMsg] = useState("");
   const [bondErr, setBondErr] = useState("");
@@ -118,16 +118,43 @@ export default function Rewards({
     }
   }
 
-  async function prepareBond() {
+  const loadIdentity = useCallback(async () => {
+    setIdentErr("");
+    try {
+      setIdent(await call<ValidatorIdentity>("validator_identity"));
+    } catch (e) {
+      setIdentErr(String(e));
+    }
+  }, []);
+
+  useEffect(() => {
+    if (active) loadIdentity();
+  }, [active, loadIdentity]);
+
+  async function copyNodeKey() {
+    if (!ident) return;
+    try {
+      await copySensitive(ident.env_line);
+      setCopiedKey(true);
+      setTimeout(() => setCopiedKey(false), 2500);
+    } catch {
+      setBondErr("Could not reach the clipboard; select the line and copy it by hand.");
+    }
+  }
+
+  async function bond() {
     setBondErr("");
     setBondMsg("");
     setBonding(true);
     try {
-      const r = await call<BondRequest>("bond_request", {
+      const msg = await call<string>("bond_validator", {
         stakeZcrypt: stake.trim(),
         commissionPct: commissionPct.trim(),
       });
-      setBondReq(r);
+      setBondMsg(msg);
+      await load();
+      await loadIdentity();
+      await loadValidators();
     } catch (e) {
       setBondErr(String(e));
     } finally {
@@ -135,25 +162,16 @@ export default function Rewards({
     }
   }
 
-  async function submitBond() {
-    if (!bondReq) return;
+  async function unbond() {
     setBondErr("");
     setBondMsg("");
     setBonding(true);
     try {
-      const msg = await call<string>("bond_validator_signed", {
-        rewardIndex: bondReq.reward_index,
-        consensusPubkeyHex: vpk.trim(),
-        nonce: nonce.trim(),
-        signatureHex: sig.trim(),
-        stakeZcrypt: stake.trim(),
-        commissionPct: commissionPct.trim(),
-      });
+      const msg = await call<string>("unbond_validator");
       setBondMsg(msg);
-      setBondReq(null);
-      setVpk("");
-      setSig("");
       await load();
+      await loadIdentity();
+      await loadValidators();
     } catch (e) {
       setBondErr(String(e));
     } finally {
@@ -264,75 +282,73 @@ export default function Rewards({
       </div>
 
       <div className="card" style={{ maxWidth: 560, margin: "1.25rem auto 0" }}>
-        <h3 style={{ marginTop: 0 }}>🛡️ Become a validator</h3>
-        <div style={{ fontSize: "0.82rem", opacity: 0.75, marginBottom: "0.7rem" }}>
-          Bond a running validator node using a stake from <b>this wallet's balance</b>. The validator's
-          consensus <b>private key stays on the validator host</b>: the wallet prepares the bond, the host
-          signs it, and the wallet submits the signature with the stake pledge. Rewards accrue to a fresh
-          reward key of this wallet. The stake is pledged (burned) and returns after a 10-day unbond.
-        </div>
-        <div className="field">
-          <label>Stake (ZCRYPT, min 10,000)</label>
-          <input
-            value={stake}
-            onChange={(e) => setStake(e.target.value)}
-            inputMode="numeric"
-            disabled={!!bondReq}
-          />
-        </div>
-        <div className="field">
-          <label>Commission % (your cut of delegators' rewards)</label>
-          <input
-            value={commissionPct}
-            onChange={(e) => setCommissionPct(e.target.value)}
-            inputMode="decimal"
-            disabled={!!bondReq}
-          />
-          <div style={{ fontSize: "0.72rem", opacity: 0.6, marginTop: 4 }}>
-            Lower commission attracts more delegators; you keep this % of what your
-            delegators earn. 0-100%.
-          </div>
-        </div>
-        {!bondReq ? (
-          <button className="btn-primary btn-block" disabled={bonding} onClick={prepareBond}>
-            {bonding ? "Preparing…" : "1. Prepare bond (creates the reward key)"}
-          </button>
+        <h3 style={{ marginTop: 0 }}>🛡️ Run a validator</h3>
+        {identErr && <div className="msg err">{identErr}</div>}
+        {!ident ? (
+          <div style={{ fontSize: "0.82rem", opacity: 0.7 }}>Loading your validator identity…</div>
         ) : (
           <>
-            <div className="mono-box" style={{ fontSize: "0.74rem", whiteSpace: "pre-wrap" }}>
-{`reward_address = ${bondReq.reward_address_hex}
-chain_id       = ${bondReq.chain_id}
-stake_base     = ${bondReq.stake_base}
-commission_bps = ${bondReq.commission_bps}`}
-            </div>
-            <div style={{ fontSize: "0.74rem", opacity: 0.7, margin: "0.4rem 0 0.6rem" }}>
-              2. On the validator host, sign with the consensus key (ed25519) the bytes{" "}
-              <code>{bondReq.message_layout}</code>, where <code>nonce</code> is the node's{" "}
-              <code>/staking/auth_nonce/&lt;consensus_pubkey_hex&gt;</code>. Then paste the pubkey, the nonce
-              you used and the signature below. Nothing secret is entered here.
+            <div style={{ fontSize: "0.82rem", opacity: 0.8, marginBottom: "0.7rem" }}>
+              This wallet owns a validator identity, derived from your recovery phrase. Your node signs
+              blocks with it; this wallet bonds and unbonds it. Nothing to copy back from the server.
             </div>
             <div className="field">
-              <label>Validator consensus PUBLIC key (hex, 64 chars)</label>
-              <input value={vpk} onChange={(e) => setVpk(e.target.value)} spellCheck={false} />
+              <label>Your validator (consensus public key)</label>
+              <div className="mono-box" style={{ fontSize: "0.72rem", wordBreak: "break-all" }}>{ident.pubkey_hex}</div>
             </div>
-            <div className="field">
-              <label>Nonce used in the signature</label>
-              <input value={nonce} onChange={(e) => setNonce(e.target.value)} inputMode="numeric" />
-            </div>
-            <div className="field">
-              <label>Signature (hex, 128 chars)</label>
-              <input value={sig} onChange={(e) => setSig(e.target.value)} spellCheck={false} />
-            </div>
-            <button
-              className="btn-primary btn-block"
-              disabled={bonding || vpk.trim().length !== 64 || sig.trim().length !== 128}
-              onClick={submitBond}
-            >
-              {bonding ? "Bonding on-chain…" : `3. Bond ${stake || "?"} ZCRYPT`}
-            </button>
-            <button className="btn-link" style={{ marginTop: "0.5rem" }} onClick={() => setBondReq(null)}>
-              Cancel
-            </button>
+
+            {ident.bonded ? (
+              <>
+                <div className="msg ok" style={{ fontSize: "0.8rem" }}>
+                  Active: {fmt(ident.stake)} ZCRYPT staked at {ident.commission_pct}% commission. Rewards accrue to this
+                  wallet every 100 blocks; claim them above.
+                </div>
+                <button className="btn-secondary btn-block" style={{ marginTop: "0.6rem" }} disabled={bonding} onClick={unbond}>
+                  {bonding ? "Working on-chain…" : "Unbond (stake returns after 10 days)"}
+                </button>
+              </>
+            ) : (
+              <>
+                <details open={showSetup} onToggle={(e) => setShowSetup((e.target as HTMLDetailsElement).open)} style={{ margin: "0.2rem 0 0.8rem" }}>
+                  <summary style={{ cursor: "pointer", fontSize: "0.82rem" }}>
+                    <b>Node setup</b> (once, before the node's first start)
+                  </summary>
+                  <div style={{ fontSize: "0.78rem", opacity: 0.8, margin: "0.5rem 0" }}>
+                    Put this line in the <code>.env</code> next to <code>docker-compose.validator.yml</code>, then start the
+                    node. It installs this identity as the node's signing key. It is a secret: treat it like the
+                    recovery phrase. The clipboard clears after 60 seconds.
+                  </div>
+                  <div className="mono-box" style={{ fontSize: "0.66rem", wordBreak: "break-all", maxHeight: 90, overflow: "auto" }}>
+                    {ident.env_line.slice(0, 24)}…
+                  </div>
+                  <button className="copy-btn" style={{ marginTop: "0.4rem" }} onClick={copyNodeKey}>
+                    {copiedKey ? "✓ Copied (clears in 60 s)" : "📋 Copy the .env line"}
+                  </button>
+                  <div style={{ fontSize: "0.72rem", opacity: 0.6, marginTop: "0.5rem" }}>
+                    Already running a node with its own key? Stop it, remove its volume, add the line, start again.
+                    The node must be synced before you bond, or it misses blocks.
+                  </div>
+                </details>
+                <div className="field">
+                  <label>Stake (ZCRYPT, min 10,000)</label>
+                  <input value={stake} onChange={(e) => setStake(e.target.value)} inputMode="numeric" />
+                </div>
+                <div className="field">
+                  <label>Commission % (your cut of delegators' rewards)</label>
+                  <input value={commissionPct} onChange={(e) => setCommissionPct(e.target.value)} inputMode="decimal" />
+                  <div style={{ fontSize: "0.72rem", opacity: 0.6, marginTop: 4 }}>
+                    Lower commission attracts more delegators; you keep this % of what they earn. 0-100%.
+                  </div>
+                </div>
+                <button className="btn-primary btn-block" disabled={bonding} onClick={bond}>
+                  {bonding ? "Bonding on-chain…" : `Bond ${stake || "?"} ZCRYPT`}
+                </button>
+                <div style={{ fontSize: "0.72rem", opacity: 0.6, marginTop: "0.5rem" }}>
+                  The stake is pledged (burned) from this wallet and comes back after a 10-day unbond. Your node joins the
+                  active set on the next block.
+                </div>
+              </>
+            )}
           </>
         )}
         {bondErr && <div className="msg err">{bondErr}</div>}

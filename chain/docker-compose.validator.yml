@@ -83,6 +83,9 @@ services:
       # Optional: skip auto-discovery by giving the full seed string <node_id>@host:26656.
       ZCRYPT_SEEDS: ${ZCRYPT_SEEDS:-}
       RPC_CORS_ORIGINS: ${RPC_CORS_ORIGINS:-[]}
+      # The validator identity from the wallet (Rewards, Run a validator, Node setup):
+      # base64 of priv_validator_key.json. Set it in .env BEFORE the first start.
+      VALIDATOR_KEY: ${VALIDATOR_KEY:-}
     entrypoint: ["/bin/sh", "/entrypoint.sh"]
     volumes:
       - ./docker/validator-entrypoint.sh:/entrypoint.sh:ro

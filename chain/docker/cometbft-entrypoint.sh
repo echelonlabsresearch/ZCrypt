@@ -12,6 +12,31 @@ ABCI_ADDR="${ABCI_ADDR:-tcp://abci:26658}"
 GENESIS="$HOME_DIR/config/genesis.json"
 CFG="$HOME_DIR/config/config.toml"
 
+# VALIDATOR_KEY: the validator identity the operator's wallet created (base64 of a
+# priv_validator_key.json). Written before `cometbft init`, which keeps an existing key
+# file instead of generating one, so the node signs with the wallet-owned key and the
+# wallet can bond/unbond it with no further host step. Empty = generate a key here.
+install_validator_key() {
+  [ -n "${VALIDATOR_KEY:-}" ] || return 0
+  KEYF="$1/config/priv_validator_key.json"
+  if [ -f "$KEYF" ]; then
+    echo "[identity] priv_validator_key.json already exists; VALIDATOR_KEY ignored (remove the volume to replace it)"
+    return 0
+  fi
+  mkdir -p "$1/config"
+  if ! ( umask 077; printf '%s' "$VALIDATOR_KEY" | base64 -d > "$KEYF" 2>/dev/null ) \
+     || ! grep -q '"priv_key"' "$KEYF" || ! grep -q 'PrivKeyEd25519' "$KEYF"; then
+    rm -f "$KEYF"
+    echo "[identity] ERROR: VALIDATOR_KEY is not the base64 of a priv_validator_key.json (copy the whole line from the wallet)" >&2
+    exit 1
+  fi
+  # CometBFT only loads an existing key together with its double-sign guard file.
+  mkdir -p "$1/data"
+  [ -f "$1/data/priv_validator_state.json" ] \
+    || printf '{\n  "height": "0",\n  "round": 0,\n  "step": 0\n}\n' > "$1/data/priv_validator_state.json"
+  echo "[identity] installed the wallet-provided validator key"
+}
+
 # check NAME VALUE ERE: abort unless VALUE matches the whole extended regex.
 check() {
   if ! printf '%s' "$2" | grep -Eq "^($3)$"; then
@@ -22,6 +47,9 @@ check() {
 
 if [ ! -f "$GENESIS" ]; then
   echo "Initializing CometBFT home at $HOME_DIR"
+  # The genesis validator's key: the foundation wallet's validator identity when
+  # VALIDATOR_KEY is set (so the wallet bonds it with no host step), else generated here.
+  install_validator_key "$HOME_DIR"
   cometbft init --home "$HOME_DIR" >/dev/null
 
   CHAIN_ID="${CHAIN_ID:-zcrypt-1}"

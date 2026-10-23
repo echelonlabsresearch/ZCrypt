@@ -33,7 +33,7 @@ RUN cd /build/impl && \
       cargo build --locked --release -p zcrypt-abci-node; \
     fi && \
     cargo build --locked --release -p zcrypt-explorer && \
-    cargo build --locked --release -p zcrypt-bridge --bin bridge_watcher
+    cargo build --locked --release -p zcrypt-bridge --bin bridge_watcher --bin bond_validator
 
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
@@ -44,6 +44,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
 COPY --from=build /build/impl/target/release/zcrypt-abci-node /usr/local/bin/zcrypt-abci-node
 COPY --from=build /build/impl/target/release/zcrypt-explorer /usr/local/bin/zcrypt-explorer
 COPY --from=build /build/impl/target/release/bridge_watcher /usr/local/bin/bridge_watcher
+# Host-side bond signer for the wallet's two-step bond (README-validator.md, step 3).
+COPY --from=build /build/impl/target/release/bond_validator /usr/local/bin/bond_validator
 ENV ABCI_PORT=26658
 ENV EXPLORER_PORT=8080
 # Consensus state lives on the /data volume (RocksDB dir + periodic postcard backup).

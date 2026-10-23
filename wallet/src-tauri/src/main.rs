@@ -4475,8 +4475,6 @@ async fn bond_validator_signed(
     state: State<'_, AppState>,
 ) -> R<String> {
     let (stake, commission_bps) = parse_bond_params(&stake_zcrypt, &commission_pct)?;
-    let atomic = zcrypt_core::emission::ATOMIC;
-    let commission_pct_display = format!("{}.{:02}", commission_bps / 100, commission_bps % 100);
     let pk: [u8; 32] = hex::decode(consensus_pubkey_hex.trim())
         .map_err(|e| format!("consensus pubkey: invalid hex ({e})"))?
         .try_into()
@@ -4486,7 +4484,24 @@ async fn bond_validator_signed(
         .try_into()
         .map_err(|_| "signature must be 64 bytes (128 hex chars)".to_string())?;
     let nonce: u64 = nonce.trim().parse().map_err(|_| "nonce must be a number".to_string())?;
-    let url = node_url(&state)?;
+    submit_bond(&state, reward_index, pk, nonce, sig, stake, commission_bps).and_then(ok)
+}
+
+/// Verify a BOND signature, pledge the stake from this wallet's coins, broadcast, and
+/// record the result. Shared by the in-wallet validator (key derived from the phrase) and
+/// the external-signer path.
+fn submit_bond(
+    state: &State<'_, AppState>,
+    reward_index: u32,
+    pk: [u8; 32],
+    nonce: u64,
+    sig: [u8; 64],
+    stake: u64,
+    commission_bps: u16,
+) -> Result<String, String> {
+    let atomic = zcrypt_core::emission::ATOMIC;
+    let commission_pct_display = format!("{}.{:02}", commission_bps / 100, commission_bps % 100);
+    let url = node_url(state)?;
     let vpk_hex = hex::encode(pk);
     // Reject re-bond in the wallet: consensus destroys the previous self-bond pledge.
     if let Ok(list) = chain::query_str(&url, "/staking/validators") {
@@ -4501,7 +4516,7 @@ async fn bond_validator_signed(
         }
     }
     let leaves = chain::fetch_leaves(&url)?;
-    with_wallet(&state, |w| {
+    with_wallet(state, |w| {
         let cid = chain_id_for(&url)?;
         if !w.action_keys.iter().any(|a| a.index == reward_index && a.kind == "bond") {
             return Err("unknown bond request; start again from step 1".into());
@@ -4535,7 +4550,199 @@ async fn bond_validator_signed(
             stake / atomic, commission_pct_display, vpk_hex
         ))
     })
-    .and_then(ok)
+    
+}
+
+// ---------------------------------------------------------------------------
+// The wallet's own validator identity
+// ---------------------------------------------------------------------------
+
+/// The consensus key this wallet runs a validator with: ed25519, derived from the recovery
+/// phrase under its own domain tag, so it restores with the phrase and is never copied back
+/// from a node. The node imports it once, at install time, through `VALIDATOR_KEY` in its
+/// `.env` (see `validator_identity`). After that every staking action is a wallet action.
+fn validator_signing_key(w: &Wallet) -> ed25519_dalek::SigningKey {
+    use sha2::Digest;
+    let mut h = sha2::Sha256::new();
+    h.update(b"ZCRYPT-VALIDATOR-KEY-v1");
+    h.update(w.account.seed());
+    h.update(0u32.to_le_bytes());
+    let mut seed: [u8; 32] = h.finalize().into();
+    let sk = ed25519_dalek::SigningKey::from_bytes(&seed);
+    zcrypt_core::keys::wipe(&mut seed);
+    sk
+}
+
+/// CometBFT's `priv_validator_key.json` for a signing key: the node loads this file, and
+/// `cometbft init` keeps an existing one instead of generating a fresh identity.
+fn cometbft_key_file(sk: &ed25519_dalek::SigningKey) -> String {
+    use base64::Engine as _;
+    use sha2::Digest;
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let pk = sk.verifying_key().to_bytes();
+    let address = hex::encode_upper(&sha2::Sha256::digest(pk)[..20]);
+    let mut full = Vec::with_capacity(64);
+    full.extend_from_slice(&sk.to_bytes());
+    full.extend_from_slice(&pk);
+    serde_json::json!({
+        "address": address,
+        "pub_key": { "type": "tendermint/PubKeyEd25519", "value": b64.encode(pk) },
+        "priv_key": { "type": "tendermint/PrivKeyEd25519", "value": b64.encode(&full) },
+    })
+    .to_string()
+}
+
+#[derive(Serialize)]
+struct ValidatorIdentity {
+    /// Consensus public key (hex), the validator's id on chain.
+    pubkey_hex: String,
+    /// The line to put in the node's `.env` before its first start. SECRET: it is the
+    /// validator's signing key (base64 of priv_validator_key.json).
+    env_line: String,
+    /// Whether this key is in the active set right now.
+    bonded: bool,
+    /// Current stake (base units) and commission when bonded.
+    stake: u64,
+    commission_pct: f64,
+    /// Whether an unbond is in flight for this validator's reward keys is reported by
+    /// `my_unbonding`; this flags that the key has a pending nonce history (ever bonded).
+    ever_bonded: bool,
+}
+
+/// This wallet's validator identity and its current on-chain state.
+#[tauri::command]
+async fn validator_identity(state: State<'_, AppState>) -> R<ValidatorIdentity> {
+    let url = node_url(&state)?;
+    let (pubkey_hex, env_line) = {
+        let g = state.wallet.lock().unwrap();
+        let w = g.as_ref().ok_or("wallet is locked")?;
+        let sk = validator_signing_key(w);
+        use base64::Engine as _;
+        let file = cometbft_key_file(&sk);
+        (
+            hex::encode(sk.verifying_key().to_bytes()),
+            format!("VALIDATOR_KEY={}", base64::engine::general_purpose::STANDARD.encode(file.as_bytes())),
+        )
+    };
+    let mut bonded = false;
+    let mut stake = 0u64;
+    let mut commission_pct = 0.0;
+    if let Ok(list) = chain::query_str(&url, "/staking/validators") {
+        for tok in list.split(',') {
+            let f: Vec<&str> = tok.split(':').collect();
+            if f.len() >= 2 && f[0].eq_ignore_ascii_case(&pubkey_hex) {
+                bonded = true;
+                stake = f[1].trim().parse().unwrap_or(0);
+                if f.len() >= 3 {
+                    commission_pct = f[2].trim().parse::<u16>().unwrap_or(0) as f64 / 100.0;
+                }
+            }
+        }
+    }
+    let ever_bonded = chain::query_str(&url, &format!("/staking/auth_nonce/{pubkey_hex}"))
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .map(|n| n > 0)
+        .unwrap_or(false);
+    ok(ValidatorIdentity { pubkey_hex, env_line, bonded, stake, commission_pct, ever_bonded })
+}
+
+/// Bond this wallet's validator: allocate a fresh reward key, sign the BOND with the
+/// wallet-held consensus key, pledge the stake from this wallet's coins, and broadcast.
+/// One click; nothing leaves the wallet but the transaction.
+#[tauri::command]
+async fn bond_validator(stake_zcrypt: String, commission_pct: String, state: State<'_, AppState>) -> R<String> {
+    use ed25519_dalek::Signer;
+    let (stake, commission_bps) = parse_bond_params(&stake_zcrypt, &commission_pct)?;
+    let url = node_url(&state)?;
+    let cid = chain_id_for(&url)?;
+    let (reward_index, pk, nonce, sig) = with_wallet(&state, |w| {
+        let sk = validator_signing_key(w);
+        let pk = sk.verifying_key().to_bytes();
+        let nonce: u64 = chain::query_str(&url, &format!("/staking/auth_nonce/{}", hex::encode(pk)))?
+            .trim()
+            .parse()
+            .map_err(|_| "node returned a malformed nonce".to_string())?;
+        let idx = w.alloc_index();
+        w.note_action(idx, "bond", "");
+        let reward = w.key_at(idx).reward_address();
+        let msg = bond_message(&cid, &pk, stake, &reward, commission_bps, nonce);
+        Ok((idx, pk, nonce, sk.sign(&msg).to_bytes()))
+    })?;
+    submit_bond(&state, reward_index, pk, nonce, sig, stake, commission_bps).and_then(ok)
+}
+
+/// Leave the active set. Signed with the wallet-held consensus key; the stake comes back
+/// as a claimable balance after the 10-day unbonding period (see `my_unbonding`).
+#[tauri::command]
+async fn unbond_validator(state: State<'_, AppState>) -> R<String> {
+    use ed25519_dalek::Signer;
+    let url = node_url(&state)?;
+    let cid = chain_id_for(&url)?;
+    let tx = {
+        let g = state.wallet.lock().unwrap();
+        let w = g.as_ref().ok_or("wallet is locked")?;
+        let sk = validator_signing_key(w);
+        let pk = sk.verifying_key().to_bytes();
+        let pk_hex = hex::encode(pk);
+        let bonded = chain::query_str(&url, "/staking/validators")
+            .unwrap_or_default()
+            .split(',')
+            .any(|tok| tok.split(':').next().map(|p| p.eq_ignore_ascii_case(&pk_hex)).unwrap_or(false));
+        if !bonded {
+            return Err("this wallet's validator is not in the active set".into());
+        }
+        let nonce: u64 = chain::query_str(&url, &format!("/staking/auth_nonce/{pk_hex}"))?
+            .trim()
+            .parse()
+            .map_err(|_| "node returned a malformed nonce".to_string())?;
+        let mut msg = Vec::new();
+        msg.extend_from_slice(b"ZCRYPT-UNBOND-v1");
+        msg.extend_from_slice(&cid);
+        msg.extend_from_slice(&pk);
+        msg.extend_from_slice(&nonce.to_le_bytes());
+        let sig = sk.sign(&msg).to_bytes();
+        let mut t = vec![0x5Eu8];
+        t.extend_from_slice(&pk);
+        t.extend_from_slice(&nonce.to_le_bytes());
+        t.extend_from_slice(&sig);
+        t
+    };
+    chain::broadcast(&url, &tx)?;
+    with_wallet(&state, |w| {
+        w.push_hist("unbond", 0, "validator unbond".into(), zcrypt_shield::ASSET_ZCRYPT);
+        Ok(())
+    })?;
+    ok(format!(
+        "Unbond broadcast. The node leaves the active set on the next block; the stake returns as claimable after {} days.",
+        zcrypt_core::staking::UNBONDING_PERIOD_SECS / 86_400
+    ))
+}
+
+#[cfg(test)]
+mod validator_identity_tests {
+    use super::*;
+
+    #[test]
+    fn key_file_matches_cometbft_layout() {
+        use base64::Engine as _;
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let file = cometbft_key_file(&sk);
+        let j: serde_json::Value = serde_json::from_str(&file).unwrap();
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let pk = b64.decode(j["pub_key"]["value"].as_str().unwrap()).unwrap();
+        let priv_ = b64.decode(j["priv_key"]["value"].as_str().unwrap()).unwrap();
+        assert_eq!(pk, sk.verifying_key().to_bytes());
+        assert_eq!(priv_.len(), 64);
+        assert_eq!(&priv_[..32], &[7u8; 32]);
+        assert_eq!(&priv_[32..], &pk[..]);
+        assert_eq!(j["address"].as_str().unwrap().len(), 40);
+        assert_eq!(j["priv_key"]["type"], "tendermint/PrivKeyEd25519");
+        // The same first-32-bytes convention bond_validator's --key-file and the old
+        // VALIDATOR_SEED_HEX recipe rely on.
+        let seed: [u8; 32] = priv_[..32].try_into().unwrap();
+        assert_eq!(ed25519_dalek::SigningKey::from_bytes(&seed).verifying_key().to_bytes(), sk.verifying_key().to_bytes());
+    }
 }
 
 /// Select the fewest on-chain ZCRYPT coins (<=2 = N_IN) covering `stake` and build a shield
@@ -8089,6 +8296,9 @@ fn main() {
             claim_fees,
             bond_request,
             bond_validator_signed,
+            validator_identity,
+            bond_validator,
+            unbond_validator,
             list_validators,
             delegate_validator,
             undelegate_validator,

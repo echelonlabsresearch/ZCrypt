@@ -24,8 +24,13 @@
 //!   VALIDATOR_SEED_HEX=<64 hex> bond_validator sign \
 //!       --chain-id zcrypt-1 --reward <64 hex> --stake <base units> --commission-bps <bps> \
 //!       [--nonce <u64> | --node http://127.0.0.1:26657]     # nonce fetched from the node if omitted
+//!       [--key-file /cometbft/config/priv_validator_key.json] # read the key directly (no env)
+//!       [--json]                                              # one JSON line for the wallet
 //!
-//! Prints ONLY the 128-hex ed25519 signature on stdout (pubkey + nonce go to stderr), over
+//! Prints ONLY the 128-hex ed25519 signature on stdout (pubkey + nonce go to stderr), or with
+//! `--json` one line `{"pubkey","nonce","signature",...}` the wallet pastes back whole. The
+//! wallet generates the exact command (a one-off `docker run` of the node image with the
+//! CometBFT volume mounted read-only), so the key file never leaves the host. Signed over
 //! exactly the wallet's message:
 //!   "ZCRYPT-BOND-v1" || chain_id || consensus_pubkey(32) || stake_le(8) || reward(32) ||
 //!   commission_bps_le(2) || nonce_le(8)
@@ -78,6 +83,36 @@ fn consensus_key_from_env() -> ed25519_dalek::SigningKey {
     ed25519_dalek::SigningKey::from_bytes(&seed32)
 }
 
+/// The consensus signing key read straight from CometBFT's `priv_validator_key.json`
+/// (`priv_key.value` is base64 of seed || pubkey; the seed is the first 32 bytes). Lets the
+/// host sign without any shell/python extraction step: run inside a container that mounts
+/// the CometBFT volume read-only and point `--key-file` at it.
+fn consensus_key_from_file(path: &str) -> ed25519_dalek::SigningKey {
+    use base64::Engine as _;
+    let text = std::fs::read_to_string(path).unwrap_or_else(|e| {
+        eprintln!("bond_validator sign: cannot read {path}: {e}");
+        std::process::exit(2)
+    });
+    let json: serde_json::Value = serde_json::from_str(&text).unwrap_or_else(|e| {
+        eprintln!("bond_validator sign: {path} is not JSON: {e}");
+        std::process::exit(2)
+    });
+    let b64 = json["priv_key"]["value"].as_str().unwrap_or_else(|| {
+        eprintln!("bond_validator sign: {path} has no priv_key.value");
+        std::process::exit(2)
+    });
+    let raw = base64::engine::general_purpose::STANDARD.decode(b64).unwrap_or_else(|e| {
+        eprintln!("bond_validator sign: priv_key.value is not base64: {e}");
+        std::process::exit(2)
+    });
+    if raw.len() < 32 {
+        eprintln!("bond_validator sign: priv_key.value is too short");
+        std::process::exit(2)
+    }
+    let seed32: [u8; 32] = raw[..32].try_into().expect("32 bytes");
+    ed25519_dalek::SigningKey::from_bytes(&seed32)
+}
+
 /// `bond_validator sign ...`: print the host signature for the wallet's two-step bond.
 fn sign_subcommand(args: &[String]) {
     let mut chain_id: Option<String> = None;
@@ -86,6 +121,8 @@ fn sign_subcommand(args: &[String]) {
     let mut commission: Option<u16> = None;
     let mut nonce: Option<u64> = None;
     let mut node: Option<String> = None;
+    let mut key_file: Option<String> = None;
+    let mut json_out = false;
     let mut i = 0;
     let val = |i: &mut usize| -> String {
         *i += 1;
@@ -112,6 +149,8 @@ fn sign_subcommand(args: &[String]) {
             "--commission-bps" => commission = Some(val(&mut i).trim().parse().expect("--commission-bps: u16")),
             "--nonce" => nonce = Some(val(&mut i).trim().parse().expect("--nonce: u64")),
             "--node" => node = Some(val(&mut i)),
+            "--key-file" => key_file = Some(val(&mut i)),
+            "--json" => json_out = true,
             other => {
                 eprintln!("bond_validator sign: unknown option {other}");
                 std::process::exit(2)
@@ -119,12 +158,15 @@ fn sign_subcommand(args: &[String]) {
         }
         i += 1;
     }
-    let sk = consensus_key_from_env();
+    let sk = match key_file {
+        Some(p) => consensus_key_from_file(&p),
+        None => consensus_key_from_env(),
+    };
     let pk_hex = hex::encode(sk.verifying_key().to_bytes());
     let (chain_id, reward, stake, commission) = match (chain_id, reward, stake, commission) {
         (Some(c), Some(r), Some(s), Some(k)) => (c, r, s, k),
         _ => {
-            eprintln!("usage: bond_validator sign --chain-id <id> --reward <64hex> --stake <base units> --commission-bps <bps> [--nonce <u64> | --node <url>]");
+            eprintln!("usage: bond_validator sign --chain-id <id> --reward <64hex> --stake <base units> --commission-bps <bps> [--nonce <u64> | --node <url>] [--key-file priv_validator_key.json] [--json]");
             std::process::exit(2)
         }
     };
@@ -143,6 +185,21 @@ fn sign_subcommand(args: &[String]) {
         }
     };
     let sig = swap::sign_bond(&sk, chain_id.as_bytes(), stake, &reward, commission, nonce);
+    if json_out {
+        // One line the wallet pastes back whole ("Host reply"): everything step 3 needs.
+        println!(
+            "{}",
+            serde_json::json!({
+                "pubkey": pk_hex,
+                "nonce": nonce,
+                "signature": hex::encode(sig),
+                "chain_id": chain_id,
+                "stake": stake,
+                "commission_bps": commission,
+            })
+        );
+        return;
+    }
     eprintln!("consensus pubkey: {pk_hex}\nnonce: {nonce}\nchain: {chain_id}  stake: {stake}  commission_bps: {commission}");
     println!("{}", hex::encode(sig));
 }
