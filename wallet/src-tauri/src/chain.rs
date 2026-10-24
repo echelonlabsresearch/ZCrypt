@@ -589,7 +589,119 @@ impl ScanFetch {
 /// and backoff on rate limits. If the node keeps failing, stop and report how far the
 /// contiguous prefix got, so the caller can persist that height and resume later instead
 /// of restarting from `from` (a restore-from-genesis over Tor can take many requests).
+///
+/// Most blocks are empty, so the scan asks the node's transaction INDEX for the
+/// transactions in the range (100 per request, only the blocks that have any) instead of
+/// paging through every block header 20 at a time. A node without an index (`indexer =
+/// "null"`) falls back to the header walk.
 pub fn scan_blocks(url: &str, from: i64, to: i64) -> ScanFetch {
+    if from > to {
+        return ScanFetch::empty(to);
+    }
+    match scan_blocks_indexed(url, from, to) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("[scan] tx index unavailable ({e}); walking block headers instead");
+            scan_blocks_walk(url, from, to)
+        }
+    }
+}
+
+/// How many blocks below the tip the indexed scan leaves alone. The node indexes a block's
+/// transactions right after committing it, but asynchronously; a transaction in the newest
+/// block or two may not be searchable yet, and a cursor that moved past it would skip the
+/// note for good. Those blocks are read on the next pass instead.
+const INDEX_LAG_BLOCKS: i64 = 2;
+
+/// One row of a `tx_search` page: (height, index within the block, raw tx bytes).
+type IndexedTx = (i64, u32, Vec<u8>);
+
+/// Ask the node's transaction index for every transaction in `[from, to]`. `Err` means the
+/// index could not answer at all (so the caller should walk headers instead); a failure
+/// after the first page returns `Ok` with a partial, contiguous prefix and `error` set.
+fn scan_blocks_indexed(url: &str, from: i64, to: i64) -> Result<ScanFetch, String> {
+    let to = to - INDEX_LAG_BLOCKS;
+    if from > to {
+        return Ok(ScanFetch::empty(from - 1));
+    }
+    const PER_PAGE: usize = 100;
+    let mut rows: Vec<IndexedTx> = Vec::new();
+    let mut page = 1usize;
+    loop {
+        let u = format!(
+            "{}/tx_search?query=%22tx.height%3E%3D{from}%20AND%20tx.height%3C%3D{to}%22&per_page={PER_PAGE}&page={page}&order_by=%22asc%22",
+            base(url)
+        );
+        let v = match get_json_retry(&u) {
+            Ok(v) => v,
+            Err(e) if page == 1 => return Err(e),
+            Err(e) => return Ok(indexed_prefix(rows, from, Some(format!("tx index page {page}: {e}")))),
+        };
+        if let Some(err) = v.get("error") {
+            let msg = err["message"].as_str().unwrap_or("error");
+            let data = err["data"].as_str().unwrap_or("");
+            let text = format!("{msg} {data}").trim().to_string();
+            if page == 1 {
+                return Err(text);
+            }
+            return Ok(indexed_prefix(rows, from, Some(format!("tx index page {page}: {text}"))));
+        }
+        let res = &v["result"];
+        let total: usize = res["total_count"]
+            .as_str()
+            .and_then(|s| s.parse().ok())
+            .or_else(|| res["total_count"].as_u64().map(|n| n as usize))
+            .ok_or_else(|| "tx_search: no total_count".to_string())?;
+        let txs = res["txs"].as_array().cloned().unwrap_or_default();
+        let got = txs.len();
+        for t in txs {
+            let h = t["height"].as_str().and_then(|s| s.parse::<i64>().ok());
+            let raw = t["tx"].as_str().and_then(|s| B64.decode(s).ok());
+            if let (Some(h), Some(raw)) = (h, raw) {
+                rows.push((h, t["index"].as_u64().unwrap_or(0) as u32, raw));
+            }
+        }
+        if got == 0 || page * PER_PAGE >= total {
+            break;
+        }
+        page += 1;
+    }
+    let mut out = ScanFetch::empty(to);
+    out.blocks = group_indexed_txs(rows);
+    Ok(out)
+}
+
+/// Group index rows into per-block transaction lists, ascending by height and by position
+/// within the block (the order a block walk would have produced).
+fn group_indexed_txs(mut rows: Vec<IndexedTx>) -> Vec<(i64, Vec<Vec<u8>>)> {
+    rows.sort_by_key(|(h, i, _)| (*h, *i));
+    let mut out: Vec<(i64, Vec<Vec<u8>>)> = Vec::new();
+    for (h, _, tx) in rows {
+        match out.last_mut() {
+            Some((lh, txs)) if *lh == h => txs.push(tx),
+            _ => out.push((h, vec![tx])),
+        }
+    }
+    out
+}
+
+/// The contiguous prefix an interrupted indexed scan can safely keep. A page boundary may
+/// split one block's transactions, so the highest height seen is dropped and the cursor
+/// stops just below it; with nothing fetched the cursor does not move.
+fn indexed_prefix(rows: Vec<IndexedTx>, from: i64, error: Option<String>) -> ScanFetch {
+    let cut = rows.iter().map(|(h, _, _)| *h).max();
+    let mut out = ScanFetch::empty(from - 1);
+    out.error = error;
+    if let Some(cut) = cut {
+        out.blocks = group_indexed_txs(rows.into_iter().filter(|(h, _, _)| *h < cut).collect());
+        out.covered_to = cut - 1;
+    }
+    out
+}
+
+/// The pre-index scan: page through block headers 20 at a time and fetch each block that
+/// has transactions.
+fn scan_blocks_walk(url: &str, from: i64, to: i64) -> ScanFetch {
     let mut out = ScanFetch::empty(from - 1);
     if from > to {
         out.covered_to = to;
@@ -652,6 +764,45 @@ pub fn merkle_path(leaves: &[Commitment], leaf_idx: usize) -> Option<(Vec<Commit
         tree.append(c).ok()?;
     }
     tree.path(leaf_idx)
+}
+
+#[cfg(test)]
+mod scan_index_tests {
+    use super::*;
+
+    fn row(h: i64, i: u32, b: u8) -> IndexedTx {
+        (h, i, vec![b])
+    }
+
+    #[test]
+    fn index_rows_group_per_block_in_walk_order() {
+        // Rows arrive by height, but a block's own transactions may come in any order.
+        let rows = vec![row(7, 1, 0xb), row(3, 0, 0xa), row(7, 0, 0xa), row(9, 0, 0xc)];
+        let blocks = group_indexed_txs(rows);
+        assert_eq!(blocks, vec![(3, vec![vec![0xa]]), (7, vec![vec![0xa], vec![0xb]]), (9, vec![vec![0xc]])]);
+    }
+
+    #[test]
+    fn interrupted_index_scan_keeps_only_whole_blocks() {
+        // Page 2 failed after rows for heights 3, 7 and 7 came back: block 7 may continue on
+        // the lost page, so it is dropped and the cursor stops at 6.
+        let rows = vec![row(3, 0, 0xa), row(7, 0, 0xa), row(7, 1, 0xb)];
+        let f = indexed_prefix(rows, 1, Some("boom".into()));
+        assert_eq!(f.blocks, vec![(3, vec![vec![0xa]])]);
+        assert_eq!(f.covered_to, 6);
+        assert_eq!(f.error.as_deref(), Some("boom"));
+        // Nothing fetched: the cursor does not move.
+        let f = indexed_prefix(Vec::new(), 10, Some("boom".into()));
+        assert!(f.blocks.is_empty());
+        assert_eq!(f.covered_to, 9);
+    }
+
+    #[test]
+    fn empty_range_moves_nothing() {
+        let f = scan_blocks("http://127.0.0.1:1", 10, 9);
+        assert!(f.blocks.is_empty() && f.error.is_none());
+        assert_eq!(f.covered_to, 9);
+    }
 }
 
 #[cfg(test)]
