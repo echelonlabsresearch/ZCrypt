@@ -22,7 +22,7 @@ body {
   margin: 0;
   background: var(--color-bg);
   color: var(--color-text);
-  font-family: "Courier New", "Consolas", monospace;
+  font-family: "Courier New", "Consolas", monospace, "Apple Color Emoji", "Segoe UI Emoji";
 }
 
 /* ---------- shell ---------- */
@@ -865,4 +865,93 @@ details.card.guide[open] > summary {
   color: var(--color-cyan);
   font-size: 0.8rem;
   font-weight: bold;
+}
+
+/* ---------- phone (the iOS app, or any window narrower than 600px) ---------- */
+@media (max-width: 600px) {
+  html, body, .app {
+    overflow-x: hidden;
+  }
+  .app {
+    /* Below the notch, above the home indicator. */
+    padding-top: env(safe-area-inset-top);
+    padding-bottom: env(safe-area-inset-bottom);
+    height: 100dvh;
+  }
+  .header {
+    padding: 0.6rem 1rem;
+  }
+  .brand h1 {
+    font-size: 1.3rem;
+    letter-spacing: 0.08em;
+  }
+  .logo-symbol {
+    font-size: 1.2rem;
+  }
+  .version {
+    display: none;
+  }
+  .balance-pill {
+    /* The portfolio tile is the balance on a phone; the pill does not fit beside the brand. */
+    display: none;
+  }
+  .header {
+    flex-shrink: 0;
+  }
+  .nav {
+    flex-shrink: 0;
+    /* A hint that the tab strip scrolls. */
+    mask-image: linear-gradient(to right, #000 85%, transparent);
+    -webkit-mask-image: linear-gradient(to right, #000 85%, transparent);
+  }
+  .nav {
+    padding: 0 0.5rem;
+    -webkit-overflow-scrolling: touch;
+    scrollbar-width: none;
+  }
+  .nav::-webkit-scrollbar {
+    display: none;
+  }
+  .nav-tab {
+    padding: 0.7rem 0.6rem;
+    font-size: 0.78rem;
+    white-space: nowrap;
+  }
+  .main {
+    padding: 1rem;
+  }
+  .view-title {
+    font-size: 1.4rem;
+    margin-bottom: 1rem;
+  }
+  .card {
+    padding: 0.9rem;
+  }
+  .dash-head {
+    flex-wrap: wrap;
+    gap: 0.6rem;
+  }
+  .dash-head h2 {
+    font-size: 1.4rem;
+  }
+  .asset-grid {
+    grid-template-columns: 1fr;
+  }
+  .footer {
+    display: none;
+  }
+  .toast-stack {
+    left: 1rem;
+    right: 1rem;
+  }
+  .toast {
+    max-width: none;
+  }
+  .mono-box {
+    font-size: 0.72rem;
+  }
+  input, select, textarea {
+    /* iOS zooms the page on focus when a field is under 16px. */
+    font-size: 16px;
+  }
 }

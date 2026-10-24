@@ -23,6 +23,8 @@ const receipt = (id: string, kind: string, amount: number, asset: string, dec: n
 
 const DATA: Record<string, unknown> = {
   wallet_exists: true,
+  take_opened_files: [],
+  prover_selftest: { prove_ms: 2300, verify_ms: 19, proof_bytes: 1_947_000, peak_rss_mb: 640, threads: 6 },
   unlock_wallet: null,
   lock_wallet: null,
   get_address: ZC,

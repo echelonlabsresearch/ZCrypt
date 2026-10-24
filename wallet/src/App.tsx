@@ -1,5 +1,6 @@
 import { useEffect, useState, useCallback } from "react";
 import { call, fmt, fmtAsset, trunc, copySensitive, clearSensitiveClipboard } from "./lib/api";
+import { listen } from "@tauri-apps/api/event";
 import Balance from "./components/Balance";
 import Send from "./components/Send";
 import Receive from "./components/Receive";
@@ -41,6 +42,9 @@ export default function App() {
   const [address, setAddress] = useState("");
   const [balance, setBalance] = useState(0);
   const [toasts, setToasts] = useState<Toast[]>([]);
+  // A `.zcrypt` file the OS opened with the app (tap on an attachment, AirDrop, Finder):
+  // queued here until the wallet is unlocked, then credited under Receive.
+  const [incoming, setIncoming] = useState<string[]>([]);
 
   // create/restore form
   const [pw, setPw] = useState("");
@@ -95,6 +99,23 @@ export default function App() {
   useEffect(() => {
     if (mode === "ready") refresh();
   }, [mode, refresh]);
+
+  // Files opened with the app: those queued before the webview was up, then live ones.
+  useEffect(() => {
+    call<string[]>("take_opened_files")
+      .then((f) => f.length && setIncoming((q) => [...q, ...f]))
+      .catch(() => {});
+    let un: (() => void) | null = null;
+    listen<string>("zcrypt-open", (e) => setIncoming((q) => [...q, e.payload]))
+      .then((u) => (un = u))
+      .catch(() => {});
+    return () => {
+      if (un) un();
+    };
+  }, []);
+  useEffect(() => {
+    if (mode === "ready" && incoming.length) setTab("receive");
+  }, [mode, incoming.length]);
 
   const pollHealth = useCallback(async () => {
     try {
@@ -405,7 +426,11 @@ export default function App() {
           <Balance balance={balance} onRefresh={refresh} />
         </div>
         <div style={{ display: tab === "receive" ? "block" : "none" }}>
-          <Receive onReceived={(r) => { refresh(); toast("Coin Received!", `+${fmtAsset(r.amount, r.decimals)} ${r.ticker}`); }} />
+          <Receive
+            incoming={incoming[0] ?? ""}
+            onConsumed={() => setIncoming((q) => q.slice(1))}
+            onReceived={(r) => { refresh(); toast("Coin Received!", `+${fmtAsset(r.amount, r.decimals)} ${r.ticker}`); }}
+          />
         </div>
         <div style={{ display: tab === "send" ? "block" : "none" }}>
           <Send active={tab === "send"} onSent={refresh} toast={toast} />

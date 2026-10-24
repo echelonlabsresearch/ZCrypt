@@ -1,0 +1,469 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 77;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		141D8CE807D5A936986CBF07 /* LaunchScreen.storyboard in Resources */ = {isa = PBXBuildFile; fileRef = D8ADAE8E03AD9A34A246ABCA /* LaunchScreen.storyboard */; };
+		16E643F84401BD03AD93AD55 /* CoreGraphics.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 5537AF1BA3AE302238B1ADD0 /* CoreGraphics.framework */; };
+		31F79741AC4E42FDC8BBABD5 /* UIKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 7A54B30298C9E0E2F4E89855 /* UIKit.framework */; };
+		4F2BE45319D72DCF5501DDAE /* Security.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = EE7EA7AFAAB67EE0EFE63658 /* Security.framework */; };
+		577A67C33A66EAC3B9050BE9 /* MetalKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 78CC28400A70326FCCD2C4A2 /* MetalKit.framework */; };
+		8BC37B2D66D695D66B06E1AE /* Metal.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 11F715F358E71BE8C8ED7D1D /* Metal.framework */; };
+		A9C6942F20D3A48370E1B5AE /* libapp.a in Frameworks */ = {isa = PBXBuildFile; fileRef = 4FC6B8A3A0B9910DEF4016A9 /* libapp.a */; };
+		ADDAEA9675004D3CFC4289F3 /* QuartzCore.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = FF976386DA6E50BCCCC2A88F /* QuartzCore.framework */; };
+		C69FD98701318E28F4B4ECA4 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = C6A5A344FDEBBB41D30C4948 /* Assets.xcassets */; };
+		CEC8A9EC5E86771711C7BBA2 /* main.mm in Sources */ = {isa = PBXBuildFile; fileRef = 03E3FD0A9871475E33651D69 /* main.mm */; };
+		E5987E7383BECD5CA95F3AEE /* WebKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 8B888555216CADEDBCC0C746 /* WebKit.framework */; };
+		F944CA5A8FB7C624638220DB /* assets in Resources */ = {isa = PBXBuildFile; fileRef = 5E90297BA4DD1A615A4FCDB3 /* assets */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXFileReference section */
+		03E3FD0A9871475E33651D69 /* main.mm */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.objcpp; path = main.mm; sourceTree = "<group>"; };
+		10F281F101855A5651C31431 /* bindings.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = bindings.h; sourceTree = "<group>"; };
+		11F715F358E71BE8C8ED7D1D /* Metal.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Metal.framework; path = System/Library/Frameworks/Metal.framework; sourceTree = SDKROOT; };
+		162E428AEC20BC939873C7BE /* zcrypt-wallet_iOS.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = "zcrypt-wallet_iOS.entitlements"; sourceTree = "<group>"; };
+		4DF34A4BD22F095EEB029793 /* zcrypt-wallet_iOS.app */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.application; path = "zcrypt-wallet_iOS.app"; sourceTree = BUILT_PRODUCTS_DIR; };
+		4FC6B8A3A0B9910DEF4016A9 /* libapp.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; path = libapp.a; sourceTree = "<group>"; };
+		5537AF1BA3AE302238B1ADD0 /* CoreGraphics.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = CoreGraphics.framework; path = System/Library/Frameworks/CoreGraphics.framework; sourceTree = SDKROOT; };
+		5E82B009F001754DB889B497 /* chain.rs */ = {isa = PBXFileReference; path = chain.rs; sourceTree = "<group>"; };
+		5E90297BA4DD1A615A4FCDB3 /* assets */ = {isa = PBXFileReference; lastKnownFileType = folder; path = assets; sourceTree = SOURCE_ROOT; };
+		74CFE04E1210E8593CA31E4F /* main.rs */ = {isa = PBXFileReference; path = main.rs; sourceTree = "<group>"; };
+		78CC28400A70326FCCD2C4A2 /* MetalKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = MetalKit.framework; path = System/Library/Frameworks/MetalKit.framework; sourceTree = SDKROOT; };
+		7A54B30298C9E0E2F4E89855 /* UIKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = UIKit.framework; path = System/Library/Frameworks/UIKit.framework; sourceTree = SDKROOT; };
+		8B888555216CADEDBCC0C746 /* WebKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = WebKit.framework; path = System/Library/Frameworks/WebKit.framework; sourceTree = SDKROOT; };
+		BB9AB00CF896B578A95F4D95 /* lib.rs */ = {isa = PBXFileReference; path = lib.rs; sourceTree = "<group>"; };
+		C527FEDE3548017381283E9C /* privfs.rs */ = {isa = PBXFileReference; path = privfs.rs; sourceTree = "<group>"; };
+		C6A5A344FDEBBB41D30C4948 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
+		D8ADAE8E03AD9A34A246ABCA /* LaunchScreen.storyboard */ = {isa = PBXFileReference; lastKnownFileType = file.storyboard; path = LaunchScreen.storyboard; sourceTree = "<group>"; };
+		E9DA96C3A3C6F25B7D83999B /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
+		EE7EA7AFAAB67EE0EFE63658 /* Security.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Security.framework; path = System/Library/Frameworks/Security.framework; sourceTree = SDKROOT; };
+		FF976386DA6E50BCCCC2A88F /* QuartzCore.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = QuartzCore.framework; path = System/Library/Frameworks/QuartzCore.framework; sourceTree = SDKROOT; };
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		46CC56B79D4C85E6B5221CB3 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				A9C6942F20D3A48370E1B5AE /* libapp.a in Frameworks */,
+				16E643F84401BD03AD93AD55 /* CoreGraphics.framework in Frameworks */,
+				8BC37B2D66D695D66B06E1AE /* Metal.framework in Frameworks */,
+				577A67C33A66EAC3B9050BE9 /* MetalKit.framework in Frameworks */,
+				ADDAEA9675004D3CFC4289F3 /* QuartzCore.framework in Frameworks */,
+				4F2BE45319D72DCF5501DDAE /* Security.framework in Frameworks */,
+				31F79741AC4E42FDC8BBABD5 /* UIKit.framework in Frameworks */,
+				E5987E7383BECD5CA95F3AEE /* WebKit.framework in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		0263048A78A62D95A3BC87D0 /* Sources */ = {
+			isa = PBXGroup;
+			children = (
+				21A6B3EA24043AB01EAC882D /* zcrypt-wallet */,
+			);
+			path = Sources;
+			sourceTree = "<group>";
+		};
+		04E5D6257FDC91B4C3238420 /* src */ = {
+			isa = PBXGroup;
+			children = (
+				5E82B009F001754DB889B497 /* chain.rs */,
+				BB9AB00CF896B578A95F4D95 /* lib.rs */,
+				74CFE04E1210E8593CA31E4F /* main.rs */,
+				C527FEDE3548017381283E9C /* privfs.rs */,
+			);
+			name = src;
+			path = ../../src;
+			sourceTree = "<group>";
+		};
+		0DF8A3D005F46AE84733083E /* Frameworks */ = {
+			isa = PBXGroup;
+			children = (
+				5537AF1BA3AE302238B1ADD0 /* CoreGraphics.framework */,
+				4FC6B8A3A0B9910DEF4016A9 /* libapp.a */,
+				11F715F358E71BE8C8ED7D1D /* Metal.framework */,
+				78CC28400A70326FCCD2C4A2 /* MetalKit.framework */,
+				FF976386DA6E50BCCCC2A88F /* QuartzCore.framework */,
+				EE7EA7AFAAB67EE0EFE63658 /* Security.framework */,
+				7A54B30298C9E0E2F4E89855 /* UIKit.framework */,
+				8B888555216CADEDBCC0C746 /* WebKit.framework */,
+			);
+			name = Frameworks;
+			sourceTree = "<group>";
+		};
+		21A6B3EA24043AB01EAC882D /* zcrypt-wallet */ = {
+			isa = PBXGroup;
+			children = (
+				03E3FD0A9871475E33651D69 /* main.mm */,
+				698F857C897B83413F112930 /* bindings */,
+			);
+			path = "zcrypt-wallet";
+			sourceTree = "<group>";
+		};
+		62554FE3ABEB8508A25BB533 /* Externals */ = {
+			isa = PBXGroup;
+			children = (
+			);
+			path = Externals;
+			sourceTree = "<group>";
+		};
+		698F857C897B83413F112930 /* bindings */ = {
+			isa = PBXGroup;
+			children = (
+				10F281F101855A5651C31431 /* bindings.h */,
+			);
+			path = bindings;
+			sourceTree = "<group>";
+		};
+		70B6AEA872B4FA909FADCAAA /* zcrypt-wallet_iOS */ = {
+			isa = PBXGroup;
+			children = (
+				E9DA96C3A3C6F25B7D83999B /* Info.plist */,
+				162E428AEC20BC939873C7BE /* zcrypt-wallet_iOS.entitlements */,
+			);
+			path = "zcrypt-wallet_iOS";
+			sourceTree = "<group>";
+		};
+		C5F7B674F9C0DAE5B074344E /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				4DF34A4BD22F095EEB029793 /* zcrypt-wallet_iOS.app */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+		CC63396409B8FE7E40A83DAC = {
+			isa = PBXGroup;
+			children = (
+				5E90297BA4DD1A615A4FCDB3 /* assets */,
+				C6A5A344FDEBBB41D30C4948 /* Assets.xcassets */,
+				D8ADAE8E03AD9A34A246ABCA /* LaunchScreen.storyboard */,
+				62554FE3ABEB8508A25BB533 /* Externals */,
+				0263048A78A62D95A3BC87D0 /* Sources */,
+				04E5D6257FDC91B4C3238420 /* src */,
+				70B6AEA872B4FA909FADCAAA /* zcrypt-wallet_iOS */,
+				0DF8A3D005F46AE84733083E /* Frameworks */,
+				C5F7B674F9C0DAE5B074344E /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		16E831EC177F165532B3D4E2 /* zcrypt-wallet_iOS */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 3D28AF63552379A9B99F30F3 /* Build configuration list for PBXNativeTarget "zcrypt-wallet_iOS" */;
+			buildPhases = (
+				9E958D7A64240B71F733957B /* Build Rust Code */,
+				57249656CBC97B87784215DD /* Sources */,
+				7657C41702B828180BD2B2ED /* Resources */,
+				46CC56B79D4C85E6B5221CB3 /* Frameworks */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = "zcrypt-wallet_iOS";
+			packageProductDependencies = (
+			);
+			productName = "zcrypt-wallet_iOS";
+			productReference = 4DF34A4BD22F095EEB029793 /* zcrypt-wallet_iOS.app */;
+			productType = "com.apple.product-type.application";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		5997B30B1AC2BD57F8B9FAFF /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = YES;
+				LastUpgradeCheck = 1430;
+				TargetAttributes = {
+					16E831EC177F165532B3D4E2 = {
+						DevelopmentTeam = HKWCZHR3TM;
+					};
+				};
+			};
+			buildConfigurationList = C6B01451FA62E339400A2784 /* Build configuration list for PBXProject "zcrypt-wallet" */;
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				Base,
+				en,
+			);
+			mainGroup = CC63396409B8FE7E40A83DAC;
+			minimizedProjectReferenceProxies = 1;
+			preferredProjectObjectVersion = 77;
+			productRefGroup = C5F7B674F9C0DAE5B074344E /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				16E831EC177F165532B3D4E2 /* zcrypt-wallet_iOS */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		7657C41702B828180BD2B2ED /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				C69FD98701318E28F4B4ECA4 /* Assets.xcassets in Resources */,
+				141D8CE807D5A936986CBF07 /* LaunchScreen.storyboard in Resources */,
+				F944CA5A8FB7C624638220DB /* assets in Resources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
+
+/* Begin PBXShellScriptBuildPhase section */
+		9E958D7A64240B71F733957B /* Build Rust Code */ = {
+			isa = PBXShellScriptBuildPhase;
+			alwaysOutOfDate = 1;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputFileListPaths = (
+			);
+			inputPaths = (
+			);
+			name = "Build Rust Code";
+			outputFileListPaths = (
+			);
+			outputPaths = (
+				"$(SRCROOT)/Externals/x86_64/${CONFIGURATION}/libapp.a",
+				"$(SRCROOT)/Externals/arm64/${CONFIGURATION}/libapp.a",
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "npm run -- tauri ios xcode-script -v --platform ${PLATFORM_DISPLAY_NAME:?} --sdk-root ${SDKROOT:?} --framework-search-paths \"${FRAMEWORK_SEARCH_PATHS:?}\" --header-search-paths \"${HEADER_SEARCH_PATHS:?}\" --gcc-preprocessor-definitions \"${GCC_PREPROCESSOR_DEFINITIONS:-}\" --configuration ${CONFIGURATION:?} ${FORCE_COLOR} ${ARCHS:?}";
+		};
+/* End PBXShellScriptBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		57249656CBC97B87784215DD /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				CEC8A9EC5E86771711C7BBA2 /* main.mm in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin XCBuildConfiguration section */
+		34D7CCEBAE86673A264FF9FB /* debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_EMBED_SWIFT_STANDARD_LIBRARIES = YES;
+				ARCHS = (
+					arm64,
+				);
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_ENTITLEMENTS = "zcrypt-wallet_iOS/zcrypt-wallet_iOS.entitlements";
+				CODE_SIGN_IDENTITY = "iPhone Developer";
+				DEVELOPMENT_TEAM = "HKWCZHR3TM";
+				ENABLE_BITCODE = NO;
+				"EXCLUDED_ARCHS[sdk=iphoneos*]" = x86_64;
+				FRAMEWORK_SEARCH_PATHS = (
+					"$(inherited)",
+					"\".\"",
+				);
+				INFOPLIST_FILE = "zcrypt-wallet_iOS/Info.plist";
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				"LIBRARY_SEARCH_PATHS[arch=arm64]" = "$(inherited) $(PROJECT_DIR)/Externals/arm64/$(CONFIGURATION) $(SDKROOT)/usr/lib/swift $(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift/$(PLATFORM_NAME) $(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift-5.0/$(PLATFORM_NAME)";
+				"LIBRARY_SEARCH_PATHS[arch=x86_64]" = "$(inherited) $(PROJECT_DIR)/Externals/x86_64/$(CONFIGURATION) $(SDKROOT)/usr/lib/swift $(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift/$(PLATFORM_NAME) $(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift-5.0/$(PLATFORM_NAME)";
+				PRODUCT_BUNDLE_IDENTIFIER = io.zcrypt.wallet;
+				PRODUCT_NAME = "ZCrypt Wallet";
+				SDKROOT = iphoneos;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				VALID_ARCHS = arm64;
+			};
+			name = debug;
+		};
+		55661ECA4C779BFB2ABA404B /* debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
+				CLANG_CXX_LIBRARY = "libc++";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_TESTABILITY = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_DYNAMIC_NO_PIC = NO;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					"$(inherited)",
+					"DEBUG=1",
+				);
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 15.0;
+				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
+				MTL_FAST_MATH = YES;
+				ONLY_ACTIVE_ARCH = YES;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = iphoneos;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG;
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+				SWIFT_VERSION = 5.0;
+			};
+			name = debug;
+		};
+		5735E67A4CE85649EE3CB1EB /* release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
+				CLANG_CXX_LIBRARY = "libc++";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				ENABLE_NS_ASSERTIONS = NO;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 15.0;
+				MTL_ENABLE_DEBUG_INFO = NO;
+				MTL_FAST_MATH = YES;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = iphoneos;
+				SWIFT_COMPILATION_MODE = wholemodule;
+				SWIFT_OPTIMIZATION_LEVEL = "-O";
+				SWIFT_VERSION = 5.0;
+			};
+			name = release;
+		};
+		5EFA80FB543C0DBF5C00D847 /* release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_EMBED_SWIFT_STANDARD_LIBRARIES = YES;
+				ARCHS = (
+					arm64,
+				);
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_ENTITLEMENTS = "zcrypt-wallet_iOS/zcrypt-wallet_iOS.entitlements";
+				CODE_SIGN_IDENTITY = "iPhone Developer";
+				DEVELOPMENT_TEAM = "HKWCZHR3TM";
+				ENABLE_BITCODE = NO;
+				"EXCLUDED_ARCHS[sdk=iphoneos*]" = x86_64;
+				FRAMEWORK_SEARCH_PATHS = (
+					"$(inherited)",
+					"\".\"",
+				);
+				INFOPLIST_FILE = "zcrypt-wallet_iOS/Info.plist";
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				"LIBRARY_SEARCH_PATHS[arch=arm64]" = "$(inherited) $(PROJECT_DIR)/Externals/arm64/$(CONFIGURATION) $(SDKROOT)/usr/lib/swift $(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift/$(PLATFORM_NAME) $(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift-5.0/$(PLATFORM_NAME)";
+				"LIBRARY_SEARCH_PATHS[arch=x86_64]" = "$(inherited) $(PROJECT_DIR)/Externals/x86_64/$(CONFIGURATION) $(SDKROOT)/usr/lib/swift $(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift/$(PLATFORM_NAME) $(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift-5.0/$(PLATFORM_NAME)";
+				PRODUCT_BUNDLE_IDENTIFIER = io.zcrypt.wallet;
+				PRODUCT_NAME = "ZCrypt Wallet";
+				SDKROOT = iphoneos;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				VALID_ARCHS = arm64;
+			};
+			name = release;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		3D28AF63552379A9B99F30F3 /* Build configuration list for PBXNativeTarget "zcrypt-wallet_iOS" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				34D7CCEBAE86673A264FF9FB /* debug */,
+				5EFA80FB543C0DBF5C00D847 /* release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = debug;
+		};
+		C6B01451FA62E339400A2784 /* Build configuration list for PBXProject "zcrypt-wallet" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				55661ECA4C779BFB2ABA404B /* debug */,
+				5735E67A4CE85649EE3CB1EB /* release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = debug;
+		};
+/* End XCConfigurationList section */
+	};
+	rootObject = 5997B30B1AC2BD57F8B9FAFF /* Project object */;
+}

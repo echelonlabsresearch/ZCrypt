@@ -5,7 +5,10 @@ edition.workspace = true
 license.workspace = true
 
 [features]
-default = []
+# The node's RocksDB consensus-state store. Off for wallets: a phone has no node, and the
+# RocksDB build does not cross-compile for the iOS simulator.
+default = ["state-db"]
+state-db = ["dep:rocksdb"]
 
 [dependencies]
 sha3.workspace = true
@@ -26,4 +29,4 @@ zcrypt-shield = { path = "../shield", default-features = false }
 ml-dsa = "0.1.1"
 bitcoin = "0.32"
 # Incremental consensus-state store (replaces full-file postcard dumps for live commit).
-rocksdb = { version = "0.22", default-features = true }
+rocksdb = { version = "0.22", default-features = true, optional = true }

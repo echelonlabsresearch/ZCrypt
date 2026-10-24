@@ -118,6 +118,41 @@ wallet's cross-chain swap screens are not ported.
 `coins.enc`, `settings.json` and `chain_id.txt` are written 0600. `settings.json` holds the
 bitcoind RPC password only in regtest / bitcoind mode; self-custody mode (default) needs none.
 
+## iOS app
+
+The same crate is the iPhone app: `src-tauri/src/lib.rs` is the wallet, `main.rs` the desktop
+binary, and `src-tauri/gen/apple` the generated Xcode project (committed; edit `project.yml`
+and `zcrypt-wallet_iOS/Info.plist`, never the `.xcodeproj`). Prerequisites: Xcode, CocoaPods,
+`rustup target add aarch64-apple-ios aarch64-apple-ios-sim` on the project toolchain, and a
+development team in `tauri.conf.json` (`bundle.iOS.developmentTeam`).
+
+```sh
+npx tauri ios dev "iPhone 17 Pro"                 # simulator, with the Vite dev server
+npx tauri ios build --export-method debugging      # signed IPA for a paired phone, in gen/apple/build/arm64
+xcrun devicectl device install app --device <udid> "src-tauri/gen/apple/build/arm64/ZCrypt Wallet.ipa"
+```
+
+What differs from the desktop build:
+
+* **Data** lives in the app's own sandbox (`app_data_dir`), not `~/.zcrypt`. Exports go to
+  the app's `Documents`, which the Files app can show (`UIFileSharingEnabled`).
+* **`.zcrypt` files open in the app.** The app owns the `io.zcrypt.payment` document type
+  (`CFBundleDocumentTypes` / `UTExportedTypeDeclarations` in `Info.plist`), so a bearer coin,
+  stealth note or receipt tapped in Mail, Messages, Files or AirDrop shows "Open in ZCrypt".
+  The Rust side receives it as `RunEvent::Opened`, queues the text (`take_opened_files`) and
+  emits `zcrypt-open`; the UI switches to Receive and credits it exactly as a dropped file. A
+  bearer coin is swept on the spot (the proof is built on the phone); the Inbox copy is deleted
+  after it is read. The same registration makes `.zcrypt` files open the desktop app on macOS.
+* **Prover self-test** (Settings): builds and verifies one full-size 2-in / 3-out proof and
+  reports time, proof size and peak memory for that device. The `selftest-on-launch` feature
+  runs it at startup and prints to stdout for measurement builds:
+  `npx tauri ios build --features selftest-on-launch`, then
+  `xcrun devicectl device process launch --console --device <udid> io.zcrypt.wallet`.
+* Tor is a setting the phone cannot satisfy (no local daemon): leave it off and talk to the
+  public RPC over HTTPS, as the default does.
+* Not yet: Face ID in front of the password, Keychain storage of the keystore, a `zcrypt:`
+  URL scheme, Android (`npx tauri android init` is the same shape).
+
 ## Signing and notarization (macOS)
 
 `bundle.macOS.signingIdentity` in `src-tauri/tauri.conf.json` is `null` so a build works

@@ -56,7 +56,16 @@ const TYPES = [
  * Receive: everything about getting paid in one place. Your addresses (normal, stealth,
  * Bitcoin), the drop zone that claims a coin file or an encrypted note, and the view key.
  */
-export default function Receive({ onReceived }: { onReceived: (r: ReceivedInfo) => void }) {
+export default function Receive({
+  onReceived,
+  incoming = "",
+  onConsumed,
+}: {
+  onReceived: (r: ReceivedInfo) => void;
+  /** Text of a `.zcrypt` file the OS opened with the app; credited as soon as it arrives. */
+  incoming?: string;
+  onConsumed?: () => void;
+}) {
   // Addresses & keys
   const [normal, setNormal] = useState("");
   const [btcAddr, setBtcAddr] = useState("");
@@ -90,6 +99,14 @@ export default function Receive({ onReceived }: { onReceived: (r: ReceivedInfo) 
   useEffect(() => {
     load();
   }, [load]);
+
+  // A file handed over by the OS behaves like a drop: show it, then credit it.
+  useEffect(() => {
+    if (!incoming || busy) return;
+    setBlob(incoming);
+    receive(incoming).finally(() => onConsumed?.());
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [incoming]);
 
   async function newStealth() {
     setErr("");

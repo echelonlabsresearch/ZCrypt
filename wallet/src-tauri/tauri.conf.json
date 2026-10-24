@@ -44,6 +44,21 @@
       "signingIdentity": null,
       "providerShortName": null,
       "entitlements": null
+    },
+    "fileAssociations": [
+      {
+        "ext": [
+          "zcrypt"
+        ],
+        "name": "ZCrypt payment",
+        "description": "A ZCrypt bearer coin, stealth note or payment receipt",
+        "mimeType": "application/x-zcrypt",
+        "role": "Viewer"
+      }
+    ],
+    "iOS": {
+      "developmentTeam": "HKWCZHR3TM",
+      "minimumSystemVersion": "15.0"
     }
   }
 }

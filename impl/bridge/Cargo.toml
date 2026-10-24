@@ -16,7 +16,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 ed25519-dalek = "2"
 sha2 = { workspace = true }
-zcrypt-core = { path = "../core" }
+zcrypt-core = { path = "../core", default-features = false }
 zcrypt-shield = { path = "../shield" }
 url = "2"                                        # strict loopback detection for the Tor bypass
 zeroize = { version = "1", features = ["derive"] }   # wipe BIP-39 seeds and HTLC keys

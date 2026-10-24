@@ -36,6 +36,7 @@ pub mod shield_tx;
 pub mod smt;
 pub mod spv;
 pub mod staking;
+#[cfg(feature = "state-db")]
 pub mod state_db;
 pub mod ws;
 pub mod zvm;

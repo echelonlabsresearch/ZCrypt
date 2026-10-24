@@ -5,11 +5,19 @@ edition = "2021"
 license = "MIT"
 description = "ZCrypt post-quantum wallet"
 
+[lib]
+name = "zcrypt_wallet_lib"
+# staticlib: the iOS app links the wallet in; cdylib: Android; rlib: the desktop binary and tests.
+crate-type = ["staticlib", "cdylib", "rlib"]
+
 [features]
 default = []
 # Devnet demo commands (off-chain mint_coins / send_coin for UI testing). OFF by default:
 # they credit or spend coins without any transaction and must never ship in a real build.
 devnet = []
+# Measurement builds only: run the prover self-test once at startup and print it to stdout
+# (`xcrun devicectl device process launch --console` shows it for a phone).
+selftest-on-launch = []
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
@@ -27,7 +35,7 @@ hex = "0.4"
 chacha20poly1305 = "0.10"
 ureq = { version = "2", features = ["json", "socks-proxy"] }
 base64 = "0.22"
-zcrypt-core = { path = "../../impl/core" }
+zcrypt-core = { path = "../../impl/core", default-features = false }
 zcrypt-shield = { path = "../../impl/shield" }
 zcrypt-bridge = { path = "../../impl/bridge" }
 bitcoin = "0.32"
@@ -36,6 +44,7 @@ argon2 = "0.5"
 ed25519-dalek = "2"   # sign validator BOND/DELEGATE txs
 sha2 = "0.10"         # validator/delegator id = SHA256(pubkey)[..20]
 zeroize = { version = "1", features = ["derive"] }   # wipe seeds / mnemonics / plaintext buffers on drop
+libc = "0.2"          # getrusage for the prover self-test's peak memory
 url = "2"             # strict node-URL policy (https or .onion for remote hosts) + loopback detection
 
 # Dependency advisories tracked (no fix available short of upstream Tauri / Plonky3 bumps):

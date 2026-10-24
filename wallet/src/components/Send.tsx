@@ -337,12 +337,12 @@ export default function Send({
             <div className="msg ok">
               {deliver === "stealth"
                 ? "Stealth note — share it with the recipient (any channel). Only their stealth key can open it, and nothing on-chain reveals the payment. The receipt is in History."
-                : "Bearer coin — send the file like a photo. Opening it credits their wallet the full amount. Until that claim is in a block, anyone who has the file can claim it first. The receipt is in History."}
+                : "Bearer coin — send the .zcrypt file like a photo. Opening it in the ZCrypt app credits their wallet the full amount. Until that claim is in a block, anyone who has the file can claim it first. The receipt is in History."}
             </div>
             <div className="mono-box">{file}</div>
             <ShareBar
               text={file}
-              filename={deliver === "stealth" ? "zcrypt-stealth-note.txt" : "zcrypt-bearer.txt"}
+              filename={deliver === "stealth" ? "zcrypt-stealth-note.zcrypt" : "zcrypt-bearer.zcrypt"}
             />
           </div>
         )}

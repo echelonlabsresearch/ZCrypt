@@ -1,6 +1,14 @@
 import { useEffect, useState } from "react";
 import { call, copySensitive } from "../lib/api";
 
+interface ProverSelftest {
+  prove_ms: number;
+  verify_ms: number;
+  proof_bytes: number;
+  peak_rss_mb: number;
+  threads: number;
+}
+
 interface NodeStatus {
   connected: boolean;
   height: number;
@@ -26,6 +34,20 @@ interface WalletSettings {
 }
 
 export default function Settings() {
+  const [testing, setTesting] = useState(false);
+  const [selftestRes, setSelftestRes] = useState<ProverSelftest | null>(null);
+  const [selftestErr, setSelftestErr] = useState("");
+  async function selftest() {
+    setTesting(true);
+    setSelftestErr("");
+    try {
+      setSelftestRes(await call<ProverSelftest>("prover_selftest"));
+    } catch (e) {
+      setSelftestErr(String(e));
+    } finally {
+      setTesting(false);
+    }
+  }
   const [pw, setPw] = useState("");
   const [phrase, setPhrase] = useState("");
   const [err, setErr] = useState("");
@@ -355,6 +377,39 @@ export default function Settings() {
           </>
         )}
         {err && <div className="msg err">{err}</div>}
+      </div>
+
+      <div className="card" style={{ marginTop: "1.2rem" }}>
+        <h2>🧪 Prover self-test</h2>
+        <div style={{ fontSize: "0.8rem", opacity: 0.7, marginBottom: "0.6rem" }}>
+          Every payment is a proof built on this device. This builds and checks one full-size
+          transfer proof without touching your wallet or the network, so you know how long a
+          payment takes here.
+        </div>
+        <button className="btn-secondary" disabled={testing} onClick={selftest}>
+          {testing ? "Proving…" : "Run self-test"}
+        </button>
+        {selftestErr && <div className="msg err" style={{ marginTop: "0.6rem" }}>{selftestErr}</div>}
+        {selftestRes && (
+          <>
+            <div className="card-row" style={{ marginTop: "0.6rem" }}>
+              <span>Prove</span>
+              <span style={{ color: "var(--color-cyan)" }}>{(selftestRes.prove_ms / 1000).toFixed(1)} s</span>
+            </div>
+            <div className="card-row">
+              <span>Verify</span>
+              <span style={{ color: "var(--color-cyan)" }}>{selftestRes.verify_ms} ms</span>
+            </div>
+            <div className="card-row">
+              <span>Proof size</span>
+              <span style={{ color: "var(--color-cyan)" }}>{(selftestRes.proof_bytes / 1024).toFixed(0)} KB</span>
+            </div>
+            <div className="card-row">
+              <span>Peak memory</span>
+              <span style={{ color: "var(--color-cyan)" }}>{selftestRes.peak_rss_mb} MB · {selftestRes.threads} cores</span>
+            </div>
+          </>
+        )}
       </div>
 
       <div className="card" style={{ marginTop: "1.2rem" }}>
