@@ -36,11 +36,64 @@ pub struct SignedTx {
     pub vout0: OutPoint,
     /// Fee paid (satoshis).
     pub fee: u64,
+    /// Inputs spent.
+    pub inputs: usize,
 }
 
 fn est_fee(n_in: usize, n_out: usize, fee_rate_sat_vb: f64) -> u64 {
     let vsize = VB_OVERHEAD + VB_INPUT * n_in as u64 + VB_OUTPUT * n_out as u64;
     (vsize as f64 * fee_rate_sat_vb).ceil() as u64
+}
+
+/// What one more P2WPKH input adds to the fee at this rate. A coin worth less than this
+/// costs more to spend than it brings in, so it is left alone (spending it would only
+/// shrink the amount that reaches the destination).
+fn input_cost(fee_rate_sat_vb: f64) -> u64 {
+    (VB_INPUT as f64 * fee_rate_sat_vb).ceil() as u64
+}
+
+/// Confirmed coins worth spending at this rate, largest first.
+fn spendable(utxos: &[WalletUtxo], fee_rate_sat_vb: f64) -> Vec<&WalletUtxo> {
+    let floor = input_cost(fee_rate_sat_vb);
+    let mut avail: Vec<&WalletUtxo> = utxos.iter().filter(|u| u.utxo.confirmed && u.utxo.value > floor).collect();
+    avail.sort_by(|a, b| b.utxo.value.cmp(&a.utxo.value));
+    avail
+}
+
+/// The most this wallet can send in ONE transaction at `fee_rate_sat_vb`, and the fee that
+/// transaction pays: every confirmed, economical coin goes in, one output comes out, no
+/// change. `(amount, fee, inputs)`. Feed `amount` to [`build_and_sign`] and it builds
+/// exactly that transaction, so nothing is left behind as unspendable dust.
+pub fn max_sendable(utxos: &[WalletUtxo], fee_rate_sat_vb: f64) -> Result<(u64, u64, usize), String> {
+    let fee_rate_sat_vb = crate::cap_fee_rate(fee_rate_sat_vb);
+    let avail = spendable(utxos, fee_rate_sat_vb);
+    if avail.is_empty() {
+        let pending: u64 = utxos.iter().filter(|u| !u.utxo.confirmed).map(|u| u.utxo.value).sum();
+        return Err(if pending > 0 {
+            format!("no confirmed coins to spend yet ({pending} sat still unconfirmed)")
+        } else {
+            format!("no coins worth spending at {fee_rate_sat_vb:.1} sat/vB")
+        });
+    }
+    let mut total: u64 = 0;
+    for u in &avail {
+        total = total.checked_add(u.utxo.value).ok_or("utxo values overflow u64: refusing to build from this coin set")?;
+    }
+    let fee = est_fee(avail.len(), 1, fee_rate_sat_vb);
+    let amount = total.saturating_sub(fee);
+    if amount <= DUST {
+        return Err(format!(
+            "balance {total} sat is too small to move: the fee alone is {fee} sat at {fee_rate_sat_vb:.1} sat/vB"
+        ));
+    }
+    // The same quarter-of-amount cap `build_and_sign` enforces, said up front.
+    let floor = est_fee(avail.len(), 1, 1.0);
+    if fee > (amount / crate::MAX_FEE_FRACTION_DEN).max(floor) {
+        return Err(format!(
+            "balance {total} sat is too small to move at {fee_rate_sat_vb:.1} sat/vB: the {fee} sat fee would be more              than a quarter of it; try a slower fee, or wait for a quieter fee market"
+        ));
+    }
+    Ok((amount, fee, avail.len()))
 }
 
 /// `amount + fee` without wrapping (an absurd amount is an error, not a tiny target).
@@ -50,8 +103,11 @@ fn need(amount: u64, fee: u64) -> Result<u64, String> {
 
 /// Build + sign a transaction paying `amount` to `dest_spk`, funded from the wallet's
 /// `utxos`, with change back to `change_spk`. `fee_rate_sat_vb` sets the fee. Selects the
-/// fewest (largest-first) confirmed inputs that cover amount + fee; drops dust change into
-/// the fee. Signs every input with BIP-143 P2WPKH.
+/// fewest (largest-first) confirmed, economical inputs that cover amount + fee; drops dust
+/// change into the fee, and when the inputs cover the amount plus a one-output fee but not a
+/// change output, builds the one-output transaction instead of failing (this is how a "send
+/// everything" amount from [`max_sendable`] goes through). Signs every input with BIP-143
+/// P2WPKH.
 pub fn build_and_sign(
     wallet: &HdWallet,
     utxos: &[WalletUtxo],
@@ -67,9 +123,8 @@ pub fn build_and_sign(
     // that would eat more than a quarter of the amount (dust-level amounts excepted by the
     // relay floor). The chosen fee is returned in `SignedTx.fee` so a UI can show it.
     let fee_rate_sat_vb = crate::cap_fee_rate(fee_rate_sat_vb);
-    // Spend confirmed coins only, largest first (fewest inputs).
-    let mut avail: Vec<&WalletUtxo> = utxos.iter().filter(|u| u.utxo.confirmed).collect();
-    avail.sort_by(|a, b| b.utxo.value.cmp(&a.utxo.value));
+    // Spend confirmed, economical coins only, largest first (fewest inputs).
+    let avail = spendable(utxos, fee_rate_sat_vb);
 
     // Accumulate inputs until they cover amount + the fee for the current input count
     // (assume 2 outputs: destination + change).
@@ -87,20 +142,24 @@ pub fn build_and_sign(
         }
     }
     let fee_two_out = est_fee(chosen.len(), 2, fee_rate_sat_vb);
+    let fee_one_out = est_fee(chosen.len(), 1, fee_rate_sat_vb);
     let need_two_out = need(amount, fee_two_out)?;
-    if in_total < need_two_out {
+    let need_one_out = need(amount, fee_one_out)?;
+    if in_total < need_one_out {
         let have = in_total;
+        let pending: u64 = utxos.iter().filter(|u| !u.utxo.confirmed).map(|u| u.utxo.value).sum();
+        let pending_note = if pending > 0 { format!("; {pending} sat more is still unconfirmed") } else { String::new() };
         return Err(format!(
-            "insufficient funds: need ~{need_two_out} sat (amount {amount} + fee), confirmed balance {have} sat across {} coin(s)",
+            "insufficient funds: need ~{need_one_out} sat (amount {amount} + fee), confirmed balance {have} sat across {} coin(s){pending_note}",
             chosen.len()
         ));
     }
 
-    // Decide change: if the change output would be dust, drop it (add to fee, 1 output).
-    let change = in_total - amount - fee_two_out;
+    // Decide change: a change output needs the inputs to cover its own fee share AND must be
+    // worth more than dust; otherwise the whole remainder is fee and the tx has one output.
     let mut outputs = vec![TxOut { value: Amount::from_sat(amount), script_pubkey: dest_spk }];
-    let fee = if change > DUST {
-        outputs.push(TxOut { value: Amount::from_sat(change), script_pubkey: change_spk });
+    let fee = if in_total >= need_two_out && in_total - need_two_out > DUST {
+        outputs.push(TxOut { value: Amount::from_sat(in_total - need_two_out), script_pubkey: change_spk });
         fee_two_out
     } else {
         // No change output: everything above `amount` IS the fee the network collects, so
@@ -110,8 +169,8 @@ pub fn build_and_sign(
     };
     debug_assert_eq!(in_total, outputs.iter().map(|o| o.value.to_sat()).sum::<u64>() + fee);
     // Bridge M4: refuse to pay more than a quarter of the amount in fees (the relay floor for
-    // a 1-in/2-out P2WPKH tx at 1 sat/vB is the only exception, for dust-level amounts).
-    let floor = est_fee(chosen.len(), 2, 1.0);
+    // this transaction's shape at 1 sat/vB is the only exception, for dust-level amounts).
+    let floor = est_fee(chosen.len(), outputs.len(), 1.0);
     if fee > (amount / crate::MAX_FEE_FRACTION_DEN).max(floor) {
         return Err(format!(
             "refusing to build: fee {fee} sats exceeds a quarter of the {amount}-sat amount \
@@ -176,6 +235,7 @@ pub fn build_and_sign(
         hex,
         vout0: OutPoint { txid, vout: 0 },
         fee,
+        inputs: chosen.len(),
     })
 }
 
@@ -292,6 +352,61 @@ mod tests {
         let change = w.change_address(0).unwrap().script_pubkey();
         let err = build_and_sign(&w, &utxos, dest, amount, change, rate).unwrap_err();
         assert!(err.contains("exceeds a quarter"), "{err}");
+    }
+
+    #[test]
+    fn one_output_tx_when_inputs_cover_the_amount_but_not_a_change_output() {
+        // Inputs cover amount + a one-output fee, but not amount + a two-output fee. The old
+        // builder called that insufficient; it is a perfectly good one-output transaction.
+        let w = HdWallet::from_mnemonic(MN, "", Network::Signet).unwrap();
+        let rate = 3.0;
+        let amount = 80_000;
+        let in_value = amount + est_fee(1, 1, rate) + 20; // 20 sat short of the two-output fee
+        assert!(in_value < amount + est_fee(1, 2, rate));
+        let utxos = vec![wu(0, 0, in_value, 0xe7)];
+        let dest = w.receive_address(1).unwrap().script_pubkey();
+        let change = w.change_address(0).unwrap().script_pubkey();
+        let signed = build_and_sign(&w, &utxos, dest, amount, change, rate).unwrap();
+        let raw = hex::decode(&signed.hex).unwrap();
+        let tx: Transaction = bitcoin::consensus::encode::deserialize(&raw).unwrap();
+        assert_eq!(tx.output.len(), 1);
+        assert_eq!(tx.output[0].value.to_sat(), amount);
+        assert_eq!(signed.fee, in_value - amount);
+    }
+
+    #[test]
+    fn max_sendable_drains_every_economical_coin_into_one_output() {
+        let w = HdWallet::from_mnemonic(MN, "", Network::Signet).unwrap();
+        let rate = 4.0;
+        // Three spendable coins, one unconfirmed coin, and one dust coin worth less than
+        // the fee its own input would add (68 vB x 4 = 272 sat).
+        let mut utxos = vec![wu(0, 0, 50_000, 0x01), wu(0, 1, 30_000, 0x02), wu(1, 0, 7_000, 0x03), wu(0, 2, 200, 0x04)];
+        let mut pending = wu(0, 3, 90_000, 0x05);
+        pending.utxo.confirmed = false;
+        utxos.push(pending);
+        let (amount, fee, n) = max_sendable(&utxos, rate).unwrap();
+        assert_eq!(n, 3, "the dust coin and the unconfirmed coin stay out");
+        assert_eq!(fee, est_fee(3, 1, rate));
+        assert_eq!(amount, 87_000 - fee);
+        // The amount it quotes is exactly what build_and_sign then builds: one output, no change.
+        let dest = w.receive_address(1).unwrap().script_pubkey();
+        let change = w.change_address(0).unwrap().script_pubkey();
+        let signed = build_and_sign(&w, &utxos, dest, amount, change, rate).unwrap();
+        let raw = hex::decode(&signed.hex).unwrap();
+        let tx: Transaction = bitcoin::consensus::encode::deserialize(&raw).unwrap();
+        assert_eq!(tx.input.len(), 3);
+        assert_eq!(tx.output.len(), 1);
+        assert_eq!(tx.output[0].value.to_sat(), amount);
+        assert_eq!(signed.fee, fee);
+    }
+
+    #[test]
+    fn max_sendable_refuses_a_balance_the_fee_would_eat() {
+        let utxos = vec![wu(0, 0, 1_200, 0x11)];
+        let err = max_sendable(&utxos, 10.0).unwrap_err();
+        assert!(err.contains("too small"), "{err}");
+        let err = max_sendable(&[], 10.0).unwrap_err();
+        assert!(err.contains("no coins"), "{err}");
     }
 
     #[test]

@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
-import { call, toBase, toBaseAsset, fmtAsset } from "../lib/api";
+import { call, toBaseAsset, fmtAsset } from "../lib/api";
 
 /** Every shielded asset uses 8 decimals — one standard for all of them (like BTC/zBTC),
  *  so users never have to pick and amounts always mean the same thing. */
@@ -13,12 +13,7 @@ interface MinterAsset {
   balance: number;
 }
 
-export default function Mint({ onMinted }: { onMinted: (amount: number) => void }) {
-  // ZCRYPT devnet faucet
-  const [amount, setAmount] = useState("");
-  const [busy, setBusy] = useState(false);
-  const [err, setErr] = useState("");
-
+export default function Mint({ onMinted }: { onMinted: () => void }) {
   // Shielded-asset mint
   const [ticker, setTicker] = useState("");
   const [aAmount, setAAmount] = useState("");
@@ -36,22 +31,6 @@ export default function Mint({ onMinted }: { onMinted: (amount: number) => void 
   useEffect(() => {
     loadMine();
   }, [loadMine]);
-
-  async function fund() {
-    setErr("");
-    const base = toBase(amount);
-    if (!base || base <= 0) return setErr("Enter a valid amount.");
-    setBusy(true);
-    try {
-      await call<number>("fund_onchain", { amount: base });
-      setAmount("");
-      onMinted(base);
-    } catch (e) {
-      setErr(String(e));
-    } finally {
-      setBusy(false);
-    }
-  }
 
   async function mintAsset() {
     setAErr("");
@@ -74,7 +53,7 @@ export default function Mint({ onMinted }: { onMinted: (amount: number) => void 
       await call<string>("mint_asset", { ticker: t, amount: base, decimals: dec, maxSupply: cap });
       setAOk(`✓ Minted ${aAmount} ${t}. It's now in Send, and in "Assets you mint" below.`);
       setAAmount("");
-      onMinted(0);
+      onMinted();
       loadMine();
     } catch (e) {
       setAErr(String(e));
@@ -95,7 +74,7 @@ export default function Mint({ onMinted }: { onMinted: (amount: number) => void 
 
   return (
     <div>
-      <h2 className="view-title">💎 Mint (devnet)</h2>
+      <h2 className="view-title">💎 Mint</h2>
 
       {mine.length > 0 && (
         <div className="card" style={{ maxWidth: 560, margin: "0 auto 1.2rem" }}>
@@ -160,23 +139,6 @@ export default function Mint({ onMinted }: { onMinted: (amount: number) => void 
         </button>
       </div>
 
-      <div className="card" style={{ maxWidth: 560, margin: "1.2rem auto 0" }}>
-        <h2>🚰 Devnet faucet (test ZCRYPT)</h2>
-        <div className="warn" style={{ marginBottom: "0.8rem" }}>
-          <b>This is not how ZCRYPT is issued.</b> Real ZCRYPT enters supply only via <b>block rewards</b> —
-          bond stake and claim them in the <b>Rewards</b> tab — plus the one-time foundation allocation. This
-          faucet just seeds <i>test</i> ZCRYPT so you can exercise the wallet on devnet; it has no place on
-          mainnet.
-        </div>
-        <div className="field">
-          <label>Amount (test ZCRYPT)</label>
-          <input value={amount} onChange={(e) => setAmount(e.target.value)} placeholder="0.0" inputMode="decimal" />
-        </div>
-        {err && <div className="msg err">{err}</div>}
-        <button className="btn-secondary btn-block" disabled={busy} onClick={fund}>
-          {busy ? "Seeding…" : "🚰 Get test ZCRYPT"}
-        </button>
-      </div>
     </div>
   );
 }

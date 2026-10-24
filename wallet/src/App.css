@@ -701,3 +701,144 @@ label {
   opacity: 0.65;
   letter-spacing: 0.02em;
 }
+
+/* ---------- portfolio (front page) ---------- */
+.dash-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  margin-bottom: 1.2rem;
+}
+.asset-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+  gap: 0.9rem;
+}
+.asset-tile {
+  background: var(--color-bg-light);
+  border: 1px solid var(--color-border);
+  border-radius: 10px;
+  padding: 1rem 1.1rem;
+  min-height: 112px;
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+}
+.asset-tile.primary {
+  border: 2px solid var(--color-green);
+  box-shadow: 0 0 16px rgba(0, 255, 0, 0.12);
+}
+.asset-tile-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 0.5rem;
+}
+.asset-ticker {
+  font-weight: bold;
+  letter-spacing: 0.08em;
+  white-space: nowrap;
+}
+.asset-kind {
+  font-size: 0.68rem;
+  opacity: 0.5;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  white-space: nowrap;
+}
+.asset-amount {
+  font-size: 1.55rem;
+  font-weight: bold;
+  font-variant-numeric: tabular-nums;
+  margin: 0.5rem 0 0.3rem;
+  color: var(--color-text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.asset-amount.dim {
+  opacity: 0.35;
+}
+.asset-sub {
+  font-size: 0.74rem;
+  opacity: 0.65;
+}
+.dash-foot {
+  margin-top: 1.1rem;
+  font-size: 0.78rem;
+  opacity: 0.55;
+  text-align: center;
+}
+
+/* ---------- receive: addresses beside the drop zone ---------- */
+.receive-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 1.2rem;
+  align-items: stretch;
+}
+@media (max-width: 860px) {
+  .receive-grid {
+    grid-template-columns: 1fr;
+  }
+}
+.addr-box {
+  background: var(--color-bg);
+  border: 1px solid var(--color-border);
+  border-radius: 8px;
+  padding: 0.7rem 0.8rem;
+}
+.addr-box code {
+  color: var(--color-cyan);
+  word-break: break-all;
+  font-size: 0.9rem;
+  line-height: 1.5;
+}
+.dropzone.compact {
+  min-height: 0;
+  padding: 1.2rem 0;
+  gap: 0.6rem;
+}
+.dropzone.compact .drop-icon {
+  font-size: 2.2rem;
+}
+details.card.guide > summary {
+  cursor: pointer;
+  color: var(--color-cyan);
+  font-weight: bold;
+  font-size: 1.05rem;
+}
+details.card.guide[open] > summary {
+  margin-bottom: 0.4rem;
+}
+
+/* ---------- history: one list, rows open to their receipt ---------- */
+.tx-card.expandable {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 0;
+}
+.tx-row {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  width: 100%;
+}
+.tx-card.expandable .tx-row {
+  cursor: pointer;
+}
+.tx-card.expandable:hover {
+  border-left-color: var(--color-cyan);
+}
+.tx-chevron {
+  color: var(--color-cyan);
+  font-size: 0.9rem;
+  width: 1rem;
+  text-align: center;
+}
+.tx-detail {
+  margin-top: 0.9rem;
+  padding-top: 0.9rem;
+  border-top: 1px dashed var(--color-border);
+}

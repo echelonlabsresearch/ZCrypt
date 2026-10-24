@@ -202,10 +202,10 @@ npm run tauri:dev          # run in dev (compiles the Rust backend first — a f
 npm run tauri:build        # binaries land in wallet/src-tauri/target/release/bundle/
 ```
 
-In the app: **Settings → Consensus Node**, point it at your chain
-(`http://localhost:36657` for the single-node stack, `http://localhost:46657` for the
-3-node stack; Tor is ON by default and fails closed, so either run a local Tor daemon or
-toggle it off for a localhost node), then:
+In the app the default node is the public `https://rpc.zcrypt.network`, with Tor off, so
+a fresh install works out of the box. For a local chain go to **Settings → Consensus Node**
+and point it at `http://localhost:36657` (single-node stack) or `http://localhost:46657`
+(3-node stack); a localhost node is always reached directly, Tor or not. Then:
 
 - **Fund** (Mint tab) seeds coins into the pool via `0x56` (devnet builds only).
 - **Send** builds a real hidden-amount shield tx and broadcasts it: one proof with the

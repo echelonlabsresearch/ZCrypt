@@ -30,6 +30,9 @@ export default function Rewards({
     stake: number;
     commission_pct: number;
     ever_bonded: boolean;
+    signed_this_epoch: number;
+    epoch_progress: number;
+    epoch_blocks: number;
   };
   const [ident, setIdent] = useState<ValidatorIdentity | null>(null);
   const [identErr, setIdentErr] = useState("");
@@ -300,9 +303,26 @@ export default function Rewards({
             {ident.bonded ? (
               <>
                 <div className="msg ok" style={{ fontSize: "0.8rem" }}>
-                  Active: {fmt(ident.stake)} ZCRYPT staked at {ident.commission_pct}% commission. Rewards accrue to this
-                  wallet every 100 blocks; claim them above.
+                  Bonded: {fmt(ident.stake)} ZCRYPT staked at {ident.commission_pct}% commission. Rewards accrue to this
+                  wallet every {ident.epoch_blocks || 100} blocks; claim them above.
                 </div>
+                {ident.epoch_progress >= 5 && ident.signed_this_epoch === 0 ? (
+                  <div className="msg err" style={{ fontSize: "0.8rem" }}>
+                    <b>Your node is not signing.</b> The chain has seen 0 signatures from this key in the {ident.epoch_progress}{" "}
+                    blocks of the current epoch, so no rewards accrue. Bonding is done from this wallet, but blocks are signed by
+                    a node running with this identity. Either no node is running, or it runs with its own key instead of the{" "}
+                    <code>.env</code> line under <b>Node setup</b>: install that line before the node's first start (an existing
+                    node must be stopped, its data volume removed, and started again).
+                  </div>
+                ) : ident.signed_this_epoch > 0 ? (
+                  <div className="msg ok" style={{ fontSize: "0.8rem" }}>
+                    ✓ Your node is signing: {ident.signed_this_epoch} of {ident.epoch_progress} blocks so far this epoch.
+                  </div>
+                ) : (
+                  <div style={{ fontSize: "0.78rem", opacity: 0.65 }}>
+                    Epoch just started; the signing check needs a few more blocks.
+                  </div>
+                )}
                 <button className="btn-secondary btn-block" style={{ marginTop: "0.6rem" }} disabled={bonding} onClick={unbond}>
                   {bonding ? "Working on-chain…" : "Unbond (stake returns after 10 days)"}
                 </button>
@@ -344,8 +364,9 @@ export default function Rewards({
                   {bonding ? "Bonding on-chain…" : `Bond ${stake || "?"} ZCRYPT`}
                 </button>
                 <div style={{ fontSize: "0.72rem", opacity: 0.6, marginTop: "0.5rem" }}>
-                  The stake is pledged (burned) from this wallet and comes back after a 10-day unbond. Your node joins the
-                  active set on the next block.
+                  The stake is pledged (burned) from this wallet and comes back after a 10-day unbond. Bonding puts this key in
+                  the active set on the next block; a node running with it (Node setup above) must then sign, or no rewards
+                  accrue. This card shows whether it does.
                 </div>
               </>
             )}

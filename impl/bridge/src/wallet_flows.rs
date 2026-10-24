@@ -186,6 +186,79 @@ pub fn redeem_claim_is_safe(confirmations: u64, min_conf: u64, locktime: u32, bt
     Ok(())
 }
 
+/// How soon a plain Bitcoin send should confirm, as the Esplora fee-estimate target it
+/// asks for. `Normal` is the wallet's confirmation depth (at least 3 blocks), which is what
+/// bridge funding has always used; `Fast` aims at the next couple of blocks; `Slow` accepts
+/// about a day, the cheapest estimate Esplora publishes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SendSpeed {
+    Fast,
+    Normal,
+    Slow,
+}
+
+impl SendSpeed {
+    pub fn parse(s: &str) -> Result<Self, String> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "fast" => Ok(SendSpeed::Fast),
+            "" | "normal" => Ok(SendSpeed::Normal),
+            "slow" | "economy" => Ok(SendSpeed::Slow),
+            other => Err(format!("unknown fee speed `{other}` (fast, normal or slow)")),
+        }
+    }
+    fn target(self, sc: &crate::selfcustody::SelfCustodyBtc) -> u32 {
+        match self {
+            SendSpeed::Fast => 2,
+            SendSpeed::Normal => sc.conf_target().max(3),
+            SendSpeed::Slow => 144,
+        }
+    }
+}
+
+/// What a plain send would pay right now, before anything is signed.
+#[derive(Clone, Debug)]
+pub struct SendQuote {
+    /// Satoshis that reach the destination.
+    pub amount_sats: u64,
+    /// Satoshis the network collects.
+    pub fee_sats: u64,
+    /// The clamped rate the quote was made at.
+    pub fee_rate_sat_vb: f64,
+    /// Inputs the transaction would spend.
+    pub inputs: usize,
+}
+
+/// The fee rate for `speed`, from Esplora, clamped like every other rate the bridge uses.
+fn send_fee_rate(sc: &crate::selfcustody::SelfCustodyBtc, speed: SendSpeed) -> Result<f64, String> {
+    sc.esplora.fee_rate_sat_vb(speed.target(sc))
+}
+
+/// Quote a send of `amount` to `dest` at `speed`: the fee the real build would pay, found
+/// by running the real builder against the wallet's current coins and signing nothing that
+/// is broadcast. The same coin selection, the same fee cap, so the quote is the truth.
+pub fn selfcustody_quote(
+    sc: &crate::selfcustody::SelfCustodyBtc,
+    dest: &bitcoin::Address,
+    amount: Amount,
+    speed: SendSpeed,
+) -> Result<SendQuote, String> {
+    let utxos = sc.esplora.wallet_utxos(&sc.hd)?;
+    let fee_rate = send_fee_rate(sc, speed)?;
+    // Change goes to a derived address either way; which index does not affect the fee.
+    let change = sc.hd.change_address(0)?.script_pubkey();
+    let signed = crate::txbuilder::build_and_sign(&sc.hd, &utxos, dest.script_pubkey(), amount.to_sat(), change, fee_rate)?;
+    Ok(SendQuote { amount_sats: amount.to_sat(), fee_sats: signed.fee, fee_rate_sat_vb: fee_rate, inputs: signed.inputs })
+}
+
+/// The most the wallet can send in one transaction at `speed`, with the fee that pays:
+/// every confirmed, economical coin, one output, no change left behind.
+pub fn selfcustody_max(sc: &crate::selfcustody::SelfCustodyBtc, speed: SendSpeed) -> Result<SendQuote, String> {
+    let utxos = sc.esplora.wallet_utxos(&sc.hd)?;
+    let fee_rate = send_fee_rate(sc, speed)?;
+    let (amount_sats, fee_sats, inputs) = crate::txbuilder::max_sendable(&utxos, fee_rate)?;
+    Ok(SendQuote { amount_sats, fee_sats, fee_rate_sat_vb: fee_rate, inputs })
+}
+
 /// Pay `amount` from the self-custody wallet to an external `dest` address: build, sign
 /// and broadcast through Esplora with the wallet's own keys. Returns the txid and the fee
 /// paid (satoshis). Nothing but the signed transaction leaves the process.
@@ -193,10 +266,11 @@ pub fn selfcustody_send(
     sc: &crate::selfcustody::SelfCustodyBtc,
     dest: &bitcoin::Address,
     amount: Amount,
+    speed: SendSpeed,
 ) -> Result<(bitcoin::Txid, u64), String> {
     let change = sc.fresh_change_address()?.script_pubkey();
     let utxos = sc.esplora.wallet_utxos(&sc.hd)?;
-    let fee_rate = sc.esplora.fee_rate_sat_vb(sc.conf_target().max(3))?;
+    let fee_rate = send_fee_rate(sc, speed)?;
     let signed = crate::txbuilder::build_and_sign(&sc.hd, &utxos, dest.script_pubkey(), amount.to_sat(), change, fee_rate)?;
     sc.esplora.broadcast(&signed.hex)?;
     Ok((signed.txid, signed.fee))

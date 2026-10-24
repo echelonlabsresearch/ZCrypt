@@ -58,6 +58,11 @@ export default function Settings() {
   const [tor, setTor] = useState<TorStatus | null>(null);
   const [jitter, setJitter] = useState(true);
   const [pinned, setPinned] = useState<string | null>(null);
+  // Bitcoin (self-custody): which network, and which Esplora server answers for it.
+  const [btcNetwork, setBtcNetwork] = useState("bitcoin");
+  const [esploraUrl, setEsploraUrl] = useState("");
+  const [btcSaved, setBtcSaved] = useState(false);
+  const [btcErr, setBtcErr] = useState("");
 
   useEffect(() => {
     call<WalletSettings>("get_settings")
@@ -67,6 +72,8 @@ export default function Settings() {
         setTorEnabled(!!s.tor_enabled);
         setTorProxy(s.tor_proxy || "127.0.0.1:9050");
         setJitter(s.broadcast_jitter !== false);
+        setBtcNetwork(s.btc_network || "bitcoin");
+        setEsploraUrl(s.esplora_url || "");
       })
       .catch(() => {});
     checkNode();
@@ -105,6 +112,36 @@ export default function Settings() {
 
   async function saveNode() {
     await saveSettings({ node_url: nodeUrl.trim() });
+  }
+
+  async function saveBitcoin() {
+    setBtcErr("");
+    const merged: WalletSettings = {
+      ...(full ?? {
+        node_url: nodeUrl.trim(),
+        btc_url: "http://localhost:18443",
+        btc_user: "zcrypt",
+        btc_pass: "zcrypt",
+        btc_wallet: "demo",
+        btc_network: "bitcoin",
+        btc_selfcustody: true,
+        esplora_url: "https://blockstream.info/api",
+        tor_enabled: torEnabled,
+        tor_proxy: torProxy.trim() || "127.0.0.1:9050",
+        broadcast_jitter: jitter,
+      }),
+      btc_network: btcNetwork,
+      esplora_url: esploraUrl.trim(),
+    };
+    try {
+      await call("save_settings", { settings: merged });
+    } catch (e) {
+      setBtcErr(String(e));
+      return;
+    }
+    setFull(merged);
+    setBtcSaved(true);
+    setTimeout(() => setBtcSaved(false), 1500);
   }
 
   async function checkNode() {
@@ -149,11 +186,12 @@ export default function Settings() {
         <h2>🌐 Consensus Node</h2>
         <div className="field" style={{ marginTop: "0.8rem" }}>
           <label>CometBFT RPC URL</label>
-          <input value={nodeUrl} onChange={(e) => setNodeUrl(e.target.value)} placeholder="http://localhost:36657" />
+          <input value={nodeUrl} onChange={(e) => setNodeUrl(e.target.value)} placeholder="https://rpc.zcrypt.network" />
           <div style={{ fontSize: "0.76rem", opacity: 0.6, marginTop: "0.3rem" }}>
-            A remote node must be <code>https://</code> or a Tor <code>.onion</code> address. Plain <code>http://</code> is
-            accepted only for a node on this machine, because unencrypted RPC lets anyone on the path read and alter your
-            queries and transactions.
+            The public node <code>https://rpc.zcrypt.network</code> is the default and works out of the box. A remote node
+            must be <code>https://</code> or a Tor <code>.onion</code> address; plain <code>http://</code> is accepted only
+            for a node on this machine (<code>http://localhost:36657</code> for a local devnet), because unencrypted RPC lets
+            anyone on the path read and alter your queries and transactions.
           </div>
         </div>
         <div style={{ display: "flex", gap: "0.6rem", alignItems: "center", flexWrap: "wrap" }}>
@@ -186,21 +224,53 @@ export default function Settings() {
             <>🔏 No chain pinned yet: the first node you connect to defines the chain your signatures bind to.</>
           )}
         </div>
-        <div className="warn" style={{ marginTop: "0.9rem" }}>
-          Local devnet default is <code style={{ color: "var(--color-cyan)" }}>http://localhost:36657</code> (the
-          Docker compose chain). The height only advances when a transaction is
-          submitted — empty blocks are disabled, so a stable height while idle is
-          normal, not a stall. Fund or Send and you'll see it move.
+        <div style={{ fontSize: "0.78rem", opacity: 0.6, marginTop: "0.9rem" }}>
+          The node operator sees your IP and which blocks you fetch, not your keys, amounts or addresses. Turn on Tor below
+          to hide the IP as well. A local devnet with empty blocks disabled holds a stable height while idle; that is not a
+          stall.
         </div>
+      </div>
+
+      <div className="card" style={{ marginTop: "1.2rem" }}>
+        <h2>₿ Bitcoin</h2>
+        <div style={{ fontSize: "0.82rem", opacity: 0.75, marginBottom: "0.7rem" }}>
+          Your Bitcoin keys come from the same recovery phrase (BIP-84). Balances, fee estimates and broadcasts go through
+          an <b>Esplora</b> server, which therefore learns your Bitcoin addresses. Use your own, or route it over Tor.
+        </div>
+        <div className="field">
+          <label>Network</label>
+          <select value={btcNetwork} onChange={(e) => setBtcNetwork(e.target.value)}>
+            <option value="bitcoin">Bitcoin mainnet</option>
+            <option value="signet">Signet (test coins)</option>
+            <option value="testnet4">Testnet4 (test coins)</option>
+            <option value="regtest">Regtest (local bitcoind)</option>
+          </select>
+        </div>
+        <div className="field">
+          <label>Esplora URL</label>
+          <input value={esploraUrl} onChange={(e) => setEsploraUrl(e.target.value)} placeholder="https://blockstream.info/api" />
+          <div style={{ fontSize: "0.76rem", opacity: 0.6, marginTop: "0.3rem" }}>
+            Must match the network: mainnet <code>https://blockstream.info/api</code> or <code>https://mempool.space/api</code>;
+            signet <code>https://mempool.space/signet/api</code>; testnet4 <code>https://mempool.space/testnet4/api</code>.
+            Remote servers must be <code>https://</code> or <code>.onion</code>. Regtest ignores this and uses the local
+            bitcoind wallet.
+          </div>
+        </div>
+        <div style={{ display: "flex", gap: "0.6rem", alignItems: "center", flexWrap: "wrap" }}>
+          <button className="btn-primary" onClick={saveBitcoin}>{btcSaved ? "✓ Saved" : "Save Bitcoin settings"}</button>
+          <span style={{ fontSize: "0.78rem", opacity: 0.6 }}>Check the balance from the Portfolio tab; it is never fetched on its own.</span>
+        </div>
+        {btcErr && <div className="msg err">{btcErr}</div>}
       </div>
 
       <div className="card" style={{ marginTop: "1.2rem" }}>
         <h2>🧅 Tor Privacy</h2>
         <div style={{ fontSize: "0.82rem", opacity: 0.75, marginBottom: "0.7rem" }}>
-          When enabled, the wallet reaches the node <b>only through a local Tor proxy</b>, so the node operator and
-          anyone on the network path can't tie your IP to the coins you look up. <b>On by default</b> and fail-closed.
-          Queries, broadcasts and bridge traffic each use their own Tor circuit. Requires a Tor daemon running locally
-          (hostnames, including <code>.onion</code>, resolve inside Tor, so there are no DNS leaks).
+          When enabled, the wallet reaches the node and the Esplora server <b>only through a local Tor proxy</b>, so the
+          operators and anyone on the network path can't tie your IP to the coins you look up. <b>Off by default</b> so
+          the wallet works out of the box; once on it is fail-closed. Queries, broadcasts and bridge traffic each use
+          their own Tor circuit. Requires a Tor daemon running locally (hostnames, including <code>.onion</code>, resolve
+          inside Tor, so there are no DNS leaks).
         </div>
         <label style={{ display: "flex", alignItems: "center", gap: "0.6rem", cursor: "pointer" }}>
           <input

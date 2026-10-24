@@ -23,6 +23,27 @@ interface BtcWallet {
 
 const btcFmt = (n: number) => n.toLocaleString(undefined, { maximumFractionDigits: 8 });
 
+/** Exact BTC string for a satoshi count (no float formatting). */
+const satsToBtc = (sats: number) => {
+  const whole = Math.floor(sats / 1e8);
+  const frac = String(sats % 1e8).padStart(8, "0").replace(/0+$/, "");
+  return frac ? `${whole}.${frac}` : String(whole);
+};
+
+type Speed = "fast" | "normal" | "slow";
+const SPEED_LABEL: Record<Speed, string> = {
+  fast: "Fast — next couple of blocks",
+  normal: "Normal — about an hour",
+  slow: "Slow — about a day, cheapest",
+};
+
+interface BtcQuote {
+  amount_sats: number;
+  fee_sats: number;
+  fee_rate_sat_vb: number;
+  inputs: number;
+}
+
 export default function Send({
   active,
   onSent,
@@ -43,6 +64,12 @@ export default function Send({
   const [okMsg, setOkMsg] = useState("");
   const [onchainOk, setOnchainOk] = useState(false);
   const [file, setFile] = useState("");
+  // Bitcoin: fee speed, a live quote from the same builder that signs, and "Max".
+  const [speed, setSpeed] = useState<Speed>("normal");
+  const [quote, setQuote] = useState<BtcQuote | null>(null);
+  const [quoteErr, setQuoteErr] = useState("");
+  const [quoting, setQuoting] = useState(false);
+  const [maxBusy, setMaxBusy] = useState(false);
 
   const loadAssets = useCallback(() => {
     call<HeldAsset[]>("held_assets").then(setAssets).catch(() => {});
@@ -58,6 +85,52 @@ export default function Send({
 
   const isBtc = sel === "btc";
   const asset = assets.find((a) => String(a.asset_id) === sel) ?? FALLBACK;
+
+  // Quote the Bitcoin fee whenever the address, amount or speed changes (debounced). The
+  // quote runs the real coin selection, so what it says is what the send will pay.
+  useEffect(() => {
+    if (!isBtc) return;
+    setQuote(null);
+    setQuoteErr("");
+    const addr = recipient.trim();
+    const amt = amount.trim();
+    if (!addr || !amt) return;
+    let sats: number;
+    try {
+      sats = toBaseAsset(amt, 8);
+    } catch {
+      return;
+    }
+    if (sats <= 0) return;
+    const t = setTimeout(async () => {
+      setQuoting(true);
+      try {
+        setQuote(await call<BtcQuote>("estimate_btc_send", { address: addr, btc: amt, speed }));
+        setQuoteErr("");
+      } catch (e) {
+        setQuote(null);
+        setQuoteErr(String(e));
+      } finally {
+        setQuoting(false);
+      }
+    }, 500);
+    return () => clearTimeout(t);
+  }, [isBtc, recipient, amount, speed]);
+
+  async function useMax() {
+    setMaxBusy(true);
+    setErr("");
+    try {
+      const q = await call<BtcQuote>("btc_max_send", { speed });
+      setAmount(satsToBtc(q.amount_sats));
+      setQuote(q);
+      setQuoteErr("");
+    } catch (e) {
+      setQuoteErr(String(e));
+    } finally {
+      setMaxBusy(false);
+    }
+  }
 
   function resetOutputs() {
     setErr("");
@@ -75,13 +148,14 @@ export default function Send({
         const sats = toBaseAsset(amount, 8);
         if (!sats || sats <= 0) throw new Error("Enter a valid BTC amount.");
         const btcAmt = sats / 1e8;
-        if (btc && btcAmt > btc.balance) throw new Error("Amount exceeds your BTC balance.");
         if (!recipient.trim()) throw new Error("Enter a Bitcoin address.");
-        const txid = await call<string>("withdraw_btc", { address: recipient.trim(), btc: amount.trim() });
-        setOkMsg(`✓ Withdrew ${btcFmt(btcAmt)} BTC — txid ${txid.slice(0, 16)}…`);
-        toast("BTC withdrawn", `${btcFmt(btcAmt)} BTC sent on-chain`);
+        const txid = await call<string>("withdraw_btc", { address: recipient.trim(), btc: amount.trim(), speed });
+        const feeNote = quote ? ` (fee ${quote.fee_sats.toLocaleString()} sat)` : "";
+        setOkMsg(`✓ Sent ${btcFmt(btcAmt)} BTC${feeNote} — txid ${txid}`);
+        toast("BTC sent", `${btcFmt(btcAmt)} BTC broadcast on the Bitcoin network`);
         setAmount("");
         setRecipient("");
+        setQuote(null);
         onSent();
         loadAssets();
         return;
@@ -128,7 +202,7 @@ export default function Send({
   }
 
   const availLabel = isBtc
-    ? `Amount (BTC) — available ${btcFmt(btc?.balance ?? 0)}`
+    ? `Amount (BTC) — ${btcFmt(btc?.balance ?? 0)} on your deposit address`
     : `Amount (${asset.ticker}) — available ${fmtAsset(asset.balance, asset.decimals)}`;
 
   return (
@@ -154,11 +228,22 @@ export default function Send({
           </select>
           {isBtc && (
             <div style={{ fontSize: "0.8rem", opacity: 0.7, marginTop: "0.5rem" }}>
-              Withdraw real on-chain Bitcoin to any external address. To move BTC <b>privately</b>, shield it to
-              zBTC in the Bridge tab, then send zBTC here.
+              Real on-chain Bitcoin to any external address, signed here with keys from your phrase. To move BTC{" "}
+              <b>privately</b>, shield it to zBTC in the Bridge tab, then send zBTC here.
             </div>
           )}
         </div>
+
+        {isBtc && (
+          <div className="field">
+            <label>Fee</label>
+            <select value={speed} onChange={(e) => setSpeed(e.target.value as Speed)}>
+              {(Object.keys(SPEED_LABEL) as Speed[]).map((k) => (
+                <option key={k} value={k}>{SPEED_LABEL[k]}</option>
+              ))}
+            </select>
+          </div>
+        )}
 
         {!isBtc && (
           <div className="field">
@@ -185,7 +270,30 @@ export default function Send({
 
         <div className="field">
           <label>{availLabel}</label>
-          <input value={amount} onChange={(e) => setAmount(e.target.value)} placeholder="0.0" inputMode="decimal" />
+          <div style={{ display: "flex", gap: "0.5rem", alignItems: "center" }}>
+            <input value={amount} onChange={(e) => setAmount(e.target.value)} placeholder="0.0" inputMode="decimal" style={{ flex: 1 }} />
+            {isBtc && (
+              <button className="copy-btn" disabled={maxBusy} onClick={useMax} title="Everything in the wallet after the fee, in one transaction, nothing left behind">
+                {maxBusy ? "…" : "Max"}
+              </button>
+            )}
+          </div>
+          {isBtc && (
+            <div style={{ fontSize: "0.76rem", opacity: 0.72, marginTop: "0.4rem", minHeight: "1.1em" }}>
+              {quoting ? (
+                "Pricing the transaction…"
+              ) : quote ? (
+                <>
+                  Fee <b>{quote.fee_sats.toLocaleString()} sat</b> at {quote.fee_rate_sat_vb.toFixed(1)} sat/vB · {quote.inputs} input{quote.inputs === 1 ? "" : "s"} ·
+                  recipient gets <b>{satsToBtc(quote.amount_sats)} BTC</b>. Priced by the same builder that signs: the fee is never more than a quarter of the amount, and change below dust goes to the miner, not to a coin you cannot spend.
+                </>
+              ) : quoteErr ? (
+                <span style={{ color: "var(--color-yellow)" }}>{quoteErr}</span>
+              ) : (
+                "Enter an address and an amount to see the fee before you send. Max sends everything spendable in one transaction."
+              )}
+            </div>
+          )}
         </div>
 
         {!isBtc && deliver !== "bearer" && (
@@ -206,10 +314,10 @@ export default function Send({
         <button className="btn-primary btn-block" disabled={busy} onClick={submit}>
           {busy
             ? isBtc
-              ? "Sending…"
+              ? "Signing & broadcasting…"
               : "Proving…"
             : isBtc
-            ? "₿ Withdraw BTC"
+            ? "₿ Send BTC"
             : deliver === "bearer"
             ? "💠 Create Bearer Coin"
             : "📤 Send"}

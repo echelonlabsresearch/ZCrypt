@@ -46,7 +46,12 @@ monospace, glow effects).
 Point the wallet at your node in **Settings → Consensus Node** (default
 `http://localhost:36657`). Then:
 
-- **Fund (Mint tab)** → seeds two coins into the node's commitment tree (`0x56`).
+- **Portfolio** (front page) → one tile per asset held: ZCRYPT, each shielded asset, and
+  Bitcoin L1 (checked on click only, since that asks the Esplora server about your address).
+- **Receive** → your normal address and Bitcoin deposit address, the drop zone for bearer
+  coins / stealth notes / receipts, stealth addresses with their backup keys, and the view key.
+- **Devnet faucet** → the `0x56` faucet (`fund_onchain`) is still a backend command the live
+  test uses, but it has no button; real ZCRYPT comes from block rewards and bearer coins.
   One coin is enough to spend: a ZCRYPT send burns its gas inside its own proof.
 - **Send** → builds a real hidden-amount shield tx (up to 2 inputs, each hidden in
   the whole pool, 3 outputs + encrypted notes), broadcast via `broadcast_tx_commit`.

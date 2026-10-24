@@ -164,6 +164,10 @@ struct HistItem {
     /// formats each row correctly instead of assuming ZCRYPT's 6 (which showed 3 as 300).
     #[serde(default = "default_decimals")]
     decimals: u8,
+    /// The saved payment receipt this row produced (`PaymentReceipt::id`), or empty. A
+    /// send or a bearer coin has one; the History view opens it under the row.
+    #[serde(default)]
+    receipt_id: String,
 }
 
 /// A local proof that this wallet created an output. It lives in the encrypted
@@ -595,6 +599,7 @@ impl Wallet {
             HistItem {
                 tx_id: format!("{kind}-{t}"),
                 kind: kind.into(),
+                receipt_id: String::new(),
                 amount,
                 counterparty,
                 timestamp: t,
@@ -621,10 +626,20 @@ impl Wallet {
         let commitment = zcrypt_shield::commit_asset(amount, blind, owner_pk, asset_id);
         let t = self.tick();
         let decimals = if asset_id == zcrypt_shield::ASSET_ZCRYPT { 6 } else { 8 };
+        let id = format!("receipt-{t}");
+        // Attach it to the history row it belongs to: the newest send or bearer row for
+        // this asset that has no receipt yet (the row is pushed just before the receipt).
+        if let Some(h) = self
+            .history
+            .iter_mut()
+            .find(|h| h.receipt_id.is_empty() && h.asset_id == asset_id && (h.kind == "send" || h.kind == "bearer"))
+        {
+            h.receipt_id = id.clone();
+        }
         self.receipts.insert(
             0,
             PaymentReceipt {
-                id: format!("receipt-{t}"),
+                id,
                 kind: kind.into(),
                 amount,
                 asset_id,
@@ -1995,10 +2010,11 @@ struct Settings {
     /// or route over Tor.
     #[serde(default = "default_esplora_url")]
     esplora_url: String,
-    /// Route node RPC through a local Tor SOCKS proxy (default ON for privacy).
-    /// When on and the node is not localhost, RPC goes via SOCKS so the wallet's IP
-    /// and query pattern stay hidden. Localhost/127.0.0.1 skips Tor automatically
-    /// (devnet). Requires a Tor daemon on `tor_proxy` for remote nodes.
+    /// Route node RPC through a local Tor SOCKS proxy. Off by default so a fresh install
+    /// talks to the public node without a Tor daemon; when on and the node is not
+    /// localhost, RPC goes via SOCKS so the wallet's IP and query pattern stay hidden.
+    /// Localhost/127.0.0.1 skips Tor automatically (devnet). Requires a Tor daemon on
+    /// `tor_proxy` for remote nodes, and fails closed without one.
     #[serde(default = "default_tor_enabled")]
     tor_enabled: bool,
     /// Local Tor SOCKS5 listener (Tor daemon default `127.0.0.1:9050`; Tor Browser
@@ -2036,15 +2052,18 @@ fn default_esplora_url() -> String {
     "https://blockstream.info/api".into()
 }
 fn default_tor_enabled() -> bool {
-    true
+    false
 }
+/// The public ZCrypt node a fresh install talks to. Over https, so the URL policy in
+/// `chain::check_node_url` admits it without Tor; a local devnet is `http://localhost:36657`.
+const DEFAULT_NODE_URL: &str = "https://rpc.zcrypt.network";
 fn default_tor_proxy() -> String {
     "127.0.0.1:9050".into()
 }
 impl Default for Settings {
     fn default() -> Self {
         Settings {
-            node_url: "http://localhost:36657".into(),
+            node_url: DEFAULT_NODE_URL.into(),
             btc_url: default_btc_url(),
             btc_user: default_btc_user(),
             btc_pass: default_btc_pass(),
@@ -2346,10 +2365,20 @@ mod tor_tests {
     const SENTINEL: &str = "socks5://127.0.0.1:1";
 
     #[test]
-    fn tor_on_by_default_skips_localhost_and_normalizes_when_remote() {
-        // Default: Tor enabled, but default node is localhost → still direct.
-        let mut s = Settings::default();
-        assert!(s.tor_enabled);
+    fn fresh_install_is_direct_to_the_public_node_over_https() {
+        // Out of the box: Tor off, the public https node, so the wallet works without a Tor
+        // daemon and the URL policy accepts the node (remote + https).
+        let s = Settings::default();
+        assert!(!s.tor_enabled);
+        assert_eq!(s.node_url, "https://rpc.zcrypt.network");
+        chain::check_node_url(&s.node_url).expect("default node passes the URL policy");
+        assert_eq!(tor_proxy_url(&s), None, "Tor off → direct");
+    }
+
+    #[test]
+    fn tor_on_skips_localhost_and_normalizes_when_remote() {
+        // Tor enabled, but a localhost node → still direct.
+        let mut s = Settings { tor_enabled: true, node_url: "http://localhost:36657".into(), ..Default::default() };
         assert_eq!(tor_proxy_url(&s), None, "localhost node must not use Tor");
 
         // Remote node + bare host:port -> normalized to a socks5:// URL.
@@ -2384,7 +2413,7 @@ mod tor_tests {
         // THE M8 FIX: Tor ON + a REMOTE node + a blank/whitespace proxy must NOT go direct
         // (which would leak the wallet IP). It routes to the unusable sentinel so the request
         // fails closed. Previously this returned None → direct → IP leak.
-        let mut s = Settings { node_url: "http://node.example:26657".into(), ..Default::default() };
+        let mut s = Settings { tor_enabled: true, node_url: "http://node.example:26657".into(), ..Default::default() };
         for blank in ["", "   ", "\t "] {
             s.tor_proxy = blank.into();
             assert_eq!(
@@ -2401,8 +2430,7 @@ mod tor_tests {
     fn enabled_loopback_target_stays_direct_even_with_blank_proxy() {
         // A loopback node is never Tor-routed (Tor can't reach a local process), so a blank
         // proxy there is still DIRECT — not fail-closed. This is the intended exception.
-        let mut s = Settings::default();
-        assert!(s.tor_enabled);
+        let mut s = Settings { tor_enabled: true, ..Default::default() };
         for loop_url in ["http://localhost:36657", "http://127.0.0.1:36657"] {
             s.node_url = loop_url.into();
             s.tor_proxy = "".into();
@@ -4623,6 +4651,13 @@ struct ValidatorIdentity {
     /// Whether an unbond is in flight for this validator's reward keys is reported by
     /// `my_unbonding`; this flags that the key has a pending nonce history (ever bonded).
     ever_bonded: bool,
+    /// Blocks this validator has signed in the current reward epoch, per the node's own
+    /// participation count. Zero while bonded means the node is not signing with this key.
+    signed_this_epoch: u64,
+    /// Blocks elapsed in the current epoch, and the epoch length. Together with
+    /// `signed_this_epoch` the UI can say "signed 56 of 56" or "signed 0 of 56".
+    epoch_progress: u64,
+    epoch_blocks: u64,
 }
 
 /// This wallet's validator identity and its current on-chain state.
@@ -4660,7 +4695,42 @@ async fn validator_identity(state: State<'_, AppState>) -> R<ValidatorIdentity> 
         .and_then(|s| s.trim().parse::<u64>().ok())
         .map(|n| n > 0)
         .unwrap_or(false);
-    ok(ValidatorIdentity { pubkey_hex, env_line, bonded, stake, commission_pct, ever_bonded })
+    let (signed_this_epoch, epoch_progress, epoch_blocks) = validator_participation(&url, &pubkey_hex);
+    ok(ValidatorIdentity {
+        pubkey_hex,
+        env_line,
+        bonded,
+        stake,
+        commission_pct,
+        ever_bonded,
+        signed_this_epoch,
+        epoch_progress,
+        epoch_blocks,
+    })
+}
+
+/// `(signed_this_epoch, epoch_progress, epoch_blocks)` for a consensus key, from the node's
+/// `/staking/validators_json` report. Zeros when the node cannot answer or the key is not
+/// bonded. This is the one number that says whether the validator is really running: the
+/// chain counts the signatures it sees, so a bonded key whose node is offline, or runs with a
+/// different `priv_validator_key.json`, shows zero.
+fn validator_participation(url: &str, pubkey_hex: &str) -> (u64, u64, u64) {
+    let Ok(raw) = chain::query_str(url, "/staking/validators_json") else {
+        return (0, 0, 0);
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return (0, 0, 0);
+    };
+    let progress = v["epoch_progress"].as_u64().unwrap_or(0);
+    let epoch = v["epoch_blocks"].as_u64().unwrap_or(0);
+    let signed = v["validators"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|x| x["consensus_pubkey"].as_str().is_some_and(|k| k.eq_ignore_ascii_case(pubkey_hex)))
+        .and_then(|x| x["signed_this_epoch"].as_u64())
+        .unwrap_or(0);
+    (signed, progress, epoch)
 }
 
 /// Bond this wallet's validator: allocate a fresh reward key, sign the BOND with the
@@ -7004,19 +7074,78 @@ fn btc_wallet_snapshot(state: &State<AppState>) -> BtcWallet {
 }
 
 /// Withdraw real BTC from your wallet to an external Bitcoin address.
+/// A Bitcoin send quote for the UI: what reaches the destination, what the network takes,
+/// and the rate it was priced at. `amount_sats` is the amount the caller asked for, or, from
+/// `btc_max_send`, the most the wallet can send in one transaction.
+#[derive(Serialize)]
+struct BtcSendQuote {
+    amount_sats: u64,
+    fee_sats: u64,
+    fee_rate_sat_vb: f64,
+    inputs: usize,
+}
+
+fn btc_quote(q: zcrypt_bridge::wallet_flows::SendQuote) -> BtcSendQuote {
+    BtcSendQuote { amount_sats: q.amount_sats, fee_sats: q.fee_sats, fee_rate_sat_vb: q.fee_rate_sat_vb, inputs: q.inputs }
+}
+
+/// The fee a send of `btc` to `address` would pay right now at `speed` (fast, normal, slow),
+/// priced by the same builder that signs the real transaction. Self-custody only: a bitcoind
+/// wallet (regtest) sets its own fee and this returns an error the UI treats as "no quote".
 #[tauri::command]
-async fn withdraw_btc(address: String, btc: String, state: State<'_, AppState>) -> R<String> {
+async fn estimate_btc_send(address: String, btc: String, speed: String, state: State<'_, AppState>) -> R<BtcSendQuote> {
     let sats = parse_decimal_units(&btc, 8)?;
     if sats == 0 {
         return Err("enter a BTC amount".into());
     }
+    let speed = zcrypt_bridge::wallet_flows::SendSpeed::parse(&speed)?;
+    let Some(sc) = selfcustody_wallet(&state, 0)? else {
+        return Err("fee quotes need self-custody mode; the bitcoind wallet sets its own fee".into());
+    };
+    let dest = zcrypt_bridge::parse_address(address.trim(), sc.network())?;
+    zcrypt_bridge::wallet_flows::selfcustody_quote(&sc, &dest, bitcoin::Amount::from_sat(sats), speed)
+        .map(btc_quote)
+        .and_then(ok)
+}
+
+/// The most this wallet can send in one Bitcoin transaction at `speed`, after the fee:
+/// every confirmed coin worth spending, one output, nothing left behind. The UI's "Max".
+#[tauri::command]
+async fn btc_max_send(speed: String, state: State<'_, AppState>) -> R<BtcSendQuote> {
+    let speed = zcrypt_bridge::wallet_flows::SendSpeed::parse(&speed)?;
+    let Some(sc) = selfcustody_wallet(&state, 0)? else {
+        return Err("Max needs self-custody mode; with a bitcoind wallet enter the amount by hand".into());
+    };
+    zcrypt_bridge::wallet_flows::selfcustody_max(&sc, speed).map(btc_quote).and_then(ok)
+}
+
+/// The wallet's Bitcoin deposit address, derived locally from the recovery phrase (BIP-84
+/// receive/0) with no network call, so showing it reveals nothing to anyone. Regtest with a
+/// bitcoind wallet asks bitcoind for one.
+#[tauri::command]
+async fn btc_deposit_address(state: State<'_, AppState>) -> R<String> {
+    if let Some(sc) = selfcustody_wallet(&state, 0)? {
+        return sc.receive_address().map(|a| a.to_string()).and_then(ok);
+    }
+    let client = btc_client(&state)?;
+    client.new_address().map(|a| a.to_string()).and_then(ok)
+}
+
+/// Send `btc` to `address` at `speed` (fast, normal, slow; empty means normal).
+#[tauri::command]
+async fn withdraw_btc(address: String, btc: String, speed: Option<String>, state: State<'_, AppState>) -> R<String> {
+    let sats = parse_decimal_units(&btc, 8)?;
+    if sats == 0 {
+        return Err("enter a BTC amount".into());
+    }
+    let speed = zcrypt_bridge::wallet_flows::SendSpeed::parse(speed.as_deref().unwrap_or(""))?;
     let amt = bitcoin::Amount::from_sat(sats);
     let _op = BridgeOpGuard::enter();
     // Self-custody (real networks): sign locally and broadcast through Esplora; the
     // bitcoind wallet is only the regtest / self-custody-off path (wallet L11).
     if let Some(sc) = selfcustody_wallet(&state, 0)? {
         let dest = zcrypt_bridge::parse_address(address.trim(), sc.network())?;
-        let (txid, _fee) = zcrypt_bridge::wallet_flows::selfcustody_send(&sc, &dest, amt)?;
+        let (txid, _fee) = zcrypt_bridge::wallet_flows::selfcustody_send(&sc, &dest, amt, speed)?;
         return ok(txid.to_string());
     }
     let client = btc_client(&state)?;
@@ -8580,6 +8709,9 @@ fn main() {
             list_pending_redeems,
             bridge_retry_redeem_claim,
             btc_wallet_info,
+            btc_deposit_address,
+            estimate_btc_send,
+            btc_max_send,
             withdraw_btc,
             mint_asset,
             my_assets,
@@ -8949,7 +9081,7 @@ mod live_3node {
             assert!(btcw.connected, "regtest bitcoind is the wallet backend");
             assert!(!btcw.deposit_address.is_empty(), "bitcoind issued a deposit address");
             assert!(btcw.balance > 0.01, "carol's bitcoind balance {}", btcw.balance);
-            let txid = v(withdraw_btc(btcw.deposit_address, "0.001".into(), carol.st())).expect("withdraw btc");
+            let txid = v(withdraw_btc(btcw.deposit_address, "0.001".into(), None, carol.st())).expect("withdraw btc");
             assert_eq!(txid.len(), 64, "bitcoin txid, got {txid}");
             println!(
                 "[wallet] bridge_init {zbtc_id}, mature {mature}, {} BTC in the bitcoind wallet, withdrew 0.001 ({txid})",

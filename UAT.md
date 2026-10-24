@@ -111,8 +111,9 @@ Point Settings → Consensus Node at a running devnet (`http://localhost:36657` 
 or `46657` for the 3-node). Toggle Tor OFF for localhost. Then walk:
 
 1. **Create wallet** → write down the 24-word mnemonic → lock → **restore** from it → same address returns.
-2. **Fund** (devnet faucet) → balance appears.
-3. **Send** → to a **stealth address** (Addresses tab) and a **bearer** coin (hand-off string); scan/receive on the other side.
+2. Get coins in: receive a **bearer** coin from another wallet (drop it on **Receive**), claim block
+   rewards, or on a devnet call `fund_onchain` (the faucet has no button any more) → balance appears.
+3. **Send** → to a **stealth address** (made under Receive) and a **bearer** coin (hand-off string); scan/receive on the other side.
 4. **Assets** → register + mint a shielded asset (e.g. `GOLD`) → send it → recipient receives; ZCRYPT pays the gas.
 5. **Rewards** → (after bonding a validator + an epoch) claim → spendable coin appears.
 6. **Foundation dry-run** → restore the foundation mnemonic → Rewards shows 50k → Claim → spendable coin; explorer shows `50k claimed`.

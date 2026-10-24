@@ -1,16 +1,15 @@
 import { useEffect, useState, useCallback } from "react";
-import { call, fmt, fmtAsset, trunc, copy, copySensitive, clearSensitiveClipboard } from "./lib/api";
+import { call, fmt, fmtAsset, trunc, copySensitive, clearSensitiveClipboard } from "./lib/api";
 import Balance from "./components/Balance";
 import Send from "./components/Send";
 import Receive from "./components/Receive";
-import Addresses from "./components/Addresses";
 import History from "./components/History";
 import Mint from "./components/Mint";
 import Rewards from "./components/Rewards";
 import Bridge from "./components/Bridge";
 import Settings from "./components/Settings";
 
-type Tab = "balance" | "receive" | "send" | "addresses" | "history" | "mint" | "rewards" | "bridge" | "settings";
+type Tab = "balance" | "receive" | "send" | "history" | "mint" | "rewards" | "bridge" | "settings";
 type Mode = "loading" | "choose" | "create" | "restore" | "seed" | "unlock" | "ready";
 
 interface Toast {
@@ -336,7 +335,7 @@ export default function App() {
   }
 
   // ---------- main app ----------
-  const tabs: Tab[] = ["balance", "receive", "send", "addresses", "history", "mint", "rewards", "bridge", "settings"];
+  const tabs: Tab[] = ["balance", "receive", "send", "history", "mint", "rewards", "bridge", "settings"];
   return (
     <div className="app">
       <header className="header">
@@ -354,7 +353,7 @@ export default function App() {
         <div className="nav-tabs">
           {tabs.map((t) => (
             <button key={t} className={`nav-tab ${tab === t ? "active" : ""}`} onClick={() => setTab(t)}>
-              {t}
+              {t === "balance" ? "portfolio" : t}
             </button>
           ))}
         </div>
@@ -411,14 +410,11 @@ export default function App() {
         <div style={{ display: tab === "send" ? "block" : "none" }}>
           <Send active={tab === "send"} onSent={refresh} toast={toast} />
         </div>
-        <div style={{ display: tab === "addresses" ? "block" : "none" }}>
-          <Addresses />
-        </div>
         <div style={{ display: tab === "history" ? "block" : "none" }}>
           <History active={tab === "history"} />
         </div>
         <div style={{ display: tab === "mint" ? "block" : "none" }}>
-          <Mint onMinted={(a) => { refresh(); toast("Minted", `+${fmt(a)} ZCRYPT`); }} />
+          <Mint onMinted={() => { refresh(); toast("Minted", "The new asset is in your portfolio and under Send."); }} />
         </div>
         <div style={{ display: tab === "rewards" ? "block" : "none" }}>
           <Rewards active={tab === "rewards"} onClaimed={(a) => { refresh(); toast("Rewards Claimed", `+${fmt(a)} ZCRYPT now spendable`); }} />
@@ -432,12 +428,9 @@ export default function App() {
       </main>
 
       <footer className="footer">
-        <span className="util">Your Address:</span>
-        <code onClick={() => { copy(address); toast("Copied", "Address copied to clipboard."); }} title={address}>
-          {trunc(address, 22, 8)}
-        </code>
-        <span className="spacer" />
         <span className="util">post-quantum · amounts hidden · whole-pool anonymity</span>
+        <span className="spacer" />
+        <button className="btn-link" style={{ fontSize: "0.8rem" }} onClick={() => setTab("receive")}>your addresses → Receive</button>
       </footer>
 
       <div className="toast-stack">
