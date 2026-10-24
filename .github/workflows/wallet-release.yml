@@ -3,8 +3,10 @@
 # A tag vX.Y.Z (or a manual run that names an existing tag) builds the desktop
 # wallet and uploads installers to a DRAFT prerelease:
 #   * macOS Apple-silicon DMG, Developer ID signed, notarized, and stapled
-#   * Windows x64 NSIS setup.exe. No Authenticode certificate is configured,
-#     so SmartScreen warns on first install.
+#   * Windows x64 MSI (WiX). Authenticode-signed through Azure Artifact Signing (the
+#     service formerly called Trusted Signing) when the six ARTIFACT_SIGNING_* / AZURE_*
+#     secrets below are set; without them the MSI is unsigned and Defender's reputation
+#     heuristics flag it (Program:Win32/*!ml), so only ship an unsigned MSI for testing.
 #   * Linux .deb and AppImage (built on Ubuntu 22.04 so the AppImage's glibc
 #     stays old enough for current desktop distros)
 #   * SHA256SUMS for those files
@@ -26,6 +28,13 @@
 #   APPLE_ID                     Apple ID email
 #   APPLE_PASSWORD               app-specific password
 #   APPLE_TEAM_ID                10-character team id
+#
+# Windows signing (Azure Artifact Signing; optional, the job only warns when unset):
+#   AZURE_TENANT_ID, AZURE_CLIENT_ID, AZURE_CLIENT_SECRET   an app registration with the
+#                                 "Code Signing Certificate Profile Signer" role
+#   ARTIFACT_SIGNING_ENDPOINT     e.g. https://weu.codesigning.azure.net
+#   ARTIFACT_SIGNING_ACCOUNT      the Artifact Signing account name
+#   ARTIFACT_SIGNING_PROFILE      the certificate profile name
 #
 # tauri-action notarizes the .app. Gatekeeper checks the .dmg a browser
 # saved. A notarized app inside an image with no ticket of its own is
@@ -144,7 +153,7 @@ jobs:
           notes=$(cat <<EOF
           ZCrypt Wallet ${TAG}
 
-          Desktop installers built from this tag. The macOS DMG is Developer ID signed, notarized, and stapled. Windows ships an NSIS setup.exe (not Authenticode-signed). Linux ships a .deb and an AppImage. Verify every file against SHA256SUMS before opening it.
+          Desktop installers built from this tag. The macOS DMG is Developer ID signed, notarized, and stapled. Windows ships an MSI, Authenticode-signed through Azure Artifact Signing when the release was built with the signing secrets. Linux ships a .deb and an AppImage. Verify every file against SHA256SUMS before opening it.
 
           This tag also publishes the ABCI image. The wallet build does not enable the devnet feature.
 
@@ -195,7 +204,7 @@ jobs:
             cargo_jobs: "2"
           - id: windows
             runner: windows-latest
-            bundles: nsis
+            bundles: msi
             cargo_jobs: "2"
     env:
       CARGO_BUILD_JOBS: ${{ matrix.cargo_jobs }}
@@ -324,10 +333,43 @@ jobs:
           fi
           echo "Apple signing secrets are set"
 
+      - name: Windows code signing (Azure Artifact Signing)
+        if: matrix.id == 'windows'
+        shell: bash
+        env:
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+          ARTIFACT_SIGNING_ENDPOINT: ${{ secrets.ARTIFACT_SIGNING_ENDPOINT }}
+          ARTIFACT_SIGNING_ACCOUNT: ${{ secrets.ARTIFACT_SIGNING_ACCOUNT }}
+          ARTIFACT_SIGNING_PROFILE: ${{ secrets.ARTIFACT_SIGNING_PROFILE }}
+        run: |
+          set -euo pipefail
+          missing=""
+          for name in AZURE_TENANT_ID AZURE_CLIENT_ID AZURE_CLIENT_SECRET ARTIFACT_SIGNING_ENDPOINT ARTIFACT_SIGNING_ACCOUNT ARTIFACT_SIGNING_PROFILE; do
+            if [ -z "${!name}" ]; then missing="$missing $name"; fi
+          done
+          if [ -n "$missing" ]; then
+            echo "::warning::Windows MSI is NOT signed: missing secret(s)$missing. Defender will flag it; set them before a public release."
+            echo "SIGN_CONFIG_ARGS=" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          case "$ARTIFACT_SIGNING_ENDPOINT" in https://*.codesigning.azure.net) ;; *) echo "ARTIFACT_SIGNING_ENDPOINT must be an https://<region>.codesigning.azure.net URL" >&2; exit 1 ;; esac
+          cargo install artifact-signing-cli --version 0.12.0
+          # Tauri runs signCommand for every PE it bundles (the exe, then the MSI); %1 is the file.
+          printf '{"bundle":{"windows":{"signCommand":"artifact-signing-cli -e %s -a %s -c %s -d ZCrypt-Wallet %%1"}}}\n' \
+            "$ARTIFACT_SIGNING_ENDPOINT" "$ARTIFACT_SIGNING_ACCOUNT" "$ARTIFACT_SIGNING_PROFILE" > windows-sign.json
+          # GITHUB_WORKSPACE is a native Windows path (D:\a\...), which the Tauri CLI needs.
+          echo "SIGN_CONFIG_ARGS=--config $GITHUB_WORKSPACE\\windows-sign.json" >> "$GITHUB_ENV"
+          echo "Windows MSI will be signed with Artifact Signing account $ARTIFACT_SIGNING_ACCOUNT"
+
       - name: Build, sign, notarize, upload
         uses: tauri-apps/tauri-action@84b9d35b5fc46c1e45415bdb6144030364f7ebc5 # v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          AZURE_TENANT_ID: ${{ matrix.id == 'windows' && secrets.AZURE_TENANT_ID || '' }}
+          AZURE_CLIENT_ID: ${{ matrix.id == 'windows' && secrets.AZURE_CLIENT_ID || '' }}
+          AZURE_CLIENT_SECRET: ${{ matrix.id == 'windows' && secrets.AZURE_CLIENT_SECRET || '' }}
           APPLE_CERTIFICATE: ${{ matrix.id == 'macos' && secrets.APPLE_CERTIFICATE || '' }}
           APPLE_CERTIFICATE_PASSWORD: ${{ matrix.id == 'macos' && secrets.APPLE_CERTIFICATE_PASSWORD || '' }}
           APPLE_SIGNING_IDENTITY: ${{ matrix.id == 'macos' && secrets.APPLE_SIGNING_IDENTITY || '' }}
@@ -339,7 +381,7 @@ jobs:
           releaseId: ${{ needs.prepare.outputs.release_id }}
           includeUpdaterJson: false
           uploadPlainBinary: false
-          args: --bundles ${{ matrix.bundles }} -- --locked
+          args: --bundles ${{ matrix.bundles }} ${{ env.SIGN_CONFIG_ARGS }} -- --locked
 
       - name: Notarize the disk image
         if: matrix.id == 'macos'
@@ -459,8 +501,8 @@ jobs:
               sys.exit("SHA256SUMS has no .deb")
           if not any(name.endswith(".AppImage") for name in names):
               sys.exit("SHA256SUMS has no .AppImage")
-          if not any(name.endswith("-setup.exe") for name in names):
-              sys.exit("SHA256SUMS has no Windows setup.exe")
+          if not any(name.endswith(".msi") for name in names):
+              sys.exit("SHA256SUMS has no Windows .msi")
           pathlib.Path("SHA256SUMS").write_text(
               "".join(f"{seen[name]}  {name}\n" for name in names)
           )

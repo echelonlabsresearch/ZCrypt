@@ -132,10 +132,12 @@ The release workflow submits that image to the notary service, staples the ticke
 and replaces the draft asset before `SHA256SUMS` is written. A tag `vX.Y.Z` that
 matches the version in `package.json`, `src-tauri/Cargo.toml`, and `tauri.conf.json`
 runs `.github/workflows/wallet-release.yml`. That builds a signed, notarized macOS
-DMG, a Windows NSIS `setup.exe`, and a Linux `.deb` and AppImage, uploads them to a
-draft prerelease, and adds `SHA256SUMS`. The Windows installer is not
-Authenticode-signed. Publish the draft after checking the assets. There is no
-auto-update channel.
+DMG, a Windows MSI, and a Linux `.deb` and AppImage, uploads them to a draft
+prerelease, and adds `SHA256SUMS`. The MSI is Authenticode-signed through Azure
+Artifact Signing when the `AZURE_*` and `ARTIFACT_SIGNING_*` secrets are set (the
+workflow header lists them); an unsigned MSI trips Defender's reputation check, so
+set them before a public release. Publish the draft after checking the assets.
+There is no auto-update channel.
 
 A release that already went out with an unstapled image can be repaired without a
 rebuild. Stapling changes the file, so the repair rewrites the DMG lines in
