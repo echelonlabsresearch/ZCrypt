@@ -204,9 +204,15 @@ Before deploying a public testnet, clear each of these:
 
 ## Known limitations to test AROUND (not blockers, but know them)
 
-- **Single-ZCRYPT-coin send**: a freshly-claimed lone coin can't be spent until you have a
-  2nd (gas) coin. The claim-splits-a-gas-coin fix applies on a FRESH genesis; on an existing
-  coin, Fund again (devnet) to get a 2nd coin.
+- **Single-ZCRYPT-coin send is no longer a limitation**: a ZCRYPT transfer burns its gas
+  inside its own proof (`0x6A`), so one coin pays, moves value and keeps its change. Test it
+  deliberately: a fresh wallet that receives exactly one coin must be able to send part of
+  it, spend the change alone, and sweep the rest to zero. Dust below 0.01 cannot move on its
+  own and rides along with the next larger coin.
+- **Swapping into ZCRYPT with no ZCRYPT**: the ZCRYPT giver locks first and pays the gas
+  for both legs; the other side locks gas-free from the background settle pass. Test an
+  offer that nobody accepts (withdraw it: nothing was locked) and one where the taker's
+  wallet is closed for a while after the maker locks (the maker refunds at its timeout).
 - **Bridge = demo topology**: your wallet plays both user and LP (accounts 0/1 under one
   seed). A real deployment splits these into separate operators with distinct custody.
 - **Bridge watcher / real custody**: the watcher daemon runs the public bridge (profile

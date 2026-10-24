@@ -95,6 +95,10 @@ const P_P0LAST: usize = 4; // last path row of input 0
 const P_P1LAST: usize = 5; // last path row of input 1
 const P_INNER: usize = 6; // the inner row
 const NUM_SEL: usize = 7;
+/// (rows, main columns, preprocessed selector columns) of the production circuit.
+pub(crate) fn dims() -> (usize, usize, usize) {
+    (HEIGHT, TALL_W, NUM_SEL)
+}
 
 pub struct CoinsAirTall;
 

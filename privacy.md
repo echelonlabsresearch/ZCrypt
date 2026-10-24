@@ -4,17 +4,24 @@ What ZCrypt hides, how, and where the honest edges are.
 
 ## What an observer sees
 
-A shielded transfer (`0x55`) is a bundle of two shield transactions, the gas
-transaction and the main transaction, and publishes exactly:
+A shield transaction publishes exactly:
 
-* two nullifiers per transaction (one per input, phantoms included), four in all,
-* two fresh output commitments per transaction, four in all,
+* two nullifiers (one per input slot, phantoms included),
+* three fresh output commitments (an unused slot holds a value-zero commitment to
+  the burn key, so the count never varies),
 * an anchor root (a recent block-boundary root of the global commitment tree),
-* two encrypted notes per transaction, every note the same fixed size (ML-KEM-768
-  ciphertext plus AEAD payload, padded), enforced by consensus,
-* a STARK proof per transaction (about 1 MB each),
-* the 0.01 ZCRYPT gas burn, revealed as a public opening of the burn coin, and a fee
-  of exactly zero on the main transaction (there is no fee choice to fingerprint).
+* three encrypted notes, every note the same fixed size (ML-KEM-768 ciphertext plus
+  AEAD payload, padded), enforced by consensus,
+* a fee field and a STARK proof (about 2 MB).
+
+A ZCRYPT transfer (`0x6A`) is ONE such transaction: its first output is the 0.01
+ZCRYPT gas burn, revealed as a public opening of the burn coin, and the fee field is
+zero. A transfer of any other asset (`0x55`) is a bundle of two: the main
+transaction (fee zero) and a ZCRYPT gas transaction whose first output is the same
+revealed burn. In both forms the revealed burn is the only value an observer sees,
+and it is the same constant on every transfer, so there is no fee choice to
+fingerprint. The two forms do reveal which kind of asset moved: a `0x6A` is ZCRYPT,
+a `0x55` is some registered asset (which one stays hidden).
 
 That is the whole record. No sender, no recipient, no amount, no asset type, no
 link to any prior transaction. Paste any transfer into the explorer: it renders

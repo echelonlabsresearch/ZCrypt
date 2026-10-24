@@ -46,10 +46,12 @@ monospace, glow effects).
 Point the wallet at your node in **Settings → Consensus Node** (default
 `http://localhost:36657`). Then:
 
-- **Fund (Mint tab)** → seeds two coins into the node's commitment tree (`0x56`);
-  the fixed 2-input circuit needs ≥2 coins to spend.
-- **Send** → builds a real hidden-amount `0x55` shield tx (2 inputs each hidden in
-  a ring, 2 outputs + encrypted notes), broadcast via `broadcast_tx_commit`.
+- **Fund (Mint tab)** → seeds two coins into the node's commitment tree (`0x56`).
+  One coin is enough to spend: a ZCRYPT send burns its gas inside its own proof.
+- **Send** → builds a real hidden-amount shield tx (up to 2 inputs, each hidden in
+  the whole pool, 3 outputs + encrypted notes), broadcast via `broadcast_tx_commit`.
+  ZCRYPT goes as a single-proof `0x6A` (output[0] is the revealed 0.01 burn); any
+  other asset goes as a `0x55` bundle with a separate ZCRYPT gas note.
 - **Refresh** → scans new blocks, trial-decrypts on-chain notes to find incoming
   coins, and marks spent coins by checking the nullifier registry.
 

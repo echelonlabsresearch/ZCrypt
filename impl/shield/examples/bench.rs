@@ -9,7 +9,7 @@ use zcrypt_shield::{
     commit_asset, prove, spend_pubkey, tree, verify, zvm, Blind, OutCoin, SpendSecret,
     SpendWitness, ASSET_ZCRYPT, N_IN, SOUNDNESS_BITS,
 };
-use zcrypt_shield::johnson_soundness_bits;
+use zcrypt_shield::{circuit_dims, johnson_soundness_bits};
 
 fn bl(b: u64) -> Blind { core::array::from_fn(|i| zcrypt_shield::field_limb(b.wrapping_add(0x9e37u64.wrapping_mul(i as u64 + 1)))) }
 fn ss(s: u64) -> SpendSecret { let s = zcrypt_shield::field_limb(s); core::array::from_fn(|i| zcrypt_shield::field_limb(s ^ ((i as u64 + 1) * 0x11))) }
@@ -91,17 +91,18 @@ fn main() {
         johnson_soundness_bits(),
         SOUNDNESS_BITS
     );
+    println!("{}", serde_json::to_string(&circuit_dims()).unwrap_or_default());
 
     bench(
-        "2-input / 2-output spend",
+        "2-input / 3-output spend",
         &with_tree(vec![inp(100, 11, 7), inp(50, 22, 8)]),
-        &[oc(90, 33, 1), oc(55, 44, 2)],
+        &[oc(90, 33, 1), oc(50, 44, 2), oc(5, 55, 3)],
         5,
     );
     bench(
-        "1-input / 2-output spend (single coin)",
+        "1-input / 3-output spend (single coin, native gas shape: burn + payment + change)",
         &with_tree(vec![inp(500_000, 9, 4)]),
-        &[oc(300_000, 1, 1), oc(199_990, 2, 2)],
-        10,
+        &[oc(10, 1, 1), oc(300_000, 2, 2), oc(199_990, 3, 3)],
+        0,
     );
 }

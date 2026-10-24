@@ -33,7 +33,9 @@ Then open <http://localhost:8080>.
 
 Transaction types decoded: shielded transfer (`0x55`), seed (`0x56`), bond/claim/unbond/
 delegate/undelegate, asset registration (`0x59`), authority rotation (`0x61`), the HTLC
-family (`0x5A`/`0x5B`/`0x5C`/`0x5D`), and in-pool swap locks (`0x62`).
+family (`0x5A`/`0x5B`/`0x5C`/`0x5D`), in-pool swap locks (`0x62`), native ZCRYPT
+transfers (`0x6A`, one proof with the gas burned inside it) and native swap locks (`0x6B`,
+no gas note: a ZCRYPT leg pays in-proof, another asset's leg is sponsored by it).
 
 ## Design
 

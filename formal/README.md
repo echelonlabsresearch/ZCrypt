@@ -28,7 +28,13 @@ Hand-modeled faithfully from the Rust, with `file:line` provenance in each file.
 
 ### `Zcrypt/Spec.lean` — Phase 0: the transparent VM spec
 Models `shield/src/zvm.rs::execute` (the `OP_CHECK_RANGE` and `OP_CHECK_CONSERVATION`
-guards over cleartext witness values, N_IN = N_OUT = 2).
+guards over cleartext witness values, modeled at N_IN = N_OUT = 2).
+
+> The compiled circuit now has **N_OUT = 3** (a third output slot carries the in-proof
+> ZCRYPT gas burn of a native transfer). The Lean model and the Charon extract still fix
+> two outputs. The conservation and range arguments do not depend on the output count
+> (they sum over the slots), but the models have not been re-run at three; re-deriving
+> them is open work, recorded in `FORMAL-VERIFICATION-SCOPE.md`.
 
 - `no_inflation`: an accepted transfer never outputs more value than it consumed.
 - `conservation_exact`: acceptance is exactly integer conservation (no axioms at all).

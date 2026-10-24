@@ -364,6 +364,40 @@ fn field_bits() -> f64 {
 }
 
 /// The compiled consensus proof parameters (see [`ProofParams`]).
+/// The shapes of the two transfer circuits and their shared public-input vector, derived
+/// from the compiled constants (`N_IN`, `N_OUT`, `DEPTH`). Printed by the shield benchmark so
+/// documentation quotes the circuit that is actually compiled.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct CircuitDims {
+    pub n_in: usize,
+    pub n_out: usize,
+    /// outputs ‖ fee ‖ nullifiers ‖ anchor root ‖ chain-domain tag ‖ enc-notes digest.
+    pub public_inputs: usize,
+    /// Poseidon2 permutations one transfer proves (commitments, nullifiers, keys, inner
+    /// blocks and the two Merkle paths).
+    pub poseidon2_permutations: usize,
+    pub wide_rows: usize,
+    pub wide_cols: usize,
+    pub tall_rows: usize,
+    pub tall_cols: usize,
+    pub tall_selector_cols: usize,
+}
+
+pub fn circuit_dims() -> CircuitDims {
+    let (tall_rows, tall_cols, tall_selector_cols) = tall::dims();
+    CircuitDims {
+        n_in: N_IN,
+        n_out: N_OUT,
+        public_inputs: N_OUT * 8 + 1 + N_IN * 8 + 8 + CHAIN_DOMAIN_LIMBS + 8,
+        poseidon2_permutations: NBLK,
+        wide_rows: 32,
+        wide_cols: W,
+        tall_rows,
+        tall_cols,
+        tall_selector_cols,
+    }
+}
+
 pub fn proof_params() -> ProofParams {
     let fb = field_bits();
     let digest_bits = 8.0 * fb;

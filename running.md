@@ -208,7 +208,9 @@ In the app: **Settings → Consensus Node**, point it at your chain
 toggle it off for a localhost node), then:
 
 - **Fund** (Mint tab) seeds coins into the pool via `0x56` (devnet builds only).
-- **Send** builds a real hidden-amount `0x55` shield tx and broadcasts it.
+- **Send** builds a real hidden-amount shield tx and broadcasts it: one proof with the
+  gas burned inside it for ZCRYPT (`0x6A`), or a main tx plus a ZCRYPT gas note for any
+  other asset (`0x55`). A single ZCRYPT coin is enough to send.
 - **Refresh** scans new blocks, trial-decrypts on-chain notes to find your coins, and
   marks spent coins.
 - **Restore** rebuilds your account (and its coins) from the 24-word phrase.
@@ -277,7 +279,7 @@ whole-pool anonymity set spanning every asset; canonical nullifiers with a
 canonical-encoding wire gate; in-circuit Merkle membership bound to a node-validated
 anchor root; carry-checked conservation that cannot wrap the field; a hiding polynomial
 commitment (real zero-knowledge) masked by an audited ChaCha20 CSPRNG re-seeded per
-proof; a VM twin differentially tested against the circuit; and fixed-shape 2-in/2-out
+proof; a VM twin differentially tested against the circuit; and fixed-shape 2-in/3-out
 transactions in which even the input count is unobservable.
 
 **Honest limits:**

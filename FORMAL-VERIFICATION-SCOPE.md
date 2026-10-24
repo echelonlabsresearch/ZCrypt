@@ -180,3 +180,13 @@ role tag (`TAG_COMMIT = 1`, `TAG_NF = 2`, `TAG_PK = 3`, see `impl/shield/src/lib
 AIRs constrain it. The Lean file does not assume injectivity. A theorem that used to conclude
 "the two openings are equal" now returns an explicit collision of the two hash inputs, so the
 statement is "breaking the property requires finding a collision."
+
+## Arity note (circuit N_OUT = 3)
+
+The shipped circuit has two input slots and **three** output slots; the third slot is how a
+native ZCRYPT transfer (`0x6A`) carries its revealed gas burn beside the payment and the
+change. Every statement above about conservation, range and single-asset is a sum or a
+conjunction over the output slots and holds unchanged at three, but the Lean files and the
+`vm-core` extract were written and checked at `N_OUT = 2` and have not been regenerated.
+Until they are, read them as a model of the two-output instance of the same constraint
+family, not of the compiled width.
