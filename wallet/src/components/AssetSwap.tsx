@@ -13,6 +13,7 @@ interface Offer {
   give_ticker: string;
   take_ticker: string;
   my_timeout: number;
+  locked: boolean;
 }
 
 interface Preview {
@@ -144,7 +145,11 @@ export default function AssetSwap({ active }: { active: boolean }) {
         makerAddress: maker.trim(),
       });
       setTicket(offer.ticket);
-      setNote(`Locked. Send the offer to them. It refunds at block ${offer.my_timeout} if they never accept.`);
+      setNote(
+        offer.locked
+          ? `Locked. Send the offer to them. It refunds at block ${offer.my_timeout} if they never accept.`
+          : `Offer ready — nothing is locked yet and no ZCRYPT is needed on this side. Send it to them: they lock their ZCRYPT first, then this wallet locks your ${offer.give_ticker} with no gas and the swap settles on its own.`,
+      );
       await load();
     } catch (e) {
       setErr(String(e));

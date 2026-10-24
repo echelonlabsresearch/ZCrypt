@@ -356,6 +356,15 @@ struct PendingSwap {
     /// Offer text the taker hands to the maker. Empty for the maker.
     #[serde(default)]
     ticket: String,
+    /// Taker in a swap that TAKES ZCRYPT: nothing is locked yet. The maker locks its ZCRYPT
+    /// first and pays the gas for both legs; the settle pass then locks this side gas-free
+    /// (a wallet with no ZCRYPT at all can swap into ZCRYPT).
+    #[serde(default)]
+    awaiting_sponsor: bool,
+    /// The counterparty's full address (bech32), needed to encrypt the claim note of a lock
+    /// placed later by the settle pass. Empty on records from before sponsored swaps.
+    #[serde(default)]
+    counterparty_address: String,
     /// HD index of the stealth sub-account this wallet used as its key in the swap (the
     /// refund key of its own lock and the claim key of the other side's). `None` on records
     /// from before per-swap keys: the main account.
@@ -2122,37 +2131,39 @@ mod reshape_tests {
 
     #[test]
     fn ready_when_a_single_coin_covers_it() {
-        // One big ZCRYPT coin + a gas coin → send anything up to the big coin: Ready.
         assert_eq!(reshape_plan(&[5 * M, M], true, 3 * M, G), ReshapePlan::Ready);
     }
-
     #[test]
-    fn the_user_case_two_coins_send_more_than_one_reshapes_not_errors() {
-        // 5 ZCRYPT in two 2.5 coins, sending 3: NOT insufficient — reshape (split) instead.
-        let p = reshape_plan(&[25 * M / 10, 25 * M / 10], true, 3 * M, G);
-        match p {
-            ReshapePlan::SelfSend(s) => assert!(s > 0 && s < 25 * M / 10, "split within a coin"),
-            other => panic!("expected a reshape self-send, got {other:?}"),
-        }
-        // And after that split conceptually yields 3 coins, a send of 3 is Ready:
-        assert_eq!(reshape_plan(&[249 * M / 100, 125 * M / 100, 125 * M / 100], true, 3 * M, G), ReshapePlan::Ready);
+    fn a_single_zcrypt_coin_is_ready_on_its_own() {
+        // THE formerly stranded shape: one ZCRYPT coin. Gas is in-proof, so it is Ready for
+        // anything up to value − gas, including the whole coin minus gas (zero change).
+        assert_eq!(reshape_plan(&[5 * M], true, 3 * M, G), ReshapePlan::Ready);
+        assert_eq!(reshape_plan(&[5 * M], true, 5 * M - G, G), ReshapePlan::Ready);
+        assert_eq!(reshape_plan(&[5 * M], true, 5 * M - G + 1, G), ReshapePlan::Insufficient);
+        assert_eq!(reshape_plan(&[G + 1], true, 1, G), ReshapePlan::Ready);
+        assert_eq!(reshape_plan(&[G], true, 1, G), ReshapePlan::Insufficient);
     }
-
+    #[test]
+    fn the_user_case_two_coins_send_more_than_one_is_ready_not_an_error() {
+        // 5 ZCRYPT in two 2.5 coins, sending 3: both coins fund the send, gas in-proof.
+        assert_eq!(reshape_plan(&[25 * M / 10, 25 * M / 10], true, 3 * M, G), ReshapePlan::Ready);
+        // Two coins short of amount + gas: Insufficient, not a loop.
+        assert_eq!(reshape_plan(&[15 * M / 10, 15 * M / 10], true, 3 * M, G), ReshapePlan::Insufficient);
+    }
     #[test]
     fn fragmented_many_small_coins_consolidates() {
-        // Five 1-ZCRYPT coins (total 5), sending 3: top-2-after-gas = 2 < 3 → consolidate.
-        let p = reshape_plan(&[M, M, M, M, M], true, 3 * M, G);
-        assert_eq!(p, ReshapePlan::SelfSend(2 * M), "merge two smallest");
+        // Five 1-ZCRYPT coins, sending 3: top-2 = 2 < 3 + gas → merge the two largest into
+        // one coin of (2 − gas); repeat until two coins cover the send.
+        assert_eq!(reshape_plan(&[M, M, M, M, M], true, 3 * M, G), ReshapePlan::SelfSend(2 * M - G));
+        assert_eq!(reshape_plan(&[2 * M - G, M, M, M], true, 3 * M, G), ReshapePlan::SelfSend(3 * M - 2 * G));
+        assert_eq!(reshape_plan(&[3 * M - 2 * G, M, M], true, 3 * M, G), ReshapePlan::Ready);
     }
-
     #[test]
     fn genuinely_insufficient_is_reported() {
-        // Total 2 ZCRYPT, sending 3: truly not enough → Insufficient (a real error).
         assert_eq!(reshape_plan(&[M, M], true, 3 * M, G), ReshapePlan::Insufficient);
-        // No coin can even pay gas.
         assert_eq!(reshape_plan(&[G / 2], true, 0, G), ReshapePlan::Insufficient);
+        assert_eq!(reshape_plan(&[], true, 1, G), ReshapePlan::Insufficient);
     }
-
     #[test]
     fn non_zcrypt_uses_two_inputs_and_reshapes_when_needed() {
         // zBTC: gas is separate ZCRYPT (checked elsewhere); payment = top-2.
@@ -2818,13 +2829,17 @@ fn shield_pay(
     if amount > MAX_COIN {
         return Err(format!("amount too large — must be ≤ {MAX_COIN} base units"));
     }
-    // Reserve a spare ZCRYPT coin for gas before choosing payment inputs (even for a
-    // ZCRYPT send — the node can't tell ZCRYPT from a hidden asset). The proof is
-    // built after the main tx, bound to that tx.
-    let gas_i = pick_gas_coin(w, leaves, &[])?;
+    // ZCRYPT pays its own gas INSIDE the one proof (a 0x6A native transfer: output[0] is a
+    // revealed 0.01 ZCRYPT burn), so a ZCRYPT send never needs a second coin. Any other
+    // asset is moved by a 0x55 bundle: the hidden-asset transfer plus a separate ZCRYPT gas
+    // note, because the node cannot tell a hidden asset from ZCRYPT. The gas coin is reserved
+    // before the payment inputs are chosen; its proof is built after the main tx and bound to it.
+    let native = asset_id == zcrypt_shield::ASSET_ZCRYPT;
+    let gas_i = if native { usize::MAX } else { pick_gas_coin(w, leaves, &[])? };
+    let need_total = if native { amount.checked_add(GAS_FEE).ok_or("amount too large")? } else { amount };
 
-    // ---- Main transfer inputs: fewest coins of `asset_id` covering `amount`, EXCLUDING
-    //      the gas coin. No in-tx fee (the moved asset is never burned for gas). ----
+    // ---- Main transfer inputs: fewest coins of `asset_id` covering `amount` (+ the in-proof
+    //      gas for ZCRYPT), EXCLUDING the gas coin of a bundled transfer. ----
     let mut sel: Vec<usize> = w
         .coins
         .iter()
@@ -2840,32 +2855,8 @@ fn shield_pay(
         .collect();
     sel.sort_by_key(|&i| std::cmp::Reverse(w.coins[i].value));
     if sel.is_empty() {
-        // On-chain unspent coins of this asset, INCLUDING the one taken for gas, so we
-        // can tell the single-coin case apart from a genuinely empty/stale balance.
-        let onchain_incl_gas: Vec<u64> = w
-            .coins
-            .iter()
-            .enumerate()
-            .filter(|(_, c)| !c.spent && c.coin.asset_id == asset_id && c.value <= MAX_COIN
-                && chain::find_index(leaves, &c.coin.commitment()).is_some())
-            .map(|(_, c)| c.value)
-            .collect();
-        // THE single-coin case: sending ZCRYPT with exactly one ZCRYPT coin on-chain.
-        // The gas note (a separate shield tx) consumed it, so the payment has no input
-        // left. A transfer fundamentally needs TWO ZCRYPT coins — one to pay the 0.01
-        // gas, one to fund the payment — and they cannot be the same coin.
-        if asset_id == zcrypt_shield::ASSET_ZCRYPT && onchain_incl_gas.len() == 1 {
-            let bal = onchain_incl_gas[0];
-            return Err(format!(
-                "you have a single ZCRYPT coin ({:.6} ZCRYPT), and a transfer needs a SECOND ZCRYPT \
-                 coin to pay the 0.01 gas fee (gas and the payment are separate coins — the same coin \
-                 can't do both). Get a second coin first: on devnet click Fund again; otherwise receive \
-                 a payment or claim a staking reward, then retry. (A freshly-claimed single reward/vesting \
-                 coin hits exactly this — splitting it into a spendable coin + a gas coin is the fix we're landing.)",
-                bal as f64 / 1e6,
-            ));
-        }
-        // Otherwise: stale coins (from a wiped/other chain) or a genuinely empty balance.
+        // Stale coins (from a wiped/other chain) or a genuinely empty balance. (A single
+        // ZCRYPT coin is NOT a special case any more: it pays its own gas in-proof.)
         let unspent = w.coins.iter().filter(|c| !c.spent && c.coin.asset_id == asset_id).count();
         let mut by_asset: std::collections::BTreeMap<u64, u64> = std::collections::BTreeMap::new();
         for c in w.coins.iter().filter(|c| !c.spent) {
@@ -2881,8 +2872,8 @@ fn shield_pay(
             held.join(", ")
         ));
     }
-    // Fewest inputs (up to N_IN) covering the amount (gas is paid separately).
-    let need = amount as u128;
+    // Fewest inputs (up to N_IN) covering the amount (+ the in-proof gas for ZCRYPT).
+    let need = need_total as u128;
     let chosen: Vec<usize> = if w.coins[sel[0]].value as u128 >= need {
         vec![sel[0]]
     } else if sel.len() >= 2 && (w.coins[sel[0]].value as u128 + w.coins[sel[1]].value as u128) >= need {
@@ -2890,14 +2881,15 @@ fn shield_pay(
     } else {
         let total: u128 = sel.iter().map(|&i| w.coins[i].value as u128).sum();
         return Err(format!(
-            "insufficient funds: need {amount} but your {} spendable coin(s) of this asset total \
+            "insufficient funds: need {need_total}{} but your {} spendable coin(s) of this asset total \
              {total}. A spend uses up to {} inputs — consolidate first if needed.",
+            if native { " (amount + 0.01 gas)" } else { "" },
             sel.len(),
             zcrypt_shield::N_IN
         ));
     };
     let sum: u64 = chosen.iter().map(|&i| w.coins[i].value).sum();
-    let change = sum - amount;
+    let change = sum - need_total;
     if change > MAX_COIN {
         return Err(format!("change ({change}) would exceed the per-coin limit"));
     }
@@ -2929,34 +2921,51 @@ fn shield_pay(
         kem::ciphertext_to_bytes(&keys::encrypt_note_asset(&change_addr, change, blind_c, asset_id));
     // onchain_note must always be fixed-size cover-or-real so stealth is not
     // fingerprintable by empty ciphertext. Callers pass cover bytes for stealth.
-    let main_tx = shield_tx::build(
-        &chain_id,
-        &spends,
-        &[recipient_out, change_out],
-        0, // no in-tx fee — gas is the external ZCRYPT note
-        vec![onchain_note, change_note],
-    )
-    .ok_or("failed to build the shield proof")?;
-
-    // Gas is bound to the finished main tx (its proof bytes are inside txbind). An
-    // empty envelope does not verify against gas_pay_envelope(txbind(main)).
-    let gas_env = shield_tx::gas_pay_envelope(&shield_tx::txbind(&chain_id, &main_tx));
-    let (gas_tx, gas_blind, gchg_rec) = build_gas_note(w, leaves, gas_i, &chain_id, &gas_env)?;
-
-    // Bundle the gas note + main transfer and broadcast.
-    let raw = bundle_transfer(&gas_blind, &gas_tx, &main_tx);
+    let (raw, gchg_rec) = if native {
+        // 0x6A: ONE proof. output[0] = the revealed 0.01 ZCRYPT burn (the gas), output[1] =
+        // the payment, output[2] = the change. No gas coin, no gas note.
+        let gas_blind = keys::random_blind();
+        let burn_out: zcrypt_shield::OutCoin = (GAS_FEE, gas_blind, zcrypt_core::htlc_shield::BURN_PK, zcrypt_shield::ASSET_ZCRYPT);
+        let main_tx = shield_tx::build(
+            &chain_id,
+            &spends,
+            &[burn_out, recipient_out, change_out],
+            0, // the in-tx fee stays 0: the revealed burn coin is the gas
+            vec![keys::cover_note_bytes(), onchain_note, change_note],
+        )
+        .ok_or("failed to build the shield proof")?;
+        (bswap::zcrypt_transfer_tx(GAS_FEE, &gas_blind, &main_tx), None)
+    } else {
+        let main_tx = shield_tx::build(
+            &chain_id,
+            &spends,
+            &[recipient_out, change_out],
+            0, // no in-tx fee — gas is the external ZCRYPT note
+            vec![onchain_note, change_note],
+        )
+        .ok_or("failed to build the shield proof")?;
+        // Gas is bound to the finished main tx (its proof bytes are inside txbind). An
+        // empty envelope does not verify against gas_pay_envelope(txbind(main)).
+        let gas_env = shield_tx::gas_pay_envelope(&shield_tx::txbind(&chain_id, &main_tx));
+        let (gas_tx, gas_blind, gchg_rec) = build_gas_note(w, leaves, gas_i, &chain_id, &gas_env)?;
+        (bundle_transfer(&gas_blind, &gas_tx, &main_tx), gchg_rec)
+    };
     chain::broadcast(url, &raw)?;
 
     // Update the wallet: mark main inputs + the gas coin spent; record both change coins.
     for &i in &chosen {
         w.coins[i].spent = true;
     }
-    w.coins[gas_i].spent = true;
+    if !native {
+        w.coins[gas_i].spent = true;
+    }
     // Stamp both change coins with the post-inclusion tip so a scan that started before
     // this send (and whose leaf snapshot predates it) never reconciles them away.
     let born = tip_or(url, w);
-    let change_coin = change_acct.own_asset_coin(change, blind_c, asset_id);
-    w.coins.push(CoinRec::new(change_coin, born));
+    if change > 0 {
+        let change_coin = change_acct.own_asset_coin(change, blind_c, asset_id);
+        w.coins.push(CoinRec::new(change_coin, born));
+    }
     if let Some(mut rec) = gchg_rec {
         rec.born = born;
         w.coins.push(rec);
@@ -2983,43 +2992,33 @@ enum ReshapePlan {
 /// pool (a spare coin is reserved), otherwise gas is a separate ZCRYPT coin the caller
 /// already checked exists. A transfer draws from at most 2 payment coins (N_IN), and gas
 /// needs its own coin — so a balance can be "enough total" yet the wrong SHAPE. This
-/// returns a self-transfer that fixes the shape (split when too few coins, consolidate when
-/// too fragmented), so the wallet can make any within-balance send work without the user
-/// ever seeing coin plumbing.
+/// returns a self-transfer that fixes the shape (consolidate when too fragmented), so the
+/// wallet can make any within-balance send work without the user ever seeing coin plumbing.
+/// ZCRYPT never needs a spare coin: its gas is burned inside the transfer's own proof.
 fn reshape_plan(vals: &[u64], is_zcrypt: bool, amount: u64, gas_fee: u64) -> ReshapePlan {
     let mut v: Vec<u64> = vals.iter().copied().filter(|&x| x > 0).collect();
     v.sort_unstable_by(|a, b| b.cmp(a)); // descending
 
     if is_zcrypt {
-        // Reserve the SMALLEST coin that can cover gas; the rest fund the payment.
-        let Some(gi) = v.iter().rposition(|&x| x >= gas_fee) else {
-            return ReshapePlan::Insufficient; // nothing can even pay the 0.01 gas
-        };
-        let mut rest = v.clone();
-        rest.remove(gi);
-        let cover: u64 = rest.iter().take(2).sum();
-        if cover >= amount {
+        // ZCRYPT pays its gas INSIDE the proof (0x6A), so the payment coins cover
+        // amount + gas and no coin is set aside. Two inputs per spend.
+        let need = amount.saturating_add(gas_fee);
+        let cover: u64 = v.iter().take(2).sum();
+        if cover >= need {
             return ReshapePlan::Ready;
         }
         let total: u64 = v.iter().sum();
-        if total < amount.saturating_add(gas_fee) {
+        if total < need {
             return ReshapePlan::Insufficient;
         }
-        // Enough value, wrong shape.
-        if v.len() < 3 {
-            // Too few coins: gas eats the only spare. SPLIT the largest into two so the
-            // payment can use two coins. Self-send ~half of it (change stays positive).
-            let big = v[0];
-            let s = (big / 2).clamp(gas_fee, big.saturating_sub(gas_fee));
-            if s == 0 {
-                return ReshapePlan::Insufficient;
-            }
-            ReshapePlan::SelfSend(s)
-        } else {
-            // Fragmented across many coins: CONSOLIDATE the two smallest into one.
-            let n = v.len();
-            ReshapePlan::SelfSend(v[n - 1] + v[n - 2])
+        // Enough value across 3+ coins, too fragmented for one spend: CONSOLIDATE. A
+        // self-send of (top two − gas) merges the two largest into one coin (zero change),
+        // so every pass strictly grows the largest coin and the loop converges.
+        let merged = cover.saturating_sub(gas_fee);
+        if merged == 0 {
+            return ReshapePlan::Insufficient;
         }
+        ReshapePlan::SelfSend(merged)
     } else {
         // Non-ZCRYPT: gas is a separate ZCRYPT coin (caller-checked). Payment = top 2.
         let cover: u64 = v.iter().take(2).sum();
@@ -3093,9 +3092,10 @@ fn ensure_spendable(asset_id: u64, amount: u64, state: &State<AppState>) -> Resu
             ReshapePlan::Insufficient => {
                 let total: u64 = vals.iter().sum();
                 return Err(format!(
-                    "insufficient balance: you have {:.6} of this asset on-chain but the transfer \
-                     (including the 0.01 gas) needs more. Receive or fund more, then retry.",
-                    total as f64 / 1e6
+                    "insufficient balance: you have {:.6} of this asset on-chain but the transfer{} \
+                     needs more. Receive or fund more, then retry.",
+                    total as f64 / 1e6,
+                    if is_zcrypt { " (including the 0.01 gas)" } else { "" }
                 ));
             }
             // Reshape: a self-transfer that fixes the coin shape, then loop and re-check.
@@ -3395,6 +3395,14 @@ pub fn shield_txs_in_tx(tx: &[u8]) -> Vec<shield_tx::ShieldTx> {
                 out.push(main);
             }
         }
+        // native ZCRYPT transfer: burn_value(8) ‖ burn_blind(64) ‖ shield (one proof)
+        0x6A => {
+            if let Some((_, _, tx)) = bswap::parse_zcrypt_transfer_payload(body) {
+                out.push(tx);
+            }
+        }
+        // native swap-lock: header(248) ‖ sponsor_ref(32) ‖ claim opening ‖ refund opening ‖ shield
+        0x6B => push_lock_shield_two(body, 248 + 32, &mut out),
         // REGISTER / HTLC_OPEN: gas prefix (its change note may be ours), then the payload.
         0x59 | 0x5A => {
             if let Some((gas, _)) = parse_gas_prefix(body) {
@@ -3433,6 +3441,14 @@ fn push_lock_shield(body: &[u8], off: usize, out: &mut Vec<shield_tx::ShieldTx>)
     }
 }
 
+/// Shield tx after a lock header and TWO settlement openings (claim, refund), no gas prefix.
+fn push_lock_shield_two(body: &[u8], off: usize, out: &mut Vec<shield_tx::ShieldTx>) {
+    let Some((_, n1)) = body.get(off..).and_then(zcrypt_core::htlc_shield::CoinOpening::decode) else { return };
+    let Some((_, n2)) = body.get(off + n1..).and_then(zcrypt_core::htlc_shield::CoinOpening::decode) else { return };
+    if let Some(stx) = body.get(off + n1 + n2..).and_then(shield_tx::from_bytes) {
+        out.push(stx);
+    }
+}
 /// Gas tx and main shield tx of a swap lock. Openings sit between the 248-byte header
 /// and the gas prefix; older locks put the gas prefix directly after the header.
 fn push_swap_shields(body: &[u8], out: &mut Vec<shield_tx::ShieldTx>) {
@@ -5210,18 +5226,37 @@ async fn claim_fees(asset_id: String, state: State<'_, AppState>) -> R<u64> {
     let (ticker, _dec) = asset_label(&url, asset);
     let mut total = 0u64;
     for (rk, pk_h) in reward_pk_hexes(&state)? {
-        let claimable = chain::staking_u64(&url, &format!("/staking/fees/{pk_h}/{asset}")).unwrap_or(0);
+        let mut claimable = chain::staking_u64(&url, &format!("/staking/fees/{pk_h}/{asset}")).unwrap_or(0);
         if claimable == 0 {
             continue;
         }
         // Next fee-coin index for reconstruction (0 for a first-ever fee claim).
         let start = chain::staking_u64(&url, &format!("/staking/fee_claim_index/{pk_h}/{asset}")).unwrap_or(0);
-        // CLAIM_FEE tx: 0x66 ‖ pk(64) ‖ asset_id(8 LE) ‖ amount(8 LE). Full balance only.
-        let mut tx = vec![0x66u8];
-        tx.extend_from_slice(&hex::decode(&pk_h).unwrap());
-        tx.extend_from_slice(&asset.to_le_bytes());
-        tx.extend_from_slice(&claimable.to_le_bytes());
-        chain::broadcast(&url, &tx)?;
+        // CLAIM_FEE tx: 0x66 ‖ pk(64) ‖ asset_id(8 LE) ‖ amount(8 LE). Full balance only: if an
+        // epoch boundary lands between the query and the mempool check, the balance has grown
+        // and the node refuses the stale amount; re-read it and try again (a few times).
+        let mut attempts = 0;
+        loop {
+            let mut tx = vec![0x66u8];
+            tx.extend_from_slice(&hex::decode(&pk_h).unwrap());
+            tx.extend_from_slice(&asset.to_le_bytes());
+            tx.extend_from_slice(&claimable.to_le_bytes());
+            match chain::broadcast(&url, &tx) {
+                Ok(()) => break,
+                // Refused for a stale amount, or admitted and then dropped by the block after
+                // the balance moved (surfaces as an inclusion timeout): re-read and retry. A
+                // balance of 0 means an earlier attempt landed after all.
+                Err(e) if attempts < 3 && (e.contains("must equal the full claimable balance") || e.contains("timed out waiting for tx")) => {
+                    attempts += 1;
+                    match chain::staking_u64(&url, &format!("/staking/fees/{pk_h}/{asset}")) {
+                        Ok(0) => break,
+                        Ok(now) => claimable = now,
+                        Err(_) => {}
+                    }
+                }
+                Err(e) => return Err(e),
+            }
+        }
         // Reconstruct the minted fee coins (node uses claim_chunks(amount, false) + monotonic
         // fee-claim indices from `start`) so our coins match the node's exactly.
         let leaves = chain::fetch_leaves(&url)?;
@@ -5908,6 +5943,34 @@ struct PreparedSwapLock {
 /// Does not broadcast and does not mark coins spent. `next_change` advances so the saved
 /// wallet already covers the change addresses. The refund blind is stored on an escrow
 /// record when `my_index` is `Some`, so a timeout refund does not need the counterparty.
+/// How a swap lock pays its 0.01 ZCRYPT gas.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum LockGas {
+    /// `0x62`: a separate ZCRYPT gas note bundled with the lock (a second coin, a second proof).
+    Bundle,
+    /// `0x6B`: no gas note. A ZCRYPT lock burns `fee` inside its own proof (0.02 when it also
+    /// pays for the counter-lock `sponsor_ref` names); another asset burns nothing and is
+    /// admitted only against the live ZCRYPT swap lock `sponsor_ref` names.
+    Native { fee: u64, sponsor_ref: [u8; 32] },
+}
+/// The gas plan for a lock of `asset`: ZCRYPT always pays in-proof (and for the counter-lock
+/// when `sponsor_for` names it); another asset rides gas-free on `sponsored_by` when the
+/// counterparty's ZCRYPT lock named this one, else it bundles a gas note.
+fn lock_gas_for(asset: u64, sponsor_for: Option<[u8; 32]>, sponsored_by: Option<[u8; 32]>) -> LockGas {
+    if asset == zcrypt_shield::ASSET_ZCRYPT {
+        LockGas::Native { fee: bswap::native_lock_fee(asset, sponsor_for.is_some()), sponsor_ref: sponsor_for.unwrap_or([0u8; 32]) }
+    } else if let Some(sponsor) = sponsored_by {
+        LockGas::Native { fee: 0, sponsor_ref: sponsor }
+    } else {
+        LockGas::Bundle
+    }
+}
+/// A swap whose taker GIVES another asset and TAKES ZCRYPT runs ZCRYPT-first: the maker
+/// locks ZCRYPT (sponsoring the taker's lock) and the taker locks second, gas-free.
+fn swap_is_sponsored_first(t: &SwapTicket) -> bool {
+    t.take_asset == zcrypt_shield::ASSET_ZCRYPT && t.give_asset != zcrypt_shield::ASSET_ZCRYPT
+}
+#[allow(clippy::too_many_arguments)]
 fn prepare_swap_lock(
     w: &mut Wallet,
     url: &str,
@@ -5917,13 +5980,21 @@ fn prepare_swap_lock(
     timeout: u64,
     counterparty: &Address,
     my_index: Option<u32>,
+    gas: LockGas,
 ) -> Result<PreparedSwapLock, String> {
     if value == 0 || value > MAX_COIN {
         return Err("enter an amount this coin can hold".to_string());
     }
     let chain_id = chain_id_for(url)?;
     let leaves = chain::fetch_leaves(url)?;
-    let (gas_tx_draft_i, _) = {
+    // The fee burned inside the lock's own proof (native gas), 0 for a bundled gas note.
+    let in_fee = match gas {
+        LockGas::Native { fee, .. } => fee,
+        LockGas::Bundle => 0,
+    };
+    let (gas_tx_draft_i, _) = if gas != LockGas::Bundle {
+        (usize::MAX, ())
+    } else {
         let gas_i = w
             .coins
             .iter()
@@ -5960,7 +6031,7 @@ fn prepare_swap_lock(
     if sel.is_empty() {
         return Err("none of that asset is spendable yet — it may still be maturing, or this wallet has none on this chain".to_string());
     }
-    let need = value as u128;
+    let need = value as u128 + in_fee as u128;
     let chosen: Vec<usize> = if w.coins[sel[0]].value as u128 >= need {
         vec![sel[0]]
     } else if sel.len() >= 2 && (w.coins[sel[0]].value as u128 + w.coins[sel[1]].value as u128) >= need {
@@ -5968,11 +6039,12 @@ fn prepare_swap_lock(
     } else {
         let total: u128 = sel.iter().map(|&i| w.coins[i].value as u128).sum();
         return Err(format!(
-            "not enough spendable coins of that asset in one or two notes (have {total}, need {value})"
+            "not enough spendable coins of that asset in one or two notes (have {total}, need {need}{})",
+            if in_fee > 0 { " including the gas" } else { "" }
         ));
     };
     let sum: u64 = chosen.iter().map(|&i| w.coins[i].value).sum();
-    let change = sum - value;
+    let change = sum - value - in_fee;
     if change > MAX_COIN {
         return Err("the change from this lock would be too large for one coin — lock a larger amount".to_string());
     }
@@ -6018,8 +6090,14 @@ fn prepare_swap_lock(
         &[],
         &settlements,
     );
-    let main_tx = shield_tx::build_bound(&chain_id, &spends, &[burn_out, change_out], 0, vec![keys::cover_note_bytes(), change_note], &envelope)
+    let main_tx = shield_tx::build_bound(&chain_id, &spends, &[burn_out, change_out], in_fee, vec![keys::cover_note_bytes(), change_note], &envelope)
         .ok_or("could not prove the lock")?;
+    let (raw, gas_change) = if let LockGas::Native { sponsor_ref, .. } = gas {
+        let raw = bswap::swap_lock_native_tx(
+            value, &burn_blind, asset, hashlock, timeout, &party_pk, &me, &sponsor_ref, &main_tx, &claim_open, &refund_open,
+        );
+        (raw, None)
+    } else {
     let gas_coin = w.coins[gas_i].coin;
     let gidx = chain::find_index(&leaves, &gas_coin.commitment()).ok_or("gas coin is not on this chain")?;
     let (gps, gpd) = chain::merkle_path(&leaves, gidx as usize).ok_or("gas coin is not in the tree")?;
@@ -6054,21 +6132,27 @@ fn prepare_swap_lock(
     let raw = bswap::swap_lock_tx(
         value, &burn_blind, asset, hashlock, timeout, &party_pk, &me, &gas_blind, &gas_tx, &main_tx, &claim_open, &refund_open,
     );
+        (raw, Some((gchg_acct, gchg_val, gchg_blind)))
+    };
     let escrow = escrow_id_for(EscrowKind::Swap, asset, value, hashlock, timeout, &party_pk, &me);
     // The main account (my_index None) has no HD index to store; its refund note is on /htlc.
     if let Some(index) = my_index {
         upsert_escrow_blind(w, index, &escrow, "refund", "swap", value, asset, &hex::encode(hashlock), timeout, false, refund_blind);
     }
     let mut inputs: Vec<String> = chosen.iter().map(|&i| commitment_hex(&w.coins[i].coin.commitment())).collect();
-    inputs.push(commitment_hex(&w.coins[gas_i].coin.commitment()));
+    if gas_i != usize::MAX {
+        inputs.push(commitment_hex(&w.coins[gas_i].coin.commitment()));
+    }
     let mut changes = Vec::new();
     if change > 0 {
         let coin = change_acct.own_asset_coin(change, change_blind, asset);
         changes.push(SwapChange { value: coin.value, blind: coin.blind, spend_secret: coin.spend_secret, asset_id: coin.asset_id });
     }
-    if gchg_val > 0 {
-        let coin = gchg_acct.own_coin(gchg_val, gchg_blind);
-        changes.push(SwapChange { value: coin.value, blind: coin.blind, spend_secret: coin.spend_secret, asset_id: coin.asset_id });
+    if let Some((gchg_acct, gchg_val, gchg_blind)) = gas_change {
+        if gchg_val > 0 {
+            let coin = gchg_acct.own_coin(gchg_val, gchg_blind);
+            changes.push(SwapChange { value: coin.value, blind: coin.blind, spend_secret: coin.spend_secret, asset_id: coin.asset_id });
+        }
     }
     Ok(PreparedSwapLock { raw, escrow, inputs, changes })
 }
@@ -6142,6 +6226,9 @@ struct SwapOffer {
     give_ticker: String,
     take_ticker: String,
     my_timeout: u64,
+    /// Whether this wallet locked already. A swap INTO ZCRYPT locks nothing up front: the
+    /// other side locks its ZCRYPT first and this wallet then locks gas-free.
+    locked: bool,
 }
 
 /// A fresh stealth address for the other side of a swap to put in its offer (wallet H10): a
@@ -6197,22 +6284,25 @@ async fn swap_asset_start(
         let me = w.key_at(idx);
         let preimage = zcrypt_bridge::wallet_flows::bridge_preimage(&Zeroizing::new(w.account.seed()), idx);
         let hashlock = zcrypt_core::nullifier::htlc_hashlock(&preimage);
-        let prepared = prepare_swap_lock(w, &url, give_asset, give_amount, &hashlock, give_timeout, &maker_addr, Some(idx))?;
+        let me_pk = me.pubkey();
+        // This wallet's lock id is fixed by the terms, so the ticket can name it before it exists.
+        let my_escrow = escrow_id_for(EscrowKind::Swap, give_asset, give_amount, &hashlock, give_timeout, &maker_pk, &me_pk);
         let ticket_body = SwapTicket {
             give_asset,
             give_amount,
             take_asset,
             take_amount,
             hashlock,
-            taker_pk: me.pubkey(),
+            taker_pk: me_pk,
             give_timeout,
-            give_escrow: prepared.escrow,
+            give_escrow: my_escrow,
             maker_pk,
             taker_address: me.stealth_address(),
         };
         let ticket = encode_swap_ticket(&ticket_body);
         let their = maker_escrow_id(&ticket_body);
-        let pending = PendingSwap {
+        let sponsored_first = swap_is_sponsored_first(&ticket_body);
+        let mut pending = PendingSwap {
             role: "taker".into(),
             preimage_hex: hex::encode(preimage),
             hashlock_hex: hex::encode(hashlock),
@@ -6221,19 +6311,49 @@ async fn swap_asset_start(
             take_asset,
             take_amount,
             counterparty_pk_hex: hex::encode(pk64(&maker_pk)),
-            my_escrow_hex: hex::encode(prepared.escrow),
+            my_escrow_hex: hex::encode(my_escrow),
             their_escrow_hex: hex::encode(their),
             my_timeout: give_timeout,
-            input_commitments: prepared.inputs.clone(),
-            changes: prepared.changes.clone(),
+            input_commitments: Vec::new(),
+            changes: Vec::new(),
             started_height: tip,
             scanned_through: 30,
             ticket: ticket.clone(),
             my_index: Some(idx),
+            awaiting_sponsor: sponsored_first,
+            counterparty_address: maker_addr.to_bech32(),
         };
+        if sponsored_first {
+            // Swapping INTO ZCRYPT: lock nothing now. The maker locks ZCRYPT first (paying the
+            // gas for both legs and naming this lock); the settle pass then locks this side
+            // with no gas note, so a wallet holding no ZCRYPT at all can make this offer.
+            // The offer must still be honest: this wallet has to be able to fund the lock.
+            let mut have: Vec<u64> = w.coins.iter().filter(|c| !c.spent && c.coin.asset_id == give_asset && c.value <= MAX_COIN).map(|c| c.value).collect();
+            have.sort_unstable_by(|a, b| b.cmp(a));
+            if have.iter().take(2).sum::<u64>() < give_amount {
+                return Err(format!(
+                    "not enough spendable {give_ticker} in one or two notes to back this offer (have {})",
+                    have.iter().sum::<u64>()
+                ));
+            }
+            w.pending_swaps.push(pending);
+            save_now(&state, w, "offer a swap")?;
+            return Ok(SwapOffer { ticket, give_ticker, take_ticker, my_timeout: give_timeout, locked: false });
+        }
+        // Giving ZCRYPT: this lock pays the gas for both legs and names the maker's lock, so
+        // the maker locks gas-free. Giving another asset for another asset: a bundled gas note.
+        let gas = lock_gas_for(give_asset, Some(their), None);
+        let prepared = prepare_swap_lock(w, &url, give_asset, give_amount, &hashlock, give_timeout, &maker_addr, Some(idx), gas)?;
+        if prepared.escrow != my_escrow {
+            let id_hex = hex::encode(prepared.escrow);
+            w.escrows.retain(|e| !(e.id_hex == id_hex && e.role == "refund"));
+            return Err("the lock this wallet would publish is not the one its offer names".to_string());
+        }
+        pending.input_commitments = prepared.inputs.clone();
+        pending.changes = prepared.changes.clone();
         commit_swap_lock(&state, w, &url, &prepared, pending)?;
         w.push_hist("swap", -(give_amount as i64), format!("locked for {take_ticker}"), give_asset);
-        Ok(SwapOffer { ticket, give_ticker, take_ticker, my_timeout: give_timeout })
+        Ok(SwapOffer { ticket, give_ticker, take_ticker, my_timeout: give_timeout, locked: true })
     })
     .and_then(ok)
 }
@@ -6263,7 +6383,19 @@ struct SwapPreview {
 
 /// Check an offer against consensus: the taker's lock must exist, be open, be a swap, and
 /// carry exactly the ticket's terms and keys. Returns the lock and the current ZC tip.
-fn verify_offer_lock(zc: &Zcrypt, t: &SwapTicket) -> Result<(bswap::EscrowInfo, u64), String> {
+fn verify_offer_lock(zc: &Zcrypt, t: &SwapTicket) -> Result<(Option<bswap::EscrowInfo>, u64), String> {
+    if t.taker_address.pubkey() != t.taker_pk {
+        return Err("this offer's address does not match the key it names".to_string());
+    }
+    if taker_escrow_id(t) != t.give_escrow {
+        return Err("this offer does not match the lock it names".to_string());
+    }
+    if swap_is_sponsored_first(t) {
+        // The taker locks SECOND (gas-free) once this wallet's ZCRYPT lock is on chain, so
+        // there is nothing of theirs to verify yet: the terms are what the ticket says.
+        let tip = zc.height()? as u64;
+        return Ok((None, tip));
+    }
     let info = bswap::query_escrow(zc, &t.give_escrow)?.ok_or("their lock is not on the chain yet")?;
     if info.state != "open" {
         return Err("their lock is no longer open".to_string());
@@ -6276,14 +6408,8 @@ fn verify_offer_lock(zc: &Zcrypt, t: &SwapTicket) -> Result<(bswap::EscrowInfo, 
     if info.party_pk != pk64(&t.maker_pk).to_vec() || info.refund_pk != pk64(&t.taker_pk).to_vec() {
         return Err("their lock pays someone else".to_string());
     }
-    if t.taker_address.pubkey() != t.taker_pk {
-        return Err("this offer's address does not match the key it names".to_string());
-    }
-    if taker_escrow_id(t) != t.give_escrow {
-        return Err("this offer does not match the lock it names".to_string());
-    }
     let tip = zc.height()? as u64;
-    Ok((info, tip))
+    Ok((Some(info), tip))
 }
 
 /// Decode an offer and show its terms, with nothing locked. The UI must display these and
@@ -6312,7 +6438,7 @@ async fn swap_asset_preview(ticket: String, state: State<'_, AppState>) -> R<Swa
         let w = g.as_ref().ok_or("wallet is locked")?;
         let my_index = own_key_index(w, &t.maker_pk).ok_or("this offer is addressed to a key this wallet does not hold")?;
         let acct = swap_account(w, my_index);
-        if coin_from_note(&acct, &info.claim_enc_note).is_none() {
+        if info.as_ref().is_some_and(|i| coin_from_note(&acct, &i.claim_enc_note).is_none()) {
             return Err("their lock's settlement note does not open to this wallet".to_string());
         }
         w.coins.iter().filter(|c| !c.spent && c.coin.asset_id == t.take_asset).map(|c| c.value).sum()
@@ -6361,7 +6487,7 @@ async fn swap_asset_accept(ticket: String, state: State<'_, AppState>) -> R<Stri
         // sub-account (the one `swap_receive_address` handed out), wallet H10.
         let my_index = own_key_index(w, &t.maker_pk).ok_or("this offer is addressed to a key this wallet does not hold")?;
         let acct = swap_account(w, my_index);
-        if coin_from_note(&acct, &info.claim_enc_note).is_none() {
+        if info.as_ref().is_some_and(|i| coin_from_note(&acct, &i.claim_enc_note).is_none()) {
             return Err("their lock's settlement note does not open to this wallet".to_string());
         }
         if let Some(i) = my_index {
@@ -6370,7 +6496,13 @@ async fn swap_asset_accept(ticket: String, state: State<'_, AppState>) -> R<Stri
         if w.pending_swaps.iter().any(|p| p.my_escrow_hex == hex::encode(mine)) {
             return Err("this wallet already accepted that offer".to_string());
         }
-        let prepared = prepare_swap_lock(w, &url, t.take_asset, t.take_amount, &t.hashlock, take_timeout, &t.taker_address, my_index)?;
+        // Gas: paying ZCRYPT, this lock burns its own fee in-proof and (ZCRYPT-first) pays for
+        // the taker's lock too. Paying another asset, it rides gas-free on the taker's ZCRYPT
+        // lock when that lock named it; otherwise it bundles a gas note.
+        let sponsor_for = swap_is_sponsored_first(&t).then_some(t.give_escrow);
+        let sponsored_by = info.as_ref().filter(|i| i.sponsor_for == mine.to_vec() && !i.sponsor_used).map(|_| t.give_escrow);
+        let gas = lock_gas_for(t.take_asset, sponsor_for, sponsored_by);
+        let prepared = prepare_swap_lock(w, &url, t.take_asset, t.take_amount, &t.hashlock, take_timeout, &t.taker_address, my_index, gas)?;
         if prepared.escrow != mine {
             let id_hex = hex::encode(prepared.escrow);
             w.escrows.retain(|e| !(e.id_hex == id_hex && e.role == "refund"));
@@ -6394,12 +6526,20 @@ async fn swap_asset_accept(ticket: String, state: State<'_, AppState>) -> R<Stri
             scanned_through: 30,
             ticket: String::new(),
             my_index,
+            awaiting_sponsor: false,
+            counterparty_address: t.taker_address.to_bech32(),
         };
         commit_swap_lock(&state, w, &url, &prepared, pending)?;
         w.push_hist("swap", -(t.take_amount as i64), format!("locked for {give_ticker}"), t.take_asset);
-        Ok(format!(
-            "Locked {take_ticker}. Their wallet claims it, then yours collects the {give_ticker}; the wallet keeps checking in the background while it is unlocked."
-        ))
+        Ok(if sponsor_for.is_some() {
+            format!(
+                "Locked {take_ticker} (this lock also pays the gas for theirs). Their wallet locks {give_ticker} with no gas and claims; then yours collects the {give_ticker}. The wallet keeps checking in the background while it is unlocked."
+            )
+        } else {
+            format!(
+                "Locked {take_ticker}. Their wallet claims it, then yours collects the {give_ticker}; the wallet keeps checking in the background while it is unlocked."
+            )
+        })
     })
     .and_then(ok)
 }
@@ -6432,7 +6572,9 @@ async fn list_pending_swaps(state: State<'_, AppState>) -> R<Vec<PendingSwapView
     for p in &w.pending_swaps {
         let (give_ticker, give_decimals) = asset_label(&url, p.give_asset);
         let (take_ticker, take_decimals) = asset_label(&url, p.take_asset);
-        let phase = if p.role == "taker" {
+        let phase = if p.awaiting_sponsor {
+            "Waiting for them to lock their ZCRYPT first; this wallet then locks with no gas".to_string()
+        } else if p.role == "taker" {
             "Waiting for them to lock their side".to_string()
         } else {
             "Waiting for them to claim, then this wallet collects".to_string()
@@ -6449,7 +6591,7 @@ async fn list_pending_swaps(state: State<'_, AppState>) -> R<Vec<PendingSwapView
             ticket: p.ticket.clone(),
             my_escrow_hex: p.my_escrow_hex.clone(),
             my_timeout: p.my_timeout,
-            can_refund: tip >= p.my_timeout,
+            can_refund: !p.awaiting_sponsor && tip >= p.my_timeout,
         });
     }
     ok(out)
@@ -6521,6 +6663,106 @@ fn claim_their_lock(
     }
 }
 
+/// Taker of a swap INTO ZCRYPT, waiting for the maker's ZCRYPT lock. Once that lock is on
+/// chain, is the other leg of this swap, pays this key, has life left and named this lock as
+/// the one it sponsors, lock the give asset with NO gas note. Until then, nothing is spent;
+/// if the maker never locks, the offer lapses once its lock could no longer be placed.
+#[allow(clippy::too_many_arguments)]
+fn lock_sponsored_side(
+    state: &State<AppState>,
+    url: &str,
+    zc: &Zcrypt,
+    tip: i64,
+    p: &PendingSwap,
+    my_escrow: &[u8; 32],
+    their_escrow: &[u8; 32],
+    hashlock: &[u8; 32],
+    my_pk: &[u8; 64],
+    counterparty: &[u8; 64],
+) -> Result<Option<String>, String> {
+    // Already on chain (a crash between broadcast and save): the record is a normal lock now.
+    if bswap::query_escrow(zc, my_escrow)?.is_some() {
+        with_wallet(state, |w| {
+            if let Some(slot) = w.pending_swaps.iter().position(|s| s.my_escrow_hex == p.my_escrow_hex) {
+                w.pending_swaps[slot].awaiting_sponsor = false;
+                let commitments = w.pending_swaps[slot].input_commitments.clone();
+                let changes = w.pending_swaps[slot].changes.clone();
+                mark_swap_inputs_spent(w, &commitments);
+                materialize_swap_changes(w, url, &changes);
+            }
+            Ok(())
+        })?;
+        return Ok(None);
+    }
+    let Some(theirs) = bswap::query_escrow(zc, their_escrow)? else {
+        // The maker's lock expires SWAP_MAKER_CLAIM_MARGIN_BLOCKS before this one; once that
+        // height is reached no valid maker lock can appear, so the offer lapses.
+        if tip as u64 >= p.my_timeout.saturating_sub(bswap::SWAP_MAKER_CLAIM_MARGIN_BLOCKS) {
+            with_wallet(state, |w| {
+                w.pending_swaps.retain(|s| s.my_escrow_hex != p.my_escrow_hex);
+                Ok(())
+            })?;
+            return Ok(Some("The offer was never accepted; nothing was locked.".to_string()));
+        }
+        return Ok(None);
+    };
+    if theirs.state != "open" {
+        with_wallet(state, |w| {
+            w.pending_swaps.retain(|s| s.my_escrow_hex != p.my_escrow_hex);
+            Ok(())
+        })?;
+        return Ok(Some("Their lock closed before this wallet locked; the swap is off and nothing was spent.".to_string()));
+    }
+    // The same rule the claim uses (H6): a swap lock, paying this key, refunding to them, the
+    // offered terms, enough life left. Not yet safe is not an error; the next pass retries.
+    if let Err(why) = zcrypt_bridge::wallet_flows::swap_claim_is_safe(&theirs, tip as u64, my_pk, counterparty, p.take_asset, p.take_amount, hashlock) {
+        eprintln!("[swap] not locking against their lock yet: {why}");
+        return Ok(None);
+    }
+    // Gas-free only when their lock paid for exactly this lock; otherwise a bundled gas note
+    // (which needs ZCRYPT here, and fails loudly if there is none).
+    let sponsored_by = (theirs.sponsor_for == my_escrow.to_vec() && !theirs.sponsor_used).then_some(*their_escrow);
+    let gas = lock_gas_for(p.give_asset, None, sponsored_by);
+    let (give_ticker, _) = asset_label(url, p.give_asset);
+    with_wallet(state, |w| {
+        let maker_addr = Address::from_bech32(&p.counterparty_address).ok_or("corrupt swap record (counterparty address)")?;
+        let prepared = prepare_swap_lock(w, url, p.give_asset, p.give_amount, hashlock, p.my_timeout, &maker_addr, p.my_index, gas)?;
+        if prepared.escrow != *my_escrow {
+            let id_hex = hex::encode(prepared.escrow);
+            w.escrows.retain(|e| !(e.id_hex == id_hex && e.role == "refund"));
+            return Err("the lock this wallet would publish is not the one its offer named".to_string());
+        }
+        // Record what the lock spends BEFORE broadcasting, so a crash can still account for it.
+        let Some(slot) = w.pending_swaps.iter().position(|s| s.my_escrow_hex == p.my_escrow_hex) else {
+            return Ok(None);
+        };
+        w.pending_swaps[slot].awaiting_sponsor = false;
+        w.pending_swaps[slot].input_commitments = prepared.inputs.clone();
+        w.pending_swaps[slot].changes = prepared.changes.clone();
+        w.pending_swaps[slot].started_height = tip;
+        save_now(state, w, "lock a swap")?;
+        match chain::broadcast(url, &prepared.raw) {
+            Ok(()) => {
+                mark_swap_inputs_spent(w, &prepared.inputs);
+                materialize_swap_changes(w, url, &prepared.changes);
+                w.push_hist("swap", -(p.give_amount as i64), "locked for ZCRYPT".to_string(), p.give_asset);
+                Ok(Some(format!("They locked ZCRYPT first; this wallet locked {give_ticker} with no gas. Claiming next.")))
+            }
+            Err(e) if broadcast_definitely_failed(&e) => {
+                // Nothing committed: back to waiting, so a later pass can try again.
+                if let Some(s) = w.pending_swaps.iter_mut().find(|s| s.my_escrow_hex == p.my_escrow_hex) {
+                    s.awaiting_sponsor = true;
+                    s.input_commitments.clear();
+                    s.changes.clear();
+                }
+                w.escrows.retain(|x| !(x.id_hex == p.my_escrow_hex && x.role == "refund"));
+                let _ = save_now(state, w, "undo a swap lock the node did not accept");
+                Err(format!("swap lock refused: {e}"))
+            }
+            Err(e) => Err(format!("{e}. The lock may still have reached the chain: the swap stays listed and settles or clears on its own")),
+        }
+    })
+}
 fn settle_one_swap(state: &State<AppState>, url: &str, zc: &Zcrypt, tip: i64, p: &PendingSwap) -> Result<Option<String>, String> {
     let my_escrow = parse_id_hex(&p.my_escrow_hex)?;
     let their_escrow = parse_id_hex(&p.their_escrow_hex)?;
@@ -6534,6 +6776,9 @@ fn settle_one_swap(state: &State<AppState>, url: &str, zc: &Zcrypt, tip: i64, p:
         let w = g.get().ok_or("wallet is locked")?;
         pk64(&swap_account(w, p.my_index).pubkey())
     };
+    if p.awaiting_sponsor {
+        return lock_sponsored_side(state, url, zc, tip, p, &my_escrow, &their_escrow, &hashlock, &my_pk, &counterparty);
+    }
     let mine = bswap::query_escrow(zc, &my_escrow)?;
     // A lock that reached the chain spends those coins even if the wallet crashed first.
     if mine.is_some() {
@@ -6681,6 +6926,15 @@ async fn swap_asset_refund(escrow_hex: String, state: State<'_, AppState>) -> R<
             .cloned()
             .ok_or("no swap with that lock")?
     };
+    if p.awaiting_sponsor {
+        // Nothing is locked on this side yet: withdrawing the offer costs nothing. (A maker
+        // who locks against it afterwards simply refunds at its own timeout.)
+        return with_wallet(&state, |w| {
+            w.pending_swaps.retain(|s| s.my_escrow_hex != p.my_escrow_hex);
+            Ok("Offer withdrawn; nothing was locked on this side.".to_string())
+        })
+        .and_then(ok);
+    }
     if (tip as u64) < p.my_timeout {
         return Err(format!("this lock refunds itself at block {} (the chain is at {tip})", p.my_timeout));
     }
@@ -8804,11 +9058,17 @@ mod live_3node {
         let offer = v(swap_asset_start(asset_id.clone(), give_amt, "0".into(), take_amt, maker, alice.st())).expect("swap start");
         assert_eq!(offer.give_ticker.to_ascii_uppercase(), ticker.to_ascii_uppercase());
         assert_eq!(offer.take_ticker, "ZCRYPT");
+        // Alice GIVES the asset and TAKES ZCRYPT: ZCRYPT-first. Nothing is locked yet; Bob
+        // locks his ZCRYPT first (paying the gas for both legs) and Alice's settle pass then
+        // locks her asset with no gas note.
+        assert!(!offer.locked, "a swap into ZCRYPT locks nothing up front");
         let alice_open = v(list_pending_swaps(alice.st())).unwrap();
         assert_eq!(alice_open.len(), 1);
         assert_eq!(alice_open[0].role, "taker");
         assert!(!alice_open[0].can_refund);
         assert_eq!(alice_open[0].give_amount, give_amt);
+        assert!(alice_open[0].phase.contains("lock their ZCRYPT first"), "{}", alice_open[0].phase);
+        let zc_before_swap = v(get_balance(alice.st())).unwrap().total;
         let preview = wait_until("swap offer on chain", 90, || v(swap_asset_preview(offer.ticket.clone(), bob.st())).ok());
         assert_eq!(preview.receive_amount, give_amt);
         assert_eq!(preview.pay_amount, take_amt);
@@ -8817,11 +9077,23 @@ mod live_3node {
         assert!(preview.my_timeout < preview.their_timeout, "the maker's lock expires first");
         assert!(preview.blocks_left > 0);
         let accepted = v(swap_asset_accept(offer.ticket.clone(), bob.st())).expect("swap accept");
+        assert!(accepted.contains("also pays the gas for theirs"), "{accepted}");
         let bob_open = v(list_pending_swaps(bob.st())).unwrap();
         assert_eq!(bob_open.len(), 1);
         assert_eq!(bob_open[0].role, "maker");
         assert!(!bob_open[0].can_refund);
         println!("[wallet] {accepted}");
+        // Bob's ZCRYPT lock is a native lock that burned 2 × 0.01 and names Alice's lock.
+        let bob_lock = wait_until("bob's sponsoring lock on chain", 90, || {
+            bswap::query_escrow(&Zcrypt::new(&url), &parse_id_hex(&bob_open[0].my_escrow_hex).ok()?).ok().flatten()
+        });
+        assert_eq!(bob_lock.sponsor_for, hex::decode(&alice_open[0].my_escrow_hex).unwrap(), "Bob's lock sponsors exactly Alice's lock");
+        let locked_gas_free = wait_until("alice locks gas-free against bob's lock", 120, || {
+            let moved = v(swap_asset_settle(alice.st())).ok()?;
+            moved.into_iter().find(|m| m.contains("with no gas"))
+        });
+        println!("[wallet] {locked_gas_free}");
+        assert!(bswap::query_escrow(&Zcrypt::new(&url), &parse_id_hex(&bob_open[0].my_escrow_hex).unwrap()).unwrap().unwrap().sponsor_used);
         wait_until("both swaps to finish", 300, || {
             let _ = v(swap_asset_settle(alice.st())).ok()?;
             let _ = v(swap_asset_settle(bob.st())).ok()?;
@@ -8833,7 +9105,12 @@ mod live_3node {
             let held = v(held_assets(bob.st())).ok()?;
             held.into_iter().find(|a| a.asset_id == minted.asset_id && a.balance >= give_amt)
         });
-        println!("[wallet] swap settled: Bob holds {give_amt} {ticker}, both pending lists are empty");
+        wait_until("alice holds the swapped ZCRYPT", 60, || {
+            v(scan_onchain(alice.st())).ok()?;
+            let b = v(get_balance(alice.st())).ok()?;
+            (b.total >= zc_before_swap + take_amt).then_some(())
+        });
+        println!("[wallet] swap settled (ZCRYPT-first, Alice paid no gas): Bob holds {give_amt} {ticker}, Alice +{take_amt} ZCRYPT, both pending lists are empty");
 
         let unknown = v(swap_asset_refund("00".repeat(32), alice.st())).unwrap_err();
         assert!(unknown.contains("no swap with that lock"), "{unknown}");
@@ -8842,16 +9119,84 @@ mod live_3node {
             held.into_iter().find(|a| a.asset_id == minted.asset_id && a.balance >= 50_000)
         });
         let maker2 = v(swap_receive_address(bob.st())).expect("second swap address");
-        let offer2 = v(swap_asset_start(asset_id, 50_000, "0".into(), 20_000, maker2, alice.st())).expect("second swap");
+        let offer2 = v(swap_asset_start(asset_id.clone(), 50_000, "0".into(), 20_000, maker2, alice.st())).expect("second swap");
         let early = v(list_pending_swaps(alice.st())).unwrap();
         assert_eq!(early.len(), 1);
         assert!(!early[0].can_refund);
-        let too_soon = v(swap_asset_refund(early[0].my_escrow_hex.clone(), alice.st())).unwrap_err();
-        assert!(too_soon.contains("refunds itself at block"), "{too_soon}");
-        assert_eq!(v(list_pending_swaps(alice.st())).unwrap().len(), 1, "a refused refund leaves the lock pending");
+        // An offer INTO ZCRYPT that nobody accepted has locked nothing: it is simply withdrawn.
+        let withdrawn = v(swap_asset_refund(early[0].my_escrow_hex.clone(), alice.st())).expect("withdraw an unlocked offer");
+        assert!(withdrawn.contains("withdrawn"), "{withdrawn}");
+        assert!(v(list_pending_swaps(alice.st())).unwrap().is_empty(), "a withdrawn offer is gone");
         assert!(v(list_pending_swaps(bob.st())).unwrap().is_empty(), "bob never accepted the second offer");
         println!("[wallet] swap_asset_refund unknown lock: {unknown}");
-        println!("[wallet] swap_asset_refund before the timeout (offer still open, {}): {too_soon}", offer2.my_timeout);
+        println!("[wallet] swap_asset_refund on an unaccepted offer (lapses at {}): {withdrawn}", offer2.my_timeout);
+
+        // The other direction: Bob GIVES ZCRYPT, takes the asset. He locks FIRST (0x6B,
+        // 2 × 0.01 in-proof, naming Alice's lock); Alice accepts with a gas-free lock and
+        // the real refund path is exercised on a live lock.
+        let alice_swap_addr = v(swap_receive_address(alice.st())).expect("alice swap address");
+        let offer3 = v(swap_asset_start("0".into(), ZC, asset_id.clone(), 30_000, alice_swap_addr, bob.st())).expect("ZCRYPT-giving swap start");
+        assert!(offer3.locked, "giving ZCRYPT locks up front");
+        let bob_early = v(list_pending_swaps(bob.st())).unwrap();
+        assert_eq!(bob_early.len(), 1);
+        let too_soon = v(swap_asset_refund(bob_early[0].my_escrow_hex.clone(), bob.st())).unwrap_err();
+        assert!(too_soon.contains("refunds itself at block"), "{too_soon}");
+        let bob_lock3 = wait_until("bob's ZCRYPT lock on chain", 90, || {
+            bswap::query_escrow(&Zcrypt::new(&url), &parse_id_hex(&bob_early[0].my_escrow_hex).ok()?).ok().flatten()
+        });
+        assert!(!bob_lock3.sponsor_for.is_empty(), "a ZCRYPT taker lock sponsors the maker's lock");
+        let preview3 = v(swap_asset_preview(offer3.ticket.clone(), alice.st())).expect("preview");
+        assert_eq!(preview3.pay_amount, 30_000);
+        assert!(preview3.my_timeout < preview3.their_timeout);
+        let accepted3 = v(swap_asset_accept(offer3.ticket.clone(), alice.st())).expect("alice accepts gas-free");
+        println!("[wallet] {accepted3}");
+        assert!(bswap::query_escrow(&Zcrypt::new(&url), &parse_id_hex(&bob_early[0].my_escrow_hex).unwrap()).unwrap().unwrap().sponsor_used, "Alice's lock used Bob's sponsorship");
+        wait_until("the ZCRYPT-giving swap to finish", 300, || {
+            let _ = v(swap_asset_settle(alice.st())).ok()?;
+            let _ = v(swap_asset_settle(bob.st())).ok()?;
+            let a = v(list_pending_swaps(alice.st())).ok()?;
+            let b = v(list_pending_swaps(bob.st())).ok()?;
+            (a.is_empty() && b.is_empty()).then_some(())
+        });
+        wait_until("bob holds more of the asset", 60, || {
+            let held = v(held_assets(bob.st())).ok()?;
+            held.into_iter().find(|a| a.asset_id == minted.asset_id && a.balance >= give_amt + 30_000)
+        });
+        println!("[wallet] swap settled the other way (Bob gave 1 ZCRYPT and sponsored Alice's lock); both pending lists are empty");
+
+        // NEVER STRANDED: a wallet whose ENTIRE ZCRYPT is one coin sends from it (the gas is
+        // burned inside the one proof), spends the change, sweeps to zero, and only a truly
+        // empty wallet is told it has nothing to send.
+        // Dana pays Charles (not Bob: Bob's live balance is compared against a restore below).
+        let dana = W::new(&url, &btc_url);
+        v(create_wallet(pw.clone(), dana.st())).expect("create dana");
+        let dana_addr = v(get_address(dana.st())).unwrap();
+        let payee = v(get_address(charles.st())).unwrap();
+        v(send_onchain(dana_addr, 5 * ZC, "0".into(), alice.st())).expect("alice -> dana one coin");
+        wait_until("dana's single coin", 60, || {
+            v(scan_onchain(dana.st())).ok()?;
+            (v(get_balance(dana.st())).ok()?.total == 5 * ZC).then_some(())
+        });
+        let one = v(send_onchain(payee.clone(), 2 * ZC, "0".into(), dana.st())).expect("a single coin pays its own gas");
+        assert!(one.on_chain);
+        assert_eq!(v(get_balance(dana.st())).unwrap().total, 3 * ZC - GAS_FEE, "change = coin − amount − gas");
+        wait_until("dana's change is spendable", 60, || {
+            v(scan_onchain(dana.st())).ok()?;
+            v(send_onchain(payee.clone(), ZC, "0".into(), dana.st())).ok()
+        });
+        let left = v(get_balance(dana.st())).unwrap().total;
+        assert_eq!(left, 2 * ZC - 2 * GAS_FEE);
+        wait_until("dana sweeps everything but the gas", 60, || {
+            v(scan_onchain(dana.st())).ok()?;
+            v(send_onchain(payee.clone(), left - GAS_FEE, "0".into(), dana.st())).ok()
+        });
+        assert_eq!(v(get_balance(dana.st())).unwrap().total, 0, "nothing stranded");
+        let empty = match v(send_onchain(payee.clone(), 1, "0".into(), dana.st())) {
+            Err(e) => e,
+            Ok(_) => panic!("an empty wallet sent a coin"),
+        };
+        assert!(empty.contains("insufficient") || empty.contains("nothing") || empty.contains("no "), "{empty}");
+        println!("[wallet] Dana (one coin) sent 2, then 1, then swept to zero with no second coin; empty wallet: {empty}");
 
         // Charles is idle. Lock drops his keys; the wrong password is refused; unlock restores him.
         let charles_addr = v(get_address(charles.st())).unwrap();

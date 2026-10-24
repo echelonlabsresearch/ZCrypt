@@ -519,6 +519,13 @@ pub fn out_asset_coin(to: &Address, value: u64, blind: Blind, asset_id: u64) -> 
 }
 
 /// A fresh random blinding factor (for building a new coin's commitment + note).
+/// A value-0 PAD output: a fresh blind, the burn key (nobody can spend it, there is nothing
+/// to spend), the transaction's asset. `shield_tx::build` appends these when a spend names
+/// fewer than `N_OUT` coins, so every transfer on the wire has the same shape.
+pub fn pad_coin(asset_id: u64) -> OutCoin {
+    (0, random_blind(), crate::htlc_shield::BURN_PK, asset_id)
+}
+
 pub fn random_blind() -> Blind {
     rand_blind()
 }

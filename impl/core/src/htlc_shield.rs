@@ -297,6 +297,15 @@ pub struct HtlcEscrow {
     pub claim_coin: Option<HiddenCoin>,
     /// The coin an expire appends (`Burn`, `Swap`). Absent on a `Mint`.
     pub refund_coin: Option<HiddenCoin>,
+    /// **Gas sponsorship** (native swap locks, `0x6B`). On a ZCRYPT swap lock that burned
+    /// `2 × MIN_FEE`: the escrow id of the ONE counter-lock (same hashlock, keys crossed) that
+    /// may be admitted without a gas note. `None` on every other escrow.
+    #[serde(default)]
+    pub sponsor_for: Option<Hash>,
+    /// Set once the sponsored counter-lock has been admitted, so a sponsorship pays for
+    /// exactly one lock.
+    #[serde(default)]
+    pub sponsor_used: bool,
 }
 
 impl HtlcEscrow {
@@ -547,6 +556,8 @@ impl HtlcBook {
                 btc_claim_pk,
                 claim_coin,
                 refund_coin,
+                sponsor_for: None,
+                sponsor_used: false,
             },
         );
         Ok(id)
@@ -697,11 +708,67 @@ impl HtlcBook {
         refund_pk: PubKey,
         claim: HiddenCoin,
         refund: HiddenCoin,
+        sponsor_for: Option<Hash>,
     ) -> Result<Hash, String> {
-        self.insert(
+        let id = self.insert(
             EscrowKind::Swap, asset_id, value, hashlock, timeout_height, counterparty_pk, refund_pk, None, Vec::new(),
             Some(claim), Some(refund),
-        )
+        )?;
+        if let Some(e) = self.escrows.get_mut(&id) {
+            e.sponsor_for = sponsor_for;
+        }
+        Ok(id)
+    }
+    /// Whether the OPEN ZCRYPT swap lock `sponsor` may pay the gas of the counter-lock
+    /// `sponsored` (its escrow id) at `height`. The two locks must form one swap: the same
+    /// hashlock, and the keys crossed (the ZCRYPT lock pays the party who is refunded on the
+    /// counter-lock, and refunds to the party who claims it). The sponsor must have named
+    /// exactly this counter-lock when it burned the second fee, and must not have sponsored
+    /// before. Read-only; [`Self::mark_sponsor_used`] records the use.
+    pub fn sponsor_check(
+        &self,
+        sponsor: &Hash,
+        sponsored: &Hash,
+        height: u64,
+        hashlock: &Hash,
+        counterparty_pk: &PubKey,
+        refund_pk: &PubKey,
+    ) -> Result<(), String> {
+        let e = self.escrows.get(sponsor).ok_or("gas sponsor: no such escrow")?;
+        if e.kind != EscrowKind::Swap {
+            return Err("gas sponsor: the sponsoring escrow is not a swap lock".to_string());
+        }
+        if e.asset_id != zcrypt_shield::ASSET_ZCRYPT {
+            return Err("gas sponsor: only a ZCRYPT swap lock can pay a counter-lock's gas".to_string());
+        }
+        if e.state != EscrowState::Open || height >= e.timeout_height {
+            return Err("gas sponsor: the sponsoring lock is not open (settled or timed out)".to_string());
+        }
+        if e.hashlock != *hashlock {
+            return Err("gas sponsor: the sponsoring lock has a different hashlock".to_string());
+        }
+        if e.party_pk != *refund_pk || e.refund_pk != *counterparty_pk {
+            return Err("gas sponsor: the sponsoring lock is not the other leg of this swap (keys are not crossed)".to_string());
+        }
+        match e.sponsor_for {
+            None => return Err("gas sponsor: the sponsoring lock did not burn a second fee for a counter-lock".to_string()),
+            Some(id) if id != *sponsored => return Err("gas sponsor: the sponsoring lock named a different counter-lock".to_string()),
+            Some(_) => {}
+        }
+        if e.sponsor_used {
+            return Err("gas sponsor: this sponsorship has already paid for a lock".to_string());
+        }
+        Ok(())
+    }
+    /// Record that `sponsor` has paid for its counter-lock. Fails if it cannot sponsor (so a
+    /// caller that skipped [`Self::sponsor_check`] still cannot double-spend a sponsorship).
+    pub fn mark_sponsor_used(&mut self, sponsor: &Hash) -> Result<(), String> {
+        let e = self.escrows.get_mut(sponsor).ok_or("gas sponsor: no such escrow")?;
+        if e.sponsor_for.is_none() || e.sponsor_used {
+            return Err("gas sponsor: this sponsorship has already paid for a lock".to_string());
+        }
+        e.sponsor_used = true;
+        Ok(())
     }
 
     /// Claim with a preimage before the timeout. Returns the escrow's `(kind,
@@ -805,6 +872,14 @@ impl HtlcBook {
             buf.extend_from_slice(&e.btc_claim_pk);
             push_hidden(&mut buf, &e.claim_coin);
             push_hidden(&mut buf, &e.refund_coin);
+            match &e.sponsor_for {
+                Some(id) => {
+                    buf.push(1);
+                    buf.extend_from_slice(id);
+                }
+                None => buf.push(0),
+            }
+            buf.push(e.sponsor_used as u8);
         }
         for (timeout, ids) in &self.retired {
             buf.extend_from_slice(&timeout.to_le_bytes());
@@ -985,7 +1060,7 @@ mod tests {
         let claim = hidden(&pk(7), 500, 0xE71, 11);
         let refund = hidden(&pk(8), 500, 0xE71, 12);
         let coins = [claim.commitment, refund.commitment];
-        let id = b.lock_swap(0xE71, 500, lock, 400, pk(7), pk(8), claim, refund).unwrap();
+        let id = b.lock_swap(0xE71, 500, lock, 400, pk(7), pk(8), claim, refund, None).unwrap();
         assert_eq!(coins.len(), 2);
         assert!(coins.iter().all(|c| b.is_reserved(c)));
         // Same parameters as a Burn: a different id, so it does not collide. Its refund
@@ -993,6 +1068,75 @@ mod tests {
         assert!(b.lock_burn(0xE71, 500, lock, 400, pk(7), &[], hidden(&pk(7), 500, 0xE71, 13)).is_ok());
         b.claim(&id, x, 10).unwrap();
         assert!(coins.iter().all(|c| !b.is_reserved(c)), "settling releases the reservation");
+    }
+
+    #[test]
+    fn sponsorship_pays_for_exactly_the_named_counter_lock_once() {
+        // LP (pk 7) locks ZCRYPT for the newcomer (pk 8), naming the newcomer's lock id.
+        let mut b = HtlcBook::default();
+        let x = b"sponsor-preimage-of-32-bytes!!!!";
+        let lock = htlc_hashlock(x);
+        let gold = 0xE71u64;
+        // The newcomer's lock: GOLD, claimable by the LP (party 7), refundable to 8.
+        let newcomer_id = escrow_id(EscrowKind::Swap, gold, 900, &lock, 500, &pk(7), &pk(8));
+        let lp_id = b
+            .lock_swap(zcrypt_shield::ASSET_ZCRYPT, 500, lock, 400, pk(8), pk(7), hidden(&pk(8), 500, 0, 1), hidden(&pk(7), 500, 0, 2), Some(newcomer_id))
+            .unwrap();
+        assert_eq!(b.get(&lp_id).unwrap().sponsor_for, Some(newcomer_id));
+        assert!(!b.get(&lp_id).unwrap().sponsor_used);
+        // The named counter-lock, keys crossed, same hashlock, sponsor still open: OK.
+        b.sponsor_check(&lp_id, &newcomer_id, 10, &lock, &pk(7), &pk(8)).unwrap();
+        // Wrong hashlock, keys not crossed, a different counter-lock id, a stranger's id: refused.
+        let other_lock = htlc_hashlock(b"another-preimage-of-32-bytes!!!!");
+        assert!(b.sponsor_check(&lp_id, &newcomer_id, 10, &other_lock, &pk(7), &pk(8)).unwrap_err().contains("different hashlock"));
+        assert!(b.sponsor_check(&lp_id, &newcomer_id, 10, &lock, &pk(8), &pk(7)).unwrap_err().contains("keys are not crossed"));
+        let dust_id = escrow_id(EscrowKind::Swap, gold, 1, &lock, 500, &pk(7), &pk(8));
+        assert!(b.sponsor_check(&lp_id, &dust_id, 10, &lock, &pk(7), &pk(8)).unwrap_err().contains("named a different counter-lock"));
+        assert!(b.sponsor_check(&[9u8; 32], &newcomer_id, 10, &lock, &pk(7), &pk(8)).unwrap_err().contains("no such escrow"));
+        // Timed out: refused even while the record is still Open.
+        assert!(b.sponsor_check(&lp_id, &newcomer_id, 400, &lock, &pk(7), &pk(8)).unwrap_err().contains("not open"));
+        // One sponsorship pays one lock.
+        b.mark_sponsor_used(&lp_id).unwrap();
+        assert!(b.get(&lp_id).unwrap().sponsor_used);
+        assert!(b.sponsor_check(&lp_id, &newcomer_id, 10, &lock, &pk(7), &pk(8)).unwrap_err().contains("already paid"));
+        assert!(b.mark_sponsor_used(&lp_id).unwrap_err().contains("already paid"));
+        // A ZCRYPT lock that burned only its own fee sponsors nothing.
+        let plain_id = b
+            .lock_swap(zcrypt_shield::ASSET_ZCRYPT, 501, lock, 400, pk(8), pk(7), hidden(&pk(8), 501, 0, 3), hidden(&pk(7), 501, 0, 4), None)
+            .unwrap();
+        assert!(b.sponsor_check(&plain_id, &newcomer_id, 10, &lock, &pk(7), &pk(8)).unwrap_err().contains("did not burn a second fee"));
+        assert!(b.mark_sponsor_used(&plain_id).is_err());
+        // A non-ZCRYPT lock can never sponsor, whatever it names.
+        let gold_id = b
+            .lock_swap(gold, 7, lock, 400, pk(8), pk(7), hidden(&pk(8), 7, gold, 5), hidden(&pk(7), 7, gold, 6), Some(newcomer_id))
+            .unwrap();
+        assert!(b.sponsor_check(&gold_id, &newcomer_id, 10, &lock, &pk(7), &pk(8)).unwrap_err().contains("only a ZCRYPT swap lock"));
+        // A settled sponsor is no sponsor.
+        b.claim(&lp_id, x, 10).unwrap();
+        assert!(b.sponsor_check(&lp_id, &newcomer_id, 10, &lock, &pk(7), &pk(8)).unwrap_err().contains("not open"));
+    }
+
+    #[test]
+    fn sponsorship_is_part_of_the_consensus_root() {
+        // Two books equal in every settled field but the sponsorship must hash differently:
+        // a node that forgot a sponsorship was used would otherwise settle quietly.
+        let x = b"root-preimage-of-exactly-32-byte";
+        let lock = htlc_hashlock(x);
+        let target = [0x5Au8; 32];
+        let mk = |sponsor: Option<Hash>| {
+            let mut b = HtlcBook::default();
+            let id = b
+                .lock_swap(zcrypt_shield::ASSET_ZCRYPT, 500, lock, 400, pk(8), pk(7), hidden(&pk(8), 500, 0, 1), hidden(&pk(7), 500, 0, 2), sponsor)
+                .unwrap();
+            (b, id)
+        };
+        let (plain, _) = mk(None);
+        let (sponsoring, id) = mk(Some(target));
+        assert_ne!(plain.root(), sponsoring.root(), "sponsor_for is committed");
+        let mut used = sponsoring.clone();
+        used.mark_sponsor_used(&id).unwrap();
+        assert_ne!(sponsoring.root(), used.root(), "sponsor_used is committed");
+        assert_eq!(used.root(), used.clone().root(), "deterministic");
     }
 
     #[test]

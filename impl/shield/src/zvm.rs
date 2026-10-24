@@ -259,18 +259,18 @@ mod tests {
 
     #[test]
     fn vm_equals_circuit_on_valid_spends() {
-        assert_equiv(vec![inp(100, 11, 7, 3), inp(50, 22, 8, 5)], vec![oc(90, 33, 1), oc(55, 44, 2)], 5);
-        assert_equiv(vec![inp(1_000, 1, 2, 0), inp(2_000, 3, 4, 9)], vec![oc(2_990, 5, 6), oc(0, 7, 8)], 10);
+        assert_equiv(vec![inp(100, 11, 7, 3), inp(50, 22, 8, 5)], vec![oc(90, 33, 1), oc(55, 44, 2), oc(0, 0xE1, 0xE2)], 5);
+        assert_equiv(vec![inp(1_000, 1, 2, 0), inp(2_000, 3, 4, 9)], vec![oc(2_990, 5, 6), oc(0, 7, 8), oc(0, 0xE1, 0xE2)], 10);
     }
 
     #[test]
     fn vm_equals_circuit_on_large_values() {
         // multi-limb values (high limb non-zero) the VM and circuit must agree on
         assert_equiv(vec![inp(5_000_000_000, 11, 7, 3), inp(3_000_000_000, 22, 8, 5)],
-                     vec![oc(7_999_999_895, 33, 1), oc(100, 44, 2)], 5);
+                     vec![oc(7_999_999_895, 33, 1), oc(100, 44, 2), oc(0, 0xE1, 0xE2)], 5);
         // over the per-coin cap: both reject
         assert_equiv(vec![inp(MAX_COIN_VALUE + 1, 1, 1, 0), inp(0, 2, 2, 0)],
-                     vec![oc(0, 3, 1), oc(0, 4, 2)], 0);
+                     vec![oc(0, 3, 1), oc(0, 4, 2), oc(0, 0xE1, 0xE2)], 0);
     }
 
     #[test]
@@ -278,25 +278,25 @@ mod tests {
         // THE "stuck with one coin" fix: spend a SINGLE coin (1 real input). The
         // circuit pads the second slot as inactive; VM and circuit must still agree,
         // and the proof must verify.
-        assert_equiv(vec![inp(100, 11, 7, 3)], vec![oc(95, 33, 1), oc(0, 44, 2)], 5);
+        assert_equiv(vec![inp(100, 11, 7, 3)], vec![oc(95, 33, 1), oc(0, 44, 2), oc(0, 0xE1, 0xE2)], 5);
         // single large (multi-limb) coin split into recipient + change.
-        assert_equiv(vec![inp(5_000_000_000, 9, 4, 6)], vec![oc(4_000_000_000, 1, 1), oc(999_999_990, 2, 2)], 10);
+        assert_equiv(vec![inp(5_000_000_000, 9, 4, 6)], vec![oc(4_000_000_000, 1, 1), oc(999_999_990, 2, 2), oc(0, 0xE1, 0xE2)], 10);
         // a single-input spend that does NOT conserve must be rejected by both.
-        assert_equiv(vec![inp(100, 11, 7, 3)], vec![oc(95, 33, 1), oc(1, 44, 2)], 5);
+        assert_equiv(vec![inp(100, 11, 7, 3)], vec![oc(95, 33, 1), oc(1, 44, 2), oc(0, 0xE1, 0xE2)], 5);
     }
 
     #[test]
     fn vm_equals_circuit_on_adversarial_spends() {
         // value not conserved
-        assert_equiv(vec![inp(100, 1, 1, 0), inp(1, 2, 2, 0)], vec![oc(100, 3, 1), oc(1, 4, 2)], 5);
+        assert_equiv(vec![inp(100, 1, 1, 0), inp(1, 2, 2, 0)], vec![oc(100, 3, 1), oc(1, 4, 2), oc(0, 0xE1, 0xE2)], 5);
         // over-range input value
-        assert_equiv(vec![inp(MAX_COIN_VALUE + 1, 1, 1, 0), inp(1, 2, 2, 0)], vec![oc(0, 3, 1), oc(0, 4, 2)], 0);
+        assert_equiv(vec![inp(MAX_COIN_VALUE + 1, 1, 1, 0), inp(1, 2, 2, 0)], vec![oc(0, 3, 1), oc(0, 4, 2), oc(0, 0xE1, 0xE2)], 0);
         // fake membership: corrupt one input's authentication path so the two inputs
         // no longer agree on a shared tree root. VM rejects ("inputs disagree on tree
         // root"); the circuit has no shared root so `prove` returns None. Both reject.
         let mut ins = with_tree(vec![inp(100, 11, 7, 3), inp(50, 22, 8, 5)]);
         ins[0].path_siblings[0][0] ^= 1;
-        assert_equiv_built(ins, vec![oc(90, 33, 1), oc(55, 44, 2)], 5);
+        assert_equiv_built(ins, vec![oc(90, 33, 1), oc(55, 44, 2), oc(0, 0xE1, 0xE2)], 5);
     }
 
     #[test]
@@ -304,7 +304,7 @@ mod tests {
         // The circuit doesn't just say "valid" — it commits to precisely the
         // outputs the VM computed. Change any of them and the proof fails.
         let inputs = with_tree(vec![inp(100, 11, 7, 3), inp(50, 22, 8, 5)]);
-        let outputs = vec![oc(90, 33, 1), oc(55, 44, 2)];
+        let outputs = vec![oc(90, 33, 1), oc(55, 44, 2), oc(0, 0xE1, 0xE2)];
         let vm = run_shield_transfer(&inputs, &outputs, 5);
         let (outs, nfs, root, proof) = prove(&inputs, &outputs, 5, TEST_CHAIN, &[0u64; 8]).unwrap();
         assert_eq!(outs, vm.output_commitments);

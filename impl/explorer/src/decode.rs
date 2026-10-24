@@ -60,6 +60,22 @@ fn parse_swap_proofs(body: &[u8]) -> Option<(ShieldTx, ShieldTx)> {
 
 /// Display range for `len` body bytes at `off`. Byte 0 of the transaction is the tag,
 /// so body offset 0 is displayed as 1.
+/// The 0x6B native swap lock: header ‖ sponsor_ref(32) ‖ claim opening ‖ refund opening ‖ asset
+/// spend (no gas prefix). Returns the asset spend.
+fn parse_native_swap_spend(body: &[u8]) -> Option<ShieldTx> {
+    let (_, n1) = zcrypt_core::htlc_shield::CoinOpening::decode(body.get(NATIVE_SWAP_HEAD..)?)?;
+    let (_, n2) = zcrypt_core::htlc_shield::CoinOpening::decode(body.get(NATIVE_SWAP_HEAD + n1..)?)?;
+    shield_tx::from_bytes(body.get(NATIVE_SWAP_HEAD + n1 + n2..)?)
+}
+/// 0x6B: the swap header plus the 32-byte sponsor reference.
+const NATIVE_SWAP_HEAD: usize = SWAP_HEAD + 32;
+/// The 0x6A native ZCRYPT transfer body: `burn_value(8) ‖ burn_blind(64) ‖ shield_tx`.
+fn parse_zcrypt_transfer(body: &[u8]) -> Option<(u64, zcrypt_shield::Blind, ShieldTx)> {
+    let value = rd_u64(body, 0)?;
+    let blind = rd_blind(body, 8)?;
+    let tx = shield_tx::from_bytes(body.get(8 + BB..)?)?;
+    Some((value, blind, tx))
+}
 fn range_at(off: usize, len: usize) -> String {
     format!("[{}..{}]", off + 1, off + 1 + len)
 }
@@ -173,6 +189,36 @@ burned, while every other output stays hidden", hex_at(0, BB)));
             let (gas, main) = parse_transfer(body)?;
             shield_rows(&format!("[69..{}] gas", 69 + gas_len), &gas, &mut r);
             shield_rows(&format!("[{}..] main", 69 + gas_len), &main, &mut r);
+        }
+        0x6A => {
+            r.push(row("".into(), "STRUCTURE", "a 0x6A NATIVE ZCRYPT transfer is ONE shield tx. Its output[0] is a \
+revealed ZCRYPT burn coin (≥ 0.01): every node recomputes commit_asset(burn value, burn blind, BURN_PK, ZCRYPT) \
+and requires it to equal output[0]. A spend is single-asset, so the revealed burn pins every hidden input and \
+output to ZCRYPT — the gas is ZCRYPT with no second coin and no second proof.".into()));
+            r.push(row("[1..9]".into(), "burn value (u64 LE, atomic ZCRYPT) — the gas; must be ≥ MIN_FEE", rd_u64(body, 0).map(zcry)?));
+            r.push(row("[9..73]".into(), "burn blind: the PUBLIC opening of output[0]", hex_at(8, BB)));
+            let (_, _, tx) = parse_zcrypt_transfer(body)?;
+            shield_rows("[73..] transfer", &tx, &mut r);
+        }
+        0x6B => {
+            let aid = rd_u64(body, 8 + BB)?;
+            r.push(row("".into(), "STRUCTURE", "a 0x6B NATIVE swap lock is the 0x62 escrow header, then a 32-byte \
+SPONSOR reference, the claim and refund openings, and the asset spend — with NO gas prefix. A ZCRYPT lock burns \
+its gas as the spend's in-tx fee (0.01, or 0.02 when it also pays for the counter-lock it names); a lock of any \
+other asset pays nothing and is admitted only if the ZCRYPT swap lock it names is open, is the other leg of this \
+swap (same hashlock, keys crossed), named exactly this lock, and has not sponsored before.".into()));
+            r.push(row("[1..9]".into(), "locked value (u64 LE, in the asset's own atomic units)", asset_amt(rd_u64(body, 0)?, Some(aid), None, None)));
+            r.push(row("[9..73]".into(), "lock blind (opens the burn output)", hex_at(8, BB)));
+            r.push(row("[73..81]".into(), "asset id (u64 LE) -> Ctx.asset_registered lookup", format!("{aid}")));
+            r.push(row("[81..113]".into(), "hashlock (SHA-256)", hex_at(16 + BB, 32)));
+            r.push(row("[113..121]".into(), "timeout height (u64 LE)", format!("{}", rd_u64(body, 48 + BB)?)));
+            r.push(row("[121..185]".into(), "counterparty shield pubkey", hex_at(56 + BB, 64)));
+            r.push(row("[185..249]".into(), "refund shield pubkey", hex_at(120 + BB, 64)));
+            r.push(row("[249..281]".into(), if aid == zcrypt_shield::ASSET_ZCRYPT { "sponsor_for: the counter-lock this ZCRYPT lock pays gas for (zero = none)" } else { "sponsored_by: the ZCRYPT swap lock paying this lock's gas" }, hex_at(SWAP_HEAD, 32)));
+            let n1 = push_opening(body, NATIVE_SWAP_HEAD, "claim settlement", &mut r)?;
+            let n2 = push_opening(body, NATIVE_SWAP_HEAD + n1, "refund settlement", &mut r)?;
+            let stx = parse_native_swap_spend(body)?;
+            shield_rows(&format!("[{}..] asset spend (fee = the ZCRYPT gas, or 0 when sponsored)", NATIVE_SWAP_HEAD + n1 + n2 + 1), &stx, &mut r);
         }
         0x57 => {
             // Wire: ed25519_pk(32) ‖ stake(8) ‖ reward(32) ‖ commission_bps(2) ‖ nonce(8) ‖ sig(64) ‖ stake_blind(64) ‖ shield_tx
@@ -497,6 +543,45 @@ pub fn describe_tx(b: &[u8], chain_id: &[u8], with_rules: bool, height: u64) -> 
                 "explains": "One leg of an in-pool asset-for-asset swap. The locked value and asset are public for the escrow; the funding coins are hidden. Both settlement commitments are in this transaction; their blinds travel only in the encrypted notes. Gas is 0.01 ZCRYPT in a separate proof, and the locked asset is not charged. Two such legs under one hashlock settle atomically.",
             })
         }
+        Some(0x6A) => match parse_zcrypt_transfer(body) {
+            Some((burn, _, tx)) => json!({
+                "type": "Shielded transfer (native ZCRYPT gas)",
+                "tag": tag_hex,
+                "hidden": HIDDEN_TRANSFER,
+                "burn_atomic": burn,
+                "public": shield_public(&tx),
+                "explains": "A ZCRYPT transfer in ONE proof: output[0] is a revealed burn of the gas (shown), the other outputs are the payment and the change. The amount and both parties stay hidden; the asset is provably ZCRYPT because the burn coin is. A single coin can pay, move value and keep its change.",
+            }),
+            None => json!({ "type": "Shielded transfer (native ZCRYPT gas)", "tag": tag_hex, "note": "payload not decodable" }),
+        },
+        Some(0x6B) => {
+            let aid = rd_u64(body, 8 + BB);
+            let opened = zcrypt_core::htlc_shield::CoinOpening::decode(body.get(NATIVE_SWAP_HEAD..).unwrap_or(&[]));
+            let (claim_commitment, refund_commitment) = match opened {
+                Some((claim, n1)) => {
+                    let refund = zcrypt_core::htlc_shield::CoinOpening::decode(body.get(NATIVE_SWAP_HEAD + n1..).unwrap_or(&[]))
+                        .map(|(o, _)| short(&o.coin.commitment));
+                    (Some(short(&claim.coin.commitment)), refund)
+                }
+                None => (None, None),
+            };
+            let sponsor = rd_hex(body, SWAP_HEAD, 32);
+            let is_zc = aid == Some(zcrypt_shield::ASSET_ZCRYPT);
+            json!({
+                "type": "In-pool swap lock (native gas)", "tag": tag_hex,
+                "value_atomic": rd_u64(body, 0),
+                "asset_id": aid.map(|a| a.to_string()),
+                "hashlock": rd_hex(body, 16 + BB, 32),
+                "timeout_height": rd_u64(body, 48 + BB),
+                "claim_commitment": claim_commitment,
+                "refund_commitment": refund_commitment,
+                "sponsor_for": if is_zc { sponsor.clone() } else { None },
+                "sponsored_by": if is_zc { None } else { sponsor },
+                "fee_atomic": parse_native_swap_spend(body).map(|t| t.fee),
+                "hidden": ["which coins funded the lock", "the settlement blinds"],
+                "explains": "One leg of an in-pool swap with no gas note. A ZCRYPT leg burns its gas in-proof (0.02 when it sponsors the other leg); a non-ZCRYPT leg is admitted gas-free only against the live ZCRYPT leg that named it. This is what lets a wallet with no ZCRYPT at all swap into ZCRYPT.",
+            })
+        }
         Some(0x63) => json!({
             "type": "Bitcoin header relay", "tag": tag_hex,
             "headers": body.len() / 80,
@@ -534,7 +619,11 @@ pub fn describe_tx(b: &[u8], chain_id: &[u8], with_rules: bool, height: u64) -> 
         if let (Some(t), Value::Object(map)) = (tag, &mut v) {
             // The FULL transaction: raw bytes + the byte map consensus parses them by.
             map.insert("raw".to_string(), raw_view(b, t, body));
-            let main = if t == 0x55 { parse_transfer(body).map(|(_, m)| m) } else { None };
+            let main = match t {
+                0x55 => parse_transfer(body).map(|(_, m)| m),
+                0x6A => parse_zcrypt_transfer(body).map(|(_, _, m)| m),
+                _ => None,
+            };
             if let Some(r) = rules(t, main.as_ref(), body, chain_id, height) {
                 map.insert("rules".to_string(), r);
             }
@@ -596,6 +685,7 @@ fn op_gate(op: u8) -> (&'static str, &'static str) {
         0x1B => ("CHECK_ASSET_REGISTERED", "asset id is registered"),
         0x1C => ("CHECK_BURN_OUTPUT", "output[0] == the declared burn coin"),
         0x1D => ("CHECK_THRESHOLD_SIG", ">= M valid ML-DSA signatures from the asset's key set"),
+        0x21 => ("CHECK_GAS_PAID", "a ZCRYPT lock burned its fee in-proof, or a live paired ZCRYPT swap lock named this lock as the one it sponsors"),
         _ => ("?", "unknown opcode"),
     }
 }
@@ -710,6 +800,8 @@ fn gate_op_result(tag: u8, op: u8, body: &[u8], chain_id: &[u8], height: u64) ->
             let asset = rd_u64(body, 8 + BB)?;
             let stx = if tag == 0x62 {
                 parse_swap_proofs(body)?.1
+            } else if tag == 0x6B {
+                parse_native_swap_spend(body)?
             } else {
                 let (_, n) = zcrypt_core::htlc_shield::CoinOpening::decode(body.get(BURN_HEAD..)?)?;
                 shield_tx::from_bytes(body.get(BURN_HEAD + n..)?)?
@@ -749,7 +841,7 @@ fn gate_op_result(tag: u8, op: u8, body: &[u8], chain_id: &[u8], height: u64) ->
         }
         // state-dependent checks: honest note. (0x1D here is rotation, which binds a historical
         // epoch; 0x1E is the SPV deposit proof, verified against the consensus header chain.)
-        0x14 | 0x15 | 0x17 | 0x1B | 0x1D | 0x1E => Some(state),
+        0x14 | 0x15 | 0x17 | 0x1B | 0x1D | 0x1E | 0x21 => Some(state),
         _ => None,
     }
 }
@@ -757,7 +849,8 @@ fn gate_op_result(tag: u8, op: u8, body: &[u8], chain_id: &[u8], height: u64) ->
 fn rules(tag: u8, main: Option<&ShieldTx>, body: &[u8], chain_id: &[u8], height: u64) -> Option<Value> {
     use zcrypt_core::zvm as g;
     let (prog, shield): (&[u8], bool) = match tag {
-        0x55 => (zcrypt_shield::zvm::SHIELD_TRANSFER, true),
+        0x55 | 0x6A => (zcrypt_shield::zvm::SHIELD_TRANSFER, true),
+        0x6B => (g::SWAP_LOCK_NATIVE, false),
         0x57 => (g::BOND, false),
         0x58 => (g::CLAIM, false),
         0x59 => (g::REGISTER, false),

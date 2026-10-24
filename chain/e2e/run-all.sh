@@ -35,7 +35,7 @@ say "0/7  Build the RPC test drivers (release)"
     --bin swap_demo --bin swap_pool_demo --bin fee_flow_3node \
     --bin public_roundtrip_e2e --bin public_bridge_adversarial --bin watcher_daemon_e2e \
     --bin spv_guards_3node --bin rotate_reserve --bin rotate_reserve_3node \
-    --bin audit_fixes_3node )
+    --bin audit_fixes_3node --bin stranded_value_3node )
 WALLET_DIR="$(cd "$CHAIN_DIR/../wallet/src-tauri" && pwd)"
 say "0b/7 Build the WALLET backend test (release, tauri mock app)"
 ( cd "$WALLET_DIR" && cargo test --release --locked --features devnet --no-run )
@@ -100,6 +100,9 @@ ZC_URL="$N0" BTC_URL="$BTC" "$BIN/watcher_daemon_e2e"
 
 say "8c2/9 AUDIT-FIX regressions: aliased value refused, duplicate escrow id refused before the burn, ONE HTLC per escrow on the consensus payout key, refund-branch spend recognized"
 ZC_URL="$N0" BTC_URL="$BTC" "$BIN/audit_fixes_3node"
+
+say "8c3/9 NEVER STRANDED: single-coin native ZCRYPT sends (one proof, in-proof gas), a zero-ZCRYPT wallet swapping INTO ZCRYPT on a sponsored gas-free lock, and the adversarial shapes consensus must refuse"
+ZC_URL="$N0" "$BIN/stranded_value_3node"
 
 say "8d/9 WALLET backend (every tauri command) against the live chain: payments, receipts, staking, bridge, session, swap, assets, exports"
 ( cd "$WALLET_DIR" && ZC_E2E_URL="$N0" BTC_URL="$BTC" VALIDATOR_SEED_HEX="$VSEED" \

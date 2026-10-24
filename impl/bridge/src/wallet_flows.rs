@@ -299,6 +299,8 @@ mod tests {
             claim_enc_note: vec![],
             refund_commitment: vec![],
             refund_enc_note: vec![],
+            sponsor_for: vec![],
+            sponsor_used: false,
         }
     }
 

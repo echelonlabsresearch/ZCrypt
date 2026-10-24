@@ -1334,8 +1334,235 @@ impl Node {
         }
         self.htlc.lock_swap(
             asset_id, value, hashlock, timeout_height, counterparty_pk, refund_pk,
-            claim.coin.clone(), refund.coin.clone(),
+            claim.coin.clone(), refund.coin.clone(), None,
         )
+    }
+
+    // ------------------------------------------------------------------------------------
+    // Native ZCRYPT gas: one proof, one coin.
+    // ------------------------------------------------------------------------------------
+
+    /// The header rule of a **native ZCRYPT transfer** (`0x6A`): `output[0]` is the revealed
+    /// burn coin `commit_asset(burn_value, burn_blind, BURN_PK, ZCRYPT)` with `burn_value ≥
+    /// MIN_FEE`, and the in-tx fee is 0. Because a spend is single-asset, a revealed ZCRYPT
+    /// burn output pins every input and output of the proof to ZCRYPT, so the gas is provably
+    /// ZCRYPT without a second coin or a second proof: one coin pays, moves value, and keeps
+    /// its change. `burn_value` may exceed `MIN_FEE` (a wallet may burn dust it would otherwise
+    /// have to keep as an unspendable change coin); it is public either way.
+    fn zcrypt_transfer_header_ok(
+        tx: &crate::shield_tx::ShieldTx,
+        burn_value: u64,
+        burn_blind: &zcrypt_shield::Blind,
+    ) -> Result<(), String> {
+        if burn_value < crate::emission::MIN_FEE {
+            return Err(format!(
+                "zcrypt-transfer: burn must be ≥ MIN_FEE ({}); got {burn_value}",
+                crate::emission::MIN_FEE
+            ));
+        }
+        lock_value_ok(burn_value)?;
+        if tx.fee != 0 {
+            return Err(format!("zcrypt-transfer: in-tx fee must be 0 (gas is the revealed burn coin); got {}", tx.fee));
+        }
+        let expected = zcrypt_shield::commit_asset(burn_value, burn_blind, &crate::htlc_shield::BURN_PK, zcrypt_shield::ASSET_ZCRYPT);
+        let ctx = zvm::Ctx { burn_output_ok: tx.output_commitments.first() == Some(&expected), ..Default::default() };
+        gate(zvm::ZCRYPT_TRANSFER, &ctx).map_err(|e| format!("zcrypt-transfer: {e}"))
+    }
+
+    /// Proof-free mempool half of [`Self::check_zcrypt_transfer`] (see [`Self::precheck_shield`]).
+    pub fn precheck_zcrypt_transfer(
+        &self,
+        tx: &crate::shield_tx::ShieldTx,
+        burn_value: u64,
+        burn_blind: zcrypt_shield::Blind,
+    ) -> Result<(), String> {
+        Self::zcrypt_transfer_header_ok(tx, burn_value, &burn_blind)?;
+        self.precheck_shield(tx)
+    }
+
+    /// Mempool check of a native ZCRYPT transfer: header rule + the shield proof. Does not
+    /// mutate state.
+    pub fn check_zcrypt_transfer(
+        &self,
+        chain_id: &[u8],
+        tx: &crate::shield_tx::ShieldTx,
+        burn_value: u64,
+        burn_blind: zcrypt_shield::Blind,
+    ) -> Result<(), String> {
+        Self::zcrypt_transfer_header_ok(tx, burn_value, &burn_blind)?;
+        self.check_shield(chain_id, tx)
+    }
+
+    /// Apply a native ZCRYPT transfer (`0x6A`): the burn coin is appended like any output
+    /// (nobody holds the burn key), the other outputs are the payment and the change. The
+    /// declared `(burn_value, burn_blind)` cannot be rewritten in the mempool: the commitment
+    /// they open is one of the proof's public outputs.
+    pub fn submit_zcrypt_transfer(
+        &mut self,
+        chain_id: &[u8],
+        tx: &crate::shield_tx::ShieldTx,
+        burn_value: u64,
+        burn_blind: zcrypt_shield::Blind,
+    ) -> Result<Receipt, String> {
+        Self::zcrypt_transfer_header_ok(tx, burn_value, &burn_blind)?;
+        self.submit_shield(chain_id, tx)
+    }
+
+    /// The gas rule of a **native swap lock** (`0x6B`, no gas prefix). Returns what the new
+    /// escrow records as `sponsor_for`.
+    ///
+    /// * **ZCRYPT lock**: the asset spend burns its gas as the in-tx fee (the revealed burn
+    ///   output pins the spend to ZCRYPT). `fee ≥ MIN_FEE`; with a non-zero `sponsor_ref`
+    ///   the lock also pays for its counter-lock and `fee ≥ 2 × MIN_FEE`. `sponsor_ref` is
+    ///   then the escrow id of the ONE counter-lock it sponsors.
+    /// * **Any other asset**: `fee == 0` (the locked asset is never the gas) and `sponsor_ref`
+    ///   names a live ZCRYPT swap lock that is the other leg of this swap (same hashlock,
+    ///   keys crossed) and that burned the second fee naming exactly this lock
+    ///   ([`crate::htlc_shield::HtlcBook::sponsor_check`]). One sponsorship pays one lock.
+    ///
+    /// Pinning the sponsored id into the sponsor is what makes this safe: nobody but the
+    /// agreed counterparty can consume a sponsorship (a dust lock from a stranger has a
+    /// different id), and the LP decides whom it pays for when it locks.
+    #[allow(clippy::too_many_arguments)]
+    fn native_lock_gas_rule(
+        &self,
+        asset_id: u64,
+        fee: u64,
+        sponsor_ref: &Hash,
+        my_id: &Hash,
+        hashlock: &Hash,
+        counterparty_pk: &zcrypt_shield::PubKey,
+        refund_pk: &zcrypt_shield::PubKey,
+    ) -> Result<Option<Hash>, String> {
+        let min_fee = crate::emission::MIN_FEE;
+        if asset_id == zcrypt_shield::ASSET_ZCRYPT {
+            let sponsor_for = (*sponsor_ref != NO_SPONSOR).then_some(*sponsor_ref);
+            let need = if sponsor_for.is_some() { 2 * min_fee } else { min_fee };
+            if fee < need {
+                return Err(format!(
+                    "swap-lock: a ZCRYPT lock must burn ≥ {need} as its fee ({}); got {fee}",
+                    if sponsor_for.is_some() { "MIN_FEE for itself + MIN_FEE for the counter-lock it sponsors" } else { "MIN_FEE" }
+                ));
+            }
+            if sponsor_for == Some(*my_id) {
+                return Err("swap-lock: a lock cannot sponsor itself".to_string());
+            }
+            return Ok(sponsor_for);
+        }
+        if fee != 0 {
+            return Err(format!("swap-lock: a non-ZCRYPT lock must have fee 0 (the locked asset is never the gas); got {fee}"));
+        }
+        if *sponsor_ref == NO_SPONSOR {
+            return Err("swap-lock: a non-ZCRYPT lock without a gas note must name the ZCRYPT swap lock that sponsors it".to_string());
+        }
+        self.htlc.sponsor_check(sponsor_ref, my_id, self.current_height, hashlock, counterparty_pk, refund_pk)?;
+        Ok(None)
+    }
+
+    /// Mempool mirror of every proof-free precondition of a native swap lock (`0x6B`):
+    /// asset, horizon, value, the gas rule and the escrow id / settlement-coin freshness.
+    #[allow(clippy::too_many_arguments)]
+    pub fn precheck_swap_lock_native(
+        &self,
+        asset_id: u64,
+        value: u64,
+        hashlock: &Hash,
+        timeout_height: u64,
+        counterparty_pk: &zcrypt_shield::PubKey,
+        refund_pk: &zcrypt_shield::PubKey,
+        sponsor_ref: &Hash,
+        fee: u64,
+        coins: &[zcrypt_shield::Commitment],
+    ) -> Result<(), String> {
+        if !crate::asset_registry::asset_id_ok(asset_id) {
+            return Err("asset id is not a canonical field element".to_string());
+        }
+        if !self.assets.is_registered(asset_id) {
+            return Err("asset is not registered".to_string());
+        }
+        self.check_timeout_horizon(timeout_height, crate::htlc_shield::MAX_ESCROW_HORIZON_BLOCKS)?;
+        if value == 0 {
+            return Err("escrow value must be positive".to_string());
+        }
+        lock_value_ok(value)?;
+        let my_id = crate::htlc_shield::escrow_id(
+            crate::htlc_shield::EscrowKind::Swap, asset_id, value, hashlock, timeout_height, counterparty_pk, refund_pk,
+        );
+        self.native_lock_gas_rule(asset_id, fee, sponsor_ref, &my_id, hashlock, counterparty_pk, refund_pk)?;
+        self.escrow_id_available(
+            crate::htlc_shield::EscrowKind::Swap, asset_id, value, hashlock, timeout_height, counterparty_pk, refund_pk, coins,
+        )
+    }
+
+    /// Lock coins into a **swap** escrow with no gas note (`0x6B`): the same escrow as
+    /// [`Self::swap_lock`], gas paid by the rule in [`Self::native_lock_gas_rule`]. A ZCRYPT
+    /// lock needs ONE coin (the fee is in-proof), so a wallet holding a single ZCRYPT coin can
+    /// open a swap; a non-ZCRYPT lock needs NO ZCRYPT at all when its counterparty's ZCRYPT
+    /// lock sponsors it, so a wallet with zero ZCRYPT can swap its way to some.
+    #[allow(clippy::too_many_arguments)]
+    pub fn swap_lock_native(
+        &mut self,
+        chain_id: &[u8],
+        shield_tx: &crate::shield_tx::ShieldTx,
+        value: u64,
+        blind: zcrypt_shield::Blind,
+        asset_id: u64,
+        hashlock: Hash,
+        timeout_height: u64,
+        counterparty_pk: zcrypt_shield::PubKey,
+        refund_pk: zcrypt_shield::PubKey,
+        sponsor_ref: Hash,
+        claim: &crate::htlc_shield::CoinOpening,
+        refund: &crate::htlc_shield::CoinOpening,
+    ) -> Result<Hash, String> {
+        if !crate::asset_registry::asset_id_ok(asset_id) {
+            return Err("asset id is not a canonical field element".to_string());
+        }
+        self.check_timeout_horizon(timeout_height, crate::htlc_shield::MAX_ESCROW_HORIZON_BLOCKS)?;
+        if value == 0 {
+            return Err("escrow value must be positive".to_string());
+        }
+        lock_value_ok(value)?;
+        let my_id = crate::htlc_shield::escrow_id(
+            crate::htlc_shield::EscrowKind::Swap, asset_id, value, &hashlock, timeout_height, &counterparty_pk, &refund_pk,
+        );
+        let gas = self.native_lock_gas_rule(asset_id, shield_tx.fee, &sponsor_ref, &my_id, &hashlock, &counterparty_pk, &refund_pk);
+        // VM gate: program SWAP_LOCK_NATIVE = [CHECK_ASSET_REGISTERED, CHECK_BURN_OUTPUT, CHECK_GAS_PAID].
+        let expected = zcrypt_shield::commit_asset(value, &blind, &crate::htlc_shield::BURN_PK, asset_id);
+        let ctx = zvm::Ctx {
+            asset_registered: self.assets.is_registered(asset_id),
+            burn_output_ok: shield_tx.output_commitments.first() == Some(&expected),
+            gas_ok: gas.is_ok(),
+            ..Default::default()
+        };
+        if let Err(e) = gate(zvm::SWAP_LOCK_NATIVE, &ctx) {
+            // Report the precise gas reason when that is the failing guard.
+            return Err(gas.err().unwrap_or(e));
+        }
+        let sponsor_for = gas?;
+        claim.verify(&counterparty_pk, value, asset_id)?;
+        refund.verify(&refund_pk, value, asset_id)?;
+        self.settlement_fresh(
+            crate::htlc_shield::EscrowKind::Swap, asset_id, value, &hashlock, timeout_height, &counterparty_pk, &refund_pk,
+            &[claim.coin.commitment, refund.coin.commitment],
+        )?;
+        let envelope = crate::htlc_shield::lock_envelope(
+            crate::htlc_shield::ENV_SWAP_LOCK,
+            asset_id, value, &hashlock, timeout_height, &counterparty_pk, &refund_pk, &[],
+            &[claim.coin.clone(), refund.coin.clone()],
+        );
+        // Verify + apply the spend (records nullifiers, appends outputs). Nothing above
+        // mutated state, so a refused lock burns nothing and consumes no sponsorship.
+        self.submit_shield_bound(chain_id, shield_tx, &envelope)?;
+        if asset_id != zcrypt_shield::ASSET_ZCRYPT {
+            self.htlc.mark_sponsor_used(&sponsor_ref)?;
+        }
+        let id = self.htlc.lock_swap(
+            asset_id, value, hashlock, timeout_height, counterparty_pk, refund_pk,
+            claim.coin.clone(), refund.coin.clone(), sponsor_for,
+        )?;
+        debug_assert_eq!(id, my_id);
+        Ok(id)
     }
 
     /// Claim an escrow with a preimage (before timeout). For a **mint** escrow this
@@ -2561,6 +2788,9 @@ impl Node {
         self.smt.contains(nf)
     }
 }
+
+/// The all-zero `sponsor_ref` of a native swap lock (`0x6B`): sponsors nothing / sponsored by nobody.
+pub const NO_SPONSOR: Hash = [0u8; 32];
 
 /// Every revealed value that enters consensus (escrow locks, mint opens) must be a value the
 /// circuit could actually have committed. `commit_asset` reduces the upper limb mod p, so

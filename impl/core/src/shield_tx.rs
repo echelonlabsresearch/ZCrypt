@@ -148,7 +148,8 @@ pub fn gas_pay_envelope(payload: &[u8]) -> Vec<u8> {
 
 /// Build a shielded-pool spend: prove whole-tree membership + openings + nullifiers +
 /// conservation. `spends` (1..=`N_IN`) carry each input's coin + authentication path;
-/// `outputs` are `(value, blind, recipient_pk, asset)` for the `N_OUT` new coins.
+/// `outputs` are `(value, blind, recipient_pk, asset)` for up to `N_OUT` new coins (short
+/// lists are padded with value-0 coins, see [`crate::keys::pad_coin`]).
 pub fn build(
     chain_id: &[u8],
     spends: &[Spend],
@@ -171,9 +172,21 @@ pub fn build_bound(
     enc_notes: Vec<Vec<u8>>,
     envelope: &[u8],
 ) -> Option<ShieldTx> {
-    if spends.is_empty() || spends.len() > N_IN || outputs.len() != N_OUT || enc_notes.len() != N_OUT {
+    if spends.is_empty() || spends.len() > N_IN || outputs.is_empty() || outputs.len() > N_OUT || enc_notes.len() != outputs.len() {
         return None;
     }
+    // A caller may name fewer than `N_OUT` coins (recipient + change is the common shape).
+    // The circuit always proves exactly `N_OUT` outputs, so the rest are PAD coins: value 0,
+    // a fresh blind, the burn key, the transaction's asset, under a cover note. On the wire a
+    // padded transfer is indistinguishable from one that used every output.
+    let mut outputs: Vec<OutCoin> = outputs.to_vec();
+    let mut enc_notes = enc_notes;
+    let asset = outputs[0].3;
+    while outputs.len() < N_OUT {
+        outputs.push(crate::keys::pad_coin(asset));
+        enc_notes.push(crate::keys::cover_note_bytes());
+    }
+    let outputs = outputs.as_slice();
     let witnesses: Vec<SpendWitness> = spends
         .iter()
         .map(|s| SpendWitness {
@@ -579,15 +592,33 @@ mod tests {
                 path_dirs: s.path_dirs.clone(),
             })
             .collect();
-        let outs = [oc(90_000, 33, 2), oc(50_000, 44, 3)];
+        let outs = [oc(90_000, 33, 2), oc(50_000, 44, 3), oc(0, 55, 4)];
         let vm = zcrypt_shield::zvm::run_shield_transfer(&witnesses, &outs, FEE);
-        let tx = build(CHAIN, &[a, b], &outs, FEE, notes()).unwrap();
+        let tx = build(CHAIN, &[a, b], &outs, FEE, vec![crate::keys::cover_note_bytes(); N_OUT]).unwrap();
         assert!(vm.accept);
         assert_eq!(tx.output_commitments, vm.output_commitments);
         assert_eq!(
             tx.inputs.iter().map(|i| i.nullifier).collect::<Vec<_>>(),
             vm.nullifiers
         );
+    }
+
+    #[test]
+    fn short_output_lists_are_padded_to_the_circuit_width() {
+        // recipient + change is the common shape; `build` pads it with value-0 coins so the
+        // wire always carries N_OUT outputs and N_OUT notes, and the node accepts it as is.
+        let pool = pool_with(tc(100_000, 11, 0), tc(50_000, 22, 1));
+        let a = spend_coin(100_000, 11, 0, 0, &pool);
+        let tx = build(CHAIN, &[a], &[oc(90_000, 33, 2), oc(0, 44, 3)], FEE, notes()).unwrap();
+        assert_eq!(tx.output_commitments.len(), N_OUT);
+        assert_eq!(tx.enc_notes.len(), N_OUT);
+        assert!(tx.enc_notes.iter().all(|n| n.len() == crate::kem::NOTE_WIRE_LEN));
+        let mut node = seeded_node(&pool);
+        node.submit_shield(CHAIN, &tx).expect("padded spend is accepted");
+        // Too many outputs, or notes that do not match the outputs named, are refused.
+        let a = spend_coin(100_000, 11, 0, 0, &pool);
+        assert!(build(CHAIN, &[a.clone()], &[oc(1, 1, 1), oc(2, 2, 2), oc(3, 3, 3), oc(4, 4, 4)], FEE, vec![crate::keys::cover_note_bytes(); 4]).is_none());
+        assert!(build(CHAIN, &[a], &[oc(90_000, 33, 2)], FEE, notes()).is_none(), "one output, two notes");
     }
 
     #[test]

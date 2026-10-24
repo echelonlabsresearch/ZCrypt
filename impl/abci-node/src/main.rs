@@ -168,6 +168,14 @@ const SENTINEL_DISABLE_TAG: u8 = 0x68;
 /// over `spv::reserve_rotation_digest(chain, asset, epoch, old, new)`. The old key is
 /// retired (its in-flight deposits still mint), new deposits must pay the new key.
 const ROTATE_RESERVE_TAG: u8 = 0x69;
+/// Native ZCRYPT transfer: ONE proof whose output[0] is a revealed ZCRYPT burn coin (≥ MIN_FEE).
+/// Wire: `0x6A ‖ burn_value(8) ‖ burn_blind(64) ‖ shield_tx`. See `Node::submit_zcrypt_transfer`.
+const ZCRYPT_TRANSFER_TAG: u8 = 0x6A;
+/// Native swap lock, no gas prefix: `0x6B ‖ 248-byte header ‖ sponsor_ref(32) ‖ claim opening ‖
+/// refund opening ‖ asset spend`. A ZCRYPT lock pays its fee in-proof (2 × MIN_FEE when it
+/// sponsors the counter-lock named by `sponsor_ref`); any other asset must be sponsored by the
+/// live ZCRYPT swap lock `sponsor_ref` names. See `Node::swap_lock_native`.
+const SWAP_LOCK_NATIVE_TAG: u8 = 0x6B;
 
 /// Devnet foundation account seed. The genesis foundation allocation is registered to
 /// this account's REWARD ADDRESS (`h("ZC-REWARD-ADDR", pk)`), so the matching wallet
@@ -765,6 +773,60 @@ fn parse_transfer(
     let main_tx = zcrypt_core::shield_tx::from_bytes(rest)?;
     Some((gas_blind, gas_tx, main_tx))
 }
+/// Parse a native ZCRYPT transfer payload (the bytes after `0x6A`):
+/// `burn_value(8) ‖ burn_blind(64) ‖ shield_tx`.
+fn parse_zcrypt_transfer(b: &[u8]) -> Option<(u64, Blind, ShieldTx)> {
+    if b.len() < 8 + BB {
+        return None;
+    }
+    let value = u64::from_le_bytes(b[0..8].try_into().ok()?);
+    let blind = rd_blind(b, 8)?;
+    let tx = zcrypt_core::shield_tx::from_bytes(&b[8 + BB..])?;
+    Some((value, blind, tx))
+}
+/// Parse a native swap-lock payload (the bytes after `0x6B`): the 248-byte swap header, then
+/// `sponsor_ref(32)`, the claim opening, the refund opening, and the asset spend. No gas prefix.
+#[allow(clippy::type_complexity)]
+fn parse_swap_lock_native(
+    b: &[u8],
+) -> Option<(
+    u64,
+    Blind,
+    u64,
+    [u8; 32],
+    u64,
+    [u64; 8],
+    [u64; 8],
+    [u8; 32],
+    zcrypt_core::htlc_shield::CoinOpening,
+    zcrypt_core::htlc_shield::CoinOpening,
+    zcrypt_core::shield_tx::ShieldTx,
+)> {
+    const A: usize = 8 + BB;
+    const H: usize = A + 8;
+    const T: usize = H + 32;
+    const C: usize = T + 8;
+    const R: usize = C + 64;
+    const S: usize = R + 64;
+    const END: usize = S + 32;
+    if b.len() < END {
+        return None;
+    }
+    let value = u64::from_le_bytes(b[0..8].try_into().ok()?);
+    let blind = rd_blind(b, 8)?;
+    let asset_id = u64::from_le_bytes(b[A..A + 8].try_into().ok()?);
+    let mut hashlock = [0u8; 32];
+    hashlock.copy_from_slice(&b[H..H + 32]);
+    let timeout = u64::from_le_bytes(b[T..T + 8].try_into().ok()?);
+    let counterparty_pk = parse_pubkey(&b[C..R])?;
+    let refund_pk = parse_pubkey(&b[R..S])?;
+    let mut sponsor_ref = [0u8; 32];
+    sponsor_ref.copy_from_slice(&b[S..END]);
+    let (claim, n1) = zcrypt_core::htlc_shield::CoinOpening::decode(&b[END..])?;
+    let (refund_open, n2) = zcrypt_core::htlc_shield::CoinOpening::decode(&b[END + n1..])?;
+    let tx = zcrypt_core::shield_tx::from_bytes(&b[END + n1 + n2..])?;
+    Some((value, blind, asset_id, hashlock, timeout, counterparty_pk, refund_pk, sponsor_ref, claim, refund_open, tx))
+}
 
 /// Parse and AUTHENTICATE a delegate header (156 bytes):
 ///   delegator_pubkey(32) ‖ target_addr(20) ‖ stake_le(8) ‖ reward(32) ‖ signature(64)
@@ -988,6 +1050,8 @@ fn tag_name(b: Option<u8>) -> &'static str {
         Some(BTC_REANCHOR_TAG) => "BTC_REANCHOR",
         Some(CLAIM_FEE_TAG) => "CLAIM_FEE",
         Some(ROTATE_RESERVE_TAG) => "ROTATE_RESERVE",
+        Some(ZCRYPT_TRANSFER_TAG) => "ZCRYPT_TRANSFER",
+        Some(SWAP_LOCK_NATIVE_TAG) => "SWAP_LOCK_NATIVE",
         _ => "UNKNOWN",
     }
 }
@@ -1725,6 +1789,51 @@ impl ZcryptApp {
                 }
                 None => Err("malformed swap-lock tx".to_string()),
             }
+        } else if tx.first() == Some(&ZCRYPT_TRANSFER_TAG) {
+            match parse_zcrypt_transfer(&tx[1..]) {
+                // Header rule (burn ≥ MIN_FEE opening output[0], fee 0) + anchor/nullifier/output
+                // freshness now; the one proof is deferred past the lock like every shield tx.
+                Some((burn_value, burn_blind, stx)) => s
+                    .node
+                    .precheck_zcrypt_transfer(&stx, burn_value, burn_blind)
+                    .map(|()| deferred.push((stx, Vec::new()))),
+                None => Err("malformed native ZCRYPT transfer (burn value, burn blind, shield tx)".to_string()),
+            }
+        } else if tx.first() == Some(&SWAP_LOCK_NATIVE_TAG) {
+            match parse_swap_lock_native(&tx[1..]) {
+                Some((value, blind, asset, lock, timeout, cp, refund, sponsor_ref, claim_open, refund_open, stx)) => {
+                    if let Err(e) = claim_open.verify(&cp, value, asset) {
+                        Err(e)
+                    } else if let Err(e) = refund_open.verify(&refund, value, asset) {
+                        Err(e)
+                    } else {
+                        let expected = zcrypt_shield::commit_asset(
+                            value, &blind, &zcrypt_core::htlc_shield::BURN_PK, asset,
+                        );
+                        if stx.output_commitments.first() != Some(&expected) {
+                            Err("swap-lock: output[0] is not the declared burn coin".to_string())
+                        } else {
+                            let env = zcrypt_core::htlc_shield::lock_envelope(
+                                zcrypt_core::htlc_shield::ENV_SWAP_LOCK,
+                                asset, value, &lock, timeout, &cp, &refund, &[],
+                                &[claim_open.coin.clone(), refund_open.coin.clone()],
+                            );
+                            // Same admission as delivery: asset, horizon, value bound, the GAS RULE
+                            // (own in-proof fee, or a live sponsor that named this lock), escrow id
+                            // and settlement coins, then the proof-free spend checks. The proof is
+                            // deferred, so a refused lock never burns a coin or a sponsorship.
+                            s.node
+                                .precheck_swap_lock_native(
+                                    asset, value, &lock, timeout, &cp, &refund, &sponsor_ref, stx.fee,
+                                    &[claim_open.coin.commitment, refund_open.coin.commitment],
+                                )
+                                .and_then(|()| s.node.precheck_shield(&stx))
+                                .map(|()| deferred.push((stx, env)))
+                        }
+                    }
+                }
+                None => Err("malformed native swap-lock tx".to_string()),
+            }
         } else {
             Err(CLASSICAL_DISABLED.to_string()) // classical native path removed
         };
@@ -2148,6 +2257,33 @@ impl ZcryptApp {
                         }
                     }
                     None => Err("malformed swap-lock tx".to_string()),
+                }
+            } else if bytes.first() == Some(&ZCRYPT_TRANSFER_TAG) {
+                match parse_zcrypt_transfer(&bytes[1..]) {
+                    Some((burn_value, burn_blind, stx)) => s.node.submit_zcrypt_transfer(chain_id, &stx, burn_value, burn_blind),
+                    None => Err("malformed native ZCRYPT transfer".to_string()),
+                }
+            } else if bytes.first() == Some(&SWAP_LOCK_NATIVE_TAG) {
+                match parse_swap_lock_native(&bytes[1..]) {
+                    Some((value, blind, asset, lock, timeout, counterparty_pk, refund_pk, sponsor_ref, claim_open, refund_open, stx)) => {
+                        match s.node.swap_lock_native(
+                            chain_id, &stx, value, blind, asset, lock, timeout, counterparty_pk, refund_pk, sponsor_ref,
+                            &claim_open, &refund_open,
+                        ) {
+                            Ok(id) => {
+                                let data =
+                                    serde_json::json!({ "escrow_id": hex::encode(id) }).to_string();
+                                tx_results.push(ExecTxResult {
+                                    code: OK,
+                                    data: data.into_bytes().into(),
+                                    ..Default::default()
+                                });
+                                continue;
+                            }
+                            Err(e) => Err(e),
+                        }
+                    }
+                    None => Err("malformed native swap-lock tx".to_string()),
                 }
             } else if bytes.first() == Some(&BTC_HEADERS_TAG) {
                 // The per-block budget is charged only for batches consensus ACCEPTS. Charging
@@ -2599,6 +2735,10 @@ impl ZcryptApp {
                                 // block txs: a failed duplicate lock in the same block can carry a
                                 // different key and would otherwise get its own funded HTLC.
                                 "btc_claim_pk": hex::encode(&e.btc_claim_pk),
+                                // Gas sponsorship (native swap locks): the one counter-lock this
+                                // ZCRYPT lock pays for, and whether that payment has been used.
+                                "sponsor_for": e.sponsor_for.map(hex::encode).unwrap_or_default(),
+                                "sponsor_used": e.sponsor_used,
                                 // The settlement coins. The commitment is the leaf consensus
                                 // appends; the note carries the hidden blind, encrypted to the
                                 // beneficiary. Empty when this kind has no coin on that side.
@@ -3500,6 +3640,66 @@ mod tests {
         let (k, p) = node.sentinel_update().expect("power drops back to the floor");
         assert_eq!(k, skey);
         assert_eq!(p, 10, "floor, never zero");
+    }
+
+    fn dummy_stx(fee: u64) -> ShieldTx {
+        ShieldTx { inputs: vec![], output_commitments: vec![], enc_notes: vec![], fee, root: [0u64; 8], proof: vec![1, 2, 3] }
+    }
+
+    #[test]
+    fn native_zcrypt_transfer_wire_parses_and_rejects_truncation() {
+        let blind: Blind = core::array::from_fn(|i| 100 + i as u64);
+        let stx = dummy_stx(0);
+        let mut b = Vec::new();
+        b.extend_from_slice(&12_345u64.to_le_bytes());
+        for l in blind {
+            b.extend_from_slice(&l.to_le_bytes());
+        }
+        b.extend_from_slice(&zcrypt_core::shield_tx::to_bytes(&stx));
+        let (v, bl, tx) = parse_zcrypt_transfer(&b).expect("parses");
+        assert_eq!(v, 12_345);
+        assert_eq!(bl, blind);
+        assert_eq!(tx.proof, vec![1, 2, 3]);
+        assert!(parse_zcrypt_transfer(&b[..8 + BB - 1]).is_none(), "short header");
+        assert!(parse_zcrypt_transfer(&b[..b.len() - 1]).is_none(), "truncated shield tx");
+        assert_eq!(tag_name(Some(ZCRYPT_TRANSFER_TAG)), "ZCRYPT_TRANSFER");
+        assert_eq!(tag_name(Some(SWAP_LOCK_NATIVE_TAG)), "SWAP_LOCK_NATIVE");
+    }
+
+    #[test]
+    fn native_swap_lock_wire_carries_the_sponsor_ref_and_no_gas_prefix() {
+        let blind: Blind = core::array::from_fn(|i| 7 + i as u64);
+        let cp: [u64; 8] = core::array::from_fn(|i| 20 + i as u64);
+        let rf: [u64; 8] = core::array::from_fn(|i| 40 + i as u64);
+        let sponsor = [0xABu8; 32];
+        let (holder, _) = zcrypt_core::keys::new_account();
+        let (_, claim) = zcrypt_core::htlc_shield::CoinOpening::prove(&holder.normal_address(), &cp, 500, 9, zcrypt_core::keys::random_blind()).unwrap();
+        let (_, refund) = zcrypt_core::htlc_shield::CoinOpening::prove(&holder.normal_address(), &rf, 500, 9, zcrypt_core::keys::random_blind()).unwrap();
+        let mut b = Vec::new();
+        b.extend_from_slice(&500u64.to_le_bytes());
+        for l in blind {
+            b.extend_from_slice(&l.to_le_bytes());
+        }
+        b.extend_from_slice(&9u64.to_le_bytes());
+        b.extend_from_slice(&[0x11u8; 32]);
+        b.extend_from_slice(&777u64.to_le_bytes());
+        b.extend_from_slice(&pubkey_bytes(&cp));
+        b.extend_from_slice(&pubkey_bytes(&rf));
+        b.extend_from_slice(&sponsor);
+        b.extend_from_slice(&claim.encode());
+        b.extend_from_slice(&refund.encode());
+        b.extend_from_slice(&zcrypt_core::shield_tx::to_bytes(&dummy_stx(20_000)));
+        let (v, bl, a, h, t, c, r, sp, co, ro, tx) = parse_swap_lock_native(&b).expect("parses");
+        assert_eq!((v, bl, a, h, t), (500, blind, 9, [0x11u8; 32], 777));
+        assert_eq!((c, r, sp), (cp, rf, sponsor));
+        assert_eq!(co.coin.commitment, claim.coin.commitment);
+        assert_eq!(ro.coin.commitment, refund.coin.commitment);
+        assert_eq!(tx.fee, 20_000);
+        assert!(parse_swap_lock_native(&b[..279]).is_none(), "header + sponsor ref only");
+        assert!(parse_swap_lock_native(&b[..b.len() - 1]).is_none(), "truncated spend");
+        // The same bytes are NOT a valid 0x62 lock: there the openings follow the header
+        // directly, so the sponsor ref lands where an opening's length prefix is expected.
+        assert!(parse_swap_lock(&b).is_none() || parse_swap_lock(&b).is_some_and(|p| p.11.fee != 20_000));
     }
 
     #[test]

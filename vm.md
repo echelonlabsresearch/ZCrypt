@@ -48,7 +48,7 @@ of milliseconds) and displays the values the COMPUTE steps emitted.
 ## The consensus gate programs
 
 Every other value-affecting transaction is gated by a program over guard
-opcodes (`0x10`..`0x1D`), each a single readable predicate:
+opcodes (`0x10`..`0x21`), each a single readable predicate:
 
 ```
 BOND        = [CHECK_MIN_STAKE, HALT]
@@ -59,11 +59,15 @@ HTLC_CLAIM  = [CHECK_ESCROW_OPEN, CHECK_BEFORE_TIMEOUT, CHECK_PREIMAGE, HALT]
 HTLC_EXPIRE = [CHECK_ESCROW_OPEN, CHECK_AT_OR_AFTER_TIMEOUT, HALT]
 BURN_LOCK   = [CHECK_ASSET_REGISTERED, CHECK_BURN_OUTPUT, HALT]
 ROTATE_AUTH = [CHECK_ASSET_HAS_AUTHORITY, CHECK_THRESHOLD_SIG, HALT]
+ZCRYPT_TRANSFER  = [CHECK_BURN_OUTPUT, HALT]
+SWAP_LOCK_NATIVE = [CHECK_ASSET_REGISTERED, CHECK_BURN_OUTPUT, CHECK_GAS_PAID, HALT]
 ```
 
 Guards read a small register file (`Ctx`): stake, amount, claimable, ticker,
 escrow state, height, timeout, hashlock, preimage, the M-of-N key set and
-signatures. Note what lives in `CHECK_AMOUNT_LE_CLAIMABLE`: for the foundation
+signatures, and `gas_ok` (`CHECK_GAS_PAID`, `0x21`): a native swap lock either
+burned its own ZCRYPT fee inside its proof or is sponsored by the live, paired
+ZCRYPT swap lock that named it. Note what lives in `CHECK_AMOUNT_LE_CLAIMABLE`: for the foundation
 address, `claimable` is the vesting schedule, so "the foundation cannot claim
 early" is not policy, it is an opcode.
 

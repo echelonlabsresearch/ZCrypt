@@ -36,6 +36,8 @@ one of these live):
 | `0x60` | Undelegate | signature-checked | same 10-day maturity |
 | `0x61` | Rotate mint authority | ROTATE_AUTH | epoch-bound, replay-proof handoff to a new key set |
 | `0x62` | In-pool swap lock | BURN_LOCK | one leg of a private asset-for-asset atomic swap |
+| `0x6A` | Native ZCRYPT transfer | ZCRYPT_TRANSFER | ONE proof: `output[0]` is a revealed ZCRYPT burn (≥ 0.01) that is the gas, so a single coin pays, moves value and keeps its change |
+| `0x6B` | Native swap lock | SWAP_LOCK_NATIVE | a swap leg with no gas note: a ZCRYPT leg burns its fee in-proof (0.02 when it sponsors the other leg); any other leg is admitted gas-free against the ZCRYPT leg that named it |
 
 ### The 0x55 bundle
 
@@ -45,6 +47,33 @@ unspendable key; publishing `gas_blind` makes that single output publicly
 checkable (every node recomputes the commitment) while everything else stays
 hidden. This is how a transfer of a hidden non-ZCRYPT asset still provably pays
 ZCRYPT gas. Both halves verify and apply atomically.
+
+### Native ZCRYPT gas: `0x6A` and `0x6B`
+
+A ZCRYPT transfer does not need the bundle. `0x6A ‖ burn_value(8) ‖ burn_blind(64)
+‖ shield_tx` is a single shield tx whose `output[0]` is a revealed burn of
+`burn_value ≥ 0.01` ZCRYPT to the unspendable key. A spend is single-asset, so
+the revealed ZCRYPT burn pins every hidden input and output to ZCRYPT, and the
+burn IS the gas. The circuit has three outputs (burn, payment, change), so a
+wallet whose entire balance is one coin can pay the fee, pay the recipient and
+keep its change in one proof; a wallet is never stranded with a coin it cannot
+move. Dust below the fee rides along with a later coin (the burn may exceed
+0.01 so no dust change coin has to be kept).
+
+A swap leg can also skip the gas note. `0x6B` is the `0x62` header followed by
+a 32-byte `sponsor_ref`, the two settlement openings and the asset spend. A
+ZCRYPT leg burns its gas as the spend's in-tx fee: 0.01, or 0.02 when it
+**sponsors** the other leg, in which case `sponsor_ref` names the counter-lock
+(its escrow id is a pure function of the terms, so it can be named before it
+exists) and the escrow records `sponsor_for`. A leg of any other asset pays
+nothing: it is admitted only when `sponsor_ref` names a ZCRYPT swap lock that is
+open, is the other leg of this swap (same hashlock, keys crossed), named exactly
+this lock, and has not sponsored before; admission marks that sponsorship used.
+Both facts are part of the escrow book and therefore of the state root. The
+wallet runs every swap that touches ZCRYPT ZCRYPT-first, so a wallet holding no
+ZCRYPT at all can swap into it: the ZCRYPT giver locks first and pays for both
+legs, the newcomer locks second with no gas, claims (claims are gas-free), and
+then owns a ZCRYPT coin that spends on its own via `0x6A`.
 
 ## Economics
 

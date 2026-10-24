@@ -256,7 +256,7 @@ pub const SHIFT: usize = BITS;
 /// (≈4.5 billion ZCRYPT at 1e6, or ≈45 million zBTC at 1e8 — no practical cap.)
 pub const MAX_COIN_VALUE: u64 = (1u64 << (2 * BITS)) - 1;
 pub const N_IN: usize = 2;
-pub const N_OUT: usize = 2;
+pub const N_OUT: usize = 3;
 const S: usize = N_IN + N_OUT;
 /// Commitment-tree depth the in-circuit Merkle path is proven against. MUST equal
 /// [`tree::DEPTH`] so the circuit's recomputed root matches the node's tree root.
@@ -1377,7 +1377,7 @@ mod tests {
     #[test]
     fn pool_spend_verifies_hidden() {
         let (ins, root) = with_tree(vec![inp(100, 11, 7, 3), inp(50, 22, 8, 5)]);
-        let (o, nf, r, p) = prove(&ins, &[oc(90, 33, 1), oc(55, 44, 2)], 5, TEST_CHAIN, &[0u64; 8]).unwrap();
+        let (o, nf, r, p) = prove(&ins, &[oc(90, 33, 1), oc(55, 44, 2), oc(0, 0xE1, 0xE2)], 5, TEST_CHAIN, &[0u64; 8]).unwrap();
         assert_eq!(r, root, "proof anchors on the shared tree root");
         assert!(verify(&o, &nf, 5, &r, &p, TEST_CHAIN, &[0u64; 8]));
         // the spent coin's commitment never appears in the proof's public inputs —
@@ -1392,7 +1392,7 @@ mod tests {
         // root — the membership binding is what stops a proof-only verifier from
         // accepting a coin that isn't in the tree.
         let (ins, _root) = with_tree(vec![inp(100, 11, 7, 3), inp(50, 22, 8, 5)]);
-        let (o, nf, r, p) = prove(&ins, &[oc(90, 33, 1), oc(55, 44, 2)], 5, TEST_CHAIN, &[0u64; 8]).unwrap();
+        let (o, nf, r, p) = prove(&ins, &[oc(90, 33, 1), oc(55, 44, 2), oc(0, 0xE1, 0xE2)], 5, TEST_CHAIN, &[0u64; 8]).unwrap();
         assert!(verify(&o, &nf, 5, &r, &p, TEST_CHAIN, &[0u64; 8]));
         let mut wrong = r;
         wrong[0] ^= 1;
@@ -1408,7 +1408,7 @@ mod tests {
         let (mut ins, _root) = with_tree(vec![inp(100, 11, 7, 3), inp(50, 22, 8, 5)]);
         ins[0].path_siblings[0][0] ^= 1; // corrupt the authentication path
         // Now input 0 recomputes to a different root than input 1 → no shared root.
-        assert!(prove(&ins, &[oc(90, 33, 1), oc(55, 44, 2)], 5, TEST_CHAIN, &[0u64; 8]).is_none());
+        assert!(prove(&ins, &[oc(90, 33, 1), oc(55, 44, 2), oc(0, 0xE1, 0xE2)], 5, TEST_CHAIN, &[0u64; 8]).is_none());
     }
 
     #[test]
@@ -1427,7 +1427,7 @@ mod tests {
             value: 100, blind: bl(11), spend_secret: ss(7), asset_id: ASSET_ZCRYPT,
             path_siblings: sib, path_dirs: dir,
         };
-        let (o, nf, r, p) = prove(&[a], &[oc(95, 33, 1), oc(0, 44, 2)], 5, TEST_CHAIN, &[0u64; 8]).unwrap();
+        let (o, nf, r, p) = prove(&[a], &[oc(95, 33, 1), oc(0, 44, 2), oc(0, 0xE1, 0xE2)], 5, TEST_CHAIN, &[0u64; 8]).unwrap();
         assert_ne!(r, real_root, "a corrupted path recomputes to a different root");
         assert!(!verify(&o, &nf, 5, &real_root, &p, TEST_CHAIN, &[0u64; 8]), "must not verify against the true pool root");
     }
@@ -1440,7 +1440,7 @@ mod tests {
         assert!(a > (1 << BITS) && (a >> SHIFT) > 0); // genuinely multi-limb
         let (ins, _root) = with_tree(vec![inp(a, 11, 7, 3), inp(b, 22, 8, 5)]);
         let out0 = a + b - 100 - 5;
-        let (o, nf, r, p) = prove(&ins, &[oc(out0, 33, 1), oc(100, 44, 2)], 5, TEST_CHAIN, &[0u64; 8]).unwrap();
+        let (o, nf, r, p) = prove(&ins, &[oc(out0, 33, 1), oc(100, 44, 2), oc(0, 0xE1, 0xE2)], 5, TEST_CHAIN, &[0u64; 8]).unwrap();
         assert!(verify(&o, &nf, 5, &r, &p, TEST_CHAIN, &[0u64; 8]));
     }
 
@@ -1450,7 +1450,7 @@ mod tests {
         // 2^SHIFT, which must borrow one unit from the high limb (the carry path).
         let v = 1u64 << SHIFT;
         let (ins, _root) = with_tree(vec![inp(v, 11, 7, 3), inp(0, 22, 8, 5)]);
-        let (o, nf, r, p) = prove(&ins, &[oc(v - 1, 33, 1), oc(1, 44, 2)], 0, TEST_CHAIN, &[0u64; 8]).unwrap();
+        let (o, nf, r, p) = prove(&ins, &[oc(v - 1, 33, 1), oc(1, 44, 2), oc(0, 0xE1, 0xE2)], 0, TEST_CHAIN, &[0u64; 8]).unwrap();
         assert!(verify(&o, &nf, 0, &r, &p, TEST_CHAIN, &[0u64; 8]), "carry across the limb boundary must verify");
     }
 
@@ -1458,7 +1458,7 @@ mod tests {
     fn over_the_two_limb_cap_is_rejected() {
         // A value above 2^(2·BITS)-1 has a high limb out of range -> rejected.
         let (ins, _root) = with_tree(vec![inp(MAX_COIN_VALUE + 1, 11, 7, 3), inp(0, 22, 8, 5)]);
-        assert!(prove(&ins, &[oc(0, 33, 1), oc(0, 44, 2)], 0, TEST_CHAIN, &[0u64; 8]).is_none());
+        assert!(prove(&ins, &[oc(0, 33, 1), oc(0, 44, 2), oc(0, 0xE1, 0xE2)], 0, TEST_CHAIN, &[0u64; 8]).is_none());
     }
 
     #[test]
@@ -1468,7 +1468,7 @@ mod tests {
         // distinct nullifiers — so a 1-input spend looks exactly like a 2-input one
         // on-chain (no all-zero NULL_NF sentinel gives the input count away).
         let (ins, _root) = with_tree(vec![inp(100, 11, 7, 3)]);
-        let (o, nf, r, p) = prove(&ins, &[oc(90, 33, 1), oc(5, 44, 2)], 5, TEST_CHAIN, &[0u64; 8]).unwrap();
+        let (o, nf, r, p) = prove(&ins, &[oc(90, 33, 1), oc(5, 44, 2), oc(0, 0xE1, 0xE2)], 5, TEST_CHAIN, &[0u64; 8]).unwrap();
         assert_eq!(nf.len(), N_IN);
         assert_ne!(nf[0], NULL_NF, "the real input publishes a real nullifier");
         assert_ne!(nf[1], NULL_NF, "the dummy slot ALSO publishes a real nullifier (no sentinel)");
@@ -1478,7 +1478,7 @@ mod tests {
         // Structural indistinguishability: a genuine 2-input spend has the same shape —
         // two non-null, distinct, canonical nullifiers.
         let (ins2, _) = with_tree(vec![inp(100, 11, 7, 3), inp(50, 22, 8, 5)]);
-        let (_o2, nf2, _r2, _p2) = prove(&ins2, &[oc(90, 33, 1), oc(55, 44, 2)], 5, TEST_CHAIN, &[0u64; 8]).unwrap();
+        let (_o2, nf2, _r2, _p2) = prove(&ins2, &[oc(90, 33, 1), oc(55, 44, 2), oc(0, 0xE1, 0xE2)], 5, TEST_CHAIN, &[0u64; 8]).unwrap();
         assert_eq!(nf2.len(), nf.len());
         for n in nf.iter().chain(nf2.iter()) {
             assert_ne!(*n, NULL_NF);
@@ -1493,17 +1493,17 @@ mod tests {
         // agree), but spends of DIFFERENT coins get different dummies (no collision).
         let (a1, _) = with_tree(vec![inp(100, 11, 7, 3)]);
         let (a2, _) = with_tree(vec![inp(100, 11, 7, 3)]); // same coin
-        let da = prove(&a1, &[oc(90, 33, 1), oc(5, 44, 2)], 5, TEST_CHAIN, &[0u64; 8]).unwrap().1[1];
-        let db = prove(&a2, &[oc(90, 33, 1), oc(5, 44, 2)], 5, TEST_CHAIN, &[0u64; 8]).unwrap().1[1];
+        let da = prove(&a1, &[oc(90, 33, 1), oc(5, 44, 2), oc(0, 0xE1, 0xE2)], 5, TEST_CHAIN, &[0u64; 8]).unwrap().1[1];
+        let db = prove(&a2, &[oc(90, 33, 1), oc(5, 44, 2), oc(0, 0xE1, 0xE2)], 5, TEST_CHAIN, &[0u64; 8]).unwrap().1[1];
         assert_eq!(da, db, "same real input ⇒ same dummy nullifier (deterministic)");
         let (c, _) = with_tree(vec![inp(100, 11, 9, 3)]); // different spend secret
-        let dc = prove(&c, &[oc(90, 33, 1), oc(5, 44, 2)], 5, TEST_CHAIN, &[0u64; 8]).unwrap().1[1];
+        let dc = prove(&c, &[oc(90, 33, 1), oc(5, 44, 2), oc(0, 0xE1, 0xE2)], 5, TEST_CHAIN, &[0u64; 8]).unwrap().1[1];
         assert_ne!(da, dc, "different real input ⇒ different dummy nullifier (no collision)");
         // The bug this guards: two DIFFERENT coins that REUSE one spend key (same s=7,
         // different value) must still get different dummies — else a wallet spending
         // both in separate 1-input txs would self-collide as a false double-spend.
         let (e, _) = with_tree(vec![inp(200, 11, 7, 3)]); // same key s=7, value 200 not 100
-        let de = prove(&e, &[oc(190, 33, 1), oc(5, 44, 2)], 5, TEST_CHAIN, &[0u64; 8]).unwrap().1[1];
+        let de = prove(&e, &[oc(190, 33, 1), oc(5, 44, 2), oc(0, 0xE1, 0xE2)], 5, TEST_CHAIN, &[0u64; 8]).unwrap().1[1];
         assert_ne!(da, de, "same key, different coin ⇒ different dummy (tag binds the whole coin)");
     }
 
@@ -1517,7 +1517,7 @@ mod tests {
         // ONLY values the chain reveals, and assert it no longer reproduces the dummy.
         let (ins, _) = with_tree(vec![inp(100, 11, 7, 3)]);
         let (_o, nf, _r, _p) =
-            prove(&ins, &[oc(90, 33, 1), oc(5, 44, 2)], 5, TEST_CHAIN, &[0u64; 8]).unwrap();
+            prove(&ins, &[oc(90, 33, 1), oc(5, 44, 2), oc(0, 0xE1, 0xE2)], 5, TEST_CHAIN, &[0u64; 8]).unwrap();
 
         // The old derivation, verbatim, over public inputs: the published nf[0].
         const DOMAIN: u64 = 0xD0_11_D0_11;
@@ -1556,8 +1556,8 @@ mod tests {
         // input -> a coin spent in a 1-input tx can't be re-spent in a 2-input tx.
         let (ia, _) = with_tree(vec![inp(100, 11, 7, 3)]);
         let (ib, _) = with_tree(vec![inp(100, 11, 7, 8), inp(50, 22, 9, 2)]);
-        let a = prove(&ia, &[oc(90, 33, 1), oc(5, 44, 2)], 5, TEST_CHAIN, &[0u64; 8]).unwrap();
-        let b = prove(&ib, &[oc(140, 3, 1), oc(5, 4, 2)], 5, TEST_CHAIN, &[0u64; 8]).unwrap();
+        let a = prove(&ia, &[oc(90, 33, 1), oc(5, 44, 2), oc(0, 0xE1, 0xE2)], 5, TEST_CHAIN, &[0u64; 8]).unwrap();
+        let b = prove(&ib, &[oc(140, 3, 1), oc(5, 4, 2), oc(0, 0xE1, 0xE2)], 5, TEST_CHAIN, &[0u64; 8]).unwrap();
         assert_eq!(a.1[0], b.1[0], "same coin+secret -> same nullifier regardless of arity");
     }
 
@@ -1566,12 +1566,12 @@ mod tests {
         // The pad is value 0, so it can't conjure inputs: 100 in, 200 out is rejected
         // (conservation holds over the real input alone).
         let (ins, _root) = with_tree(vec![inp(100, 11, 7, 3)]);
-        assert!(prove(&ins, &[oc(150, 33, 1), oc(50, 44, 2)], 0, TEST_CHAIN, &[0u64; 8]).is_none());
+        assert!(prove(&ins, &[oc(150, 33, 1), oc(50, 44, 2), oc(0, 0xE1, 0xE2)], 0, TEST_CHAIN, &[0u64; 8]).is_none());
     }
 
     #[test]
     fn zero_inputs_rejected() {
-        assert!(prove(&[], &[oc(0, 33, 1), oc(0, 44, 2)], 0, TEST_CHAIN, &[0u64; 8]).is_none());
+        assert!(prove(&[], &[oc(0, 33, 1), oc(0, 44, 2), oc(0, 0xE1, 0xE2)], 0, TEST_CHAIN, &[0u64; 8]).is_none());
     }
 
     #[test]
@@ -1590,7 +1590,7 @@ mod tests {
             value: 100, blind: bl(11), spend_secret: ss(999), asset_id: ASSET_ZCRYPT,
             path_siblings: sib, path_dirs: dir,
         };
-        let (o, nf, r, p) = prove(&[attacker], &[oc(95, 33, 1), oc(0, 44, 2)], 5, TEST_CHAIN, &[0u64; 8]).unwrap();
+        let (o, nf, r, p) = prove(&[attacker], &[oc(95, 33, 1), oc(0, 44, 2), oc(0, 0xE1, 0xE2)], 5, TEST_CHAIN, &[0u64; 8]).unwrap();
         assert_ne!(r, real_root, "wrong secret ⇒ different leaf ⇒ different root");
         assert!(!verify(&o, &nf, 5, &real_root, &p, TEST_CHAIN, &[0u64; 8]), "cannot spend a coin you don't own");
     }
@@ -1598,13 +1598,13 @@ mod tests {
     #[test]
     fn non_conserving_unprovable() {
         let (ins, _root) = with_tree(vec![inp(100, 1, 1, 0), inp(1, 2, 2, 0)]);
-        assert!(prove(&ins, &[oc(100, 3, 1), oc(1, 4, 2)], 5, TEST_CHAIN, &[0u64; 8]).is_none());
+        assert!(prove(&ins, &[oc(100, 3, 1), oc(1, 4, 2), oc(0, 0xE1, 0xE2)], 5, TEST_CHAIN, &[0u64; 8]).is_none());
     }
 
     #[test]
     fn wrong_fee_rejected() {
         let (ins, _root) = with_tree(vec![inp(100, 11, 7, 3), inp(50, 22, 8, 5)]);
-        let (o, nf, r, p) = prove(&ins, &[oc(90, 33, 1), oc(55, 44, 2)], 5, TEST_CHAIN, &[0u64; 8]).unwrap();
+        let (o, nf, r, p) = prove(&ins, &[oc(90, 33, 1), oc(55, 44, 2), oc(0, 0xE1, 0xE2)], 5, TEST_CHAIN, &[0u64; 8]).unwrap();
         assert!(!verify(&o, &nf, 6, &r, &p, TEST_CHAIN, &[0u64; 8]));
     }
 
@@ -1613,7 +1613,7 @@ mod tests {
         // chain_domain is a STARK public input: a proof for chain A must not
         // verify under chain B's tag.
         let (ins, _root) = with_tree(vec![inp(100, 11, 7, 3), inp(50, 22, 8, 5)]);
-        let (o, nf, r, p) = prove(&ins, &[oc(90, 33, 1), oc(55, 44, 2)], 5, TEST_CHAIN, &[0u64; 8]).unwrap();
+        let (o, nf, r, p) = prove(&ins, &[oc(90, 33, 1), oc(55, 44, 2), oc(0, 0xE1, 0xE2)], 5, TEST_CHAIN, &[0u64; 8]).unwrap();
         assert!(verify(&o, &nf, 5, &r, &p, TEST_CHAIN, &[0u64; 8]));
         assert!(
             !verify(&o, &nf, 5, &r, &p, b"other-chain", &[0u64; 8]),
@@ -1649,7 +1649,7 @@ mod tests {
         // of the SAME statement must differ in their bytes (the hiding randomness is
         // no longer a fixed public constant). Both must still verify.
         let (ins, _root) = with_tree(vec![inp(100, 11, 7, 3), inp(50, 22, 8, 5)]);
-        let outs = [oc(90, 33, 1), oc(55, 44, 2)];
+        let outs = [oc(90, 33, 1), oc(55, 44, 2), oc(0, 0xE1, 0xE2)];
         let (o1, n1, rt1, p1) = prove(&ins, &outs, 5, TEST_CHAIN, &[0u64; 8]).unwrap();
         let (_o2, _n2, _rt2, p2) = prove(&ins, &outs, 5, TEST_CHAIN, &[0u64; 8]).unwrap();
         assert_ne!(p1, p2, "proof bytes must differ — masking RNG must be fresh per proof");
@@ -1661,8 +1661,8 @@ mod tests {
     fn nullifier_canonical() {
         let (ia, _) = with_tree(vec![inp(100, 11, 7, 3), inp(50, 22, 8, 5)]);
         let (ib, _) = with_tree(vec![inp(100, 11, 7, 1), inp(50, 22, 8, 2)]);
-        let a = prove(&ia, &[oc(90, 33, 1), oc(55, 44, 2)], 5, TEST_CHAIN, &[0u64; 8]).unwrap();
-        let b = prove(&ib, &[oc(80, 3, 1), oc(65, 4, 2)], 5, TEST_CHAIN, &[0u64; 8]).unwrap();
+        let a = prove(&ia, &[oc(90, 33, 1), oc(55, 44, 2), oc(0, 0xE1, 0xE2)], 5, TEST_CHAIN, &[0u64; 8]).unwrap();
+        let b = prove(&ib, &[oc(80, 3, 1), oc(65, 4, 2), oc(0, 0xE1, 0xE2)], 5, TEST_CHAIN, &[0u64; 8]).unwrap();
         assert_eq!(a.1[0], b.1[0]); // same coin+secret, different tree position -> same nf
     }
 
@@ -1675,7 +1675,7 @@ mod tests {
         // Two zBTC input coins -> two zBTC outputs + a zBTC fee. A whole-pool spend
         // over a non-native asset verifies, with conservation in that asset.
         let (ins, _root) = with_tree(vec![inpa(100, 11, 7, 3, ZBTC), inpa(50, 22, 8, 5, ZBTC)]);
-        let (o, nf, r, p) = prove(&ins, &[oca(90, 33, 1, ZBTC), oca(55, 44, 2, ZBTC)], 5, TEST_CHAIN, &[0u64; 8]).unwrap();
+        let (o, nf, r, p) = prove(&ins, &[oca(90, 33, 1, ZBTC), oca(55, 44, 2, ZBTC), oca(0, 0xE1, 0xE2, ZBTC)], 5, TEST_CHAIN, &[0u64; 8]).unwrap();
         assert!(verify(&o, &nf, 5, &r, &p, TEST_CHAIN, &[0u64; 8]));
         // the spent zBTC coin's commitment is never revealed — only the tree root is.
         assert!(!o.contains(&tca(100, 11, 7, ZBTC)), "spent coin stays hidden in the pool");
@@ -1686,10 +1686,10 @@ mod tests {
         // Inputs are zBTC but an output claims native ZCRYPT -> mixing assets is
         // rejected (you cannot alchemize one asset into another).
         let (ins, _root) = with_tree(vec![inpa(100, 11, 7, 3, ZBTC), inpa(50, 22, 8, 5, ZBTC)]);
-        assert!(prove(&ins, &[oca(90, 33, 1, ZBTC), oc(55, 44, 2)], 5, TEST_CHAIN, &[0u64; 8]).is_none());
+        assert!(prove(&ins, &[oca(90, 33, 1, ZBTC), oc(55, 44, 2), oc(0, 0xE1, 0xE2)], 5, TEST_CHAIN, &[0u64; 8]).is_none());
         // Mismatched input assets are likewise rejected.
         let (mixed, _root) = with_tree(vec![inpa(100, 11, 7, 3, ZBTC), inp(50, 22, 8, 5)]);
-        assert!(prove(&mixed, &[oca(90, 33, 1, ZBTC), oca(55, 44, 2, ZBTC)], 5, TEST_CHAIN, &[0u64; 8]).is_none());
+        assert!(prove(&mixed, &[oca(90, 33, 1, ZBTC), oca(55, 44, 2, ZBTC), oca(0, 0xE1, 0xE2, ZBTC)], 5, TEST_CHAIN, &[0u64; 8]).is_none());
     }
 
     #[test]

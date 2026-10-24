@@ -737,7 +737,7 @@ mod tests {
     #[test]
     fn tall_two_input_parity_verifies_and_is_smaller() {
         let (ins, root) = with_tree(vec![inp(100, 11, 7), inp(50, 22, 8)]);
-        let outs = [oc(90, 33, 1), oc(55, 44, 2)];
+        let outs = [oc(90, 33, 1), oc(55, 44, 2), oc(0, 0xE1, 0xE2)];
 
         // WIDE reference (the retained circuit; production `prove` now routes to tall).
         let (wo, wn, wr, wp) = prove_wide(&ins, &outs, 5, CHAIN, &[0u64; 8]).expect("wide prove");
@@ -753,7 +753,7 @@ mod tests {
         assert!(verify_tall(&to, &tn, 5, &tr, &tp, CHAIN, &[0u64; 8]), "tall verifies");
 
         eprintln!(
-            "[tall] full 2-in/2-out shield: WIDE proof {} bytes ({:.0} KB) | TALL proof {} bytes ({:.0} KB) | {:.2}x smaller",
+            "[tall] full 2-in/3-out shield: WIDE proof {} bytes ({:.0} KB) | TALL proof {} bytes ({:.0} KB) | {:.2}x smaller",
             wp.len(), wp.len() as f64 / 1024.0, tp.len(), tp.len() as f64 / 1024.0,
             wp.len() as f64 / tp.len() as f64,
         );
@@ -767,7 +767,7 @@ mod tests {
     #[test]
     fn tall_rejects_tampered_public_inputs() {
         let (ins, _root) = with_tree(vec![inp(100, 11, 7), inp(50, 22, 8)]);
-        let (o, n, r, p) = prove_tall(&ins, &[oc(90, 33, 1), oc(55, 44, 2)], 5, CHAIN, &[0u64; 8]).unwrap();
+        let (o, n, r, p) = prove_tall(&ins, &[oc(90, 33, 1), oc(55, 44, 2), oc(0, 0xE1, 0xE2)], 5, CHAIN, &[0u64; 8]).unwrap();
         assert!(verify_tall(&o, &n, 5, &r, &p, CHAIN, &[0u64; 8]));
         // wrong root
         let mut wrong = r;
@@ -793,7 +793,7 @@ mod tests {
         // so a mempool relayer cannot strip/replace a tx's encrypted notes and keep it valid.
         let (ins, _root) = with_tree(vec![inp(100, 11, 7), inp(50, 22, 8)]);
         let dig = [1u64, 2, 3, 4, 5, 6, 7, 8];
-        let (o, n, r, p) = prove_tall(&ins, &[oc(90, 33, 1), oc(55, 44, 2)], 5, CHAIN, &dig).unwrap();
+        let (o, n, r, p) = prove_tall(&ins, &[oc(90, 33, 1), oc(55, 44, 2), oc(0, 0xE1, 0xE2)], 5, CHAIN, &dig).unwrap();
         assert!(verify_tall(&o, &n, 5, &r, &p, CHAIN, &dig), "the committed digest verifies");
         let mut other = dig;
         other[0] ^= 1;
@@ -805,7 +805,7 @@ mod tests {
     fn tall_single_input_parity() {
         // 1-input spend: the 2nd slot is a value-0 dummy (arity fix) with a dummy path.
         let (ins, _root) = with_tree(vec![inp(100, 11, 7)]);
-        let outs = [oc(90, 33, 1), oc(5, 44, 2)];
+        let outs = [oc(90, 33, 1), oc(5, 44, 2), oc(0, 0xE1, 0xE2)];
         let (wo, wn, wr, _wp) = prove_wide(&ins, &outs, 5, CHAIN, &[0u64; 8]).expect("wide");
         let (to, tn, tr, tp) = prove_tall(&ins, &outs, 5, CHAIN, &[0u64; 8]).expect("tall");
         assert_eq!((to.clone(), tn.clone(), tr), (wo, wn, wr), "single-input parity with wide");
@@ -818,7 +818,7 @@ mod tests {
         // to. The tall circuit must reproduce them exactly (VM ≡ tall, transitively via
         // VM ≡ wide ≡ tall, asserted directly here).
         let (ins, _root) = with_tree(vec![inp(100, 11, 7), inp(50, 22, 8)]);
-        let outs = [oc(90, 33, 1), oc(55, 44, 2)];
+        let outs = [oc(90, 33, 1), oc(55, 44, 2), oc(0, 0xE1, 0xE2)];
         let vm = zvm::run_shield_transfer(&ins, &outs, 5);
         let (to, tn, _tr, _tp) = prove_tall(&ins, &outs, 5, CHAIN, &[0u64; 8]).unwrap();
         assert!(vm.accept);
@@ -830,19 +830,19 @@ mod tests {
     fn tall_rejects_invalid_shapes_like_wide() {
         // Invalid witnesses are rejected identically (shape_ok is shared): non-conserving,
         // over the per-coin cap, and a corrupted authentication path (no shared root).
-        let mk = |ins: &[SpendWitness], o: [OutCoin; 2], fee: u64| {
+        let mk = |ins: &[SpendWitness], o: [OutCoin; 3], fee: u64| {
             (
                 prove_wide(ins, &o, fee, CHAIN, &[0u64; 8]).is_none(),
                 prove_tall(ins, &o, fee, CHAIN, &[0u64; 8]).is_none(),
             )
         };
         let (nc, _) = with_tree(vec![inp(100, 1, 1), inp(1, 2, 2)]);
-        assert_eq!(mk(&nc, [oc(100, 3, 1), oc(1, 4, 2)], 5), (true, true), "non-conserving");
+        assert_eq!(mk(&nc, [oc(100, 3, 1), oc(1, 4, 2), oc(0, 0xE1, 0xE2)], 5), (true, true), "non-conserving");
         let (oc_ov, _) = with_tree(vec![inp(MAX_COIN_VALUE + 1, 1, 1), inp(0, 2, 2)]);
-        assert_eq!(mk(&oc_ov, [oc(0, 3, 1), oc(0, 4, 2)], 0), (true, true), "over cap");
+        assert_eq!(mk(&oc_ov, [oc(0, 3, 1), oc(0, 4, 2), oc(0, 0xE1, 0xE2)], 0), (true, true), "over cap");
         let (mut corrupt, _) = with_tree(vec![inp(100, 11, 7), inp(50, 22, 8)]);
         corrupt[0].path_siblings[0][0] ^= 1;
-        assert_eq!(mk(&corrupt, [oc(90, 33, 1), oc(55, 44, 2)], 5), (true, true), "corrupted path");
+        assert_eq!(mk(&corrupt, [oc(90, 33, 1), oc(55, 44, 2), oc(0, 0xE1, 0xE2)], 5), (true, true), "corrupted path");
     }
 
     #[test]
@@ -852,7 +852,7 @@ mod tests {
         let b = 3_000_000_000u64;
         let (ins, _root) = with_tree(vec![inp(a, 11, 7), inp(b, 22, 8)]);
         let out0 = a + b - 100 - 5;
-        let (to, tn, tr, tp) = prove_tall(&ins, &[oc(out0, 33, 1), oc(100, 44, 2)], 5, CHAIN, &[0u64; 8]).unwrap();
+        let (to, tn, tr, tp) = prove_tall(&ins, &[oc(out0, 33, 1), oc(100, 44, 2), oc(0, 0xE1, 0xE2)], 5, CHAIN, &[0u64; 8]).unwrap();
         assert!(verify_tall(&to, &tn, 5, &tr, &tp, CHAIN, &[0u64; 8]));
     }
 
@@ -875,7 +875,7 @@ mod tests {
         // guard against the masking RNG regressing to a fixed/derived seed, which would
         // silently void hiding while every proof still verified.
         let (ins, root) = with_tree(vec![inp(100, 11, 7), inp(50, 22, 8)]);
-        let outs = [oc(90, 33, 1), oc(55, 44, 2)];
+        let outs = [oc(90, 33, 1), oc(55, 44, 2), oc(0, 0xE1, 0xE2)];
 
         const N: usize = 8;
         let mut proofs: Vec<Vec<u8>> = Vec::with_capacity(N);
@@ -934,7 +934,7 @@ mod tests {
         // could append junk to the proof field, keep the proof valid, and change the tx's
         // identity (txbind). The decoder must now consume the proof exactly.
         let (ins, _root) = with_tree(vec![inp(100, 11, 7), inp(50, 22, 8)]);
-        let (o, n, r, p) = prove_tall(&ins, &[oc(90, 33, 1), oc(55, 44, 2)], 5, CHAIN, &[0u64; 8]).unwrap();
+        let (o, n, r, p) = prove_tall(&ins, &[oc(90, 33, 1), oc(55, 44, 2), oc(0, 0xE1, 0xE2)], 5, CHAIN, &[0u64; 8]).unwrap();
         assert!(verify_tall(&o, &n, 5, &r, &p, CHAIN, &[0u64; 8]));
         let mut padded = p.clone();
         padded.push(0);

@@ -1315,6 +1315,236 @@ pub fn parse_transfer_payload(b: &[u8]) -> Option<(shield_tx::ShieldTx, shield_t
     Some((gas_tx, main_tx))
 }
 
+/// Build a **native ZCRYPT transfer** (`0x6A`): `0x6A ‖ burn_value(8) ‖ burn_blind(64) ‖
+/// shield_tx`, where `stx.output[0] == commit_asset(burn_value, burn_blind, BURN_PK, ZCRYPT)`
+/// and `burn_value ≥ MIN_FEE`. ONE proof: the revealed ZCRYPT burn pins the (single-asset)
+/// spend to ZCRYPT, so the gas is ZCRYPT without a second coin or a bundled gas note.
+pub fn zcrypt_transfer_tx(burn_value: u64, burn_blind: &Blind, stx: &shield_tx::ShieldTx) -> Vec<u8> {
+    let body = shield_tx::to_bytes(stx);
+    let mut t = Vec::with_capacity(1 + 8 + zcrypt_shield::BLIND_BYTES + body.len());
+    t.push(0x6Au8);
+    t.extend_from_slice(&burn_value.to_le_bytes());
+    for limb in burn_blind {
+        t.extend_from_slice(&limb.to_le_bytes());
+    }
+    t.extend_from_slice(&body);
+    t
+}
+
+/// Parse a native ZCRYPT transfer payload (the bytes AFTER the `0x6A` tag) into
+/// `(burn_value, burn_blind, shield_tx)`, for scanning received coins. Mirrors the node.
+pub fn parse_zcrypt_transfer_payload(b: &[u8]) -> Option<(u64, Blind, shield_tx::ShieldTx)> {
+    const BB: usize = zcrypt_shield::BLIND_BYTES;
+    if b.len() < 8 + BB {
+        return None;
+    }
+    let value = u64::from_le_bytes(b[0..8].try_into().ok()?);
+    let mut blind: Blind = [0u64; zcrypt_shield::BLIND_LIMBS];
+    for (i, limb) in blind.iter_mut().enumerate() {
+        *limb = u64::from_le_bytes(b[8 + i * 8..16 + i * 8].try_into().ok()?);
+    }
+    let stx = shield_tx::from_bytes(&b[8 + BB..])?;
+    Some((value, blind, stx))
+}
+
+/// Prove and encode a native ZCRYPT transfer of `recipient` (an `OutCoin` of `amount` ZCRYPT)
+/// from `inputs` (1..=N_IN ZCRYPT coins), burning exactly `burn` (≥ MIN_FEE; a wallet burns
+/// `MIN_FEE`, or `MIN_FEE + dust` to avoid keeping a dust change coin) and returning the
+/// change to `change_to`. `recipient_note` is the on-chain note for output[1] (a real note,
+/// or cover bytes for a stealth/bearer send). Returns the tx bytes and the change coin.
+/// This is how a wallet holding a SINGLE ZCRYPT coin sends: no second coin, no second proof.
+pub fn build_zcrypt_transfer(
+    zc: &Zcrypt,
+    inputs: &[Coin],
+    recipient: OutCoin,
+    recipient_note: Vec<u8>,
+    change_to: &Account,
+    burn: u64,
+) -> Result<(Vec<u8>, Coin), String> {
+    if inputs.is_empty() || inputs.iter().any(|c| c.asset_id != zcrypt_shield::ASSET_ZCRYPT) {
+        return Err("a native ZCRYPT transfer spends ZCRYPT coins only".to_string());
+    }
+    if recipient.3 != zcrypt_shield::ASSET_ZCRYPT {
+        return Err("a native ZCRYPT transfer pays ZCRYPT only".to_string());
+    }
+    let total: u64 = inputs.iter().map(|c| c.value).sum();
+    let change = total
+        .checked_sub(recipient.0)
+        .and_then(|r| r.checked_sub(burn))
+        .ok_or_else(|| format!("insufficient funds: inputs {total} < amount {} + burn {burn}", recipient.0))?;
+    let burn_blind = zcrypt_core::keys::random_blind();
+    let burn_out: OutCoin = (burn, burn_blind, zcrypt_core::htlc_shield::BURN_PK, zcrypt_shield::ASSET_ZCRYPT);
+    let chg_blind = zcrypt_core::keys::random_blind();
+    let chg_out = zcrypt_core::keys::out_coin(&change_to.normal_address(), change, chg_blind);
+    let chg_note = zcrypt_core::kem::ciphertext_to_bytes(&zcrypt_core::keys::encrypt_note(&change_to.normal_address(), change, chg_blind));
+    let stx = build_shield_spend_n(zc, inputs, &[burn_out, recipient, chg_out], 0, vec![zcrypt_core::keys::cover_note_bytes(), recipient_note, chg_note], &[])?;
+    Ok((zcrypt_transfer_tx(burn, &burn_blind, &stx), change_to.own_coin(change, chg_blind)))
+}
+
+/// [`build_shield_spend_bound`] for any output count up to `N_OUT` (short lists are padded by
+/// `shield_tx::build`).
+pub fn build_shield_spend_n(
+    zc: &Zcrypt,
+    coins: &[Coin],
+    outputs: &[OutCoin],
+    fee: u64,
+    notes: Vec<Vec<u8>>,
+    envelope: &[u8],
+) -> Result<shield_tx::ShieldTx, String> {
+    let leaves = zc.leaves()?;
+    let mut tree = zcrypt_shield::tree::CommitmentTree::new();
+    for &c in &leaves {
+        tree.append(c).unwrap();
+    }
+    let mut spends = Vec::new();
+    for coin in coins {
+        let idx = find_index(&leaves, &coin.commitment()).ok_or("input coin not on chain")?;
+        let (path_siblings, path_dirs) = tree.path(idx as usize).ok_or("input coin not in commitment tree")?;
+        spends.push(Spend {
+            value: coin.value,
+            blind: coin.blind,
+            spend_secret: coin.spend_secret,
+            asset_id: coin.asset_id,
+            path_siblings,
+            path_dirs,
+        });
+    }
+    shield_tx::build_bound(chain_id(), &spends, outputs, fee, notes, envelope).ok_or("shield proof failed".to_string())
+}
+
+/// Build a **native swap lock** (`0x6B`): the 0x62 header and openings, then `sponsor_ref`
+/// (32 bytes) and the asset spend — NO gas prefix. For a ZCRYPT lock `sponsor_ref` is the
+/// escrow id of the counter-lock it pays for (`stx.fee ≥ 2 × MIN_FEE`), or all-zero
+/// (`stx.fee ≥ MIN_FEE`, sponsors nothing). For any other asset it is the live ZCRYPT swap
+/// lock that sponsors this one (`stx.fee == 0`).
+#[allow(clippy::too_many_arguments)]
+pub fn swap_lock_native_tx(
+    value: u64,
+    blind: &Blind,
+    asset: u64,
+    lock: &[u8; 32],
+    timeout: u64,
+    counterparty_pk: &PubKey,
+    refund_pk: &PubKey,
+    sponsor_ref: &[u8; 32],
+    stx: &shield_tx::ShieldTx,
+    claim: &zcrypt_core::htlc_shield::CoinOpening,
+    refund: &zcrypt_core::htlc_shield::CoinOpening,
+) -> Vec<u8> {
+    let mut t = vec![0x6Bu8];
+    t.extend_from_slice(&value.to_le_bytes());
+    for limb in blind {
+        t.extend_from_slice(&limb.to_le_bytes());
+    }
+    t.extend_from_slice(&asset.to_le_bytes());
+    t.extend_from_slice(lock);
+    t.extend_from_slice(&timeout.to_le_bytes());
+    t.extend_from_slice(&pk_bytes(counterparty_pk));
+    t.extend_from_slice(&pk_bytes(refund_pk));
+    t.extend_from_slice(sponsor_ref);
+    t.extend_from_slice(&claim.encode());
+    t.extend_from_slice(&refund.encode());
+    t.extend_from_slice(&shield_tx::to_bytes(stx));
+    t
+}
+
+/// Parse the header of a native swap lock (the bytes AFTER the `0x6B` tag):
+/// `(value, blind, asset, hashlock, timeout, counterparty_pk, refund_pk, sponsor_ref)`.
+#[allow(clippy::type_complexity)]
+pub fn parse_swap_lock_native(payload: &[u8]) -> Option<(u64, Blind, u64, [u8; 32], u64, PubKey, PubKey, [u8; 32])> {
+    const HEAD: usize = 8 + zcrypt_shield::BLIND_BYTES + 8 + 32 + 8 + 64 + 64;
+    let (value, blind, asset, hashlock, timeout, cp, refund) = parse_swap_lock(payload)?;
+    let mut sponsor_ref = [0u8; 32];
+    sponsor_ref.copy_from_slice(payload.get(HEAD..HEAD + 32)?);
+    Some((value, blind, asset, hashlock, timeout, cp, refund, sponsor_ref))
+}
+
+/// The gas a native swap lock of `asset` burns in-proof: a ZCRYPT lock pays `MIN_FEE` for
+/// itself and another `MIN_FEE` when it sponsors a counter-lock; any other asset pays 0 (it
+/// must be sponsored). Mirrors `Node::native_lock_gas_rule`.
+pub fn native_lock_fee(asset: u64, sponsors: bool) -> u64 {
+    if asset != zcrypt_shield::ASSET_ZCRYPT {
+        0
+    } else if sponsors {
+        2 * zcrypt_core::emission::MIN_FEE
+    } else {
+        zcrypt_core::emission::MIN_FEE
+    }
+}
+
+/// The timeout of a lock placed SECOND against a sponsor that was placed first: the sponsor
+/// (the ZCRYPT leg, claimed by the party who reveals the preimage) must expire
+/// [`SWAP_MAKER_CLAIM_MARGIN_BLOCKS`] before the sponsored leg, so the ZCRYPT giver always
+/// has time to claim after the reveal. Deterministic, so the sponsor can name the sponsored
+/// lock's id before it exists.
+pub fn sponsored_lock_timeout(sponsor_timeout: u64) -> u64 {
+    sponsor_timeout + SWAP_MAKER_CLAIM_MARGIN_BLOCKS
+}
+
+/// Lock `value` of `asset` from `locker`'s `coins` into a swap escrow claimable by
+/// `counterparty` with NO gas note (`0x6B`). ZCRYPT: the fee is burned in-proof (one coin is
+/// enough); `sponsor_ref` names the counter-lock to sponsor, or `[0; 32]`. Other assets: fee
+/// 0, `sponsor_ref` is the ZCRYPT lock that sponsors this one. Broadcasts and returns
+/// `(escrow_id, change_coin, claim_enc_note)`.
+#[allow(clippy::too_many_arguments)]
+pub fn send_swap_lock_native(
+    zc: &Zcrypt,
+    locker: &Account,
+    asset: u64,
+    value: u64,
+    coins: &[Coin],
+    hashlock: &[u8; 32],
+    timeout: u64,
+    counterparty: &zcrypt_core::keys::Address,
+    sponsor_ref: [u8; 32],
+) -> Result<([u8; 32], Coin, Vec<u8>), String> {
+    let in_total: u64 = coins.iter().map(|c| c.value).sum();
+    let fee = native_lock_fee(asset, sponsor_ref != [0u8; 32]);
+    let change_value = in_total
+        .checked_sub(value)
+        .and_then(|r| r.checked_sub(fee))
+        .ok_or_else(|| format!("lock value {value} + fee {fee} exceeds the locker's coins ({in_total})"))?;
+    let burn_blind = zcrypt_core::keys::random_blind();
+    let change_blind = zcrypt_core::keys::random_blind();
+    let burn_out: OutCoin = (value, burn_blind, zcrypt_core::htlc_shield::BURN_PK, asset);
+    let change_out: OutCoin = (change_value, change_blind, locker.pubkey(), asset);
+    let change_note = zcrypt_core::kem::ciphertext_to_bytes(&zcrypt_core::keys::encrypt_note_asset(
+        &locker.normal_address(),
+        change_value,
+        change_blind,
+        asset,
+    ));
+    let (_claim_blind, claim_open) = zcrypt_core::htlc_shield::CoinOpening::create(counterparty, value, asset)?;
+    let (_refund_blind, refund_open) =
+        zcrypt_core::htlc_shield::CoinOpening::create(&locker.normal_address(), value, asset)?;
+    let counterparty_pk = counterparty.pubkey();
+    let settlements = [claim_open.coin.clone(), refund_open.coin.clone()];
+    let envelope = zcrypt_core::htlc_shield::lock_envelope(
+        zcrypt_core::htlc_shield::ENV_SWAP_LOCK,
+        asset,
+        value,
+        hashlock,
+        timeout,
+        &counterparty_pk,
+        &locker.pubkey(),
+        &[],
+        &settlements,
+    );
+    let stx = build_shield_spend_bound(
+        zc,
+        coins,
+        &[burn_out, change_out],
+        fee,
+        vec![zcrypt_core::keys::cover_note_bytes(), change_note],
+        &envelope,
+    )?;
+    let data = zc.broadcast(&swap_lock_native_tx(
+        value, &burn_blind, asset, hashlock, timeout, &counterparty_pk, &locker.pubkey(), &sponsor_ref, &stx, &claim_open, &refund_open,
+    ))?;
+    let escrow = escrow_id_from(&data)?;
+    Ok((escrow, locker.own_asset_coin(change_value, change_blind, asset), claim_open.coin.enc_note))
+}
+
 /// Prove the SPV claim coin: net of the bridge fee, encrypted to `to`. The open tx
 /// header still carries the gross deposit. Returns the blind the beneficiary spends with.
 pub fn spv_claim_opening(
@@ -1690,6 +1920,11 @@ pub struct EscrowInfo {
     pub claim_enc_note: Vec<u8>,
     pub refund_commitment: Vec<u8>,
     pub refund_enc_note: Vec<u8>,
+    /// Gas sponsorship (native swap locks, `0x6B`): the escrow id of the ONE counter-lock
+    /// this ZCRYPT lock pays gas for (32 bytes), empty when it sponsors nothing.
+    pub sponsor_for: Vec<u8>,
+    /// Whether that sponsorship has already admitted a lock.
+    pub sponsor_used: bool,
 }
 
 /// Query one escrow by id; `Ok(None)` if consensus has no such escrow (rejected/garbage tx).
@@ -1723,6 +1958,8 @@ pub fn query_escrow(zc: &dyn ZcNode, escrow_id: &[u8; 32]) -> Result<Option<Escr
         claim_enc_note: hex_field("claim_enc_note"),
         refund_commitment: hex_field("refund_commitment"),
         refund_enc_note: hex_field("refund_enc_note"),
+        sponsor_for: hex_field("sponsor_for"),
+        sponsor_used: v.get("sponsor_used").and_then(|x| x.as_bool()).unwrap_or(false),
     }))
 }
 
@@ -3166,10 +3403,13 @@ pub fn find_swap_lock(
     let zc_tip = zc.height()? as u64;
     for h in from..=to {
         for tx in zc.block_txs(h)? {
-            if tx.first() != Some(&0x62) {
-                continue;
-            }
-            let Some((v, _blind, a, lock, timeout, counterparty, refund)) = parse_swap_lock(&tx[1..]) else {
+            // Both lock wires open the same escrow: 0x62 (gas prefix) and 0x6B (native gas).
+            let parsed = match tx.first() {
+                Some(&0x62) => parse_swap_lock(&tx[1..]),
+                Some(&0x6B) => parse_swap_lock_native(&tx[1..]).map(|(v, b, a, l, t, c, r, _)| (v, b, a, l, t, c, r)),
+                _ => None,
+            };
+            let Some((v, _blind, a, lock, timeout, counterparty, refund)) = parsed else {
                 continue;
             };
             if lock != *hashlock || counterparty != *claimant_pk || a != asset || v != value {
@@ -3469,6 +3709,49 @@ pub fn swap_in_pool_progress(
 
     progress(100, "Swap complete — the asset is in your wallet.");
     Ok(SwapResult { received, give_change })
+}
+
+#[cfg(test)]
+mod native_gas_wire_tests {
+    use super::*;
+
+    fn stx(fee: u64) -> shield_tx::ShieldTx {
+        shield_tx::ShieldTx { inputs: vec![], output_commitments: vec![], enc_notes: vec![], fee, root: [0u64; 8], proof: vec![9, 9] }
+    }
+
+    #[test]
+    fn zcrypt_transfer_wire_round_trips() {
+        let blind: Blind = core::array::from_fn(|i| 3 + i as u64);
+        let raw = zcrypt_transfer_tx(10_000, &blind, &stx(0));
+        assert_eq!(raw[0], 0x6A);
+        let (v, b, tx) = parse_zcrypt_transfer_payload(&raw[1..]).expect("parses");
+        assert_eq!((v, b, tx.proof), (10_000, blind, vec![9, 9]));
+        assert!(parse_zcrypt_transfer_payload(&raw[1..raw.len() - 1]).is_none());
+    }
+
+    #[test]
+    fn native_swap_lock_wire_round_trips_and_find_swap_lock_reads_both_tags() {
+        let blind: Blind = core::array::from_fn(|i| 5 + i as u64);
+        let cp: PubKey = core::array::from_fn(|i| 30 + i as u64);
+        let rf: PubKey = core::array::from_fn(|i| 50 + i as u64);
+        let lock = [0x22u8; 32];
+        let sponsor = [0xCDu8; 32];
+        let (holder, _) = zcrypt_core::keys::new_account();
+        let (_, claim) = zcrypt_core::htlc_shield::CoinOpening::prove(&holder.normal_address(), &cp, 700, 4, zcrypt_core::keys::random_blind()).unwrap();
+        let (_, refund) = zcrypt_core::htlc_shield::CoinOpening::prove(&holder.normal_address(), &rf, 700, 4, zcrypt_core::keys::random_blind()).unwrap();
+        let raw = swap_lock_native_tx(700, &blind, 4, &lock, 999, &cp, &rf, &sponsor, &stx(20_000), &claim, &refund);
+        assert_eq!(raw[0], 0x6B);
+        let (v, b, a, l, t, c, r, sp) = parse_swap_lock_native(&raw[1..]).expect("header parses");
+        assert_eq!((v, b, a, l, t), (700, blind, 4, lock, 999));
+        assert_eq!((c, r, sp), (cp, rf, sponsor));
+        // The 0x62 header parser reads the same 248 bytes (it ignores what follows).
+        let (v2, _, a2, l2, t2, c2, r2) = parse_swap_lock(&raw[1..]).unwrap();
+        assert_eq!((v2, a2, l2, t2, c2, r2), (700, 4, lock, 999, cp, rf));
+        assert_eq!(native_lock_fee(zcrypt_shield::ASSET_ZCRYPT, false), zcrypt_core::emission::MIN_FEE);
+        assert_eq!(native_lock_fee(zcrypt_shield::ASSET_ZCRYPT, true), 2 * zcrypt_core::emission::MIN_FEE);
+        assert_eq!(native_lock_fee(4, true), 0);
+        assert_eq!(sponsored_lock_timeout(1_000), 1_000 + SWAP_MAKER_CLAIM_MARGIN_BLOCKS);
+    }
 }
 
 #[cfg(test)]

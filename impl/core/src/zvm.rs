@@ -43,6 +43,7 @@ pub const OP_CHECK_THRESHOLD_SIG: u8 = 0x1D; // ≥M valid ML-DSA sigs from the 
 pub const OP_CHECK_SPV_PROOF: u8 = 0x1E; // a verified Bitcoin SPV deposit proof (trustless mint)
 pub const OP_CHECK_AMOUNT_EQ_CLAIMABLE: u8 = 0x1F; // amount == claimable (full-balance claims only)
 pub const OP_CHECK_CLAIMABLE_MIN: u8 = 0x20; // claimable >= MIN_CLAIM (no forced dust claims)
+pub const OP_CHECK_GAS_PAID: u8 = 0x21; // the lock paid its ZCRYPT gas itself, or a paired ZCRYPT swap lock sponsors it
 
 // ---- one canonical program per transaction type ----
 /// 0x57 bond a validator.
@@ -70,6 +71,14 @@ pub const HTLC_CLAIM: &[u8] = &[OP_CHECK_ESCROW_OPEN, OP_CHECK_BEFORE_TIMEOUT, O
 pub const HTLC_EXPIRE: &[u8] = &[OP_CHECK_ESCROW_OPEN, OP_CHECK_AT_OR_AFTER_TIMEOUT, OP_HALT];
 /// 0x5D lock zBTC into a burn HTLC escrow (zBTC→BTC).
 pub const HTLC_BURN_LOCK: &[u8] = &[OP_CHECK_ASSET_REGISTERED, OP_CHECK_BURN_OUTPUT, OP_HALT];
+/// 0x6A native ZCRYPT transfer: ONE proof whose output[0] is a revealed ZCRYPT burn coin of
+/// ≥ MIN_FEE. The revealed burn pins the (single) asset of the whole spend to ZCRYPT, so the
+/// gas is ZCRYPT without a second coin or a second proof.
+pub const ZCRYPT_TRANSFER: &[u8] = &[OP_CHECK_BURN_OUTPUT, OP_HALT];
+/// 0x6B native swap lock: no gas prefix. A ZCRYPT lock burns its gas as the in-tx fee
+/// (`MIN_FEE`, or `2 × MIN_FEE` when it sponsors its counter-lock); a non-ZCRYPT lock pays
+/// nothing and must be sponsored by the paired ZCRYPT lock (same hashlock, keys crossed).
+pub const SWAP_LOCK_NATIVE: &[u8] = &[OP_CHECK_ASSET_REGISTERED, OP_CHECK_BURN_OUTPUT, OP_CHECK_GAS_PAID, OP_HALT];
 
 /// The machine's registers: tx params + the consensus state a guard may read.
 /// Fields default to a "fails-closed" value so an unset guard rejects.
@@ -102,6 +111,9 @@ pub struct Ctx {
     pub hashlock: Hash,
     pub preimage: Vec<u8>,
     pub burn_output_ok: bool,
+    /// Native lock (`0x6B`): the gas rule holds (own ZCRYPT fee, or a valid sponsor). Set by
+    /// the node from the fee and the escrow book; defaults false — fails closed.
+    pub gas_ok: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -143,9 +155,10 @@ pub fn evaluate(program: &[u8], ctx: &Ctx) -> Outcome {
             OP_CHECK_PREIMAGE if htlc_hashlock(&ctx.preimage) != ctx.hashlock => return Outcome::reject("preimage does not match hashlock"),
             OP_CHECK_ASSET_REGISTERED if !ctx.asset_registered => return Outcome::reject("asset not registered"),
             OP_CHECK_BURN_OUTPUT if !ctx.burn_output_ok => return Outcome::reject("output[0] is not the declared burn coin"),
+            OP_CHECK_GAS_PAID if !ctx.gas_ok => return Outcome::reject("gas not paid: a native lock burns its own ZCRYPT fee or is sponsored by its paired ZCRYPT swap lock"),
             OP_HALT => break,
             // a guard byte that passed, or a no-op position
-            0x10..=0x20 => {}
+            0x10..=0x21 => {}
             _ => return Outcome::reject("unknown opcode"),
         }
     }
@@ -370,6 +383,29 @@ mod tests {
         assert!(!evaluate(HTLC_BURN_LOCK, &unreg).accept);
         let badout = Ctx { asset_registered: true, burn_output_ok: false, ..Default::default() };
         assert!(!evaluate(HTLC_BURN_LOCK, &badout).accept);
+    }
+
+    #[test]
+    fn native_gas_programs_encode_the_node_guards() {
+        // 0x6A: one guard — output[0] is the declared ZCRYPT burn coin (≥ MIN_FEE is a header
+        // rule the node checks before building the ctx).
+        assert_eq!(ZCRYPT_TRANSFER, &[OP_CHECK_BURN_OUTPUT, OP_HALT][..]);
+        assert!(evaluate(ZCRYPT_TRANSFER, &Ctx { burn_output_ok: true, ..Default::default() }).accept);
+        assert!(!evaluate(ZCRYPT_TRANSFER, &Ctx::default()).accept);
+        // 0x6B: registered asset + declared burn output + the gas rule (own fee or sponsor).
+        assert_eq!(SWAP_LOCK_NATIVE, &[OP_CHECK_ASSET_REGISTERED, OP_CHECK_BURN_OUTPUT, OP_CHECK_GAS_PAID, OP_HALT][..]);
+        let good = Ctx { asset_registered: true, burn_output_ok: true, gas_ok: true, ..Default::default() };
+        assert!(evaluate(SWAP_LOCK_NATIVE, &good).accept);
+        let unpaid = Ctx { gas_ok: false, ..good.clone() };
+        let out = evaluate(SWAP_LOCK_NATIVE, &unpaid);
+        assert!(!out.accept);
+        assert!(out.reason.contains("gas not paid"));
+        assert!(!evaluate(SWAP_LOCK_NATIVE, &Ctx { burn_output_ok: false, ..good.clone() }).accept);
+        assert!(!evaluate(SWAP_LOCK_NATIVE, &Ctx { asset_registered: false, ..good }).accept);
+        // The new opcode is inside the no-op range, so a passed guard falls through.
+        assert_eq!(OP_CHECK_GAS_PAID, 0x21);
+        assert!(evaluate(&[OP_CHECK_GAS_PAID, OP_HALT], &Ctx { gas_ok: true, ..Default::default() }).accept);
+        assert!(!evaluate(&[0x22, OP_HALT], &Ctx::default()).accept, "unknown opcode rejects");
     }
 
     #[test]
