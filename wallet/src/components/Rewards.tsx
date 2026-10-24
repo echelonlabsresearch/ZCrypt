@@ -36,7 +36,9 @@ export default function Rewards({
   };
   const [ident, setIdent] = useState<ValidatorIdentity | null>(null);
   const [identErr, setIdentErr] = useState("");
-  const [showSetup, setShowSetup] = useState(false);
+  // The user confirms a node is running with this identity before Bond is enabled: bonding
+  // alone registers the key and pledges the stake; only that node can sign blocks.
+  const [nodeReady, setNodeReady] = useState(false);
   const [copiedKey, setCopiedKey] = useState(false);
   const [stake, setStake] = useState("10000");
   const [commissionPct, setCommissionPct] = useState("10");
@@ -292,8 +294,8 @@ export default function Rewards({
         ) : (
           <>
             <div style={{ fontSize: "0.82rem", opacity: 0.8, marginBottom: "0.7rem" }}>
-              This wallet owns a validator identity, derived from your recovery phrase. Your node signs
-              blocks with it; this wallet bonds and unbonds it. Nothing to copy back from the server.
+              Two parts, both required. A <b>node</b> you run signs blocks with this identity; this <b>wallet</b> bonds
+              the stake behind it. Bonding without the node registers a validator that never signs and earns nothing.
             </div>
             <div className="field">
               <label>Your validator (consensus public key)</label>
@@ -329,26 +331,38 @@ export default function Rewards({
               </>
             ) : (
               <>
-                <details open={showSetup} onToggle={(e) => setShowSetup((e.target as HTMLDetailsElement).open)} style={{ margin: "0.2rem 0 0.8rem" }}>
-                  <summary style={{ cursor: "pointer", fontSize: "0.82rem" }}>
-                    <b>Node setup</b> (once, before the node's first start)
-                  </summary>
-                  <div style={{ fontSize: "0.78rem", opacity: 0.8, margin: "0.5rem 0" }}>
-                    Put this line in the <code>.env</code> next to <code>docker-compose.validator.yml</code>, then start the
-                    node. It installs this identity as the node's signing key. It is a secret: treat it like the
-                    recovery phrase. The clipboard clears after 60 seconds.
+                <div className="step">
+                  <div className="step-head">
+                    <span className="step-num">1</span>
+                    <b>Run a node with this identity</b>
                   </div>
-                  <div className="mono-box" style={{ fontSize: "0.66rem", wordBreak: "break-all", maxHeight: 90, overflow: "auto" }}>
+                  <div style={{ fontSize: "0.78rem", opacity: 0.8, margin: "0.4rem 0" }}>
+                    On any machine with Docker: clone the repo, copy <code>chain/validator.env.example</code> to{" "}
+                    <code>.env</code>, paste the line below into it, then{" "}
+                    <code>docker compose -f docker-compose.validator.yml up -d</code>. The line is the node's signing key:
+                    it goes in <b>before the first start</b>, and the file stays private. A node already running with its
+                    own key must be stopped, its volume removed, and started again with the line in place.
+                  </div>
+                  <div className="mono-box" style={{ fontSize: "0.66rem", wordBreak: "break-all", maxHeight: 60, overflow: "auto" }}>
                     {ident.env_line.slice(0, 24)}…
                   </div>
                   <button className="copy-btn" style={{ marginTop: "0.4rem" }} onClick={copyNodeKey}>
                     {copiedKey ? "✓ Copied (clears in 60 s)" : "📋 Copy the .env line"}
                   </button>
                   <div style={{ fontSize: "0.72rem", opacity: 0.6, marginTop: "0.5rem" }}>
-                    Already running a node with its own key? Stop it, remove its volume, add the line, start again.
-                    The node must be synced before you bond, or it misses blocks.
+                    Let it sync to the chain tip before step 2, or it misses blocks from the moment it is bonded.
                   </div>
-                </details>
+                </div>
+
+                <div className="step" style={{ marginTop: "0.9rem" }}>
+                  <div className="step-head">
+                    <span className="step-num">2</span>
+                    <b>Bond the stake from this wallet</b>
+                  </div>
+                  <label style={{ display: "flex", gap: "0.5rem", alignItems: "flex-start", fontWeight: "normal", fontSize: "0.8rem", margin: "0.5rem 0 0.8rem", cursor: "pointer" }}>
+                    <input type="checkbox" style={{ width: "auto", marginTop: 2 }} checked={nodeReady} onChange={(e) => setNodeReady(e.target.checked)} />
+                    <span>My node is running with this identity and is synced.</span>
+                  </label>
                 <div className="field">
                   <label>Stake (ZCRYPT, min 10,000)</label>
                   <input value={stake} onChange={(e) => setStake(e.target.value)} inputMode="numeric" />
@@ -360,13 +374,13 @@ export default function Rewards({
                     Lower commission attracts more delegators; you keep this % of what they earn. 0-100%.
                   </div>
                 </div>
-                <button className="btn-primary btn-block" disabled={bonding} onClick={bond}>
+                <button className="btn-primary btn-block" disabled={bonding || !nodeReady} onClick={bond} title={nodeReady ? "" : "Confirm step 1 first"}>
                   {bonding ? "Bonding on-chain…" : `Bond ${stake || "?"} ZCRYPT`}
                 </button>
                 <div style={{ fontSize: "0.72rem", opacity: 0.6, marginTop: "0.5rem" }}>
-                  The stake is pledged (burned) from this wallet and comes back after a 10-day unbond. Bonding puts this key in
-                  the active set on the next block; a node running with it (Node setup above) must then sign, or no rewards
-                  accrue. This card shows whether it does.
+                  The stake is pledged from this wallet and comes back after a 10-day unbond. Your key joins the active set on
+                  the next block, and from then on this card shows whether your node is signing.
+                </div>
                 </div>
               </>
             )}

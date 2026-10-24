@@ -842,3 +842,27 @@ details.card.guide[open] > summary {
   padding-top: 0.9rem;
   border-top: 1px dashed var(--color-border);
 }
+
+/* ---------- run a validator: two numbered steps ---------- */
+.step {
+  border: 1px solid var(--color-border);
+  border-radius: 8px;
+  padding: 0.8rem 0.9rem;
+}
+.step-head {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+}
+.step-num {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.5rem;
+  height: 1.5rem;
+  border-radius: 50%;
+  border: 1px solid var(--color-cyan);
+  color: var(--color-cyan);
+  font-size: 0.8rem;
+  font-weight: bold;
+}
