@@ -316,8 +316,8 @@ export async function shareFile(text: string, filename: string, save: (f: string
     try {
       await call<boolean>("share_file", { filename, content: text });
       return "shared";
-    } catch {
-      /* fall through to the web share API, then to saving */
+    } catch (e) {
+      return `Could not open the share sheet: ${String(e)}`;
     }
   }
   try {

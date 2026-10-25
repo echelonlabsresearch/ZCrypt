@@ -8660,7 +8660,7 @@ mod ios_share {
     use objc2::MainThreadMarker;
     use objc2_core_foundation::{CGPoint, CGRect, CGSize};
     use objc2_foundation::{NSArray, NSString, NSURL};
-    use objc2_ui_kit::{UIActivityViewController, UIPopoverArrowDirection, UIViewController};
+    use objc2_ui_kit::{UIActivityViewController, UIDevice, UIPopoverArrowDirection, UIUserInterfaceIdiom, UIViewController};
 
     /// Runs on the main thread (tauri's `with_webview` guarantees it).
     pub fn present(vc: *mut std::ffi::c_void, path: &str) {
@@ -8674,9 +8674,10 @@ mod ios_share {
         let items: Retained<NSArray<AnyObject>> = NSArray::from_retained_slice(&[Retained::into_super(Retained::into_super(url))]);
         // SAFETY: documented UIKit initializer; `items` holds one NSURL.
         let avc = unsafe { UIActivityViewController::initWithActivityItems_applicationActivities(mtm.alloc(), &items, None) };
-        // On a wide screen UIKit would show a popover; anchor it to the bottom centre with no
-        // arrow so it reads as a sheet there too. On a phone this is ignored and a sheet is used.
-        if let (Some(pop), Some(view)) = (avc.popoverPresentationController(), vc.view()) {
+        // iPad requires a popover anchor. On iPhone an anchor makes iOS 26 present the share
+        // sheet as a small popover ("teardrop") instead of the full sheet, so none is set there.
+        let ipad = UIDevice::currentDevice(mtm).userInterfaceIdiom() == UIUserInterfaceIdiom::Pad;
+        if let (true, Some(pop), Some(view)) = (ipad, avc.popoverPresentationController(), vc.view()) {
             let b = view.bounds();
             pop.setSourceView(Some(&view));
             pop.setSourceRect(CGRect::new(CGPoint::new(b.size.width / 2.0, b.size.height - 1.0), CGSize::new(1.0, 1.0)));

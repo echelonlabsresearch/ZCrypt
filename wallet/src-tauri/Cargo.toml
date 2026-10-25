@@ -70,4 +70,4 @@ security-framework-sys = "2"
 objc2 = "0.6"
 objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSArray", "NSString", "NSURL", "NSObject"] }
 objc2-core-foundation = { version = "0.3", default-features = false, features = ["std", "CFCGTypes"] }
-objc2-ui-kit = { version = "0.3", default-features = false, features = ["std", "UIActivityViewController", "UIViewController", "UIPopoverPresentationController", "UIPresentationController", "UIView", "UIResponder"] }
+objc2-ui-kit = { version = "0.3", default-features = false, features = ["std", "UIActivityViewController", "UIViewController", "UIPopoverPresentationController", "UIPresentationController", "UIView", "UIResponder", "UIDevice"] }

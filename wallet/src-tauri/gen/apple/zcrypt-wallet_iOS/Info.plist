@@ -34,12 +34,16 @@
 			<array>
 				<string>zcrypt</string>
 			</array>
+			<key>LSItemContentTypes</key>
+			<array>
+				<string>io.zcrypt.payment</string>
+			</array>
 			<key>CFBundleTypeName</key>
 			<string>ZCrypt payment</string>
 			<key>CFBundleTypeRole</key>
 			<string>Viewer</string>
 			<key>LSHandlerRank</key>
-			<string>Default</string>
+			<string>Owner</string>
 		</dict>
 	</array>
 	<key>UTExportedTypeDeclarations</key>

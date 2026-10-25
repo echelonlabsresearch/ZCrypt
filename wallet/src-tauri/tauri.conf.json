@@ -53,7 +53,9 @@
         "name": "ZCrypt payment",
         "description": "A ZCrypt bearer coin, stealth note or payment receipt",
         "mimeType": "application/x-zcrypt",
-        "role": "Viewer"
+        "role": "Viewer",
+        "rank": "Owner",
+        "contentTypes": ["io.zcrypt.payment"]
       }
     ],
     "iOS": {
