@@ -542,11 +542,17 @@ pub fn broadcast(url: &str, tx: &[u8]) -> Result<(), String> {
 /// GET `u` as JSON with backoff on transient failures: a 429 (honouring `Retry-After`),
 /// a 5xx, or a transport error is retried a few times; anything else fails at once.
 fn get_json_retry(u: &str) -> Result<Value, String> {
+    get_json_retry_with(u, TIMEOUT_S)
+}
+
+/// Same, with its own timeout: a page of shielded transactions is tens of megabytes
+/// (each carries a 2 MB proof), which the default 45 s cannot move over a slow link.
+fn get_json_retry_with(u: &str, secs: u64) -> Result<Value, String> {
     let mut wait = std::time::Duration::from_millis(500);
     let max_wait = std::time::Duration::from_secs(30);
     let attempts = 4;
     for attempt in 1..=attempts {
-        match agent().get(u).call() {
+        match agent_with_timeout(secs).get(u).call() {
             Ok(r) => return r.into_json().map_err(|e| e.to_string()),
             Err(ureq::Error::Status(code, resp)) => {
                 let transient = code == 429 || code >= 500;
@@ -624,7 +630,11 @@ fn scan_blocks_indexed(url: &str, from: i64, to: i64) -> Result<ScanFetch, Strin
     if from > to {
         return Ok(ScanFetch::empty(from - 1));
     }
-    const PER_PAGE: usize = 100;
+    // Shielded transactions are ~4 MB each on the wire (two proofs), so a page is kept
+    // to about 40 MB and given a long timeout: a page of 100 ran past 45 s and was cut
+    // off mid-body, which made the whole index look unavailable.
+    const PER_PAGE: usize = 10;
+    const PAGE_TIMEOUT_S: u64 = 240;
     let mut rows: Vec<IndexedTx> = Vec::new();
     let mut page = 1usize;
     loop {
@@ -632,7 +642,7 @@ fn scan_blocks_indexed(url: &str, from: i64, to: i64) -> Result<ScanFetch, Strin
             "{}/tx_search?query=%22tx.height%3E%3D{from}%20AND%20tx.height%3C%3D{to}%22&per_page={PER_PAGE}&page={page}&order_by=%22asc%22",
             base(url)
         );
-        let v = match get_json_retry(&u) {
+        let v = match get_json_retry_with(&u, PAGE_TIMEOUT_S) {
             Ok(v) => v,
             Err(e) if page == 1 => return Err(e),
             Err(e) => return Ok(indexed_prefix(rows, from, Some(format!("tx index page {page}: {e}")))),
