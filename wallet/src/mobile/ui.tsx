@@ -1,4 +1,5 @@
-import { ReactNode, useEffect, useState } from "react";
+import React, { ReactNode, useEffect, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import { call } from "../lib/api";
 
 // ---------- icons (24x24, 1.8px strokes) ----------
@@ -202,19 +203,60 @@ export function dismissKeyboard() {
 }
 
 export function Sheet({ open, onClose, title, children }: { open: boolean; onClose: () => void; title?: string; children: ReactNode }) {
+  const ref = useRef<HTMLDivElement>(null);
+  const drag = useRef<{ y0: number; dy: number; active: boolean }>({ y0: 0, dy: 0, active: false });
   useEffect(() => {
     if (open) dismissKeyboard();
   }, [open]);
   if (!open) return null;
-  return (
+
+  // Swipe down to dismiss, the way a system sheet behaves. The drag only starts when the
+  // sheet's own content is scrolled to the top, so scrolling inside long sheets still works.
+  const el = () => ref.current;
+  const start = (e: React.TouchEvent) => {
+    const s = el();
+    if (!s || s.scrollTop > 0) return;
+    drag.current = { y0: e.touches[0].clientY, dy: 0, active: true };
+    s.style.transition = "none";
+  };
+  const move = (e: React.TouchEvent) => {
+    const s = el();
+    if (!s || !drag.current.active) return;
+    const dy = Math.max(0, e.touches[0].clientY - drag.current.y0);
+    drag.current.dy = dy;
+    s.style.transform = `translateY(${dy}px)`;
+  };
+  const end = () => {
+    const s = el();
+    if (!s || !drag.current.active) return;
+    drag.current.active = false;
+    s.style.transition = "transform 0.22s cubic-bezier(0.2, 0.8, 0.2, 1)";
+    if (drag.current.dy > 90) {
+      s.style.transform = `translateY(${s.offsetHeight + 40}px)`;
+      setTimeout(onClose, 180);
+    } else {
+      s.style.transform = "";
+    }
+  };
+  return overlay(
     <div className="m-sheet-backdrop" onClick={onClose}>
-      <div className="m-sheet" onClick={(e) => e.stopPropagation()}>
+      <div ref={ref} className="m-sheet" onClick={(e) => e.stopPropagation()} onTouchStart={start} onTouchMove={move} onTouchEnd={end} onTouchCancel={end}>
         <div className="m-sheet-handle" />
         {title && <h3 className="m-sheet-title">{title}</h3>}
         {children}
       </div>
     </div>
   );
+}
+
+/**
+ * Render a full-shell overlay as a child of the shell itself, never of a screen. WebKit
+ * clips absolutely positioned descendants of a scroll container (the tab screens scroll),
+ * which cut the bottom of sheets and result screens off on the phone.
+ */
+export function overlay(node: ReactNode) {
+  const host = document.querySelector(".m-app") ?? document.body;
+  return createPortal(node, host);
 }
 
 export function Switch({ on, onChange, disabled }: { on: boolean; onChange: (v: boolean) => void; disabled?: boolean }) {

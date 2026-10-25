@@ -76,7 +76,6 @@
   flex: 1;
   min-height: 0;
   overflow-y: auto;
-  -webkit-overflow-scrolling: touch;
   overscroll-behavior: contain;
   padding: calc(var(--sat) + 10px) 20px calc(var(--tabbar) + var(--sab) + 28px);
 }

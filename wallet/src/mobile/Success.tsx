@@ -1,5 +1,5 @@
 import { ReactNode, useEffect, useRef } from "react";
-import { Btn, Icon } from "./ui";
+import { Btn, Icon, overlay } from "./ui";
 
 /**
  * Full-screen "done" moment: a burst of confetti, a big check, the amount in large type.
@@ -80,7 +80,7 @@ export default function Success({
     return () => cancelAnimationFrame(raf);
   }, [tone]);
 
-  return (
+  return overlay(
     <div className={`m-done ${tone}`}>
       <canvas ref={canvas} className="m-confetti" />
       <div className="m-done-body">

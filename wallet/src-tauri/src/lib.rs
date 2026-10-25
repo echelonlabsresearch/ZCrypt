@@ -8656,12 +8656,29 @@ async fn share_file(filename: String, content: String, webview: tauri::Webview) 
 #[cfg(target_os = "ios")]
 mod ios_share {
     use objc2::rc::Retained;
-    use objc2::runtime::AnyObject;
+    use objc2::runtime::{AnyObject, Bool};
     use objc2::MainThreadMarker;
     use objc2_core_foundation::{CGPoint, CGRect, CGSize};
-    use objc2_foundation::{NSArray, NSString, NSURL};
-    use objc2_ui_kit::{UIActivityViewController, UIDevice, UIModalPresentationStyle, UIPopoverArrowDirection, UIUserInterfaceIdiom, UIViewController};
+    use objc2_foundation::{NSArray, NSError, NSString, NSURL};
+    use objc2_ui_kit::{
+        UIActivityType, UIActivityViewController, UIDevice, UIPopoverArrowDirection, UIUserInterfaceIdiom, UIViewController, UIWindow,
+        UIWindowLevelAlert,
+    };
+    use std::cell::RefCell;
 
+    thread_local! {
+        // The window that hosts the share sheet, alive until the sheet is dismissed.
+        static WINDOW: RefCell<Option<Retained<UIWindow>>> = const { RefCell::new(None) };
+    }
+
+    /// Presents the system share sheet for `path`.
+    ///
+    /// The sheet is presented from a second window of our own with a plain root view
+    /// controller, not from the window tao created for the web view. Presented from tao's
+    /// window, iOS 26 draws UIActivityViewController as a compact popover pinned to the
+    /// corner of the screen, and no presentation setting on the controller changes that;
+    /// from a plain window it is the ordinary full-height share sheet.
+    ///
     /// Runs on the main thread (tauri's `with_webview` guarantees it).
     pub fn present(vc: *mut std::ffi::c_void, path: &str) {
         let Some(mtm) = MainThreadMarker::new() else { return };
@@ -8670,26 +8687,47 @@ mod ios_share {
         }
         // SAFETY: tauri hands us the live UIViewController that hosts the WKWebView.
         let vc: &UIViewController = unsafe { &*(vc as *const UIViewController) };
+        let Some(scene) = vc.view().and_then(|v| v.window()).and_then(|w| w.windowScene()) else { return };
+
+        let win = UIWindow::initWithWindowScene(mtm.alloc(), &scene);
+        // SAFETY: reading a UIKit constant.
+        win.setWindowLevel(unsafe { UIWindowLevelAlert } + 1.0);
+        let root = UIViewController::new(mtm);
+        win.setRootViewController(Some(&root));
+        win.makeKeyAndVisible();
+
         let url = NSURL::fileURLWithPath(&NSString::from_str(path));
         let items: Retained<NSArray<AnyObject>> = NSArray::from_retained_slice(&[Retained::into_super(Retained::into_super(url))]);
         // SAFETY: documented UIKit initializer; `items` holds one NSURL.
         let avc = unsafe { UIActivityViewController::initWithActivityItems_applicationActivities(mtm.alloc(), &items, None) };
-        // iPad requires a popover anchor. On iPhone an anchor makes iOS 26 present the share
-        // sheet as a small popover ("teardrop") instead of the full sheet, so none is set there.
-        // Merely reading `popoverPresentationController` switches the presentation to a
-        // popover, so it is not touched on the phone at all.
-        let ipad = UIDevice::currentDevice(mtm).userInterfaceIdiom() == UIUserInterfaceIdiom::Pad;
-        if ipad {
-            if let (Some(pop), Some(view)) = (avc.popoverPresentationController(), vc.view()) {
+
+        // iPad requires a popover anchor; the phone must not get one.
+        if UIDevice::currentDevice(mtm).userInterfaceIdiom() == UIUserInterfaceIdiom::Pad {
+            if let (Some(pop), Some(view)) = (avc.popoverPresentationController(), root.view()) {
                 let b = view.bounds();
                 pop.setSourceView(Some(&view));
                 pop.setSourceRect(CGRect::new(CGPoint::new(b.size.width / 2.0, b.size.height - 1.0), CGSize::new(1.0, 1.0)));
-                pop.setPermittedArrowDirections(UIPopoverArrowDirection(0));
+                pop.setPermittedArrowDirections(UIPopoverArrowDirection::Down);
             }
-        } else {
-            avc.setModalPresentationStyle(UIModalPresentationStyle::PageSheet);
         }
-        vc.presentViewController_animated_completion(&avc, true, None);
+
+        // When the sheet goes away, so does our window, and touches reach the web view again.
+        let done = block2::RcBlock::new(move |_t: *mut UIActivityType, _ok: Bool, _r: *mut NSArray, _e: *mut NSError| {
+            WINDOW.with(|w| {
+                if let Some(w) = w.borrow_mut().take() {
+                    w.setHidden(true);
+                }
+            });
+        });
+        // SAFETY: UIKit copies and retains the block for the controller's lifetime.
+        unsafe { avc.setCompletionWithItemsHandler(&*done as *const _ as *mut _) };
+
+        WINDOW.with(|w| {
+            if let Some(old) = w.borrow_mut().replace(win) {
+                old.setHidden(true);
+            }
+        });
+        root.presentViewController_animated_completion(&avc, true, None);
     }
 }
 
