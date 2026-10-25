@@ -549,7 +549,10 @@ impl Wallet {
         }
     }
 
-    /// Every reward key this wallet has bound (every bond and delegation), deduplicated.
+    /// Every reward key this wallet has bound (every bond and delegation), plus the main
+    /// account's own key: that is the address the genesis foundation allocation vests to
+    /// (`foundation_keys new` derives it from the same mnemonic) and the address legacy
+    /// CLI bonds named, so it is checked even when this wallet has bonded nothing yet.
     fn reward_keys(&self) -> Vec<RewardKey> {
         let mut v: Vec<RewardKey> = self
             .action_keys
@@ -557,6 +560,7 @@ impl Wallet {
             .filter(|a| a.kind == "bond" || a.kind == "delegate")
             .map(|a| RewardKey { index: if a.legacy { 0 } else { a.index }, legacy: a.legacy })
             .collect();
+        v.push(RewardKey { index: 0, legacy: true });
         v.sort_unstable_by_key(|k| (k.legacy, k.index));
         v.dedup();
         v
