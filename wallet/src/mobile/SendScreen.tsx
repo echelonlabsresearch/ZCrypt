@@ -31,6 +31,7 @@ export default function SendScreen({ active, onSent }: { active: boolean; onSent
   const [busy, setBusy] = useState<"" | "checking" | "proving">("");
   const [result, setResult] = useState<Result | null>(null);
   const [shared, setShared] = useState("");
+  const [copied, setCopied] = useState(false);
 
   const load = useCallback(() => {
     call<HeldAsset[]>("held_assets").then(setAssets).catch(() => {});
@@ -144,8 +145,8 @@ export default function SendScreen({ active, onSent }: { active: boolean; onSent
               <Btn onClick={async () => setShared(await shareFile(result.file!, filename, saveFile))}>
                 <Icon name="share" size={18} /> Share
               </Btn>
-              <Btn kind="secondary" onClick={() => { copySensitive(result.file!); setShared("Copied. The clipboard clears in 60 s."); }}>
-                <Icon name="copy" size={18} /> Copy
+              <Btn kind="secondary" onClick={() => { copySensitive(result.file!); setCopied(true); setTimeout(() => setCopied(false), 1800); setShared("Copied. The clipboard clears in 60 s."); }}>
+                <Icon name={copied ? "check" : "copy"} size={18} /> {copied ? "Copied" : "Copy"}
               </Btn>
             </div>
             {shared && shared !== "cancelled" && (

@@ -8660,7 +8660,7 @@ mod ios_share {
     use objc2::MainThreadMarker;
     use objc2_core_foundation::{CGPoint, CGRect, CGSize};
     use objc2_foundation::{NSArray, NSString, NSURL};
-    use objc2_ui_kit::{UIActivityViewController, UIDevice, UIPopoverArrowDirection, UIUserInterfaceIdiom, UIViewController};
+    use objc2_ui_kit::{UIActivityViewController, UIDevice, UIModalPresentationStyle, UIPopoverArrowDirection, UIUserInterfaceIdiom, UIViewController};
 
     /// Runs on the main thread (tauri's `with_webview` guarantees it).
     pub fn present(vc: *mut std::ffi::c_void, path: &str) {
@@ -8676,12 +8676,18 @@ mod ios_share {
         let avc = unsafe { UIActivityViewController::initWithActivityItems_applicationActivities(mtm.alloc(), &items, None) };
         // iPad requires a popover anchor. On iPhone an anchor makes iOS 26 present the share
         // sheet as a small popover ("teardrop") instead of the full sheet, so none is set there.
+        // Merely reading `popoverPresentationController` switches the presentation to a
+        // popover, so it is not touched on the phone at all.
         let ipad = UIDevice::currentDevice(mtm).userInterfaceIdiom() == UIUserInterfaceIdiom::Pad;
-        if let (true, Some(pop), Some(view)) = (ipad, avc.popoverPresentationController(), vc.view()) {
-            let b = view.bounds();
-            pop.setSourceView(Some(&view));
-            pop.setSourceRect(CGRect::new(CGPoint::new(b.size.width / 2.0, b.size.height - 1.0), CGSize::new(1.0, 1.0)));
-            pop.setPermittedArrowDirections(UIPopoverArrowDirection(0));
+        if ipad {
+            if let (Some(pop), Some(view)) = (avc.popoverPresentationController(), vc.view()) {
+                let b = view.bounds();
+                pop.setSourceView(Some(&view));
+                pop.setSourceRect(CGRect::new(CGPoint::new(b.size.width / 2.0, b.size.height - 1.0), CGSize::new(1.0, 1.0)));
+                pop.setPermittedArrowDirections(UIPopoverArrowDirection(0));
+            }
+        } else {
+            avc.setModalPresentationStyle(UIModalPresentationStyle::PageSheet);
         }
         vc.presentViewController_animated_completion(&avc, true, None);
     }

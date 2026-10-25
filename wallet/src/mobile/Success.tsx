@@ -11,18 +11,21 @@ export default function Success({
   children,
   onDone,
   doneLabel = "Done",
+  tone = "ok",
 }: {
   title: string;
   subtitle?: string;
   children?: ReactNode;
   onDone: () => void;
   doneLabel?: string;
+  /** "bad" is the red twin of this screen: no confetti, a cross instead of the check. */
+  tone?: "ok" | "bad";
 }) {
   const canvas = useRef<HTMLCanvasElement>(null);
 
   useEffect(() => {
     const c = canvas.current;
-    if (!c || window.matchMedia("(prefers-reduced-motion: reduce)").matches) return;
+    if (!c || tone !== "ok" || window.matchMedia("(prefers-reduced-motion: reduce)").matches) return;
     const ctx = c.getContext("2d");
     if (!ctx) return;
     const dpr = Math.min(window.devicePixelRatio || 1, 2);
@@ -75,21 +78,21 @@ export default function Success({
     };
     raf = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(raf);
-  }, []);
+  }, [tone]);
 
   return (
-    <div className="m-done">
+    <div className={`m-done ${tone}`}>
       <canvas ref={canvas} className="m-confetti" />
       <div className="m-done-body">
         <div className="m-done-check">
-          <Icon name="check" size={52} stroke={2.6} />
+          <Icon name={tone === "ok" ? "check" : "close"} size={52} stroke={2.6} />
         </div>
         <h1 className="m-done-title">{title}</h1>
         {subtitle && <p className="m-done-sub">{subtitle}</p>}
         {children && <div className="m-done-extra">{children}</div>}
       </div>
       <div className="m-done-foot">
-        <Btn full onClick={onDone}>{doneLabel}</Btn>
+        <Btn full kind={tone === "ok" ? "primary" : "secondary"} onClick={onDone}>{doneLabel}</Btn>
       </div>
     </div>
   );

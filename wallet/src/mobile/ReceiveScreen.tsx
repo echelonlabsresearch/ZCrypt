@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import QRCode from "qrcode";
 import { call, copy, fmtAsset } from "../lib/api";
-import { Banner, Btn, Icon, Segmented, Spinner } from "./ui";
+import { Banner, Btn, Icon, Segmented, short, Spinner } from "./ui";
 import Success from "./Success";
 import { useAuth } from "./MobileApp";
 
@@ -37,6 +37,8 @@ export default function ReceiveScreen({
   const [busy, setBusy] = useState(false);
   const [state, setState] = useState<{ tone: "ok" | "warn" | "bad"; msg: string } | null>(null);
   const [credited, setCredited] = useState("");
+  const [failed, setFailed] = useState("");
+  const [pasted, setPasted] = useState(false);
 
   const load = useCallback(() => {
     call<string>("get_address").then(setNormal).catch(() => {});
@@ -73,7 +75,9 @@ export default function ReceiveScreen({
       setCredited(pretty);
       onReceived();
     } catch (e) {
-      setState({ tone: "bad", msg: String(e instanceof Error ? e.message : e) });
+      const msg = String(e instanceof Error ? e.message : e);
+      if (s.startsWith("zcrypt-receipt/1")) setState({ tone: "bad", msg });
+      else setFailed(msg);
     } finally {
       setBusy(false);
     }
@@ -94,6 +98,22 @@ export default function ReceiveScreen({
       /* dismissed */
     }
   }
+  async function pasteAndReceive() {
+    let t = "";
+    try {
+      t = (await navigator.clipboard.readText()).trim();
+    } catch {
+      /* empty or denied */
+    }
+    if (!t) {
+      toast("Clipboard is empty", "Copy a bearer coin, stealth note or receipt first.");
+      return;
+    }
+    setText(t);
+    setPasted(true);
+    setTimeout(() => setPasted(false), 1500);
+    await receive(t);
+  }
   async function newStealth() {
     setNewBusy(true);
     try {
@@ -109,6 +129,23 @@ export default function ReceiveScreen({
   if (credited) {
     return (
       <Success title={`${credited} received!`} subtitle="The coin is yours now and already counts in your portfolio." onDone={() => setCredited("")} />
+    );
+  }
+  if (failed) {
+    const claimed = /already|spent|claimed|nullifier/i.test(failed);
+    return (
+      <Success
+        tone="bad"
+        title={claimed ? "Already claimed" : "Could not receive"}
+        subtitle={
+          claimed
+            ? "This coin was claimed before, by this wallet or by someone else who had the file. It cannot be received twice."
+            : "The payment could not be credited. Nothing was taken from the sender."
+        }
+        onDone={() => { setFailed(""); setText(""); }}
+      >
+        {!claimed && <div className="m-done-detail">{failed}</div>}
+      </Success>
     );
   }
 
@@ -131,7 +168,7 @@ export default function ReceiveScreen({
         {address ? (
           <>
             <div className="m-qr">{qr ? <img src={qr} alt="" /> : <Spinner />}</div>
-            <div className="m-addr">{address}</div>
+            <div className="m-addr" title={address}>{short(address, 10, 8)}</div>
             <div className="m-btnrow">
               <Btn kind="secondary" onClick={async () => { await copy(address); setCopied(true); setTimeout(() => setCopied(false), 1500); }}>
                 <Icon name={copied ? "check" : "copy"} size={18} /> {copied ? "Copied" : "Copy"}
@@ -162,12 +199,25 @@ export default function ReceiveScreen({
       <div className="m-section">Open a payment file</div>
       <div className="m-card">
         <p className="m-hint" style={{ margin: "0 0 10px" }}>
-          A .zcrypt file sent to you opens in this app on its own. You can also paste a bearer coin, a stealth note or a receipt here.
+          A .zcrypt file sent to you opens in this app on its own. Copied a coin, note or receipt instead? Paste it here.
         </p>
-        <textarea className="m-textarea" value={text} onChange={(e) => setText(e.target.value)} placeholder="zcrypt-bearer/1 …" autoCapitalize="none" autoCorrect="off" spellCheck={false} />
-        <Btn full style={{ marginTop: 10 }} disabled={busy || !text.trim()} onClick={() => receive(text)}>
-          {busy ? "Claiming…" : "Receive"}
+        <Btn full disabled={busy} onClick={pasteAndReceive}>
+          {busy ? "Claiming…" : pasted ? <><Icon name="check" size={18} /> Pasted</> : <><Icon name="paste" size={18} /> Paste and receive</>}
         </Btn>
+        <textarea
+          className="m-textarea compact"
+          style={{ marginTop: 10 }}
+          value={text}
+          onChange={(e) => setText(e.target.value)}
+          onFocus={(e) => setTimeout(() => e.target.scrollIntoView({ block: "center", behavior: "smooth" }), 250)}
+          placeholder="or type it: zcrypt-bearer/1 …"
+          autoCapitalize="none"
+          autoCorrect="off"
+          spellCheck={false}
+        />
+        {text.trim() && !busy && (
+          <Btn full kind="secondary" style={{ marginTop: 10 }} onClick={() => receive(text)}>Receive what is typed</Btn>
+        )}
         {busy && <p className="m-hint m-center">Checking the chain and building the claim proof on this phone.</p>}
         {state && <Banner tone={state.tone}>{state.msg}</Banner>}
       </div>
