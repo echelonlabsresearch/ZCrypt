@@ -8,6 +8,7 @@ interface Tx {
   amount: number;
   counterparty: string;
   timestamp: number;
+  at: number;
   status: string;
   asset_id: string;
   decimals: number;
@@ -42,9 +43,31 @@ const LABEL: Record<string, string> = {
 };
 const ICON: Record<string, IconName> = { receive: "receive", send: "send", bearer: "file", reward: "shield", swap: "refresh" };
 
-/** Every movement, newest first. A row with a receipt opens to show and check it. */
+const PAGE = 10;
+
+/** "Today 14:02", "Yesterday 09:15", "12 Mar 18:40", or "—" for rows older than the clock. */
+function when(at: number): string {
+  if (!at) return "—";
+  const d = new Date(at * 1000);
+  const now = new Date();
+  const time = d.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" });
+  const sameDay = (a: Date, b: Date) => a.toDateString() === b.toDateString();
+  const yday = new Date(now);
+  yday.setDate(now.getDate() - 1);
+  if (sameDay(d, now)) return `Today ${time}`;
+  if (sameDay(d, yday)) return `Yesterday ${time}`;
+  const day = d.toLocaleDateString(undefined, { day: "numeric", month: "short", year: d.getFullYear() === now.getFullYear() ? undefined : "numeric" });
+  return `${day} ${time}`;
+}
+function whenFull(at: number): string {
+  if (!at) return "Before this wallet kept times";
+  return new Date(at * 1000).toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" });
+}
+
+/** Every movement, newest first, ten to a page. A row with a receipt opens to show and check it. */
 export default function HistoryScreen({ active, refreshTick }: { active: boolean; refreshTick: number }) {
   const [items, setItems] = useState<Tx[]>([]);
+  const [page, setPage] = useState(0);
   const [receipts, setReceipts] = useState<Receipt[]>([]);
   const [tickers, setTickers] = useState<Record<string, string>>({});
   const [open, setOpen] = useState<Tx | null>(null);
@@ -53,7 +76,10 @@ export default function HistoryScreen({ active, refreshTick }: { active: boolean
   const [copied, setCopied] = useState(false);
 
   const load = useCallback(() => {
-    call<Tx[]>("get_history").then((t) => setItems([...t].reverse())).catch(() => {});
+    // The wallet stores newest first; drop zero-amount rows and keep that order.
+    call<Tx[]>("get_history")
+      .then((t) => setItems(t.filter((x) => x.amount !== 0).sort((a, b) => b.timestamp - a.timestamp)))
+      .catch(() => {});
     call<Receipt[]>("list_receipts").then(setReceipts).catch(() => {});
     call<HeldAsset[]>("held_assets")
       .then((a) => setTickers(Object.fromEntries(a.map((x) => [x.asset_id, x.ticker]))))
@@ -99,6 +125,9 @@ export default function HistoryScreen({ active, refreshTick }: { active: boolean
   }
 
   const r = open ? receiptFor.get(open.tx_id) : undefined;
+  const pages = Math.max(1, Math.ceil(items.length / PAGE));
+  const cur = Math.min(page, pages - 1);
+  const slice = items.slice(cur * PAGE, cur * PAGE + PAGE);
 
   return (
     <>
@@ -112,7 +141,7 @@ export default function HistoryScreen({ active, refreshTick }: { active: boolean
         </div>
       ) : (
         <div className="m-list">
-          {items.map((t) => {
+          {slice.map((t) => {
             const pos = t.amount >= 0;
             const hasReceipt = receiptFor.has(t.tx_id);
             return (
@@ -122,17 +151,28 @@ export default function HistoryScreen({ active, refreshTick }: { active: boolean
                 </span>
                 <div className="grow">
                   <div className="primary">{LABEL[t.kind] ?? t.kind}</div>
-                  <div className="secondary">{t.counterparty || "—"} · block {t.timestamp.toLocaleString()}</div>
+                  <div className="secondary">{when(t.at)}{hasReceipt ? " · receipt" : ""}</div>
                 </div>
                 <div className="end m-num">
                   <div className="primary" style={{ color: pos ? "var(--ok)" : "var(--text)" }}>
                     {pos ? "+" : "−"}{fmtAsset(Math.abs(t.amount), t.decimals)}
                   </div>
-                  <div className="secondary">{unit(t.asset_id)}{hasReceipt ? " · receipt" : ""}</div>
+                  <div className="secondary">{unit(t.asset_id)}</div>
                 </div>
               </button>
             );
           })}
+        </div>
+      )}
+      {pages > 1 && (
+        <div className="m-pager">
+          <button className="m-iconbtn" disabled={cur === 0} onClick={() => setPage(cur - 1)} aria-label="Newer">
+            <Icon name="back" size={18} />
+          </button>
+          <span className="m-num">{cur * PAGE + 1}–{Math.min(items.length, cur * PAGE + PAGE)} of {items.length}</span>
+          <button className="m-iconbtn" disabled={cur >= pages - 1} onClick={() => setPage(cur + 1)} aria-label="Older">
+            <Icon name="chevron" size={18} />
+          </button>
         </div>
       )}
       <p className="m-hint m-center" style={{ marginTop: 16 }}>Finality is sub-second. Amounts are hidden on the chain; this list is kept on your phone.</p>
@@ -141,8 +181,8 @@ export default function HistoryScreen({ active, refreshTick }: { active: boolean
         {open && (
           <>
             <div className="m-kv"><span>Amount</span><span className="m-num">{open.amount >= 0 ? "+" : "−"}{fmtAsset(Math.abs(open.amount), open.decimals)} {unit(open.asset_id)}</span></div>
-            <div className="m-kv"><span>Detail</span><span>{open.counterparty || "—"}</span></div>
-            <div className="m-kv"><span>Block</span><span className="m-num">{open.timestamp.toLocaleString()}</span></div>
+            <div className="m-kv"><span>When</span><span className="m-num">{whenFull(open.at)}</span></div>
+            <div className="m-kv"><span>Detail</span><span style={{ textAlign: "right", maxWidth: "60%", wordBreak: "break-word" }}>{open.counterparty || "—"}</span></div>
             <div className="m-kv"><span>Status</span><span style={{ color: "var(--ok)" }}>{open.status}</span></div>
             {r && (
               <>

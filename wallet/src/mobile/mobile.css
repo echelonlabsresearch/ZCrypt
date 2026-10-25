@@ -1113,3 +1113,17 @@
   border-top-color: var(--accent);
   animation: m-spin 0.9s linear infinite;
 }
+
+/* ---------- history pager ---------- */
+.m-pager {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-top: 12px;
+  padding: 0 4px;
+  color: var(--text-2);
+  font-size: 14px;
+}
+.m-pager .m-iconbtn:disabled {
+  opacity: 0.35;
+}

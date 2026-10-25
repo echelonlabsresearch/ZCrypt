@@ -57,9 +57,9 @@ const DATA: Record<string, unknown> = {
   list_stealth_addresses: [{ index: 1, address: STEALTH }],
   get_view_key: "zcview1q8f2tvdw0s3jn54khce6mua7lmqqqxw5d8rt4hk0x2pv8mrw5v6e7uy3lgwk2fqe8t4u5d7q9k2m3r5xg7m0pzwjsdq3u4l8h",
   get_history: [
-    { tx_id: "send-41", kind: "send", amount: -250_000_000, counterparty: "zc1qpzry…l8h", timestamp: 41, status: "confirmed", asset_id: "0", decimals: 6, receipt_id: "receipt-42" },
-    { tx_id: "receive-38", kind: "receive", amount: 500_000_000, counterparty: "bearer claim", timestamp: 38, status: "confirmed", asset_id: "0", decimals: 6, receipt_id: "" },
-    { tx_id: "bearer-30", kind: "bearer", amount: -1_000_000, counterparty: "bearer coin", timestamp: 30, status: "confirmed", asset_id: ZBTC, decimals: 8, receipt_id: "" },
+    { tx_id: "send-41", kind: "send", amount: -250_000_000, counterparty: "zc1qpzry…l8h", timestamp: 41, at: 1761388200, status: "confirmed", asset_id: "0", decimals: 6, receipt_id: "receipt-42" },
+    { tx_id: "receive-38", kind: "receive", amount: 500_000_000, counterparty: "bearer claim", timestamp: 38, at: 1761300000, status: "confirmed", asset_id: "0", decimals: 6, receipt_id: "" },
+    { tx_id: "bearer-30", kind: "bearer", amount: -1_000_000, counterparty: "bearer coin", timestamp: 30, at: 0, status: "confirmed", asset_id: ZBTC, decimals: 8, receipt_id: "" },
     { tx_id: "shield-12", kind: "shield", amount: 3_500_000, counterparty: "BTC→zBTC", timestamp: 12, status: "confirmed", asset_id: ZBTC, decimals: 8, receipt_id: "" },
     { tx_id: "reward-9", kind: "reward", amount: 14_000_000, counterparty: "epoch 2273", timestamp: 9, status: "confirmed", asset_id: "0", decimals: 6, receipt_id: "" },
   ],

@@ -155,7 +155,11 @@ struct HistItem {
     kind: String, // "receive" | "send" | "mint" | "bearer"
     amount: i64,  // signed base units for display
     counterparty: String,
+    /// Wallet-local sequence number (the order things happened in this wallet).
     timestamp: u64,
+    /// Wall-clock time of the entry, Unix seconds. 0 on rows written before it existed.
+    #[serde(default)]
+    at: u64,
     status: String,
     /// The asset this entry moved (0 = ZCRYPT). String-serialized (u64 > JS 2^53).
     #[serde(with = "u64_str", default)]
@@ -607,6 +611,7 @@ impl Wallet {
                 amount,
                 counterparty,
                 timestamp: t,
+                at: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0),
                 status: "confirmed".into(),
                 asset_id,
                 decimals,
