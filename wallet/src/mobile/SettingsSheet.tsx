@@ -12,7 +12,7 @@ interface Settings {
   node_url: string;
 }
 
-const VERSION = "0.1.1-alpha";
+const VERSION = "0.2.0";
 
 /** Security and connection, nothing else. Reached from the gear on the portfolio. */
 export default function SettingsSheet({ open, onClose }: { open: boolean; onClose: () => void }) {
