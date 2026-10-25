@@ -120,6 +120,8 @@ bitcoind RPC password only in regtest / bitcoind mode; self-custody mode (defaul
 
 ## iOS app
 
+Measured on an iPhone 16 Pro Max (iOS 26.6.2), release build, 2-input / 3-output spend: prove 2.4 s, verify 20 ms, proof 2.1 MB, peak memory 87 MB on 6 cores. The same proof takes 1.4 s on an M-series Mac.
+
 The same crate is the iPhone app: `src-tauri/src/lib.rs` is the wallet, `main.rs` the desktop
 binary, and `src-tauri/gen/apple` the generated Xcode project (committed; edit `project.yml`
 and `zcrypt-wallet_iOS/Info.plist`, never the `.xcodeproj`). Prerequisites: Xcode, CocoaPods,

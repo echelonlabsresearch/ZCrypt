@@ -8757,9 +8757,21 @@ pub fn run() {
         .setup(|app| {
             let dir = wallet_data_dir(app);
             #[cfg(feature = "selftest-on-launch")]
-            std::thread::spawn(|| match prover_selftest_sync() {
-                Ok(r) => println!("[selftest] {}", serde_json::to_string(&r.data).unwrap_or_default()),
-                Err(e) => println!("[selftest] error: {e}"),
+            std::thread::spawn(|| {
+                // Also written to Documents/selftest.json: on iOS, stdout does not reach the host.
+                let out = export_dir().map(|d| d.join("selftest.json"));
+                let started = std::time::Instant::now();
+                if let Some(p) = &out {
+                    let _ = std::fs::write(p, "{\"status\":\"running\"}");
+                }
+                let line = match prover_selftest_sync() {
+                    Ok(r) => serde_json::to_string(&r.data).unwrap_or_default(),
+                    Err(e) => format!("{{\"error\":{:?},\"elapsed_ms\":{}}}", e, started.elapsed().as_millis()),
+                };
+                println!("[selftest] {line}");
+                if let Some(p) = out {
+                    let _ = std::fs::write(p, &line);
+                }
             });
             let _ = privfs::ensure_private_dir(&dir);
             let dir_str = dir.to_string_lossy().to_string();
