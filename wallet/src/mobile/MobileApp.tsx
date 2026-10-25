@@ -92,6 +92,31 @@ export default function MobileApp() {
       });
   }, [refreshStatus, toast]);
 
+  // Size the shell to what is actually visible. When the on-screen keyboard appears, iOS
+  // shrinks the visual viewport and may scroll the web view; a shell sized to 100% of the
+  // layout viewport then has its bottom (sheets, Done buttons, the tab bar) off screen,
+  // and the shift can outlive the keyboard. Following visualViewport keeps every bottom
+  // edge on screen on every iPhone size.
+  useEffect(() => {
+    const vv = window.visualViewport;
+    const root = document.documentElement;
+    if (!vv) return;
+    const apply = () => {
+      root.style.setProperty("--vvh", `${Math.round(vv.height)}px`);
+      root.style.setProperty("--vvt", `${Math.round(vv.offsetTop)}px`);
+      const tag = document.activeElement?.tagName;
+      if (tag !== "INPUT" && tag !== "TEXTAREA" && (window.scrollY || vv.offsetTop)) window.scrollTo(0, 0);
+    };
+    apply();
+    vv.addEventListener("resize", apply);
+    vv.addEventListener("scroll", apply);
+    window.addEventListener("focusout", () => setTimeout(apply, 50));
+    return () => {
+      vv.removeEventListener("resize", apply);
+      vv.removeEventListener("scroll", apply);
+    };
+  }, []);
+
   // Files opened with the app (AirDrop, Files, Mail): credited under Receive once unlocked.
   useEffect(() => {
     call<string[]>("take_opened_files")

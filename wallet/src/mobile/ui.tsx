@@ -1,4 +1,5 @@
 import { ReactNode, useEffect, useState } from "react";
+import { call } from "../lib/api";
 
 // ---------- icons (24x24, 1.8px strokes) ----------
 export type IconName =
@@ -310,6 +311,15 @@ export function lockMessage(secs: number): string {
 
 /** Hand a payment text to the system share sheet as a .zcrypt file; falls back to saving it. */
 export async function shareFile(text: string, filename: string, save: (f: string, t: string) => Promise<string>): Promise<string> {
+  // iOS: the native sheet, presented by the app itself, with a real .zcrypt document.
+  if (/iPhone|iPad|iPod/.test(navigator.userAgent)) {
+    try {
+      await call<boolean>("share_file", { filename, content: text });
+      return "shared";
+    } catch {
+      /* fall through to the web share API, then to saving */
+    }
+  }
   try {
     const file = new File([text], filename, { type: "application/x-zcrypt" });
     const nav = navigator as Navigator & { canShare?: (d: ShareData) => boolean };

@@ -63,7 +63,10 @@
 /* ---------- shell ---------- */
 .m-app {
   position: fixed;
-  inset: 0;
+  top: var(--vvt, 0px);
+  left: 0;
+  right: 0;
+  height: var(--vvh, 100%);
   display: flex;
   flex-direction: column;
   background: var(--bg);
@@ -1016,4 +1019,54 @@
 }
 .m-done-foot {
   padding: 8px 20px calc(var(--sab) + 20px);
+}
+
+/* ---------- short screens (iPhone SE, mini, or a keyboard on screen) ---------- */
+@media (max-height: 700px) {
+  :root[data-shell="mobile"] {
+    --tabbar: 56px;
+  }
+  .m-key {
+    height: 54px;
+    font-size: 24px;
+    border-radius: 16px;
+  }
+  .m-keypad {
+    gap: 8px 14px;
+    margin-top: 10px;
+  }
+  .m-pin-dots {
+    margin: 16px 0 6px;
+  }
+  .m-gate {
+    padding-top: calc(var(--sat) + 16px);
+  }
+  .m-logo {
+    width: 60px;
+    height: 60px;
+    border-radius: 18px;
+  }
+  .m-hero {
+    padding: 18px 18px 16px;
+  }
+  .m-hero-amount {
+    font-size: clamp(26px, 8vw, 34px);
+  }
+  .m-done-check {
+    width: 88px;
+    height: 88px;
+  }
+  .m-done-title {
+    font-size: 28px;
+    margin-top: 18px;
+  }
+  .m-seed div {
+    padding: 7px 10px;
+    font-size: 14px;
+  }
+}
+@media (max-height: 560px) {
+  .m-done-check {
+    display: none;
+  }
 }

@@ -66,3 +66,8 @@ tauri-plugin-biometric = "2"   # Face ID / Touch ID prompt, raised from Rust
 [target.'cfg(target_os = "ios")'.dependencies]
 security-framework = "3"       # Keychain item holding the device secret behind Face ID
 security-framework-sys = "2"
+# The native share sheet (UIActivityViewController) for .zcrypt files; same versions tauri uses.
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSArray", "NSString", "NSURL", "NSObject"] }
+objc2-core-foundation = { version = "0.3", default-features = false, features = ["std", "CFCGTypes"] }
+objc2-ui-kit = { version = "0.3", default-features = false, features = ["std", "UIActivityViewController", "UIViewController", "UIPopoverPresentationController", "UIPresentationController", "UIView", "UIResponder"] }

@@ -21,6 +21,7 @@ use zcrypt_core::keys;
 use zeroize::Zeroizing;
 
 const PIN_FILE: &str = "pin.json";
+#[cfg(not(target_os = "ios"))]
 const BIO_FILE: &str = "bio.key"; // non-iOS fallback for the Keychain item
 const FREE_ATTEMPTS: u32 = 5;
 const FIRST_LOCKOUT_S: u64 = 30;

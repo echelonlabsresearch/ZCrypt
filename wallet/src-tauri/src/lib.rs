@@ -8625,6 +8625,67 @@ fn un_base64ish(s: &str) -> Option<Vec<u8>> {
     hex::decode(s).ok()
 }
 
+/// Hand a payment file to the system share sheet (iOS). The text is written as a real
+/// `.zcrypt` file in the app's temporary folder and offered as a document, so WhatsApp,
+/// Mail, AirDrop and Files receive a file the recipient can tap to open in this app. The
+/// sheet is presented from the webview's view controller as a plain sheet, not the
+/// popover WebKit uses for the web share API.
+#[tauri::command]
+async fn share_file(filename: String, content: String, webview: tauri::Webview) -> R<bool> {
+    #[cfg(target_os = "ios")]
+    {
+        let safe: String = filename.chars().filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_')).collect();
+        if safe.is_empty() || content.len() > 256 * 1024 {
+            return Err("nothing to share".into());
+        }
+        let path = std::env::temp_dir().join(safe);
+        std::fs::write(&path, content.as_bytes()).map_err(|e| format!("share: {e}"))?;
+        let p = path.to_string_lossy().to_string();
+        webview
+            .with_webview(move |pw| ios_share::present(pw.view_controller(), &p))
+            .map_err(|e| e.to_string())?;
+        return ok(true);
+    }
+    #[cfg(not(target_os = "ios"))]
+    {
+        let _ = (filename, content, webview);
+        Err("the share sheet is only available on iOS".into())
+    }
+}
+
+#[cfg(target_os = "ios")]
+mod ios_share {
+    use objc2::rc::Retained;
+    use objc2::runtime::AnyObject;
+    use objc2::MainThreadMarker;
+    use objc2_core_foundation::{CGPoint, CGRect, CGSize};
+    use objc2_foundation::{NSArray, NSString, NSURL};
+    use objc2_ui_kit::{UIActivityViewController, UIPopoverArrowDirection, UIViewController};
+
+    /// Runs on the main thread (tauri's `with_webview` guarantees it).
+    pub fn present(vc: *mut std::ffi::c_void, path: &str) {
+        let Some(mtm) = MainThreadMarker::new() else { return };
+        if vc.is_null() {
+            return;
+        }
+        // SAFETY: tauri hands us the live UIViewController that hosts the WKWebView.
+        let vc: &UIViewController = unsafe { &*(vc as *const UIViewController) };
+        let url = NSURL::fileURLWithPath(&NSString::from_str(path));
+        let items: Retained<NSArray<AnyObject>> = NSArray::from_retained_slice(&[Retained::into_super(Retained::into_super(url))]);
+        // SAFETY: documented UIKit initializer; `items` holds one NSURL.
+        let avc = unsafe { UIActivityViewController::initWithActivityItems_applicationActivities(mtm.alloc(), &items, None) };
+        // On a wide screen UIKit would show a popover; anchor it to the bottom centre with no
+        // arrow so it reads as a sheet there too. On a phone this is ignored and a sheet is used.
+        if let (Some(pop), Some(view)) = (avc.popoverPresentationController(), vc.view()) {
+            let b = view.bounds();
+            pop.setSourceView(Some(&view));
+            pop.setSourceRect(CGRect::new(CGPoint::new(b.size.width / 2.0, b.size.height - 1.0), CGSize::new(1.0, 1.0)));
+            pop.setPermittedArrowDirections(UIPopoverArrowDirection(0));
+        }
+        vc.presentViewController_animated_completion(&avc, true, None);
+    }
+}
+
 #[derive(Serialize)]
 struct ProverSelftest {
     prove_ms: u64,
@@ -8880,6 +8941,7 @@ pub fn run() {
             chain_pin,
             take_opened_files,
             prover_selftest,
+            share_file,
             mobile_auth::mobile_auth_status,
             mobile_auth::mobile_create,
             mobile_auth::mobile_unlock,
