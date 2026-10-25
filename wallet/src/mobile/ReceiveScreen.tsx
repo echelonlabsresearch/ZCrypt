@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 import QRCode from "qrcode";
 import { call, copy, fmtAsset } from "../lib/api";
 import { Banner, Btn, Icon, Segmented, Spinner } from "./ui";
+import Success from "./Success";
 import { useAuth } from "./MobileApp";
 
 type Which = "normal" | "stealth";
@@ -35,6 +36,7 @@ export default function ReceiveScreen({
   const [text, setText] = useState("");
   const [busy, setBusy] = useState(false);
   const [state, setState] = useState<{ tone: "ok" | "warn" | "bad"; msg: string } | null>(null);
+  const [credited, setCredited] = useState("");
 
   const load = useCallback(() => {
     call<string>("get_address").then(setNormal).catch(() => {});
@@ -66,9 +68,9 @@ export default function ReceiveScreen({
       const bearer = s.startsWith("zcrypt-bearer/1");
       const r = await call<{ amount: number; ticker: string; decimals: number }>(bearer ? "claim_bearer" : "receive_coin", bearer ? { token: s } : { note: s });
       const pretty = `${fmtAsset(r.amount, r.decimals)} ${r.ticker}`;
-      setState({ tone: "ok", msg: `Received ${pretty}. It is in your portfolio.` });
+      setState(null);
       setText("");
-      toast("Received", pretty);
+      setCredited(pretty);
       onReceived();
     } catch (e) {
       setState({ tone: "bad", msg: String(e instanceof Error ? e.message : e) });
@@ -102,6 +104,12 @@ export default function ReceiveScreen({
     } finally {
       setNewBusy(false);
     }
+  }
+
+  if (credited) {
+    return (
+      <Success title={`${credited} received!`} subtitle="The coin is yours now and already counts in your portfolio." onDone={() => setCredited("")} />
+    );
   }
 
   return (

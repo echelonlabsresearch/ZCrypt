@@ -193,7 +193,17 @@ export function Banner({ tone = "info", children }: { tone?: "ok" | "warn" | "ba
   );
 }
 
+/** Put the on-screen keyboard away: iOS scrolls the page under it and pushes a sheet's bottom off screen. */
+export function dismissKeyboard() {
+  const el = document.activeElement as HTMLElement | null;
+  if (el && typeof el.blur === "function") el.blur();
+  window.scrollTo(0, 0);
+}
+
 export function Sheet({ open, onClose, title, children }: { open: boolean; onClose: () => void; title?: string; children: ReactNode }) {
+  useEffect(() => {
+    if (open) dismissKeyboard();
+  }, [open]);
   if (!open) return null;
   return (
     <div className="m-sheet-backdrop" onClick={onClose}>

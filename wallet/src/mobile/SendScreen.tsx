@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { call, copySensitive, fmtAsset, HeldAsset, saveFile, toBaseAsset } from "../lib/api";
-import { Btn, Field, Icon, Segmented, Sheet, shareFile, short, Spinner } from "./ui";
+import { Btn, dismissKeyboard, Field, Icon, Segmented, Sheet, shareFile, short, Spinner } from "./ui";
+import Success from "./Success";
 import { useAuth } from "./MobileApp";
 
 type Mode = "address" | "bearer";
@@ -119,30 +120,22 @@ export default function SendScreen({ active, onSent }: { active: boolean; onSent
   if (result) {
     const filename = result.kind === "bearer" ? "zcrypt-bearer.zcrypt" : "zcrypt-stealth-note.zcrypt";
     return (
-      <>
-        <div className="m-head">
-          <h1 className="m-title">Sent</h1>
-        </div>
-        <div className="m-center" style={{ marginTop: 20 }}>
-          <div className="m-success">
-            <Icon name="check" size={40} stroke={2.4} />
-          </div>
-          <div style={{ fontSize: 28, fontWeight: 700, letterSpacing: "-0.02em" }} className="m-num">
-            {result.pretty}
-          </div>
-          <p className="m-sub" style={{ marginTop: 6 }}>
-            {result.kind === "onchain"
-              ? "Settled on the chain. The recipient's wallet credits it on its next refresh."
-              : result.kind === "stealth"
-                ? "The payment is this encrypted note. Only the recipient's stealth key can open it."
-                : "The payment is this file. Whoever opens it in a ZCrypt wallet receives the full amount."}
-          </p>
-        </div>
+      <Success
+        title={result.kind === "onchain" ? `${result.pretty} sent!` : `${result.pretty} ready to send!`}
+        subtitle={
+          result.kind === "onchain"
+            ? "Settled on the chain. The recipient's wallet credits it on its next refresh."
+            : result.kind === "stealth"
+              ? "The payment is this encrypted note. Only the recipient's stealth key can open it."
+              : "The payment is this file. Whoever opens it in a ZCrypt wallet receives the full amount."
+        }
+        onDone={reset}
+      >
         {result.file && (
-          <div className="m-card" style={{ marginTop: 20 }}>
+          <div className="m-card">
             <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 10 }}>
               <span className="m-avatar soft"><Icon name="file" size={20} /></span>
-              <div>
+              <div style={{ minWidth: 0 }}>
                 <div style={{ fontWeight: 600 }}>{filename}</div>
                 <div style={{ fontSize: 13, color: "var(--text-2)" }}>{short(result.file.replace(/\s+/g, " "), 26, 8)}</div>
               </div>
@@ -163,8 +156,7 @@ export default function SendScreen({ active, onSent }: { active: boolean; onSent
             </p>
           </div>
         )}
-        <Btn full kind="secondary" style={{ marginTop: 20 }} onClick={reset}>Done</Btn>
-      </>
+      </Success>
     );
   }
 
@@ -225,7 +217,7 @@ export default function SendScreen({ active, onSent }: { active: boolean; onSent
 
       {err && <div className="m-banner bad">{err}</div>}
 
-      <Btn full style={{ marginTop: 18 }} disabled={!amount || (mode === "address" && !to)} onClick={() => { setErr(""); if (validate() !== null) setReview(true); }}>
+      <Btn full style={{ marginTop: 18 }} disabled={!amount || (mode === "address" && !to)} onClick={() => { dismissKeyboard(); setErr(""); if (validate() !== null) setReview(true); }}>
         Review
       </Btn>
 
