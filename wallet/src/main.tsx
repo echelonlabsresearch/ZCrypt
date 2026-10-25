@@ -1,6 +1,8 @@
 import React from "react";
 import ReactDOM from "react-dom/client";
 import "./index.css";
+import "./brand/fonts.css";
+import "./brand/tokens.css";
 
 const params = new URLSearchParams(window.location.search);
 

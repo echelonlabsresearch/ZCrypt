@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 40 40" width="40" height="40" fill="none">
+  <!-- Favicon: the mark in signal cyan on ink. -->
+  <rect width="40" height="40" rx="9" fill="#06080f"/>
+  <path d="M9 10h22L9 30h22" stroke="#35e0ff" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

@@ -1,0 +1,50 @@
+/* ZCrypt brand tokens — the one source of truth for colour, type, radius and motion.
+   Copies live at wallet/src/brand/tokens.css and in the website repo at brand/tokens.css;
+   change this file first and copy it over (see README.md). */
+
+:root {
+  /* ----- colour: ink surfaces ----- */
+  --zc-ink: #06080f;                 /* page / app background */
+  --zc-ink-2: #0b0f18;               /* alternate band */
+  --zc-surface: #0e121b;             /* cards, sheets */
+  --zc-surface-2: #151a26;           /* inputs, rows */
+  --zc-surface-3: #1c2231;           /* hover, pressed */
+  --zc-line: rgba(255, 255, 255, 0.07);
+  --zc-line-strong: rgba(255, 255, 255, 0.14);
+
+  /* ----- colour: text ----- */
+  --zc-text: #f3f5f9;
+  --zc-text-2: #9aa3b5;
+  --zc-text-3: #5f687a;
+
+  /* ----- colour: signal ----- */
+  --zc-cyan: #35e0ff;                /* the brand colour: links, primary actions, the mark */
+  --zc-cyan-soft: #8ee9f3;           /* cyan on dark text sizes under 16px, italics */
+  --zc-cyan-dim: rgba(53, 224, 255, 0.14);
+  --zc-violet: #6d7cff;              /* second stop of the signal gradient */
+  --zc-on-signal: #04111a;           /* ink on cyan or on the gradient */
+  --zc-signal: linear-gradient(135deg, var(--zc-cyan), var(--zc-violet));
+
+  /* ----- colour: state (never used as decoration) ----- */
+  --zc-ok: #3ddc97;
+  --zc-warn: #ffb547;
+  --zc-bad: #ff5c6c;
+
+  /* ----- type ----- */
+  --zc-font-sans: "Inter Tight", "Inter", -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", system-ui, sans-serif;
+  --zc-font-serif: "Instrument Serif", Georgia, "Times New Roman", serif;  /* editorial italics only */
+  --zc-font-mono: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace; /* hashes, amounts in tables, code */
+  --zc-tracking-display: -0.04em;
+  --zc-tracking-title: -0.02em;
+  --zc-tracking-label: 0.08em;       /* uppercase labels */
+
+  /* ----- shape ----- */
+  --zc-radius: 18px;                 /* cards, sheets, buttons */
+  --zc-radius-sm: 12px;              /* inputs, chips */
+  --zc-radius-pill: 999px;
+  --zc-tile-radius: 27.5%;           /* the logo tile: 11/40 */
+
+  /* ----- motion ----- */
+  --zc-ease: cubic-bezier(0.22, 1, 0.36, 1);
+  --zc-glow: 0 16px 40px rgba(53, 224, 255, 0.28);
+}

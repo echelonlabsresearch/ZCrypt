@@ -229,7 +229,7 @@ export default function App() {
       <div className="app">
         <div className="main">
           <div className="gate">
-            <div className="logo-big">⚡</div>
+            <div className="logo-big"><svg viewBox="0 0 40 40" fill="none" aria-hidden><path d="M9 10h22L9 30h22" stroke="currentColor" strokeWidth="5" strokeLinecap="round" strokeLinejoin="round" /></svg></div>
             <h1>ZCrypt Wallet</h1>
             <div className="tagline">Post-Quantum • Private • Zero-Knowledge</div>
 
@@ -361,7 +361,7 @@ export default function App() {
     <div className="app">
       <header className="header">
         <div className="brand">
-          <span className="logo-symbol">⚡</span>
+          <span className="logo-symbol"><svg viewBox="0 0 40 40" fill="none" aria-hidden><path d="M9 10h22L9 30h22" stroke="currentColor" strokeWidth="5" strokeLinecap="round" strokeLinejoin="round" /></svg></span>
           <h1>ZCrypt</h1>
           <span className="version">v{VERSION}</span>
         </div>

@@ -1,27 +1,28 @@
 /* ZCrypt Wallet — phone shell. Calm, dark, system typography, safe areas, no page scroll. */
 
 :root[data-shell="mobile"] {
-  --bg: #06080f;
-  --surface: #0e121b;
-  --surface-2: #151a26;
-  --surface-3: #1c2231;
-  --line: rgba(255, 255, 255, 0.07);
-  --line-strong: rgba(255, 255, 255, 0.14);
-  --text: #f3f5f9;
-  --text-2: #9aa3b5;
-  --text-3: #5f687a;
-  --accent: #35e0ff;
-  --accent-2: #6d7cff;
-  --accent-ink: #04111a;
-  --ok: #3ddc97;
-  --warn: #ffb547;
-  --bad: #ff5c6c;
-  --radius: 18px;
-  --radius-sm: 12px;
+  /* Colour and type come from the brand sheet (src/brand/tokens.css). */
+  --bg: var(--zc-ink);
+  --surface: var(--zc-surface);
+  --surface-2: var(--zc-surface-2);
+  --surface-3: var(--zc-surface-3);
+  --line: var(--zc-line);
+  --line-strong: var(--zc-line-strong);
+  --text: var(--zc-text);
+  --text-2: var(--zc-text-2);
+  --text-3: var(--zc-text-3);
+  --accent: var(--zc-cyan);
+  --accent-2: var(--zc-violet);
+  --accent-ink: var(--zc-on-signal);
+  --ok: var(--zc-ok);
+  --warn: var(--zc-warn);
+  --bad: var(--zc-bad);
+  --radius: var(--zc-radius);
+  --radius-sm: var(--zc-radius-sm);
   --sat: env(safe-area-inset-top, 0px);
   --sab: env(safe-area-inset-bottom, 0px);
   --tabbar: 62px;
-  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Inter", system-ui, sans-serif;
+  font-family: var(--zc-font-sans);
   font-size: 16px;
   line-height: 1.4;
   color-scheme: dark;
@@ -57,7 +58,7 @@
   touch-action: manipulation;
 }
 :where(:root[data-shell="mobile"]) :where(code, .m-mono) {
-  font-family: "SF Mono", ui-monospace, Menlo, monospace;
+  font-family: var(--zc-font-mono);
 }
 
 /* ---------- shell ---------- */
@@ -675,17 +676,17 @@
 .m-logo {
   width: 76px;
   height: 76px;
-  border-radius: 22px;
-  background: linear-gradient(135deg, var(--accent), var(--accent-2));
+  border-radius: var(--zc-tile-radius);
+  background: var(--zc-signal);
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  box-shadow: 0 16px 40px rgba(53, 224, 255, 0.28);
+  box-shadow: var(--zc-glow);
 }
 .m-logo.small {
   width: 36px;
   height: 36px;
-  border-radius: 11px;
+  border-radius: var(--zc-tile-radius);
   box-shadow: none;
 }
 .m-back {
@@ -841,7 +842,7 @@
   overflow: auto;
 }
 .m-addr {
-  font-family: "SF Mono", ui-monospace, Menlo, monospace;
+  font-family: var(--zc-font-mono);
   font-size: 15px;
   line-height: 1.5;
   letter-spacing: 0.01em;
@@ -1080,7 +1081,7 @@
   box-shadow: 0 0 0 14px rgba(255, 92, 92, 0.12), 0 18px 50px rgba(255, 92, 92, 0.35);
 }
 .m-done-detail {
-  font-family: "SF Mono", ui-monospace, Menlo, monospace;
+  font-family: var(--zc-font-mono);
   font-size: 13px;
   color: var(--text-2);
   background: var(--surface);
