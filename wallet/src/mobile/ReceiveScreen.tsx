@@ -39,6 +39,7 @@ export default function ReceiveScreen({
   const [credited, setCredited] = useState("");
   const [failed, setFailed] = useState("");
   const [pasted, setPasted] = useState(false);
+  const [receiving, setReceiving] = useState<"coin" | "receipt">("coin");
 
   const load = useCallback(() => {
     call<string>("get_address").then(setNormal).catch(() => {});
@@ -61,6 +62,7 @@ export default function ReceiveScreen({
     if (!s) return;
     setBusy(true);
     setState(null);
+    setReceiving(s.startsWith("zcrypt-receipt/1") ? "receipt" : "coin");
     try {
       if (s.startsWith("zcrypt-receipt/1")) {
         const r = await call<{ on_chain: boolean; names_recipient: boolean; summary: string }>("verify_receipt", { text: s });
@@ -126,6 +128,20 @@ export default function ReceiveScreen({
     }
   }
 
+  if (busy) {
+    return (
+      <Success
+        tone="busy"
+        title={receiving === "receipt" ? "Checking receipt" : "Receiving payment"}
+        subtitle={
+          receiving === "receipt"
+            ? "Looking the payment up on the chain."
+            : "Checking the chain and building the claim proof on this phone. This takes a few seconds."
+        }
+        onDone={() => {}}
+      />
+    );
+  }
   if (credited) {
     return (
       <Success title={`${credited} received!`} subtitle="The coin is yours now and already counts in your portfolio." onDone={() => setCredited("")} />
@@ -218,7 +234,6 @@ export default function ReceiveScreen({
         {text.trim() && !busy && (
           <Btn full kind="secondary" style={{ marginTop: 10 }} onClick={() => receive(text)}>Receive what is typed</Btn>
         )}
-        {busy && <p className="m-hint m-center">Checking the chain and building the claim proof on this phone.</p>}
         {state && <Banner tone={state.tone}>{state.msg}</Banner>}
       </div>
     </>
