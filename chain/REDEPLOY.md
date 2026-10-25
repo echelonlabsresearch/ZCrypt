@@ -61,8 +61,10 @@ cargo run --release -p zcrypt-bridge --bin reserve_pubkey -- \
 ```
 
 It prints the 66-hex compressed public key: that is `ZCRYPT_RESERVE_PK` for `.env`.
-Copy `reserve.key` to the VPS as `/root/ZCrypt/chain/secrets/reserve.key`, mode 0600,
-root only (`scp`, then `chmod 600`). Back the seed up offline. To keep the old public key
+Copy `reserve.key` to the VPS as `/root/ZCrypt/chain/secrets/reserve.key`. The watcher
+runs as uid 10001 inside its container and the secret is a bind mount, so the file must be
+owned by that uid: `chown 10001:10001 secrets/reserve.key && chmod 600 secrets/reserve.key`
+(a root-owned 0600 file gives `Permission denied (os error 13)` and a restart loop). Back the seed up offline. To keep the old public key
 instead, run the same command with the old custody seed and confirm the printed key equals
 the `ZCRYPT_RESERVE_PK` already in `.env`.
 
@@ -88,6 +90,7 @@ cd /root/ZCrypt
 git fetch && git checkout main && git pull            # must include native gas (b46455d or later)
 cd chain
 cp .env .env.zcrypt-1.bak                             # keep the old values for reference
+chown 10001:10001 secrets/reserve.key && chmod 600 secrets/reserve.key   # the watcher's uid
 nano .env                                             # see below
 docker compose --profile bridge build                 # abci, explorer, caddy, bridge-watcher
 ```
