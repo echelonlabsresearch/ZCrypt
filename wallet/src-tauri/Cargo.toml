@@ -59,3 +59,10 @@ p3-util = { path = "../../impl/vendor/p3-util" }
 
 [profile.release]
 opt-level = 3
+
+[target.'cfg(any(target_os = "ios", target_os = "android"))'.dependencies]
+tauri-plugin-biometric = "2"   # Face ID / Touch ID prompt, raised from Rust
+
+[target.'cfg(target_os = "ios")'.dependencies]
+security-framework = "3"       # Keychain item holding the device secret behind Face ID
+security-framework-sys = "2"

@@ -122,38 +122,36 @@ bitcoind RPC password only in regtest / bitcoind mode; self-custody mode (defaul
 
 Measured on an iPhone 16 Pro Max (iOS 26.6.2), release build, 2-input / 3-output spend: prove 2.4 s, verify 20 ms, proof 2.1 MB, peak memory 87 MB on 6 cores. The same proof takes 1.4 s on an M-series Mac.
 
-The same crate is the iPhone app: `src-tauri/src/lib.rs` is the wallet, `main.rs` the desktop
-binary, and `src-tauri/gen/apple` the generated Xcode project (committed; edit `project.yml`
-and `zcrypt-wallet_iOS/Info.plist`, never the `.xcodeproj`). Prerequisites: Xcode, CocoaPods,
-`rustup target add aarch64-apple-ios aarch64-apple-ios-sim` on the project toolchain, and a
-development team in `tauri.conf.json` (`bundle.iOS.developmentTeam`).
+The phone runs the same Rust backend behind its own shell (`src/mobile/`): a portfolio
+home, Send, Receive and History on a bottom tab bar, nothing else. Preview it in a browser
+with `npm run dev` and `http://localhost:1420/?mock=1&mobile=1` (`&fresh=1` for onboarding).
+
+**Session.** Onboarding asks for a 6-digit PIN and then offers Face ID / Touch ID. The
+keystore is unchanged (mnemonic sealed with Argon2id + ChaCha20-Poly1305); on a phone the
+password is a random device secret that is kept sealed under the PIN in `pin.json` and, when
+biometrics are on, in the iOS Keychain. The Face ID sheet is raised from Rust
+(`tauri-plugin-biometric`), so the webview never sees the secret. Five wrong PINs start a
+30 s lockout that doubles. Opening the app, and every payment, needs Face ID or the PIN.
+A wallet created with a password by an earlier build is adopted on first launch: the
+password is asked once and replaced by the PIN. Commands: `mobile_auth_status`,
+`mobile_create`, `mobile_adopt`, `mobile_unlock`, `mobile_confirm`, `mobile_set_biometric`,
+`mobile_change_pin` (`src-tauri/src/mobile_auth.rs`).
+
+**Build and install** (Xcode 26, a paired device, toolchain targets
+`aarch64-apple-ios` / `aarch64-apple-ios-sim`):
 
 ```sh
-npx tauri ios dev "iPhone 17 Pro"                 # simulator, with the Vite dev server
-npx tauri ios build --export-method debugging      # signed IPA for a paired phone, in gen/apple/build/arm64
-xcrun devicectl device install app --device <udid> "src-tauri/gen/apple/build/arm64/ZCrypt Wallet.ipa"
+npx tauri ios build --export-method debugging
+xcrun devicectl device install app --device <id> "src-tauri/gen/apple/build/arm64/ZCrypt Wallet.ipa"
 ```
 
-What differs from the desktop build:
+`npx tauri ios build --target aarch64-sim --debug` makes a simulator app (no Face ID,
+no file hand-off there). Data lives in the app's sandbox; exports go to Documents (visible
+in Files). A `.zcrypt` file opened with the app (AirDrop, Files, Mail) is credited under
+Receive. The prover self-test is behind the `selftest-on-launch` feature and writes
+`Documents/selftest.json`.
 
-* **Data** lives in the app's own sandbox (`app_data_dir`), not `~/.zcrypt`. Exports go to
-  the app's `Documents`, which the Files app can show (`UIFileSharingEnabled`).
-* **`.zcrypt` files open in the app.** The app owns the `io.zcrypt.payment` document type
-  (`CFBundleDocumentTypes` / `UTExportedTypeDeclarations` in `Info.plist`), so a bearer coin,
-  stealth note or receipt tapped in Mail, Messages, Files or AirDrop shows "Open in ZCrypt".
-  The Rust side receives it as `RunEvent::Opened`, queues the text (`take_opened_files`) and
-  emits `zcrypt-open`; the UI switches to Receive and credits it exactly as a dropped file. A
-  bearer coin is swept on the spot (the proof is built on the phone); the Inbox copy is deleted
-  after it is read. The same registration makes `.zcrypt` files open the desktop app on macOS.
-* **Prover self-test** (Settings): builds and verifies one full-size 2-in / 3-out proof and
-  reports time, proof size and peak memory for that device. The `selftest-on-launch` feature
-  runs it at startup and prints to stdout for measurement builds:
-  `npx tauri ios build --features selftest-on-launch`, then
-  `xcrun devicectl device process launch --console --device <udid> io.zcrypt.wallet`.
-* Tor is a setting the phone cannot satisfy (no local daemon): leave it off and talk to the
-  public RPC over HTTPS, as the default does.
-* Not yet: Face ID in front of the password, Keychain storage of the keystore, a `zcrypt:`
-  URL scheme, Android (`npx tauri android init` is the same shape).
+Not yet: Android, a `zcrypt:` URL scheme, push notifications.
 
 ## Signing and notarization (macOS)
 

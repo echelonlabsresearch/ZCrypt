@@ -7,6 +7,7 @@
 //! balances survive restarts.
 
 mod chain;
+mod mobile_auth;
 mod privfs;
 
 use zeroize::Zeroizing;
@@ -8752,7 +8753,10 @@ async fn take_opened_files(state: State<'_, AppState>) -> R<Vec<String>> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let app = tauri::Builder::default()
+    let builder = tauri::Builder::default();
+    #[cfg(mobile)]
+    let builder = builder.plugin(tauri_plugin_biometric::init());
+    let app = builder
         .manage(AppState::default())
         .setup(|app| {
             let dir = wallet_data_dir(app);
@@ -8872,6 +8876,13 @@ pub fn run() {
             chain_pin,
             take_opened_files,
             prover_selftest,
+            mobile_auth::mobile_auth_status,
+            mobile_auth::mobile_create,
+            mobile_auth::mobile_unlock,
+            mobile_auth::mobile_confirm,
+            mobile_auth::mobile_set_biometric,
+            mobile_auth::mobile_change_pin,
+            mobile_auth::mobile_adopt,
         ])
         .build(tauri::generate_context!())
         .expect("error while building ZCrypt wallet");

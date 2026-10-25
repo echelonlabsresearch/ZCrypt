@@ -45,6 +45,7 @@ targets:
         UIRequiredDeviceCapabilities: [arm64, metal]
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationPortrait
+        NSFaceIDUsageDescription: Face ID unlocks your wallet and confirms payments. Your PIN always works as a fallback.
         UIFileSharingEnabled: true
         LSSupportsOpeningDocumentsInPlace: false
         ITSAppUsesNonExemptEncryption: false

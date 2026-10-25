@@ -21,8 +21,24 @@ const receipt = (id: string, kind: string, amount: number, asset: string, dec: n
   text: `zcrypt-receipt/1\nkind ${kind}\namount ${amount}\nasset ${asset}\nrecipient ${recipient}\nowner_pk 7a1f…\nblind 9c0e…\ncommitment 3b5d…\n`,
 });
 
+const fresh = new URLSearchParams(window.location.search).has("fresh");
 const DATA: Record<string, unknown> = {
-  wallet_exists: true,
+  wallet_exists: !fresh,
+  // phone shell
+  mobile_auth_status: { wallet: !fresh, pin: !fresh, biometric: !fresh, biometry_available: true, biometry_type: "faceid", locked_for_s: 0 },
+  mobile_unlock: true,
+  mobile_confirm: true,
+  mobile_create: { address: ZC, seed_phrase: "abandon ability able about above absent absorb abstract absurd abuse access accident account accuse achieve acid acoustic acquire across act action actor actress actual" },
+  mobile_adopt: true,
+  mobile_set_biometric: true,
+  mobile_change_pin: true,
+  create_bearer: "zcrypt-bearer/1\ncoin zcb1qpzry9x8gf2tvdw0s3jn54khce6mua7lmqqqxw5d8rt4hk0x2pv8mrw5v6e7uy3lgwk2fqe8t4u5d7q9k2m3r5xg7m0pzwjsdq3u4l8h\ngas zcb1q8f2tvdw0s3jn54khce6mua7lmqqqxw5d8rt4hk0x2pv8mrw5v6e7uy3lgwk2fqe8t4u5d7q9k2m3r5xg7m0pzwjsdq3u4l8h\n",
+  send_onchain: null,
+  send_stealth: { file: "zcrypt-note/1\n7a1f9c0e3b5d…" },
+  claim_bearer: { amount: 25_000_000, coin_id: "ab12", ticker: "ZCRYPT", decimals: 6 },
+  new_stealth_address: null,
+  dismiss_pending_secret: null,
+  check_receipt: { on_chain: true, names_recipient: true, summary: "On chain: the coin was created for that address." },
   take_opened_files: [],
   prover_selftest: { prove_ms: 2300, verify_ms: 19, proof_bytes: 1_947_000, peak_rss_mb: 640, threads: 6 },
   unlock_wallet: null,
