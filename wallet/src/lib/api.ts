@@ -55,6 +55,21 @@ export const toBase = (zcrypt: string): number => toBaseAsset(zcrypt, ZCRYPT_DEC
 /** A shielded asset the wallet holds (from `held_assets`). `asset_id` is a STRING — it's
  *  a hash-derived u64 that exceeds JS's 2^53 safe-integer range, so it must never be a
  *  JS number (that silently corrupts the low digits and breaks sends). */
+/** What each whitelisted ticker is pegged to, for the portfolio rows. Unknown tickers fall back to the ticker itself. */
+export const WHITELIST_NAMES: Record<string, string> = {
+  ZBTC: "Bitcoin",
+  ZETH: "Ether",
+  ZSOL: "Solana",
+  ZBNB: "BNB",
+  ZTON: "Toncoin",
+  ZDAI: "Dai",
+  ZUSDT: "Tether",
+  ZGOLD: "Gold",
+};
+export const whitelistName = (ticker: string) => WHITELIST_NAMES[ticker.toUpperCase()] ?? ticker;
+/** Case-insensitive, like tickers on the chain. */
+export const isWhitelisted = (ticker: string, list: string[]) => list.some((t) => t.toUpperCase() === ticker.toUpperCase());
+
 export interface HeldAsset {
   asset_id: string;
   ticker: string;

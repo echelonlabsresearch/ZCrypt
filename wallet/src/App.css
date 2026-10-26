@@ -771,6 +771,25 @@ label {
   overflow: hidden;
   text-overflow: ellipsis;
 }
+.asset-tile.upcoming {
+  border-style: dashed;
+}
+.asset-tile.upcoming .asset-ticker {
+  opacity: 0.75;
+}
+.whitelisted {
+  display: inline-block;
+  font-size: 0.62rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  padding: 0.1rem 0.45rem;
+  margin-right: 0.35rem;
+  border-radius: 20px;
+  border: 1px solid var(--color-cyan);
+  color: var(--color-cyan);
+  opacity: 1;
+  vertical-align: middle;
+}
 .asset-amount.dim {
   opacity: 0.35;
 }

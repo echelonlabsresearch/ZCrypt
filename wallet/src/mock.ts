@@ -49,6 +49,7 @@ const DATA: Record<string, unknown> = {
     { asset_id: "0", ticker: "ZCRYPT", decimals: 6, balance: 1_234_567_890 },
     { asset_id: ZBTC, ticker: "zBTC", decimals: 8, balance: 2_500_000 },
   ],
+  whitelisted_assets: ["zBTC", "zETH", "zSOL", "zBNB", "zTON", "zDAI", "zUSDT", "zGOLD"],
   scan_onchain: 0,
   wallet_health: { save_error: null, pending_secrets: 0, pending_deposits: 0, pending_redeems: 0 },
   list_pending_secrets: [],

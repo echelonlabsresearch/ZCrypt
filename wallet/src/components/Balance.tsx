@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
-import { call, fmt, fmtAsset, HeldAsset } from "../lib/api";
+import { call, fmt, fmtAsset, HeldAsset, isWhitelisted, whitelistName } from "../lib/api";
 
 interface BtcWallet {
   connected: boolean;
@@ -20,10 +20,12 @@ export default function Balance({ balance, onRefresh }: { balance: number; onRef
   const [assets, setAssets] = useState<HeldAsset[]>([]);
   const [btc, setBtc] = useState<BtcWallet | null>(null);
   const [btcBusy, setBtcBusy] = useState(false);
+  const [whitelist, setWhitelist] = useState<string[]>([]);
 
   const load = useCallback(() => {
     call<{ coin_count: number }>("get_balance").then((b) => setCount(b.coin_count)).catch(() => {});
     call<HeldAsset[]>("held_assets").then(setAssets).catch(() => {});
+    call<string[]>("whitelisted_assets").then(setWhitelist).catch(() => {});
   }, []);
 
   async function checkBtc() {
@@ -51,6 +53,9 @@ export default function Balance({ balance, onRefresh }: { balance: number; onRef
 
   // Non-native shielded assets (zBTC, …) with a positive balance.
   const shielded = assets.filter((a) => a.asset_id !== "0" && a.balance > 0);
+  // Whitelisted tickers this wallet holds none of: the names consensus reserves for the
+  // project's own pegged assets, shown so people know which ones are real.
+  const upcoming = whitelist.filter((t) => !shielded.some((a) => a.ticker.toUpperCase() === t.toUpperCase()));
 
   return (
     <div>
@@ -75,7 +80,9 @@ export default function Balance({ balance, onRefresh }: { balance: number; onRef
           <div className="asset-tile" key={a.asset_id}>
             <div className="asset-tile-head">
               <span className="asset-ticker" style={{ color: "var(--color-yellow)" }}>{a.ticker}</span>
-              <span className="asset-kind">shielded</span>
+              <span className="asset-kind">
+                {isWhitelisted(a.ticker, whitelist) && <span className="whitelisted">whitelisted</span>} shielded
+              </span>
             </div>
             <div className="asset-amount">{fmtAsset(a.balance, a.decimals)}</div>
             <div className="asset-sub">private · anonymous among the whole pool</div>
@@ -114,6 +121,17 @@ export default function Balance({ balance, onRefresh }: { balance: number; onRef
             </>
           )}
         </div>
+
+        {upcoming.map((t) => (
+          <div className="asset-tile upcoming" key={t}>
+            <div className="asset-tile-head">
+              <span className="asset-ticker">{t}</span>
+              <span className="asset-kind"><span className="whitelisted">whitelisted</span> {whitelistName(t)}</span>
+            </div>
+            <div className="asset-amount dim">—</div>
+            <div className="asset-sub">{t.toUpperCase() === "ZBTC" ? "Shield BTC into zBTC under Bridge." : "Name reserved by the network. Coming with its own bridge."}</div>
+          </div>
+        ))}
       </div>
 
       <div className="dash-foot">

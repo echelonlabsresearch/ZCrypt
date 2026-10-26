@@ -443,6 +443,27 @@
   margin: 8px 4px 0;
   line-height: 1.45;
 }
+.m-whitelisted {
+  display: inline-block;
+  vertical-align: 2px;
+  margin-left: 8px;
+  padding: 2px 7px;
+  border-radius: 999px;
+  border: 1px solid rgba(53, 224, 255, 0.45);
+  color: var(--accent);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+.m-row.upcoming .m-avatar,
+.m-row.upcoming .primary:not(.m-whitelisted),
+.m-row.upcoming .secondary {
+  opacity: 0.6;
+}
+.m-row .primary.dim {
+  opacity: 0.35;
+}
 .m-tag {
   font-size: 13px;
   font-weight: 600;

@@ -598,16 +598,21 @@ fn parse_register(b: &[u8]) -> Option<(String, u8, Option<[u8; 32]>, u64, Option
     Some((ticker, decimals, authority, max_supply, reserve_pk))
 }
 
+/// Reserved tickers (zBTC, zETH, zSOL, ...: `asset_registry::RESERVED_TICKERS`) are never
+/// registered by transaction on a production chain: zBTC's reserve key is bound at genesis,
+/// and the other pegged assets arrive through their own protocol paths when they launch.
+/// Without this, the first-come registry would let anyone squat the name and sell a
+/// counterfeit (first-come hijack, bridge H3 / consensus M4). Devnet and tests may still
+/// register them freely.
+///
 /// zBTC may ONLY be registered in SPV form (a 33-byte reserve key): its mint
 /// authority is then trustless by construction — no key set, treasury, or
 /// capability can ever authorize a zBTC mint on this chain.
-fn zbtc_requires_spv(ticker: &str, is_spv: bool) -> Result<(), String> {
-    use zcrypt_core::asset_registry::{canonical_ticker, ZBTC_TICKER};
-    if canonical_ticker(ticker) == canonical_ticker(ZBTC_TICKER) && !SEED_ENABLED && !cfg!(test) {
-        // Production chains bind the peg's reserve key at genesis; the ticker can never be
-        // claimed by a transaction (first-come hijack, bridge H3 / consensus M4).
+fn reserved_ticker_gate(ticker: &str, is_spv: bool) -> Result<(), String> {
+    use zcrypt_core::asset_registry::{canonical_ticker, is_reserved_ticker, ZBTC_TICKER};
+    if is_reserved_ticker(ticker) && !SEED_ENABLED && !cfg!(test) {
         return Err(format!(
-            "'{ZBTC_TICKER}' is bound from genesis (zbtc_reserve_pk) and cannot be registered by transaction"
+            "'{ticker}' is reserved for a protocol-pinned asset and cannot be registered by transaction"
         ));
     }
     if canonical_ticker(ticker) == canonical_ticker(ZBTC_TICKER) && !is_spv {
@@ -1510,7 +1515,7 @@ impl ZcryptApp {
                     Some((ticker, _, _, _, reserve_pk))
                         if zcrypt_core::asset_registry::valid_ticker(&ticker) =>
                     {
-                        zbtc_requires_spv(&ticker, reserve_pk.is_some())
+                        reserved_ticker_gate(&ticker, reserve_pk.is_some())
                             .and_then(|()| s.node.precheck_gas_note(&gas_tx, gas_blind))
                             .map(|()| {
                                 deferred.push((gas_tx, zcrypt_core::shield_tx::gas_pay_envelope(rest)))
@@ -2074,7 +2079,7 @@ impl ZcryptApp {
                         Some((ticker, decimals, authority, max_supply, reserve_pk)) => {
                             // Gas is burned FIRST (a rejected registration still pays), then
                             // the registration is applied.
-                            match zbtc_requires_spv(&ticker, reserve_pk.is_some())
+                            match reserved_ticker_gate(&ticker, reserve_pk.is_some())
                                 .and_then(|()| s.node.submit_gas_note(chain_id, &gas_tx, gas_blind, rest))
                                 .and_then(|_| {
                                     match reserve_pk {

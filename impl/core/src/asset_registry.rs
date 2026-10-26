@@ -31,6 +31,20 @@ pub const ZBTC_DECIMALS: u8 = 8;
 /// registration argument, so it cannot drift or be raised.
 pub const ZBTC_MAX_SUPPLY: u64 = 21_000_000 * 100_000_000;
 
+/// Tickers reserved for protocol-pinned assets. zBTC is live; the others are the
+/// pegged assets the project will launch itself (each with its own mint machinery,
+/// like the SPV bridge behind zBTC). A production chain refuses to register any of
+/// them by transaction, so nobody can squat the name first and sell a counterfeit
+/// "zETH": the real one arrives through a protocol path when it is ready. Wallets show
+/// the list as whitelisted assets. Matching is case-insensitive, like every ticker.
+pub const RESERVED_TICKERS: &[&str] = &["zBTC", "zETH", "zSOL", "zBNB", "zTON", "zDAI", "zUSDT", "zGOLD"];
+
+/// True iff `t` names one of the [`RESERVED_TICKERS`] (any casing).
+pub fn is_reserved_ticker(t: &str) -> bool {
+    let c = canonical_ticker(t);
+    RESERVED_TICKERS.iter().any(|r| canonical_ticker(r) == c)
+}
+
 /// Canonical form of a ticker for identity + uniqueness: **case-insensitive**, so
 /// `zBTC`, `ZBTC`, and `zbtc` are the SAME asset. Display casing (the first
 /// registrant's spelling) is preserved separately in [`AssetMeta::ticker`].
@@ -495,6 +509,19 @@ mod tests {
         // Case-insensitive: all spellings share one id.
         assert_eq!(asset_id_for("zBTC"), asset_id_for("ZBTC"));
         assert_eq!(asset_id_for("zBTC"), asset_id_for("zbtc"));
+    }
+
+    #[test]
+    fn reserved_tickers_are_valid_and_case_insensitive() {
+        for t in RESERVED_TICKERS {
+            assert!(valid_ticker(t), "{t}");
+            assert!(is_reserved_ticker(t));
+            assert!(is_reserved_ticker(&t.to_ascii_uppercase()));
+            assert!(is_reserved_ticker(&t.to_ascii_lowercase()));
+        }
+        assert!(is_reserved_ticker(ZBTC_TICKER));
+        assert!(!is_reserved_ticker("USDC"));
+        assert!(!is_reserved_ticker("zETH2"));
     }
 
     #[test]

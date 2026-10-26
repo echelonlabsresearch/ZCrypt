@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { call, copySensitive, fmtAsset, HeldAsset } from "../lib/api";
+import { call, copySensitive, fmtAsset, HeldAsset, isWhitelisted, whitelistName } from "../lib/api";
 import { Icon, Sheet, Btn, shareFile, short } from "./ui";
 import { saveFile } from "../lib/api";
 import SettingsSheet from "./SettingsSheet";
@@ -21,6 +21,7 @@ const initials = (t: string) => t.replace(/^z/i, "").slice(0, 3).toUpperCase();
 /** The portfolio: what this wallet holds, with Send and Receive one tap away. */
 export default function Home({ refreshTick, onSend, onReceive }: { refreshTick: number; onSend: () => void; onReceive: () => void }) {
   const [assets, setAssets] = useState<HeldAsset[]>([]);
+  const [whitelist, setWhitelist] = useState<string[]>([]);
   const [coins, setCoins] = useState(0);
   const [node, setNode] = useState<NodeStatus | null>(null);
   const [secrets, setSecrets] = useState<PendingSecret[]>([]);
@@ -41,6 +42,10 @@ export default function Home({ refreshTick, onSend, onReceive }: { refreshTick: 
     setAssets(a);
     setCoins(b.coin_count);
     setSecrets(s);
+  }, []);
+
+  useEffect(() => {
+    call<string[]>("whitelisted_assets").then(setWhitelist).catch(() => {});
   }, []);
 
   const refresh = useCallback(async () => {
@@ -67,6 +72,8 @@ export default function Home({ refreshTick, onSend, onReceive }: { refreshTick: 
 
   const native = assets.find((a) => a.asset_id === "0") ?? { asset_id: "0", ticker: "ZCRYPT", decimals: 6, balance: 0 };
   const others = assets.filter((a) => a.asset_id !== "0");
+  // Whitelisted tickers not held yet: the names the network reserves for its own pegged assets.
+  const upcoming = whitelist.filter((t) => !others.some((a) => a.ticker.toUpperCase() === t.toUpperCase()));
   const [whole, frac] = fmtAsset(native.balance, native.decimals).split(".");
 
   const PULL_ARM = 72;
@@ -162,11 +169,29 @@ export default function Home({ refreshTick, onSend, onReceive }: { refreshTick: 
           <div className="m-row" key={a.asset_id}>
             <span className="m-avatar soft">{initials(a.ticker)}</span>
             <div className="grow">
-              <div className="primary">{a.ticker}</div>
+              <div className="primary">
+                {a.ticker}
+                {isWhitelisted(a.ticker, whitelist) && <span className="m-whitelisted">Whitelisted</span>}
+              </div>
               <div className="secondary">Shielded asset</div>
             </div>
             <div className="end m-num">
               <div className="primary">{fmtAsset(a.balance, a.decimals)}</div>
+            </div>
+          </div>
+        ))}
+        {upcoming.map((t) => (
+          <div className="m-row upcoming" key={t}>
+            <span className="m-avatar soft">{initials(t)}</span>
+            <div className="grow">
+              <div className="primary">
+                {t}
+                <span className="m-whitelisted">Whitelisted</span>
+              </div>
+              <div className="secondary">{whitelistName(t)} · {t.toUpperCase() === "ZBTC" ? "shield BTC from the desktop wallet" : "coming with its own bridge"}</div>
+            </div>
+            <div className="end m-num">
+              <div className="primary dim">—</div>
             </div>
           </div>
         ))}

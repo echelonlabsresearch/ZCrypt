@@ -6294,6 +6294,15 @@ struct RegisteredAsset {
     decimals: u8,
 }
 
+/// The tickers consensus reserves for protocol-pinned assets (`asset_registry::RESERVED_TICKERS`):
+/// zBTC today, and the pegged assets the project launches next. The portfolio shows them as
+/// whitelisted so people know which names are the real ones before the machinery behind
+/// each arrives. Same source of truth as the node, so the list cannot drift.
+#[tauri::command]
+async fn whitelisted_assets() -> R<Vec<String>> {
+    ok(zcrypt_core::asset_registry::RESERVED_TICKERS.iter().map(|t| t.to_string()).collect())
+}
+
 /// Every asset a swap can pay out: ZCRYPT, plus every ticker registered on this chain.
 #[tauri::command]
 async fn registered_assets(state: State<'_, AppState>) -> R<Vec<RegisteredAsset>> {
@@ -9014,6 +9023,7 @@ pub fn run() {
             wallet_health,
             held_assets,
             registered_assets,
+            whitelisted_assets,
             swap_receive_address,
             swap_asset_start,
             swap_asset_preview,
