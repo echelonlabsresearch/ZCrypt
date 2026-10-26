@@ -268,7 +268,9 @@ pub const DEPTH: usize = tree::DEPTH;
 // input) that prove the spent coin is a real leaf under the public root.
 // Inner hash blocks: the commitment and the nullifier are each TWO Poseidon2
 // compressions (the 8-limb blind no longer fits beside pk/value/asset in one block).
-// Inner commit i = [pk(8) ‖ blind(8)]; inner nullifier j = [spend_secret(8) ‖ blind(8)].
+// Inner commit i = [pk(8) ‖ blind(8)]; inner nullifier j = [spend_secret(8) ‖ inner_c_j(8)],
+// where inner_c_j is input j's inner commit digest (so the blind is bound through the
+// digest and never sits in a lane a sender could steer onto the pk block's padding).
 // Their 8-limb digests feed the outer (tagged) commit / nullifier blocks.
 const INNER_C_BASE: usize = S + 2 * N_IN;
 const INNER_NF_BASE: usize = INNER_C_BASE + S;
@@ -498,6 +500,14 @@ pub type SpendSecret = [u64; SPEND_SECRET_LIMBS];
 /// Spend public key `= Poseidon2(spend_secret)`, bound into the coin commitment.
 pub type PubKey = [u64; 8];
 
+/// The one blind that, under the pre-2026-10-26 nullifier layout, made a coin's inner
+/// nullifier block equal its owner's pk block. The layout no longer absorbs the blind
+/// there, so this blind is harmless to the circuit; wallets still refuse it on receipt
+/// as belt and braces, since no honest sender draws it (probability ~2^-247).
+pub fn blind_is_degenerate(b: &Blind) -> bool {
+    b[..7].iter().all(|&x| x == 0) && b[7] == TAG_PK
+}
+
 /// Fresh uniform blind (each limb rejection-sampled in the field).
 pub fn random_blind() -> Blind {
     core::array::from_fn(|_| rand_field_limb())
@@ -653,7 +663,7 @@ impl<AB: AirBuilder<F = BabyBear>> Air<AB> for CoinsAir {
         // Layouts (WIDTH=16):
         //   inner commit  [0..8]=pk(8)  [8..16]=blind(8)                       (tagless)
         //   outer commit  [0]=value_lo [1]=value_hi [2..10]=inner_c(8) [10..14]=0 [14]=asset [15]=TAG_COMMIT
-        //   inner nf      [0..8]=spend_secret(8)  [8..16]=blind(8)             (tagless)
+        //   inner nf      [0..8]=spend_secret(8)  [8..16]=inner_c(8)           (tagless)
         //   outer nf      [0..8]=inner_nf(8) [8]=value_lo [9]=value_hi [10..14]=0 [14]=asset [15]=TAG_NF
         //   pk            [0..8]=spend_secret(8), [8..15)=0, [15]=TAG_PK
         // Block indices: commit i -> i (0..S); nullifier j -> S+j; pk j -> S+N_IN+j;
@@ -713,11 +723,14 @@ impl<AB: AirBuilder<F = BabyBear>> Air<AB> for CoinsAir {
                     builder.assert_zero(row[pk_blk * BLK + t].into());
                 }
                 builder.assert_eq(row[pk_blk * BLK + WIDTH - 1], konst::<AB>(TAG_PK));
-                // CANONICAL nullifier, two blocks. Inner: [ss(8) ‖ blind(8)], the same
-                // spend secret as the pk block and the same blind as the inner commit block.
+                // CANONICAL nullifier, two blocks. Inner: [ss(8) ‖ inner_c(8)]: the same
+                // spend secret as the pk block, and the inner commit DIGEST (which binds the
+                // blind). The blind itself is never a lane of this block, so no sender-chosen
+                // blind can make it collide with the pk block [ss ‖ 0×7 ‖ TAG_PK]
+                // (review 2026-10-26, M1).
                 for t in 0..8 {
                     builder.assert_eq(row[inf_blk * BLK + t], row[pk_blk * BLK + t]);
-                    builder.assert_eq(row[inf_blk * BLK + 8 + t], row[ic_blk * BLK + 8 + t]);
+                    builder.assert_eq(row[inf_blk * BLK + 8 + t], outs[ic_blk][t].clone());
                 }
                 // Outer: [inner_nf(8), value_lo, value_hi, 0×4, asset, TAG_NF].
                 for t in 0..8 {
@@ -870,11 +883,15 @@ fn pk_input(spend_secret: &SpendSecret) -> [BabyBear; WIDTH] {
     s[15] = BabyBear::from_u64(TAG_PK);
     s
 }
-// Inner nullifier block: [0..8]=spend_secret(8) ‖ [8..16]=blind(8). Tagless (see above).
-fn inner_nf_input(spend_secret: &SpendSecret, blind: &Blind) -> [BabyBear; WIDTH] {
+// Inner nullifier block: [0..8]=spend_secret(8) ‖ [8..16]=inner commit digest(8). Tagless
+// (see above). Absorbing the inner commit DIGEST rather than the blind keeps every lane of
+// this block out of a sender's hands: with the blind here, the blind (0,…,0,TAG_PK) made
+// this block equal the pk block and the coin's nullifier computable without the spend
+// secret (review 2026-10-26, M1).
+fn inner_nf_input(spend_secret: &SpendSecret, inner_c: &Commitment) -> [BabyBear; WIDTH] {
     let mut s = [BabyBear::ZERO; WIDTH];
     for i in 0..SPEND_SECRET_LIMBS { s[i] = BabyBear::from_u64(spend_secret[i]); }
-    for i in 0..BLIND_LIMBS { s[8 + i] = BabyBear::from_u64(blind[i]); }
+    for i in 0..8 { s[8 + i] = BabyBear::from_u64(inner_c[i]); }
     s
 }
 // Outer nullifier block: [0..8]=inner_nf [8]=vlo [9]=vhi [10..14]=0 [14]=asset [15]=TAG_NF
@@ -889,8 +906,11 @@ fn nf_input(inner: &Commitment, value: u64, asset_id: u64) -> [BabyBear; WIDTH] 
     s
 }
 /// Both Poseidon2 blocks of a nullifier: `(inner, outer)`; `nf = native_commit(outer)`.
+/// The inner block absorbs the coin's inner commit digest `Poseidon2([pk ‖ blind])`.
 fn nf_blocks(spend_secret: &SpendSecret, value: u64, blind: &Blind, asset_id: u64) -> ([BabyBear; WIDTH], [BabyBear; WIDTH]) {
-    let inner = inner_nf_input(spend_secret, blind);
+    let pk = spend_pubkey(spend_secret);
+    let inner_c = native_commit(&inner_coin_input(&pk, blind));
+    let inner = inner_nf_input(spend_secret, &inner_c);
     let outer = nf_input(&native_commit(&inner), value, asset_id);
     (inner, outer)
 }

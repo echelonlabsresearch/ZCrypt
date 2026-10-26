@@ -12,7 +12,7 @@
 //!     published nullifiers/outputs). Only the row gating changes.
 //!   * ROW 0 (the INNER row) holds the S + N_IN inner blocks of the two-block commitment
 //!     and nullifier hashes: inner commit i = [pk ‖ blind], inner nullifier j =
-//!     [spend_secret ‖ blind]. It is adjacent to the core row, so the inner→outer wiring
+//!     [spend_secret ‖ inner commit digest j]. It is adjacent to the core row, so the inner→outer wiring
 //!     (digest feeds, shared pk / spend secret / blind lanes) is a plain local/next
 //!     window constraint; no extra columns, no extra carries, height unchanged.
 //!   * The N_IN·DEPTH Merkle-path blocks — the dominant cost — go TALL: one compression
@@ -201,8 +201,9 @@ impl<AB: AirBuilder<F = BabyBear>> Air<AB> for CoinsAirTall {
         // ============================================================
         // INNER ROW (gated by P_INNER == ROW_INNER; `next` is the core row). Group i
         // (i < S) is inner commit i = [pk(8) ‖ blind(8)]; group S+j is inner nullifier
-        // j = [spend_secret(8) ‖ blind(8)]. Their digests feed the core row's outer
-        // blocks, and the lanes they absorb are tied to the core row's pk blocks.
+        // j = [spend_secret(8) ‖ inner_c_j(8)], inner_c_j being group j's digest on this
+        // same row. Their digests feed the core row's outer blocks, and the lanes they
+        // absorb are tied to the core row's pk blocks.
         // ============================================================
         {
             let mut wt = builder.when_transition();
@@ -224,8 +225,10 @@ impl<AB: AirBuilder<F = BabyBear>> Air<AB> for CoinsAirTall {
                     wt.assert_zero(p_inner.clone() * (Into::<AB::Expr>::into(local[i * BLK + t]) - pk_out[t].clone()));
                     // Inner nullifier absorbs the SAME spend secret the pk block hashes...
                     wt.assert_zero(p_inner.clone() * (Into::<AB::Expr>::into(local[inf * BLK + t]) - next[pk_blk * BLK + t].into()));
-                    // ...and the SAME blind the inner commit absorbs.
-                    wt.assert_zero(p_inner.clone() * (Into::<AB::Expr>::into(local[inf * BLK + 8 + t]) - local[i * BLK + 8 + t].into()));
+                    // ...and the inner commit DIGEST (which binds the blind). Never the blind
+                    // itself: a sender-chosen blind could otherwise steer this block onto the
+                    // pk block's padding and make the nullifier public (review 2026-10-26, M1).
+                    wt.assert_zero(p_inner.clone() * (Into::<AB::Expr>::into(local[inf * BLK + 8 + t]) - outs[i][t].clone()));
                     // Outer nullifier lanes [0..8] == inner nullifier digest.
                     wt.assert_zero(p_inner.clone() * (Into::<AB::Expr>::into(next[nf_blk * BLK + t]) - outs[inf][t].clone()));
                 }
@@ -1164,9 +1167,9 @@ mod tests {
     }
 
     #[test]
-    fn mutation_inner_blind_is_shared_by_commitment_and_nullifier() {
-        // Attack: open the commitment under one blind and derive the nullifier under
-        // another, which would give one coin two nullifiers.
+    fn mutation_inner_nullifier_absorbs_the_coins_own_inner_digest() {
+        // Attack: derive the nullifier from a different inner digest than the commitment
+        // opens to (a second blind), which would give one coin two nullifiers.
         let (mut t, mut pis, _) = valid_trace();
         let g = S; // inner nullifier block of input 0 lives in group S on the inner row
         let mut st = block_state(&t, ROW_INNER, g);
@@ -1201,13 +1204,29 @@ mod tests {
     }
 
     #[test]
-    fn review_degenerate_blind_makes_inner_nullifier_equal_pk() {
-        // Review 2026-10-26: the inner nullifier block [ss ‖ blind] and the pk block
-        // [ss ‖ 0×7 ‖ TAG_PK] share one tagless permutation, so the blind (0,…,0,TAG_PK)
-        // makes inner_nf == pk. A sender chooses the recipient's blind.
+    fn degenerate_blind_no_longer_makes_the_nullifier_public() {
+        // Review 2026-10-26, M1: with the inner nullifier block [ss ‖ blind], the blind
+        // (0,…,0,TAG_PK) made it equal the pk block [ss ‖ 0×7 ‖ TAG_PK], so the sender of a
+        // coin could compute its nullifier. The block now absorbs the inner commit digest.
         let s = ss(7);
         let degenerate: Blind = [0, 0, 0, 0, 0, 0, 0, TAG_PK];
-        let inner = native_commit(&inner_nf_input(&s, &degenerate));
-        assert_eq!(inner, spend_pubkey(&s));
+        assert!(blind_is_degenerate(&degenerate));
+        assert!(!blind_is_degenerate(&bl(11)));
+        let pk = spend_pubkey(&s);
+        let (inner, _) = nf_blocks(&s, 100, &degenerate, ASSET_ZCRYPT);
+        assert_ne!(native_commit(&inner), pk, "inner nullifier must not collapse onto the pk");
+        // What a sender knows (pk, value, asset, blind) is not enough: the nullifier needs
+        // the spend secret in its lanes, and the degenerate blind buys no shortcut.
+        let nf_degenerate = nullifier_asset(&s, 100, &degenerate, ASSET_ZCRYPT);
+        let nf_other = nullifier_asset(&ss(8), 100, &degenerate, ASSET_ZCRYPT);
+        assert_ne!(nf_degenerate, nf_other);
+        // A spend with that blind still proves and verifies (the circuit mirrors nf_blocks).
+        let mut coin = inp(100, 11, 7);
+        coin.blind = degenerate;
+        let (ins, _root) = with_tree(vec![coin]);
+        let outs = [oc(90, 33, 1), oc(5, 44, 2), oc(0, 0xE1, 0xE2)];
+        let (o, n, r, p) = prove_tall(&ins, &outs, 5, CHAIN, &[0u64; 8]).expect("prove");
+        assert_eq!(n[0], nf_degenerate);
+        assert!(verify_tall(&o, &n, 5, &r, &p, CHAIN, &[0u64; 8]));
     }
 }

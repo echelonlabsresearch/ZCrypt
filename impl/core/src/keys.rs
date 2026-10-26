@@ -478,6 +478,11 @@ fn decode_note(b: &[u8]) -> Option<(u64, Blind, u64)> {
     if value > zcrypt_shield::MAX_COIN_VALUE {
         return None;
     }
+    // No honest sender draws this blind (see `blind_is_degenerate`); refuse it rather
+    // than hold a coin whose blind was chosen to be special.
+    if zcrypt_shield::blind_is_degenerate(&blind) {
+        return None;
+    }
     Some((value, blind, asset_id))
 }
 
@@ -733,6 +738,9 @@ impl BearerCoin {
         }
         if value > zcrypt_shield::MAX_COIN_VALUE {
             return None; // aliased value lanes (see decode_note)
+        }
+        if zcrypt_shield::blind_is_degenerate(&blind) {
+            return None; // a deliberately special blind (see decode_note)
         }
         Some(BearerCoin {
             coin: Coin {
