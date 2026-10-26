@@ -5642,7 +5642,7 @@ dependencies = [
 
 [[package]]
 name = "zcrypt-wallet"
-version = "0.1.1-alpha"
+version = "0.2.1"
 dependencies = [
  "argon2",
  "base64 0.22.1",
