@@ -41,6 +41,11 @@ install_validator_key() {
 check() {
   if ! printf '%s' "$2" | grep -Eq "^($3)$"; then
     echo "[genesis] invalid $1='$2' (expected /$3/)" >&2
+    # `cometbft init` has already written a default genesis.json and config.toml. Leaving
+    # them would make every later start skip this whole block (no app_state, proxy_app at
+    # 127.0.0.1) and run a chain with none of the values in .env. Remove them so the next
+    # start re-validates from scratch.
+    rm -f "$GENESIS" "$CFG" "$HOME_DIR/config/genesis.sha256"
     exit 1
   fi
 }
