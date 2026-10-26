@@ -686,6 +686,7 @@ fn op_gate(op: u8) -> (&'static str, &'static str) {
         0x13 => ("CHECK_TICKER_VALID", "2-10 alphanumerics, leading letter"),
         0x14 => ("CHECK_TICKER_FREE", "ticker and derived id not taken"),
         0x15 => ("CHECK_ASSET_HAS_AUTHORITY", "asset is registered with a mint authority"),
+        0x16 => ("CHECK_CAPABILITY", "H(capability) == the asset's authority (retired; no current program uses it)"),
         0x17 => ("CHECK_ESCROW_OPEN", "escrow exists and is Open"),
         0x18 => ("CHECK_BEFORE_TIMEOUT", "height < timeout"),
         0x19 => ("CHECK_AT_OR_AFTER_TIMEOUT", "height >= timeout"),
