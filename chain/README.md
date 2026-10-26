@@ -121,7 +121,8 @@ and injects (with `jq` when the image has it, otherwise by validated substitutio
   "foundation_sentinel_decay": 1000000,
   "btc_net": "mainnet",
   "btc_checkpoint": "<160 hex header>:<height>",
-  "zbtc_reserve_pk": "<66 hex compressed secp256k1 key>"
+  "zbtc_reserve_pk": "<66 hex compressed secp256k1 key>",
+  "reserved_mint_authority": "<64 hex: the foundation's reserved-asset key set>"
 }
 ```
 
@@ -129,5 +130,8 @@ and raises the evidence window (`max_age_num_blocks` / `max_age_duration`) to 12
 equivocation evidence outlives the 10-day unbonding period. `init_chain` reads all of it:
 the registry, the foundation reward address, the sentinel, the Bitcoin SPV anchor, and the
 zBTC reserve key (zBTC is registered against it at genesis; a later REGISTER of the ticker
-is rejected). The entrypoint prints and stores the genesis SHA-256 for validators.
+is rejected), and the foundation's reserved-asset key set (the other reserved tickers, zETH,
+zSOL, zBNB, zTON, zDAI, zUSDT and zGOLD, can only be registered by a transaction that set
+blessed offline; see "Launching a reserved asset" in LAUNCH.md). The entrypoint prints and
+stores the genesis SHA-256 for validators.
 

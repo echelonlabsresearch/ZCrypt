@@ -91,9 +91,14 @@ if [ ! -f "$GENESIS" ]; then
   # registered at genesis (devnet only).
   ZBTC_PK="${ZCRYPT_RESERVE_PK:-}"
   check ZCRYPT_RESERVE_PK "$ZBTC_PK" '|0[23][0-9a-f]{64}'
+  # reserved_mint_authority: the foundation's reserved-asset key set (64 hex, from
+  # `foundation_keys new`). Only a REGISTER tx blessed by it can claim a reserved ticker
+  # (zETH, zSOL, ...). Empty = those names stay parked; no transaction can register them.
+  RESERVED_AUTH="${ZCRYPT_RESERVED_MINT_AUTH:-}"
+  check ZCRYPT_RESERVED_MINT_AUTH "$RESERVED_AUTH" '|[0-9a-f]{64}'
 
-  APP_STATE=$(printf '{"registry":{"minted_total":0,"leaves":[]},"foundation_addr":"%s","foundation_sentinel":%s,"foundation_sentinel_decay":%s,"btc_net":"%s","btc_checkpoint":"%s","zbtc_reserve_pk":"%s"}' \
-    "$FADDR" "$FSENTINEL" "$FSENTINEL_DECAY" "$BTC_NET" "$BTC_CP" "$ZBTC_PK")
+  APP_STATE=$(printf '{"registry":{"minted_total":0,"leaves":[]},"foundation_addr":"%s","foundation_sentinel":%s,"foundation_sentinel_decay":%s,"btc_net":"%s","btc_checkpoint":"%s","zbtc_reserve_pk":"%s","reserved_mint_authority":"%s"}' \
+    "$FADDR" "$FSENTINEL" "$FSENTINEL_DECAY" "$BTC_NET" "$BTC_CP" "$ZBTC_PK" "$RESERVED_AUTH")
 
   # Evidence must stay admissible for the whole 10-day unbonding window (1 s blocks), or a
   # validator could equivocate, unbond, and outlive the evidence: 12 days of blocks and

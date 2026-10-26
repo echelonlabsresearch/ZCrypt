@@ -232,6 +232,29 @@ key); copy that public key into `ZCRYPT_RESERVE_PK` in `.env`. The 21M cap,
 8 decimals, and ticker are protocol-pinned. Once genesis carries the key, a REGISTER tx
 for the zBTC ticker is rejected, and the wallet's `bridge_init` is not needed on mainnet.
 
+### Launching a reserved asset (zETH, zSOL, zBNB, zTON, zDAI, zUSDT, zGOLD)
+
+Those tickers are reserved in consensus so nobody can squat them. Genesis carries
+`reserved_mint_authority` (from `ZCRYPT_RESERVED_MINT_AUTH`): the commitment of a 2-of-3
+ML-DSA key set derived from the foundation mnemonic, printed by `foundation_keys new`
+next to the reward address. Leave it empty and the names stay parked for good; no
+transaction can register them.
+
+To launch one later, with the chain running:
+
+1. In the wallet that will operate the asset, open Mint, type the ticker, and copy the
+   mint authority it shows (this wallet's own key-set commitment; not a secret).
+2. On the air-gapped machine, with the foundation mnemonic in a file:
+   `cargo run -p zcrypt-core --example foundation_keys bless <mnemonic-file> zcrypt-1 zETH 8 <max-supply-base> <authority>`
+   It prints `blessing_hex`, M-of-N signatures over exactly that chain, ticker, decimals,
+   cap and authority. The blessing is useless for any other registration.
+3. Paste the blessing into the wallet's Mint tab and mint. The registration carries it;
+   consensus checks it against the genesis key set, and the asset is registered under the
+   wallet's authority. Minting more later is the ordinary path for that wallet.
+
+A foundation-minted asset is a custodial peg: whoever runs it holds the ETH, SOL or gold
+behind it. Set the max supply to what is actually backed, and say so publicly.
+
 ### Validator image provenance
 
 Validators run the image by DIGEST, signed with cosign by the "Publish ABCI image"

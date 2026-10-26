@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
-import { call, toBaseAsset, fmtAsset } from "../lib/api";
+import { call, toBaseAsset, fmtAsset, isWhitelisted } from "../lib/api";
 
 /** Every shielded asset uses 8 decimals — one standard for all of them (like BTC/zBTC),
  *  so users never have to pick and amounts always mean the same thing. */
@@ -22,6 +22,19 @@ export default function Mint({ onMinted }: { onMinted: () => void }) {
   const [aBusy, setABusy] = useState(false);
   const [aErr, setAErr] = useState("");
   const [aOk, setAOk] = useState("");
+  // Reserved tickers (zETH, zSOL, ...) need the foundation's blessing over this wallet's
+  // mint authority; the authority is shown so it can be handed to the signing ceremony.
+  const [whitelist, setWhitelist] = useState<string[]>([]);
+  const [blessing, setBlessing] = useState("");
+  const [authority, setAuthority] = useState("");
+  const reserved = isWhitelisted(ticker.trim(), whitelist) && !existingTicker;
+  useEffect(() => {
+    call<string[]>("whitelisted_assets").then(setWhitelist).catch(() => {});
+  }, []);
+  useEffect(() => {
+    if (!reserved) return setAuthority("");
+    call<string>("mint_authority_for", { ticker: ticker.trim() }).then(setAuthority).catch(() => setAuthority(""));
+  }, [reserved, ticker]);
 
   // Assets this wallet is the minter of
   const [mine, setMine] = useState<MinterAsset[]>([]);
@@ -50,7 +63,8 @@ export default function Mint({ onMinted }: { onMinted: () => void }) {
     }
     setABusy(true);
     try {
-      await call<string>("mint_asset", { ticker: t, amount: base, decimals: dec, maxSupply: cap });
+      if (reserved && !blessing.trim()) return setAErr(`${t} is a reserved ticker: paste the foundation's blessing first.`);
+      await call<string>("mint_asset", { ticker: t, amount: base, decimals: dec, maxSupply: cap, blessing: reserved ? blessing.trim() : null });
       setAOk(`✓ Minted ${aAmount} ${t}. It's now in Send, and in "Assets you mint" below.`);
       setAAmount("");
       onMinted();
@@ -126,6 +140,25 @@ export default function Mint({ onMinted }: { onMinted: () => void }) {
               A permanent, on-chain ceiling on this asset's total supply. Set once at registration — it can never be
               raised, so no one (not even you) can mint past it.
             </div>
+          </div>
+        )}
+        {reserved && (
+          <div className="field">
+            <label>Foundation blessing</label>
+            <div style={{ fontSize: "0.76rem", opacity: 0.7, marginBottom: "0.4rem" }}>
+              <b>{ticker.trim()}</b> is reserved for the network's own assets. The foundation signs the registration offline
+              over this wallet's mint authority, the ticker, 8 decimals and the max supply:
+            </div>
+            <div className="mono" style={{ fontSize: "0.72rem", wordBreak: "break-all", opacity: 0.85, marginBottom: "0.4rem" }}>
+              authority {authority || "…"}
+            </div>
+            <textarea
+              value={blessing}
+              onChange={(e) => setBlessing(e.target.value)}
+              placeholder="blessing_hex from: foundation_keys bless <mnemonic-file> <chain-id> <ticker> 8 <max-supply-base> <authority>"
+              rows={3}
+              style={{ width: "100%", fontFamily: "var(--mono)", fontSize: "0.72rem" }}
+            />
           </div>
         )}
         <div className="field">

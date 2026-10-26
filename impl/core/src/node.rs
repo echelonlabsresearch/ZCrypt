@@ -248,7 +248,7 @@ pub struct NodeSnapshot {
 /// v16: each escrow stores the beneficiary's hidden settlement coin (commitment +
 /// encrypted note) instead of a public blind. Positional layout change, so older
 /// state refuses to load.
-const SNAPSHOT_VERSION: u32 = 16;
+const SNAPSHOT_VERSION: u32 = 17;
 /// Public mirror of the postcard snapshot format version (for `state_db` restore).
 pub const SNAPSHOT_VERSION_PUB: u32 = SNAPSHOT_VERSION;
 
@@ -1739,6 +1739,15 @@ impl Node {
     }
 
     // ---- shielded-asset ticker registry ----
+
+    /// Bind the foundation key set (commitment) that may bless a reserved-ticker
+    /// registration. Genesis-only; see [`crate::asset_registry::AssetRegistry::set_reserved_authority`].
+    pub fn set_reserved_mint_authority(&mut self, authority: Hash) {
+        self.assets.set_reserved_authority(authority);
+    }
+    pub fn reserved_mint_authority(&self) -> Option<Hash> {
+        self.assets.reserved_authority()
+    }
 
     /// Register a shielded-asset ticker (first-mint-wins). Returns its
     /// deterministic asset id. Consensus-checked; folded into the app_hash.

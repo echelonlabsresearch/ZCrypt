@@ -226,6 +226,17 @@ fn foundation_addr_from_genesis(app_state_bytes: &[u8]) -> Option<[u8; 32]> {
     hex::decode(h).ok()?.try_into().ok()
 }
 
+/// A 32-byte hash from the genesis `app_state` JSON (64 hex), e.g. `reserved_mint_authority`.
+/// `None` when absent, empty, or malformed (deterministic across nodes).
+fn genesis_hash32(app_state_bytes: &[u8], name: &str) -> Option<[u8; 32]> {
+    let v: serde_json::Value = serde_json::from_slice(app_state_bytes).ok()?;
+    let h = v.get(name)?.as_str()?.trim();
+    if h.is_empty() {
+        return None;
+    }
+    hex::decode(h).ok()?.try_into().ok()
+}
+
 /// A 33-byte compressed secp256k1 key from the genesis `app_state` JSON (hex), e.g.
 /// `zbtc_reserve_pk`. `None` when absent, empty, or malformed (deterministic across nodes).
 fn genesis_pubkey33(app_state_bytes: &[u8], name: &str) -> Option<[u8; 33]> {
@@ -571,7 +582,13 @@ fn parse_swap_lock(
 /// pubkey**, from which consensus derives the SPV sentinel authority itself —
 /// the registrant never chooses the hash, so an SPV asset can only ever be minted
 /// against proven Bitcoin deposits claimable by that reserve key.
-fn parse_register(b: &[u8]) -> Option<(String, u8, Option<[u8; 32]>, u64, Option<[u8; 33]>)> {
+/// A parsed REGISTER body: ticker, decimals, mint authority, max supply, the SPV reserve
+/// key when it is an SPV asset, and the foundation blessing when the ticker is a reserved
+/// one (`authority(32) ‖ encode_auth(...)`, see [`reserved_ticker_gate`]).
+type Registration = (String, u8, Option<[u8; 32]>, u64, Option<[u8; 33]>, Option<Blessing>);
+type Blessing = (zcrypt_core::mint_auth::MintKeySet, Vec<zcrypt_core::mint_auth::SignerSig>);
+
+fn parse_register(b: &[u8]) -> Option<Registration> {
     if b.len() < 2 {
         return None;
     }
@@ -583,6 +600,7 @@ fn parse_register(b: &[u8]) -> Option<(String, u8, Option<[u8; 32]>, u64, Option
     let ticker = String::from_utf8(b[2..2 + tlen].to_vec()).ok()?;
     let max_supply = u64::from_le_bytes(b[2 + tlen..2 + tlen + 8].try_into().ok()?);
     let rest = &b[2 + tlen + 8..];
+    let mut blessing = None;
     let (authority, reserve_pk) = if rest.is_empty() {
         (None, None)
     } else if rest.len() == 32 {
@@ -592,35 +610,86 @@ fn parse_register(b: &[u8]) -> Option<(String, u8, Option<[u8; 32]>, u64, Option
     } else if rest.len() == 33 {
         let pk: [u8; 33] = rest.try_into().ok()?;
         (Some(zcrypt_core::spv::spv_authority(&pk)), Some(pk))
+    } else if rest.len() > 33 {
+        // A blessed registration: the asset's own authority, then the foundation's M-of-N
+        // signatures over it. A malformed blessing fails the whole parse (fail closed).
+        let mut a = [0u8; 32];
+        a.copy_from_slice(&rest[..32]);
+        blessing = Some(zcrypt_core::mint_auth::decode_auth(&rest[32..])?);
+        (Some(a), None)
     } else {
         return None;
     };
-    Some((ticker, decimals, authority, max_supply, reserve_pk))
+    Some((ticker, decimals, authority, max_supply, reserve_pk, blessing))
 }
 
-/// Reserved tickers (zBTC, zETH, zSOL, ...: `asset_registry::RESERVED_TICKERS`) are never
-/// registered by transaction on a production chain: zBTC's reserve key is bound at genesis,
-/// and the other pegged assets arrive through their own protocol paths when they launch.
-/// Without this, the first-come registry would let anyone squat the name and sell a
-/// counterfeit (first-come hijack, bridge H3 / consensus M4). Devnet and tests may still
-/// register them freely.
+/// Who may register a reserved ticker (`asset_registry::RESERVED_TICKERS`).
+///
+/// The registry is first-come, so without this anyone could squat a name the project
+/// means to launch itself and sell a counterfeit under it (first-come hijack, bridge H3 /
+/// consensus M4). zBTC is bound at genesis and is never registered by transaction on a
+/// production chain. Every other reserved ticker needs the FOUNDATION'S BLESSING: the
+/// genesis binds a key-set commitment (`reserved_mint_authority`), and the register tx
+/// must carry M-of-N ML-DSA signatures from that set over this exact registration (chain
+/// id, ticker, decimals, cap and the asset's own mint authority). The blessed asset then
+/// mints under its own authority like any other. A chain whose genesis binds no key set
+/// keeps the names parked on production; devnet and tests may register them freely.
 ///
 /// zBTC may ONLY be registered in SPV form (a 33-byte reserve key): its mint
 /// authority is then trustless by construction — no key set, treasury, or
 /// capability can ever authorize a zBTC mint on this chain.
-fn reserved_ticker_gate(ticker: &str, is_spv: bool) -> Result<(), String> {
+fn reserved_ticker_gate(
+    node: &zcrypt_core::node::Node,
+    chain_id: &[u8],
+    ticker: &str,
+    decimals: u8,
+    max_supply: u64,
+    authority: Option<[u8; 32]>,
+    is_spv: bool,
+    blessing: Option<&Blessing>,
+) -> Result<(), String> {
     use zcrypt_core::asset_registry::{canonical_ticker, is_reserved_ticker, ZBTC_TICKER};
-    if is_reserved_ticker(ticker) && !SEED_ENABLED && !cfg!(test) {
+    use zcrypt_core::mint_auth::{reserved_register_message, verify_threshold};
+    let is_zbtc = canonical_ticker(ticker) == canonical_ticker(ZBTC_TICKER);
+    if is_zbtc && !SEED_ENABLED && !cfg!(test) {
         return Err(format!(
-            "'{ticker}' is reserved for a protocol-pinned asset and cannot be registered by transaction"
+            "'{ZBTC_TICKER}' is bound from genesis (zbtc_reserve_pk) and cannot be registered by transaction"
         ));
     }
-    if canonical_ticker(ticker) == canonical_ticker(ZBTC_TICKER) && !is_spv {
+    if is_zbtc && !is_spv {
         return Err(format!(
             "'{ZBTC_TICKER}' must be registered with a 33-byte Bitcoin reserve pubkey \
              (SPV-gated trustless mint) — discretionary mint authorities are not \
              accepted for the canonical BTC-pegged asset"
         ));
+    }
+    if !is_reserved_ticker(ticker) || is_zbtc {
+        return match blessing {
+            Some(_) => Err(format!("'{ticker}' is not a reserved ticker: a foundation blessing does not apply")),
+            None => Ok(()),
+        };
+    }
+    let Some(root) = node.reserved_mint_authority() else {
+        if !SEED_ENABLED && !cfg!(test) {
+            return Err(format!(
+                "'{ticker}' is reserved for a protocol-pinned asset and this chain binds no foundation key set \
+                 (reserved_mint_authority): it cannot be registered by transaction"
+            ));
+        }
+        return Ok(());
+    };
+    let Some((keyset, sigs)) = blessing else {
+        return Err(format!("'{ticker}' is reserved: the registration needs the foundation's blessing"));
+    };
+    let Some(authority) = authority else {
+        return Err(format!("'{ticker}' is reserved: a blessed registration must name its mint authority"));
+    };
+    if keyset.commitment() != root {
+        return Err(format!("'{ticker}': the blessing is not from the foundation key set bound at genesis"));
+    }
+    let msg = reserved_register_message(chain_id, ticker, decimals, max_supply, &authority);
+    if !verify_threshold(keyset, &msg, sigs) {
+        return Err(format!("'{ticker}': the foundation blessing does not cover this registration"));
     }
     Ok(())
 }
@@ -1289,6 +1358,16 @@ impl Application for ZcryptApp {
                  reserve public key); see chain/.env.example ZCRYPT_RESERVE_PK"
             );
         }
+        // The foundation's reserved-asset key set (`reserved_mint_authority`, 64 hex): the
+        // commitment of the M-of-N ML-DSA set whose blessing lets a REGISTER tx claim a
+        // reserved ticker (zETH, zSOL, ...). Absent = those names stay parked on production.
+        match genesis_hash32(&req.app_state_bytes, "reserved_mint_authority") {
+            Some(a) => {
+                s.node.set_reserved_mint_authority(a);
+                eprintln!("[assets] reserved-ticker blessing key set bound from genesis: {}", hex::encode(a));
+            }
+            None => eprintln!("[assets] no reserved_mint_authority in genesis: reserved tickers stay parked"),
+        }
         s.app_hash = s.node.state_root();
         ResponseInitChain {
             app_hash: s.app_hash.to_vec().into(),
@@ -1506,22 +1585,25 @@ impl ZcryptApp {
             match parse_gas_prefix(&tx[1..]) {
                 None => Err("malformed register tx (needs a ZCRYPT gas note prefix)".to_string()),
                 Some((gas_blind, gas_tx, rest)) => match parse_register(rest) {
-                    Some((ticker, _, _, _, _)) if s.node.asset_id_of(&ticker).is_some() => {
+                    Some((ticker, _, _, _, _, _)) if s.node.asset_id_of(&ticker).is_some() => {
                         Err(format!("ticker '{ticker}' is already registered"))
                     }
-                    Some((_, _, _, max_supply, _)) if max_supply == 0 => {
+                    Some((_, _, _, max_supply, _, _)) if max_supply == 0 => {
                         Err("asset must declare a non-zero max supply".to_string())
                     }
-                    Some((ticker, _, _, _, reserve_pk))
+                    Some((ticker, decimals, authority, max_supply, reserve_pk, blessing))
                         if zcrypt_core::asset_registry::valid_ticker(&ticker) =>
                     {
-                        reserved_ticker_gate(&ticker, reserve_pk.is_some())
+                        reserved_ticker_gate(
+                            &s.node, chain_id, &ticker, decimals, max_supply, authority,
+                            reserve_pk.is_some(), blessing.as_ref(),
+                        )
                             .and_then(|()| s.node.precheck_gas_note(&gas_tx, gas_blind))
                             .map(|()| {
                                 deferred.push((gas_tx, zcrypt_core::shield_tx::gas_pay_envelope(rest)))
                             })
                     }
-                    Some((ticker, _, _, _, _)) => Err(format!("invalid ticker '{ticker}'")),
+                    Some((ticker, _, _, _, _, _)) => Err(format!("invalid ticker '{ticker}'")),
                     None => Err("malformed register tx".to_string()),
                 },
             }
@@ -2076,10 +2158,13 @@ impl ZcryptApp {
                 match parse_gas_prefix(&bytes[1..]) {
                     None => Err("malformed register tx (needs a ZCRYPT gas note prefix)".to_string()),
                     Some((gas_blind, gas_tx, rest)) => match parse_register(rest) {
-                        Some((ticker, decimals, authority, max_supply, reserve_pk)) => {
+                        Some((ticker, decimals, authority, max_supply, reserve_pk, blessing)) => {
                             // Gas is burned FIRST (a rejected registration still pays), then
                             // the registration is applied.
-                            match reserved_ticker_gate(&ticker, reserve_pk.is_some())
+                            match reserved_ticker_gate(
+                                &s.node, chain_id, &ticker, decimals, max_supply, authority,
+                                reserve_pk.is_some(), blessing.as_ref(),
+                            )
                                 .and_then(|()| s.node.submit_gas_note(chain_id, &gas_tx, gas_blind, rest))
                                 .and_then(|_| {
                                     match reserve_pk {
@@ -3186,6 +3271,72 @@ mod tests {
     use super::*;
     use ed25519_dalek::{Signer, SigningKey};
     use sha2::{Digest, Sha256};
+
+    /// A register body with the foundation blessing appended, as the wallet builds it.
+    fn blessed_body(chain: &[u8], ticker: &str, dec: u8, cap: u64, auth: [u8; 32], master: &[u8]) -> Vec<u8> {
+        use zcrypt_core::mint_auth::{authorize, derive_keyset, encode_auth, reserved_register_message};
+        let (ks, signers) = derive_keyset(master, 3, 2);
+        let msg = reserved_register_message(chain, ticker, dec, cap, &auth);
+        let mut b = vec![dec, ticker.len() as u8];
+        b.extend_from_slice(ticker.as_bytes());
+        b.extend_from_slice(&cap.to_le_bytes());
+        b.extend_from_slice(&auth);
+        b.extend_from_slice(&encode_auth(&ks, &authorize(&ks, &signers, &msg)));
+        b
+    }
+
+    #[test]
+    fn reserved_ticker_needs_the_foundation_blessing_once_genesis_binds_one() {
+        use zcrypt_core::mint_auth::derive_keyset;
+        let mut node = zcrypt_core::node::Node::default();
+        let auth = [0x11u8; 32];
+        // No key set bound: the gate is open here (tests/devnet) and the blessing is not needed.
+        assert!(reserved_ticker_gate(&node, b"zcrypt-1", "zETH", 8, 1_000, Some(auth), false, None).is_ok());
+
+        node.set_reserved_mint_authority(derive_keyset(b"foundation", 3, 2).0.commitment());
+        // Unblessed: refused.
+        let e = reserved_ticker_gate(&node, b"zcrypt-1", "zETH", 8, 1_000, Some(auth), false, None).unwrap_err();
+        assert!(e.contains("blessing"), "{e}");
+        // Blessed by the foundation over these exact fields: accepted, whatever the casing.
+        let body = blessed_body(b"zcrypt-1", "zETH", 8, 1_000, auth, b"foundation");
+        let (t, d, a, cap, spv, bl) = parse_register(&body).expect("parses");
+        assert!(bl.is_some() && spv.is_none());
+        assert!(reserved_ticker_gate(&node, b"zcrypt-1", &t, d, cap, a, false, bl.as_ref()).is_ok());
+        assert!(reserved_ticker_gate(&node, b"zcrypt-1", "ZETH", d, cap, a, false, bl.as_ref()).is_ok());
+        // The same blessing on another chain, cap, decimals or authority: refused.
+        assert!(reserved_ticker_gate(&node, b"zcrypt-test", &t, d, cap, a, false, bl.as_ref()).is_err());
+        assert!(reserved_ticker_gate(&node, b"zcrypt-1", &t, d, cap + 1, a, false, bl.as_ref()).is_err());
+        assert!(reserved_ticker_gate(&node, b"zcrypt-1", &t, 6, cap, a, false, bl.as_ref()).is_err());
+        assert!(reserved_ticker_gate(&node, b"zcrypt-1", &t, d, cap, Some([0x22u8; 32]), false, bl.as_ref()).is_err());
+        // Blessed by some other key set: refused.
+        let body = blessed_body(b"zcrypt-1", "zETH", 8, 1_000, auth, b"impostor");
+        let (t, d, a, cap, _, bl) = parse_register(&body).unwrap();
+        let e = reserved_ticker_gate(&node, b"zcrypt-1", &t, d, cap, a, false, bl.as_ref()).unwrap_err();
+        assert!(e.contains("not from the foundation"), "{e}");
+        // A blessing on a ticker that is not reserved is refused too.
+        let body = blessed_body(b"zcrypt-1", "GOLD", 8, 1_000, auth, b"foundation");
+        let (t, d, a, cap, _, bl) = parse_register(&body).unwrap();
+        assert!(reserved_ticker_gate(&node, b"zcrypt-1", &t, d, cap, a, false, bl.as_ref()).is_err());
+        assert!(reserved_ticker_gate(&node, b"zcrypt-1", "GOLD", 8, 1_000, Some(auth), false, None).is_ok());
+    }
+
+    #[test]
+    fn register_body_with_a_truncated_blessing_does_not_parse() {
+        let body = blessed_body(b"zcrypt-1", "zSOL", 8, 5, [1u8; 32], b"foundation");
+        assert!(parse_register(&body).is_some());
+        assert!(parse_register(&body[..body.len() - 1]).is_none());
+        assert!(parse_register(&body[..body.len() - 40]).is_none());
+    }
+
+    #[test]
+    fn reserved_mint_authority_read_from_genesis() {
+        let a = [0x5Au8; 32];
+        let app = format!(r#"{{"foundation_addr":"","reserved_mint_authority":"{}"}}"#, hex::encode(a));
+        assert_eq!(genesis_hash32(app.as_bytes(), "reserved_mint_authority"), Some(a));
+        assert_eq!(genesis_hash32(br#"{"reserved_mint_authority":""}"#, "reserved_mint_authority"), None);
+        assert_eq!(genesis_hash32(br#"{"reserved_mint_authority":"abcd"}"#, "reserved_mint_authority"), None);
+        assert_eq!(genesis_hash32(br#"{}"#, "reserved_mint_authority"), None);
+    }
 
     #[test]
     fn foundation_addr_read_from_genesis_app_state() {

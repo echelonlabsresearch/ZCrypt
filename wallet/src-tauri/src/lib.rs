@@ -7223,20 +7223,52 @@ async fn my_assets(state: State<'_, AppState>) -> R<Vec<MinterAsset>> {
     ok(out)
 }
 
+/// This wallet's mint-authority commitment for `ticker`: what a foundation blessing must
+/// name for a reserved ticker, and what the registry will store. Not a secret.
+#[tauri::command]
+async fn mint_authority_for(ticker: String, state: State<'_, AppState>) -> R<String> {
+    let t = ticker.trim().to_string();
+    if !zcrypt_core::asset_registry::valid_ticker(&t) {
+        return Err("ticker must be 2 to 10 ASCII letters/digits starting with a letter".into());
+    }
+    with_wallet(&state, |w| {
+        let seed = w.account.seed();
+        let cap = zcrypt_core::hash::h(b"ZC-MINTCAP", &[&seed[..], t.to_ascii_uppercase().as_bytes()]);
+        Ok(hex::encode(mint_authority_commitment(&cap, 1, 1)))
+    })
+    .and_then(ok)
+}
+
 /// Mint a shielded asset by ticker (devnet issuance). Registers the ticker
 /// **first-mint-wins — DENIED if it already exists** (e.g. zBTC) — with a mint
 /// authority derived from this account, then seeds `amount` base units of the new
 /// asset to the wallet. Returns the new asset id.
+///
+/// A reserved ticker (zETH, zSOL, ...: `asset_registry::RESERVED_TICKERS`) also needs the
+/// foundation's `blessing` (hex from `foundation_keys bless`), signed over this chain, the
+/// ticker, decimals, cap and THIS wallet's mint authority. The blessing is appended to the
+/// registration; minting afterwards is the ordinary path under this wallet's authority.
 #[tauri::command]
 async fn mint_asset(
     ticker: String,
     amount: u64,
     decimals: u8,
     max_supply: u64,
+    blessing: Option<String>,
     state: State<'_, AppState>,
 ) -> R<String> {
     let url = node_url(&state)?;
     let t = ticker.trim().to_string();
+    let blessing = match blessing.as_deref().map(str::trim).filter(|b| !b.is_empty()) {
+        Some(b) => {
+            let raw = hex::decode(b).map_err(|_| "the blessing must be hex, as foundation_keys bless prints it")?;
+            if zcrypt_core::mint_auth::decode_auth(&raw).is_none() {
+                return Err("the blessing is malformed".into());
+            }
+            Some(raw)
+        }
+        None => None,
+    };
     if t.is_empty() {
         return Err("enter a ticker".into());
     }
@@ -7282,9 +7314,22 @@ async fn mint_asset(
             None => {
                 // Free → register it (first-mint-wins) with your authority. Registration is
                 // a state-creating tx and carries a ZCRYPT gas note (0.01 ZCRYPT burned).
-                let body = bswap::register_body(decimals, &t, max_supply, &my_authority);
+                let mut body = bswap::register_body(decimals, &t, max_supply, &my_authority);
+                if zcrypt_core::asset_registry::is_reserved_ticker(&t) && blessing.is_none() {
+                    return Err(format!(
+                        "'{t}' is reserved for the network's own assets: registering it needs the foundation's \
+                         blessing over this wallet's mint authority {}",
+                        hex::encode(my_authority)
+                    ));
+                }
+                if let Some(b) = &blessing {
+                    body.extend_from_slice(b);
+                }
                 let (gas, gas_i, gchg) = mint_gas_prefix(w, &url, &body)?;
-                chain::broadcast(&url, &bswap::register_tx(&t, decimals, &my_authority, max_supply, &gas))?;
+                let mut tx = vec![0x59u8];
+                tx.extend_from_slice(&gas);
+                tx.extend_from_slice(&body);
+                chain::broadcast(&url, &tx)?;
                 w.coins[gas_i].spent = true;
                 if let Some(rec) = gchg {
                     w.coins.push(rec);
@@ -9039,6 +9084,7 @@ pub fn run() {
             btc_max_send,
             withdraw_btc,
             mint_asset,
+            mint_authority_for,
             my_assets,
             address_kind,
             save_export,

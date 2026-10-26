@@ -167,9 +167,25 @@ impl AssetMeta {
 pub struct AssetRegistry {
     by_ticker: BTreeMap<String, u64>,
     by_id: BTreeMap<u64, AssetMeta>,
+    /// The foundation's reserved-asset key set, as a [`crate::mint_auth::MintKeySet`]
+    /// commitment, bound from the genesis `app_state` (`reserved_mint_authority`). A
+    /// register transaction for one of the [`RESERVED_TICKERS`] (zBTC excepted: genesis
+    /// only) is accepted only when it carries M-of-N signatures from this set over the
+    /// registration (see [`crate::mint_auth::reserved_register_message`]). `None` leaves
+    /// the reserved names parked: no transaction can claim them.
+    reserved_authority: Option<Hash>,
 }
 
 impl AssetRegistry {
+    /// Bind the foundation key set that may bless reserved-ticker registrations. Set once
+    /// at genesis; folded into [`Self::root`] so every node agrees on who may bless.
+    pub fn set_reserved_authority(&mut self, authority: Hash) {
+        self.reserved_authority = Some(authority);
+    }
+    pub fn reserved_authority(&self) -> Option<Hash> {
+        self.reserved_authority
+    }
+
     /// Register `ticker` (first-mint-wins). Returns its deterministic asset id.
     /// Rejects an invalid or already-registered ticker.
     pub fn register(
@@ -430,6 +446,13 @@ impl AssetRegistry {
                 buf.extend_from_slice(&r.retired_at_btc_height.to_le_bytes());
             }
         }
+        match &self.reserved_authority {
+            Some(a) => {
+                buf.push(1);
+                buf.extend_from_slice(a);
+            }
+            None => buf.push(0),
+        }
         h(b"ZC-ASSETS", &[&buf])
     }
 }
@@ -509,6 +532,16 @@ mod tests {
         // Case-insensitive: all spellings share one id.
         assert_eq!(asset_id_for("zBTC"), asset_id_for("ZBTC"));
         assert_eq!(asset_id_for("zBTC"), asset_id_for("zbtc"));
+    }
+
+    #[test]
+    fn reserved_authority_moves_the_root_and_reads_back() {
+        let mut r = AssetRegistry::default();
+        assert_eq!(r.reserved_authority(), None);
+        let root0 = r.root();
+        r.set_reserved_authority([9u8; 32]);
+        assert_eq!(r.reserved_authority(), Some([9u8; 32]));
+        assert_ne!(r.root(), root0, "binding the foundation key set must move the registry root");
     }
 
     #[test]

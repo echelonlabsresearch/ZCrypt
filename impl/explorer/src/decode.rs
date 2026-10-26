@@ -252,6 +252,13 @@ which hides among the whole pool", hex_at(0, 64)));
                 asset_amt(rd_u64(body, 2 + tlen)?, None, Some(dec), Some(&ticker)),
             ));
             r.push(row(format!("[{}..{}]", 11 + tlen, 43 + tlen), "mint-authority commitment (H of M-of-N ML-DSA key set)", hex_at(2 + tlen + 8, 32)));
+            if body.len() > 43 + tlen {
+                r.push(row(
+                    format!("[{}..]", 43 + tlen),
+                    "foundation blessing: M-of-N ML-DSA signatures over this registration (reserved ticker)",
+                    format!("{} bytes", body.len() - 42 - tlen),
+                ));
+            }
         }
         0x5A => {
             let aid = rd_u64(body, 0)?;
@@ -451,6 +458,7 @@ pub fn describe_tx(b: &[u8], chain_id: &[u8], with_rules: bool, height: u64) -> 
             "ticker": body.get(1).and_then(|&tl| body.get(2..2 + tl as usize)).and_then(|s| std::str::from_utf8(s).ok()),
             "max_supply": body.get(1).and_then(|&tl| rd_u64(body, 2 + tl as usize)),
             "authority_commitment": body.get(1).and_then(|&tl| rd_hex(body, 2 + tl as usize + 8, 32)),
+            "foundation_blessed": body.get(1).map(|&tl| body.len() > 42 + tl as usize),
             "explains": "Ticker, decimals, and hard cap are public; the mint authority is a commitment to an M-of-N ML-DSA key set (no secret on chain).",
         }),
         Some(0x5A) => {

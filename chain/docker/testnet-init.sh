@@ -56,7 +56,8 @@ while [ "$i" -lt 3 ]; do
   # no zBTC on this chain), so a published genesis.json fully describes the chain.
   FADDR="${ZCRYPT_FOUNDATION_ADDR:-}"
   ZBTC_PK="${ZCRYPT_RESERVE_PK:-}"
-  sed -i "s|\"app_hash\": \"\"|\"app_hash\": \"\", \"app_state\": { \"registry\": { \"minted_total\": 0, \"leaves\": [] }, \"foundation_addr\": \"$FADDR\", \"zbtc_reserve_pk\": \"$ZBTC_PK\" }|" "$GEN"
+  RESERVED_AUTH="${ZCRYPT_RESERVED_MINT_AUTH:-}"
+  sed -i "s|\"app_hash\": \"\"|\"app_hash\": \"\", \"app_state\": { \"registry\": { \"minted_total\": 0, \"leaves\": [] }, \"foundation_addr\": \"$FADDR\", \"zbtc_reserve_pk\": \"$ZBTC_PK\", \"reserved_mint_authority\": \"$RESERVED_AUTH\" }|" "$GEN"
 
   echo "[init] node$i -> abci$i configured"
   i=$((i + 1))

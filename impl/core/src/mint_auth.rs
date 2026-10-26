@@ -141,6 +141,25 @@ pub fn rotate_message(chain_id: &[u8], asset_id: u64, epoch: u64, new_commitment
     m
 }
 
+/// The message the foundation signs to bless the registration of a reserved ticker
+/// (`asset_registry::RESERVED_TICKERS`): the exact registration, so a blessing cannot be
+/// repurposed for another ticker, cap, decimals or mint authority, and the chain id, so a
+/// testnet blessing cannot replay on mainnet. The ticker goes in canonical (upper-case)
+/// form, since that is the identity the registry keys on.
+pub fn reserved_register_message(chain_id: &[u8], ticker: &str, decimals: u8, max_supply: u64, authority: &Hash) -> Vec<u8> {
+    let canon = crate::asset_registry::canonical_ticker(ticker);
+    let mut m = Vec::with_capacity(24 + 4 + chain_id.len() + 4 + canon.len() + 1 + 8 + 32);
+    m.extend_from_slice(b"ZC-RESERVED-REGISTER-v1-");
+    m.extend_from_slice(&(chain_id.len() as u32).to_le_bytes());
+    m.extend_from_slice(chain_id);
+    m.extend_from_slice(&(canon.len() as u32).to_le_bytes());
+    m.extend_from_slice(canon.as_bytes());
+    m.push(decimals);
+    m.extend_from_slice(&max_supply.to_le_bytes());
+    m.extend_from_slice(authority);
+    m
+}
+
 /// Verify that `sigs` contains **at least `keyset.threshold` valid signatures from distinct
 /// keys** of `keyset` over `msg`. Returns `false` on any malformed key/signature,
 /// out-of-range or duplicated signer index, an invalid signature, or an insufficient count.
@@ -424,5 +443,29 @@ mod tests {
             SignerSig { key_index: 1, sig: other_signers[1].sign(&msg) },
         ];
         assert!(!verify_threshold(&ks, &msg, &sigs));
+    }
+
+    #[test]
+    fn reserved_register_blessing_binds_every_field() {
+        let (ks, signers) = derive_keyset(b"foundation", 3, 2);
+        let auth = [4u8; 32];
+        let msg = reserved_register_message(b"zcrypt-1", "zETH", 8, 1_000, &auth);
+        let sigs = authorize(&ks, &signers, &msg);
+        assert!(verify_threshold(&ks, &msg, &sigs));
+        // Case-insensitive ticker identity: the same blessing covers every spelling.
+        assert_eq!(msg, reserved_register_message(b"zcrypt-1", "ZETH", 8, 1_000, &auth));
+        for other in [
+            reserved_register_message(b"zcrypt-test", "zETH", 8, 1_000, &auth),
+            reserved_register_message(b"zcrypt-1", "zSOL", 8, 1_000, &auth),
+            reserved_register_message(b"zcrypt-1", "zETH", 6, 1_000, &auth),
+            reserved_register_message(b"zcrypt-1", "zETH", 8, 1_001, &auth),
+            reserved_register_message(b"zcrypt-1", "zETH", 8, 1_000, &[5u8; 32]),
+        ] {
+            assert!(!verify_threshold(&ks, &other, &sigs));
+        }
+        // Round-trips the wire codec the register tx carries it in.
+        let (ks2, sigs2) = decode_auth(&encode_auth(&ks, &sigs)).unwrap();
+        assert_eq!(ks2.commitment(), ks.commitment());
+        assert!(verify_threshold(&ks2, &msg, &sigs2));
     }
 }
