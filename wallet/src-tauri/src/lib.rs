@@ -9556,7 +9556,7 @@ mod live_3node {
         // a live lock that has not reached its timeout).
         let ticker = format!("E{:08X}", rand::random::<u32>());
         let mint_amt = 1_000_000u64;
-        let asset_id = v(mint_asset(ticker.clone(), mint_amt, 6, 100_000_000, alice.st())).expect("mint asset");
+        let asset_id = v(mint_asset(ticker.clone(), mint_amt, 6, 100_000_000, None, alice.st())).expect("mint asset");
         let minted = wait_until("minted asset on chain", 90, || {
             let mine = v(my_assets(alice.st())).ok()?;
             mine.into_iter().find(|a| a.ticker.eq_ignore_ascii_case(&ticker) && a.balance >= mint_amt)
