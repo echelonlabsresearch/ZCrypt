@@ -39,13 +39,17 @@ install_validator_key() {
 
 # check NAME VALUE ERE: abort unless VALUE matches the whole extended regex.
 check() {
-  if ! printf '%s' "$2" | grep -Eq "^($3)$"; then
+  # printf '%s\n': an EMPTY value must still produce one line for grep to match the
+  # patterns that allow it (`|[0-9a-f]{64}`); with '%s' alone grep sees no input and
+  # every optional-but-empty value fails.
+  if ! printf '%s\n' "$2" | grep -Eq "^($3)$"; then
     echo "[genesis] invalid $1='$2' (expected /$3/)" >&2
     # `cometbft init` has already written a default genesis.json and config.toml. Leaving
     # them would make every later start skip this whole block (no app_state, proxy_app at
     # 127.0.0.1) and run a chain with none of the values in .env. Remove them so the next
     # start re-validates from scratch.
-    rm -f "$GENESIS" "$CFG" "$HOME_DIR/config/genesis.sha256"
+    rm -f "$GENESIS" "$CFG" "$HOME_DIR/config/genesis.sha256" \
+          "$HOME_DIR/config/priv_validator_key.json" "$HOME_DIR/data/priv_validator_state.json"
     exit 1
   fi
 }
