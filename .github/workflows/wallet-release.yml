@@ -432,9 +432,9 @@ jobs:
               if not path.is_file():
                   continue
               name = path.name
-              # NSIS names the installer "<product>_<version>_x64-setup.exe".
-              # Do not hash every .exe under target/; the raw wallet binary is not a release asset.
-              if name.endswith((".dmg", ".deb", ".AppImage")) or name.endswith("-setup.exe"):
+              # Windows ships the WiX MSI (tauri also leaves its updater .zip and .sig next to
+              # it, which are not release assets); the raw wallet binary is not one either.
+              if name.endswith((".dmg", ".deb", ".AppImage", ".msi")):
                   files.append(path)
           if not files:
               sys.exit("no installer under wallet/src-tauri/target")
