@@ -258,6 +258,13 @@ impl Default for Node {
     }
 }
 
+/// Whether `new` more leaves fit in a tree that already holds `len`. The tree's own append
+/// refuses a leaf past `2^DEPTH`, but by then earlier mutations of the same transaction
+/// have been applied; this pure check runs first.
+fn tree_has_room(len: usize, new: usize) -> bool {
+    len.checked_add(new).is_some_and(|t| t <= (1usize << zcrypt_shield::DEPTH))
+}
+
 impl Node {
     pub fn new() -> Self {
         let commitment_tree = CommitmentTree::new();
@@ -318,7 +325,9 @@ impl Node {
     /// cannot spend coins and then fail.
     fn note_outputs_fresh(&self, commitments: impl IntoIterator<Item = Commitment>) -> Result<(), String> {
         let mut batch = std::collections::HashSet::new();
+        let mut count = 0usize;
         for c in commitments {
+            count += 1;
             if !batch.insert(c) || self.commitment_tree.contains(&c) {
                 return Err("duplicate commitment: this opening is already in the tree".into());
             }
@@ -331,6 +340,15 @@ impl Node {
             if self.immature.iter().any(|m| m.commitment == c) {
                 return Err("duplicate commitment: this opening is an immature SPV mint".into());
             }
+        }
+        // Capacity is checked here, BEFORE any nullifier is written, so a spend whose outputs
+        // would not fit is refused whole rather than burning its inputs and then failing the
+        // append (review 2026-10-26, L1). Every path that creates leaves runs this check.
+        if !tree_has_room(self.commitment_tree.len(), count) {
+            return Err(format!(
+                "commitment tree full: {} leaves, no room for {count} more",
+                self.commitment_tree.len()
+            ));
         }
         Ok(())
     }
@@ -3172,6 +3190,14 @@ mod tests {
         assert!(!node.htlc_book().is_reserved(&coin));
         assert!(node.commitment_tree.contains(&coin));
         assert!(node.note_outputs_fresh([coin]).unwrap_err().contains("already in the tree"));
+        // Capacity: the pure check behind the freshness gate (review 2026-10-26, L1).
+        let cap = 1usize << zcrypt_shield::DEPTH;
+        assert!(tree_has_room(0, 3));
+        assert!(tree_has_room(cap - 3, 3));
+        assert!(!tree_has_room(cap - 2, 3));
+        assert!(!tree_has_room(cap, 1));
+        assert!(!tree_has_room(usize::MAX, 1), "overflow must read as no room");
+        assert!(node.note_outputs_fresh([]).is_ok());
         // A second claim or an expire is refused (settled), never a duplicate-leaf panic.
         assert!(node.htlc_claim(&id, &preimage).is_err());
         node.set_height(timeout);
