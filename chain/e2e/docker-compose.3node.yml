@@ -81,6 +81,8 @@ services:
       # (print with `cargo run -p zcrypt-bridge --bin reserve_pubkey -- --key b1b1...b1`).
       # reorg_defense_3node needs the 0x07 key instead: override ZCRYPT_RESERVE_PK for that run.
       ZCRYPT_RESERVE_PK: ${ZCRYPT_RESERVE_PK:-03eef017846ec31a44edc6c7e8d26347f9914749ff5ca31eeb51841d501e74ed70}
+      # Reserved-asset authority (empty on the test network unless a driver sets it).
+      ZCRYPT_RESERVED_MINT_AUTH: ${ZCRYPT_RESERVED_MINT_AUTH:-}
     entrypoint: ["/bin/sh", "/init.sh"]
     volumes:
       - ../docker/testnet-init.sh:/init.sh:ro

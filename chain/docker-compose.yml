@@ -55,6 +55,9 @@ services:
       # 33-byte compressed reserve PUBLIC key (hex) baked into genesis as `zbtc_reserve_pk`;
       # the node registers zBTC against it at InitChain (see cometbft-entrypoint.sh).
       ZCRYPT_RESERVE_PK: ${ZCRYPT_RESERVE_PK:-}
+      # Foundation reserved-asset key-set commitment (64 hex) baked into genesis as
+      # `reserved_mint_authority`; empty parks the reserved tickers for good.
+      ZCRYPT_RESERVED_MINT_AUTH: ${ZCRYPT_RESERVED_MINT_AUTH:-}
       FOUNDATION_SENTINEL: ${FOUNDATION_SENTINEL:-true}
       FOUNDATION_SENTINEL_DECAY: ${FOUNDATION_SENTINEL_DECAY:-1000000}
       # JSON array of allowed browser origins for the raw RPC (default: none).
