@@ -10,6 +10,7 @@ export type IconName =
   | "history"
   | "gear"
   | "faceid"
+  | "scan"
   | "copy"
   | "share"
   | "check"
@@ -122,6 +123,12 @@ const PATHS: Record<IconName, ReactNode> = {
     <>
       <path d="M12 4 2.5 20h19z" />
       <path d="M12 10v4M12 17.5v.1" />
+    </>
+  ),
+  scan: (
+    <>
+      <path d="M4 8V6a2 2 0 0 1 2-2h2M16 4h2a2 2 0 0 1 2 2v2M20 16v2a2 2 0 0 1-2 2h-2M8 20H6a2 2 0 0 1-2-2v-2" />
+      <path d="M5 12h14" />
     </>
   ),
 };

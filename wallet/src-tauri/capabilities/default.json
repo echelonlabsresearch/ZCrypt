@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Least-privilege capability for the ZCrypt wallet's single trusted window. The app uses no Tauri plugins (node/BTC RPC and file writes go through explicit Rust commands), so only the core defaults are granted — no shell, fs, or http plugin access is exposed to the webview.",
+  "description": "Least-privilege capability for the ZCrypt wallet's single trusted window. Node and BTC RPC and file writes go through explicit Rust commands, so only the core defaults are granted here: no shell, fs or http plugin access reaches the webview. Phone-only plugin permissions live in mobile.json.",
   "windows": ["main"],
   "permissions": ["core:default"]
 }

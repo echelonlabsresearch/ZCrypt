@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { call, copySensitive, fmtAsset, HeldAsset, saveFile, toBaseAsset } from "../lib/api";
 import { Btn, dismissKeyboard, Field, Icon, Segmented, Sheet, shareFile, short, Spinner } from "./ui";
+import ScanOverlay, { addressFromQr } from "./ScanOverlay";
 import Success from "./Success";
 import { useAuth } from "./MobileApp";
 
@@ -32,6 +33,7 @@ export default function SendScreen({ active, onSent }: { active: boolean; onSent
   const [result, setResult] = useState<Result | null>(null);
   const [shared, setShared] = useState("");
   const [copied, setCopied] = useState(false);
+  const [scanning, setScanning] = useState(false);
 
   const load = useCallback(() => {
     call<HeldAsset[]>("held_assets").then(setAssets).catch(() => {});
@@ -56,6 +58,14 @@ export default function SendScreen({ active, onSent }: { active: boolean; onSent
     } catch {
       toast("Clipboard is empty");
     }
+  }
+
+  function scanned(text: string) {
+    setScanning(false);
+    const addr = addressFromQr(text);
+    if (!addr) return toast("That QR code is not a ZCrypt address");
+    setTo(addr);
+    setErr("");
   }
 
   function validate(): number | null {
@@ -201,6 +211,9 @@ export default function SendScreen({ active, onSent }: { active: boolean; onSent
         <Field label="Recipient" hint="A stealth address is recognised automatically and paid with an encrypted note instead of an on-chain transfer.">
           <div className="m-input-wrap">
             <input className="m-input" value={to} onChange={(e) => setTo(e.target.value)} placeholder="zc1…" autoCapitalize="none" autoCorrect="off" spellCheck={false} />
+            <button className="m-iconbtn" style={{ width: 36, height: 36, border: 0 }} onClick={() => { dismissKeyboard(); setScanning(true); }} aria-label="Scan a QR code">
+              <Icon name="scan" size={18} />
+            </button>
             <button className="m-iconbtn" style={{ width: 36, height: 36, border: 0 }} onClick={paste} aria-label="Paste">
               <Icon name="paste" size={18} />
             </button>
@@ -221,6 +234,8 @@ export default function SendScreen({ active, onSent }: { active: boolean; onSent
       <Btn full style={{ marginTop: 18 }} disabled={!amount || (mode === "address" && !to)} onClick={() => { dismissKeyboard(); setErr(""); if (validate() !== null) setReview(true); }}>
         Review
       </Btn>
+
+      {scanning && <ScanOverlay onResult={scanned} onClose={() => setScanning(false)} onError={(m) => { setScanning(false); toast("Could not open the camera", m); }} />}
 
       <Sheet open={review} onClose={() => !busy && setReview(false)} title={busy === "proving" ? "Sending" : "Review"}>
         {busy === "proving" ? (

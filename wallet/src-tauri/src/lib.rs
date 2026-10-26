@@ -8970,6 +8970,8 @@ pub fn run() {
     let builder = tauri::Builder::default();
     #[cfg(mobile)]
     let builder = builder.plugin(tauri_plugin_biometric::init());
+    #[cfg(mobile)]
+    let builder = builder.plugin(tauri_plugin_barcode_scanner::init()); // Send: scan an address QR code
     let app = builder
         .manage(AppState::default())
         .setup(|app| {

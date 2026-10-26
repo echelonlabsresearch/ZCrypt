@@ -1161,3 +1161,70 @@
 .m-pager .m-iconbtn:disabled {
   opacity: 0.35;
 }
+
+/* ---------- QR scanner (Send) ---------- */
+/* The camera preview is a native layer behind a transparent webview: lift every background
+   the shell paints and hide the screen, leaving only the scanner overlay. */
+:root[data-shell="mobile"].m-scanning body,
+:root[data-shell="mobile"].m-scanning #root,
+:root[data-shell="mobile"].m-scanning .m-app {
+  background: transparent !important;
+  background-image: none !important;
+}
+:root[data-shell="mobile"].m-scanning .m-app > :not(.m-scan) {
+  visibility: hidden;
+}
+.m-scan {
+  position: fixed;
+  inset: 0;
+  z-index: 70;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  color: #fff;
+}
+.m-scan.starting,
+.m-scan.denied {
+  background: var(--bg);
+}
+.m-scan-close {
+  position: absolute;
+  top: calc(env(safe-area-inset-top, 0px) + 14px);
+  right: 16px;
+  background: rgba(14, 18, 27, 0.72);
+  color: #fff;
+}
+.m-scan-frame {
+  width: min(68vw, 290px);
+  aspect-ratio: 1;
+  border-radius: 24px;
+  border: 2px solid rgba(255, 255, 255, 0.92);
+  box-shadow: 0 0 0 200vmax rgba(6, 8, 15, 0.62);
+}
+.m-scan-hint {
+  position: absolute;
+  left: 32px;
+  right: 32px;
+  bottom: calc(env(safe-area-inset-bottom, 0px) + 56px);
+  text-align: center;
+  font-size: 15px;
+  color: rgba(255, 255, 255, 0.85);
+}
+.m-scan-denied {
+  padding: 0 28px;
+  text-align: center;
+  color: var(--text);
+}
+.m-scan-denied .m-avatar {
+  width: 56px;
+  height: 56px;
+  margin: 0 auto 14px;
+}
+.m-scan-denied h3 {
+  margin: 0 0 6px;
+  font-size: 20px;
+}
+.m-scan-denied .m-btnrow {
+  margin-top: 20px;
+}

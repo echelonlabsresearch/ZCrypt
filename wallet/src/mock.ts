@@ -107,6 +107,12 @@ export function installMock() {
   w.__TAURI_INTERNALS__ = {
     invoke: async (cmd: string, args?: Record<string, unknown>): Promise<unknown> => {
       await new Promise((r) => setTimeout(r, 80));
+      if (cmd === "plugin:barcode-scanner|check_permissions" || cmd === "plugin:barcode-scanner|request_permissions") return { camera: "granted" };
+      if (cmd === "plugin:barcode-scanner|scan") {
+        await new Promise((r) => setTimeout(r, 2500)); // a browser has no camera layer: pretend a code was read
+        return { content: ZC, format: "QR_CODE" };
+      }
+      if (cmd === "plugin:barcode-scanner|cancel") return null;
       if (cmd.startsWith("plugin:")) return 1; // event listen/unlisten ids
       console.log("[mock]", cmd, args ?? "");
       if (cmd in DATA) return { success: true, data: DATA[cmd] } satisfies Resp;

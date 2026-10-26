@@ -61,6 +61,7 @@ p3-util = { path = "../../impl/vendor/p3-util" }
 opt-level = 3
 
 [target.'cfg(any(target_os = "ios", target_os = "android"))'.dependencies]
+tauri-plugin-barcode-scanner = "2"
 tauri-plugin-biometric = "2"   # Face ID / Touch ID prompt, raised from Rust
 
 [target.'cfg(target_os = "ios")'.dependencies]
