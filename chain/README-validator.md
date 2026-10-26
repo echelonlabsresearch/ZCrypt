@@ -31,7 +31,7 @@ Two things worth doing before you trust it with a bond:
   ```sh
   IMG=$(grep -o 'ghcr.io/[^ ]*@sha256:[0-9a-f]*' docker-compose.validator.yml | head -1)
   cosign verify "$IMG" \
-    --certificate-identity-regexp '^https://github.com/echelonlabsresearch/zcrypt-v2/\.github/workflows/image\.yml@refs/tags/v' \
+    --certificate-identity-regexp '^https://github.com/echelonlabsresearch/ZCrypt/\.github/workflows/image\.yml@refs/tags/v' \
     --certificate-oidc-issuer https://token.actions.githubusercontent.com
   ```
 

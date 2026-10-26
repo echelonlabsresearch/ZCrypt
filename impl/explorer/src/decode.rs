@@ -693,8 +693,33 @@ fn op_gate(op: u8) -> (&'static str, &'static str) {
         0x1B => ("CHECK_ASSET_REGISTERED", "asset id is registered"),
         0x1C => ("CHECK_BURN_OUTPUT", "output[0] == the declared burn coin"),
         0x1D => ("CHECK_THRESHOLD_SIG", ">= M valid ML-DSA signatures from the asset's key set"),
+        0x1E => ("CHECK_SPV_PROOF", "a verified Bitcoin SPV deposit proof against the consensus header chain"),
+        0x1F => ("CHECK_AMOUNT_EQ_CLAIMABLE", "amount == the whole claimable balance (partial claims are refused)"),
+        0x20 => ("CHECK_CLAIMABLE_MIN", "claimable >= 1 ZCRYPT (no forced dust claims)"),
         0x21 => ("CHECK_GAS_PAID", "a ZCRYPT lock burned its fee in-proof, or a live paired ZCRYPT swap lock named this lock as the one it sponsors"),
         _ => ("?", "unknown opcode"),
+    }
+}
+
+#[cfg(test)]
+mod op_table_tests {
+    use super::op_gate;
+    use zcrypt_core::zvm as g;
+
+    /// Every opcode that appears in a consensus-gate program has a name in the explorer's
+    /// table, so a program can never render as "unknown opcode".
+    #[test]
+    fn every_gate_program_opcode_is_named() {
+        let programs: &[&[u8]] = &[
+            g::SWAP_LOCK_NATIVE, g::BOND, g::CLAIM, g::CLAIM_FEE, g::REGISTER, g::HTLC_OPEN,
+            g::HTLC_CLAIM, g::HTLC_EXPIRE, g::HTLC_BURN_LOCK, g::ROTATE_AUTH, g::HTLC_OPEN_SPV,
+            g::ZCRYPT_TRANSFER,
+        ];
+        for prog in programs {
+            for &op in *prog {
+                assert_ne!(op_gate(op).0, "?", "gate opcode 0x{op:02X} has no explorer name");
+            }
+        }
     }
 }
 
@@ -849,7 +874,7 @@ fn gate_op_result(tag: u8, op: u8, body: &[u8], chain_id: &[u8], height: u64) ->
         }
         // state-dependent checks: honest note. (0x1D here is rotation, which binds a historical
         // epoch; 0x1E is the SPV deposit proof, verified against the consensus header chain.)
-        0x14 | 0x15 | 0x17 | 0x1B | 0x1D | 0x1E | 0x21 => Some(state),
+        0x14 | 0x15 | 0x17 | 0x1B | 0x1D | 0x1E | 0x1F | 0x20 | 0x21 => Some(state),
         _ => None,
     }
 }
