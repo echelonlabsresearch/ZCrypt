@@ -102,8 +102,15 @@ validators are the bootstrap quorum; new validators join dynamically on top.
 
 ### 2. Run a node and join a running chain
 
-Bring up a full node (a CometBFT validator + its ABCI app) that peers with the network
-and syncs. On a single host you can add a 4th service to `docker-compose.3node.yml`
+On the public chain, the node's consensus identity comes from the wallet. In the wallet
+open **Rewards, Run a validator, Node setup** and click **Copy the .env line**; put that
+`VALIDATOR_KEY=...` line in a `.env` next to `chain/docker-compose.validator.yml`
+**before the node's first start**, then `docker compose -f docker-compose.validator.yml
+up -d`. The entrypoint installs the line as `priv_validator_key.json`, downloads the
+genesis from the foundation RPC, discovers a seed peer and syncs (details, genesis-hash
+pinning and image verification: [`chain/README-validator.md`](chain/README-validator.md)).
+
+On a local 3-node devnet you can instead add a 4th service to `docker-compose.3node.yml`
 (copy a `cometbftN`/`abciN` pair, give it a fresh volume + `NODE_INDEX` + published
 port); across hosts, run the same two containers and set `persistent_peers` to a
 genesis node. Every node ships the same genesis, so it validates and replicates from
@@ -111,10 +118,12 @@ block 0. At this point it is a **syncing full node** — it doesn't yet produce 
 
 ### 3. Bond → pledge stake → become a block producer
 
-Submit a **BOND (`0x57`)** transaction signed by the node's ed25519 **consensus key**
-(the first 32 bytes of its `priv_validator_key.json`). The wallet never sees that key: it
-prepares the bond and the validator host signs it with `bond_validator sign` (see
-chain/README-validator.md, section 3). Bonding **genuinely pledges your
+A **BOND (`0x57`)** transaction must be signed by the node's ed25519 **consensus key**
+(the first 32 bytes of its `priv_validator_key.json`). With the wallet-owned key from
+step 2 the wallet holds that key, so bonding is a button: **Rewards, Run a validator,
+Bond**. Only when the node generated its own key does the wallet not have it; then the
+wallet prepares the bond and the validator host signs it with `bond_validator sign`
+(chain/README-validator.md, section 3). Bonding **genuinely pledges your
 coins**: the tx carries a shield spend that burns ≥ 10,000 ZCRYPT into an unspendable
 burn coin, so the stake is real, locked value — not a self-declared number. It also
 names a reward address. On the next block the ABCI app emits the `ValidatorUpdate` and
@@ -135,7 +144,8 @@ curl -s 'http://localhost:46657/abci_query?path="/staking/validators"'
 
 ### 4. Unbond → leave → reclaim your stake
 
-Submit an **UNBOND (`0x5E`)** transaction (signed by the same consensus key). The ABCI
+Submit an **UNBOND (`0x5E`)** transaction, signed by the same consensus key (a wallet
+button with a wallet-owned key, otherwise signed on the host like the bond). The ABCI
 app sets your voting power to 0 and CometBFT drops you from the producing set on the
 next block. Your pledged stake stays **locked for a 10-day unbonding period**, then
 returns as a claimable balance — withdraw it into a spendable coin with **CLAIM
