@@ -843,6 +843,47 @@
   text-align: right;
   font-variant-numeric: tabular-nums;
 }
+/* The phrase screen: a denser grid and a footer that stays on screen, so the
+   acknowledgement and the Open button never hide below the fold. */
+.m-gate.seed {
+  padding-bottom: 0;
+}
+.m-gate.seed .m-seed {
+  grid-template-columns: 1fr 1fr 1fr;
+  gap: 6px;
+  margin-top: 12px;
+}
+.m-gate.seed .m-seed div {
+  padding: 7px 8px;
+  font-size: 13px;
+  gap: 6px;
+  border-radius: 10px;
+}
+.m-gate.seed .m-seed span {
+  width: 16px;
+  font-size: 11px;
+}
+.m-seed-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 10px;
+}
+.m-seed-actions .m-btn {
+  flex: 1;
+  min-width: 0;
+}
+.m-seed-footer {
+  position: sticky;
+  bottom: 0;
+  margin-top: auto;
+  padding: 10px 0 calc(var(--sab) + 16px);
+  background: linear-gradient(180deg, transparent, var(--bg) 22%);
+}
+.m-seed-footer .m-check {
+  margin-top: 0;
+  margin-bottom: 12px;
+  font-size: 14px;
+}
 .m-check {
   display: flex;
   gap: 12px;

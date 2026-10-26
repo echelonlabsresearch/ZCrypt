@@ -1,6 +1,6 @@
 import { useRef, useState } from "react";
-import { call, copySensitive } from "../lib/api";
-import { authError, Btn, Icon, Logo, PinPad, Spinner } from "./ui";
+import { call, copySensitive, saveFile } from "../lib/api";
+import { authError, Btn, Icon, Logo, PinPad, shareFile, Spinner } from "./ui";
 import { bioName, useAuth } from "./MobileApp";
 
 type Step = "welcome" | "restore" | "password" | "pin" | "pin2" | "bio" | "working" | "seed";
@@ -22,6 +22,7 @@ export default function Onboarding({ adopt, onDone }: { adopt: boolean; onDone: 
   const [seed, setSeed] = useState("");
   const [ack, setAck] = useState(false);
   const [copied, setCopied] = useState(false);
+  const [saved, setSaved] = useState("");
   const key = useRef(0);
   const bio = bioName(status);
 
@@ -184,7 +185,7 @@ export default function Onboarding({ adopt, onDone }: { adopt: boolean; onDone: 
   // seed
   const words = seed.split(/\s+/).filter(Boolean);
   return (
-    <div className="m-gate top">
+    <div className="m-gate top seed">
       <h1 className="m-title small" style={{ marginTop: 0 }}>Your recovery phrase</h1>
       <p className="m-sub">Write these 24 words down and keep them offline. They are the only way to recover this wallet.</p>
       <div className="m-seed">
@@ -192,15 +193,22 @@ export default function Onboarding({ adopt, onDone }: { adopt: boolean; onDone: 
           <div key={i}><span>{i + 1}</span>{w}</div>
         ))}
       </div>
-      <div className="wide">
-        <Btn full kind="secondary" small style={{ marginTop: 12 }} onClick={() => { copySensitive(seed); setCopied(true); setTimeout(() => setCopied(false), 1800); }}>
+      <div className="wide m-seed-actions">
+        <Btn full kind="secondary" small onClick={() => { copySensitive(seed); setCopied(true); setTimeout(() => setCopied(false), 1800); }}>
           <Icon name="copy" size={18} /> {copied ? "Copied · clears in 60 s" : "Copy phrase"}
         </Btn>
+        <Btn full kind="secondary" small onClick={async () => setSaved(await shareFile(seed + "\n", "zcrypt-recovery-phrase.txt", saveFile))}>
+          <Icon name="share" size={18} /> {saved === "shared" ? "Saved" : "Save to Files"}
+        </Btn>
+      </div>
+      {saved && saved !== "shared" && saved !== "cancelled" && (
+        <p className="m-hint wide" style={{ marginTop: 6 }}>{saved.startsWith("Could not") ? saved : `Saved to ${saved}`}</p>
+      )}
+      <div className="wide m-seed-footer">
         <label className="m-check">
           <input type="checkbox" checked={ack} onChange={(e) => setAck(e.target.checked)} />
           I have written the phrase down. Anyone who has it controls my funds, and ZCrypt cannot recover it for me.
         </label>
-        <div style={{ height: 18 }} />
         <Btn full disabled={!ack} onClick={onDone}>Open my wallet</Btn>
       </div>
     </div>

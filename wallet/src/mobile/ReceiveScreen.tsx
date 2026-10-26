@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import QRCode from "qrcode";
-import { call, copy, fmtAsset } from "../lib/api";
-import { Banner, Btn, Icon, Segmented, short, Spinner } from "./ui";
+import { call, copy, fmtAsset, saveFile } from "../lib/api";
+import { Banner, Btn, Icon, Segmented, shareFile, short, Spinner } from "./ui";
 import Success from "./Success";
 import { useAuth } from "./MobileApp";
 
@@ -94,10 +94,17 @@ export default function ReceiveScreen({
   }, [incoming]);
 
   async function share() {
+    // iOS: the app's own share sheet (a plain sheet, not WebKit's popover), as a text file
+    // the recipient can open or paste from. Elsewhere: the web share API with the address
+    // as text, then the clipboard as a last resort.
+    if (/iPhone|iPad|iPod/.test(navigator.userAgent)) {
+      await shareFile(address + "\n", "zcrypt-address.txt", saveFile);
+      return;
+    }
     try {
       await navigator.share({ text: address });
     } catch {
-      /* dismissed */
+      /* dismissed or unsupported */
     }
   }
   async function pasteAndReceive() {
