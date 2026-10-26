@@ -334,6 +334,22 @@ pub async fn mobile_confirm(pin: Option<String>, app: tauri::AppHandle, state: S
     ok(true)
 }
 
+/// Show the 24-word recovery phrase, after Face ID or the PIN. The authentication
+/// releases the device secret, which then unseals the keystore, so a cancelled Face ID
+/// or a wrong PIN reveals nothing. The phrase is not kept anywhere by the shell.
+#[tauri::command]
+pub async fn mobile_reveal_phrase(pin: Option<String>, app: tauri::AppHandle, state: State<'_, AppState>) -> R<super::SecretString> {
+    if state.wallet.lock().unwrap().is_none() {
+        return Err("wallet is locked".into());
+    }
+    let dir = state.data_dir.lock().unwrap().clone();
+    let secret = authenticate(app, &dir, pin, "Show your recovery phrase").await?;
+    let raw = std::fs::read_to_string(keystore_path(&dir)).map_err(|_| "no wallet")?;
+    let ks: Keystore = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
+    let phrase = unseal(&secret, &ks).ok_or("wrong password")?;
+    ok(super::SecretString(Zeroizing::new(phrase.to_string())))
+}
+
 /// Switch Face ID unlock on (needs the PIN to release the secret) or off.
 #[tauri::command]
 pub async fn mobile_set_biometric(enabled: bool, pin: Option<String>, app: tauri::AppHandle, state: State<'_, AppState>) -> R<bool> {

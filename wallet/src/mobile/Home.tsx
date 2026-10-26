@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { call, copySensitive, fmtAsset, HeldAsset } from "../lib/api";
 import { Icon, Sheet, Btn, shareFile, short } from "./ui";
 import { saveFile } from "../lib/api";
@@ -27,6 +27,10 @@ export default function Home({ refreshTick, onSend, onReceive }: { refreshTick: 
   const [spinning, setSpinning] = useState(false);
   const [settings, setSettings] = useState(false);
   const [openSecret, setOpenSecret] = useState<PendingSecret | null>(null);
+  // Pull to refresh: how far the finger has dragged down from the top of the screen.
+  const [pull, setPull] = useState(0);
+  const pullRef = useRef<{ y0: number; on: boolean }>({ y0: 0, on: false });
+  const wrap = useRef<HTMLDivElement>(null);
 
   const loadLocal = useCallback(async () => {
     const [a, b, s] = await Promise.all([
@@ -65,6 +69,23 @@ export default function Home({ refreshTick, onSend, onReceive }: { refreshTick: 
   const others = assets.filter((a) => a.asset_id !== "0");
   const [whole, frac] = fmtAsset(native.balance, native.decimals).split(".");
 
+  const PULL_ARM = 72;
+  function pullStart(e: React.TouchEvent) {
+    const scroller = wrap.current?.parentElement;
+    pullRef.current = { y0: e.touches[0].clientY, on: !!scroller && scroller.scrollTop <= 0 && !spinning };
+  }
+  function pullMove(e: React.TouchEvent) {
+    if (!pullRef.current.on) return;
+    const dy = e.touches[0].clientY - pullRef.current.y0;
+    setPull(dy > 0 ? Math.min(dy * 0.55, 110) : 0);
+  }
+  function pullEnd() {
+    if (!pullRef.current.on) return;
+    pullRef.current.on = false;
+    if (pull >= PULL_ARM) refresh();
+    setPull(0);
+  }
+
   async function dismiss(id: number) {
     await call("dismiss_pending_secret", { id }).catch(() => {});
     setOpenSecret(null);
@@ -72,19 +93,24 @@ export default function Home({ refreshTick, onSend, onReceive }: { refreshTick: 
   }
 
   return (
-    <>
+    <div ref={wrap} onTouchStart={pullStart} onTouchMove={pullMove} onTouchEnd={pullEnd} onTouchCancel={pullEnd}>
+      <div className={`m-pull ${spinning ? "busy" : ""}`} style={{ height: spinning ? 44 : pull }} aria-hidden={!spinning && pull === 0}>
+        <span
+          style={{
+            display: "inline-flex",
+            opacity: spinning ? 1 : Math.min(pull / PULL_ARM, 1),
+            transform: spinning ? "none" : `rotate(${Math.min(pull / PULL_ARM, 1) * 360}deg)`,
+            animation: spinning ? "m-spin 0.8s linear infinite" : "none",
+          }}
+        >
+          <Icon name="refresh" size={20} />
+        </span>
+      </div>
       <div className="m-head">
         <h1 className="m-title">Portfolio</h1>
-        <div style={{ display: "flex", gap: 8 }}>
-          <button className="m-iconbtn" onClick={refresh} aria-label="Refresh">
-            <span style={{ display: "inline-flex", animation: spinning ? "m-spin 0.8s linear infinite" : "none" }}>
-              <Icon name="refresh" size={20} />
-            </span>
-          </button>
-          <button className="m-iconbtn" onClick={() => setSettings(true)} aria-label="Settings">
-            <Icon name="gear" size={20} />
-          </button>
-        </div>
+        <button className="m-iconbtn" onClick={() => setSettings(true)} aria-label="Settings">
+          <Icon name="gear" size={20} />
+        </button>
       </div>
 
       <div className="m-hero">
@@ -170,6 +196,6 @@ export default function Home({ refreshTick, onSend, onReceive }: { refreshTick: 
           </>
         )}
       </Sheet>
-    </>
+    </div>
   );
 }

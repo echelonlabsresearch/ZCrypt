@@ -83,6 +83,18 @@
 .m-screen.no-tabs {
   padding-bottom: calc(var(--sab) + 28px);
 }
+/* pull to refresh: a strip above the title that grows with the drag */
+.m-pull {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+  color: var(--text-2);
+  transition: height 0.18s ease-out;
+}
+.m-pull.busy {
+  color: var(--accent);
+}
 .m-head {
   display: flex;
   align-items: center;

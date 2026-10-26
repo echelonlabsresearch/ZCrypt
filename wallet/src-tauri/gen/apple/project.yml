@@ -62,7 +62,7 @@ targets:
               public.filename-extension: [zcrypt]
               public.mime-type: [application/x-zcrypt]
         CFBundleShortVersionString: 0.2.0
-        CFBundleVersion: "1"
+        CFBundleVersion: "3"
     entitlements:
       path: zcrypt-wallet_iOS/zcrypt-wallet_iOS.entitlements
     scheme:

@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
-import { call } from "../lib/api";
-import { authError, Btn, Icon, PinPad, Sheet, Switch } from "./ui";
+import { call, copySensitive } from "../lib/api";
+import { authError, Btn, Icon, PinPad, Sheet, Switch, shareFile } from "./ui";
+import { saveFile } from "../lib/api";
 import { bioName, useAuth } from "./MobileApp";
 
 interface NodeStatus {
@@ -28,6 +29,10 @@ export default function SettingsSheet({ open, onClose }: { open: boolean; onClos
   const [pinErr, setPinErr] = useState("");
   const key = useRef(0);
   const bio = bioName(status);
+  // The recovery phrase, shown in its own sheet after Face ID or the PIN; dropped on close.
+  const [phrase, setPhrase] = useState("");
+  const [phraseBusy, setPhraseBusy] = useState(false);
+  const [copied, setCopied] = useState(false);
 
   useEffect(() => {
     if (!open) return;
@@ -53,6 +58,34 @@ export default function SettingsSheet({ open, onClose }: { open: boolean; onClos
     } finally {
       setBioBusy(false);
     }
+  }
+
+  async function showPhrase() {
+    setPhraseBusy(true);
+    try {
+      let p = "";
+      if (status.biometric) {
+        try {
+          p = await call<string>("mobile_reveal_phrase", { pin: null });
+        } catch (e) {
+          if (authError(e).kind !== "biometric") throw e;
+          // Face ID declined or unavailable: fall through to the PIN.
+        }
+      }
+      if (!p) {
+        const ok = await askPin("Enter your PIN to show the phrase", (pin) => call<string>("mobile_reveal_phrase", { pin }).then((r) => { p = r; }));
+        if (!ok) return;
+      }
+      setPhrase(p);
+    } catch (e) {
+      toast("Could not show the phrase", String(e));
+    } finally {
+      setPhraseBusy(false);
+    }
+  }
+  async function savePhrase() {
+    const r = await shareFile(`ZCrypt Wallet recovery phrase\n\n${phrase}\n\nAnyone with these 24 words can spend this wallet. Keep this file private.\n`, "zcrypt-recovery-phrase.txt", saveFile);
+    if (r !== "shared") toast(r.startsWith("Could not") ? "Could not save" : "Saved", r === "shared" ? "" : r);
   }
 
   function startChange() {
@@ -118,6 +151,14 @@ export default function SettingsSheet({ open, onClose }: { open: boolean; onClos
           </div>
           <Icon name="chevron" size={20} />
         </button>
+        <button className="m-row" onClick={showPhrase} disabled={phraseBusy}>
+          <span className="m-avatar soft"><Icon name="file" size={20} /></span>
+          <div className="grow">
+            <div className="primary">Recovery phrase</div>
+            <div className="secondary">Show the 24 words or save them to Files</div>
+          </div>
+          <Icon name="chevron" size={20} />
+        </button>
         <button className="m-row" onClick={() => { onClose(); lock(); }}>
           <span className="m-avatar soft"><Icon name="close" size={20} /></span>
           <div className="grow">
@@ -141,6 +182,24 @@ export default function SettingsSheet({ open, onClose }: { open: boolean; onClos
       <p className="m-hint m-center" style={{ marginTop: 20 }}>
         ZCrypt Wallet {VERSION} · keys never leave this phone
       </p>
+
+      <Sheet open={phrase !== ""} onClose={() => { setPhrase(""); setCopied(false); }} title="Recovery phrase">
+        <p className="m-hint" style={{ margin: "0 0 4px" }}>These 24 words are the whole wallet. Anyone who has them can spend it. Keep them offline, or in a file only you can open.</p>
+        <div className="m-seed" style={{ marginTop: 12 }}>
+          {phrase.split(" ").map((w, i) => (
+            <div key={i}><span>{i + 1}</span>{w}</div>
+          ))}
+        </div>
+        <div className="m-btnrow" style={{ marginTop: 14 }}>
+          <Btn kind="secondary" onClick={savePhrase}>
+            <Icon name="share" size={18} /> Save to Files
+          </Btn>
+          <Btn kind="secondary" onClick={() => { copySensitive(phrase); setCopied(true); setTimeout(() => setCopied(false), 1800); }}>
+            <Icon name="copy" size={18} /> {copied ? "Copied · clears in 60 s" : "Copy"}
+          </Btn>
+        </div>
+        <Btn full kind="ghost" style={{ marginTop: 6 }} onClick={() => { setPhrase(""); setCopied(false); }}>Done</Btn>
+      </Sheet>
     </Sheet>
   );
 }

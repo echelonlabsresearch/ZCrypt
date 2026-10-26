@@ -8658,6 +8658,51 @@ async fn share_file(filename: String, content: String, webview: tauri::Webview) 
     }
 }
 
+/// Re-runs WebKit's layout of the web view (iOS only; a no-op elsewhere).
+///
+/// On iOS 26 the WKWebView is created while tao's view is still at its pre-attachment
+/// size and grows to the window bounds during the view-controller transition. WebKit keeps
+/// the layout viewport it computed first (window height minus the safe areas), so
+/// `innerHeight` stays short and a band of the native background shows below the page.
+/// A `setNeedsLayout` + `layoutIfNeeded` once the view has its final frame makes WebKit
+/// re-measure. Called after the window settles and again from the shell whenever it sees
+/// `innerHeight` fall short of `screen.height`.
+#[tauri::command]
+async fn mobile_relayout(webview: tauri::Webview) -> R<bool> {
+    #[cfg(target_os = "ios")]
+    {
+        webview.with_webview(|pw| ios_relayout(pw.inner())).map_err(|e| e.to_string())?;
+        return ok(true);
+    }
+    #[cfg(not(target_os = "ios"))]
+    {
+        let _ = webview;
+        ok(false)
+    }
+}
+
+#[cfg(target_os = "ios")]
+fn ios_relayout(wk: *mut std::ffi::c_void) {
+    if wk.is_null() {
+        return;
+    }
+    // SAFETY: tauri hands us the live WKWebView, on the main thread.
+    let view: &objc2_ui_kit::UIView = unsafe { &*(wk as *const objc2_ui_kit::UIView) };
+    view.setNeedsLayout();
+    view.layoutIfNeeded();
+}
+
+/// Schedules a relayout of every webview of `window` after `delay_ms`.
+#[cfg(target_os = "ios")]
+fn ios_relayout_later(window: tauri::Window, delay_ms: u64) {
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+        for wv in window.webviews() {
+            let _ = wv.with_webview(|pw| ios_relayout(pw.inner()));
+        }
+    });
+}
+
 #[cfg(target_os = "ios")]
 mod ios_share {
     use objc2::rc::Retained;
@@ -8992,6 +9037,7 @@ pub fn run() {
             take_opened_files,
             prover_selftest,
             share_file,
+            mobile_relayout,
             mobile_auth::mobile_auth_status,
             mobile_auth::mobile_create,
             mobile_auth::mobile_unlock,
@@ -8999,7 +9045,17 @@ pub fn run() {
             mobile_auth::mobile_set_biometric,
             mobile_auth::mobile_change_pin,
             mobile_auth::mobile_adopt,
+            mobile_auth::mobile_reveal_phrase,
         ])
+        .on_window_event(|_window, _event| {
+            // iOS: the view reaches its final size during the view-controller transition;
+            // WebKit's layout viewport does not follow on its own (see `mobile_relayout`).
+            #[cfg(target_os = "ios")]
+            if let tauri::WindowEvent::Resized(_) = _event {
+                ios_relayout_later(_window.clone(), 250);
+                ios_relayout_later(_window.clone(), 1000);
+            }
+        })
         .build(tauri::generate_context!())
         .expect("error while building ZCrypt wallet");
     app.run(|_app, _event| {

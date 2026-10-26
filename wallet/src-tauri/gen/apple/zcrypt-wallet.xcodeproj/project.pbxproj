@@ -286,7 +286,7 @@
 				PRODUCT_BUNDLE_IDENTIFIER = io.zcrypt.wallet;
 				PRODUCT_NAME = "ZCrypt Wallet";
 				SDKROOT = iphoneos;
-				TARGETED_DEVICE_FAMILY = "1,2";
+				TARGETED_DEVICE_FAMILY = "1";
 				VALID_ARCHS = arm64;
 			};
 			name = debug;
@@ -437,7 +437,7 @@
 				PRODUCT_BUNDLE_IDENTIFIER = io.zcrypt.wallet;
 				PRODUCT_NAME = "ZCrypt Wallet";
 				SDKROOT = iphoneos;
-				TARGETED_DEVICE_FAMILY = "1,2";
+				TARGETED_DEVICE_FAMILY = "1";
 				VALID_ARCHS = arm64;
 			};
 			name = release;

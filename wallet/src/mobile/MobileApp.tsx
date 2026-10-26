@@ -107,13 +107,45 @@ export default function MobileApp() {
       const tag = document.activeElement?.tagName;
       if (tag !== "INPUT" && tag !== "TEXTAREA" && (window.scrollY || vv.offsetTop)) window.scrollTo(0, 0);
     };
+    // iOS: WebKit can keep a layout viewport shorter than the screen from before the web
+    // view reached its final size (a band of native background below the page, the tab
+    // bar pushed up). Ask the native side to re-run layout, and keep asking until the
+    // viewport fills the screen: too early and the view has not settled yet.
+    let fixTimer = 0;
+    let fixTries = 0;
+    const fixHeight = () => {
+      window.clearTimeout(fixTimer);
+      const tag = document.activeElement?.tagName;
+      const typing = tag === "INPUT" || tag === "TEXTAREA";
+      if (typing || window.screen.height - window.innerHeight <= 2 || fixTries >= 40) {
+        fixTries = 0;
+        return;
+      }
+      fixTries += 1;
+      call("mobile_relayout")
+        .catch(() => {})
+        .then(() => {
+          apply();
+          fixTimer = window.setTimeout(fixHeight, fixTries < 6 ? 250 : 1000);
+        });
+    };
+    const onResize = () => {
+      apply();
+      fixHeight();
+    };
     apply();
+    fixHeight();
+    window.addEventListener("resize", onResize);
+    document.addEventListener("visibilitychange", onResize);
     vv.addEventListener("resize", apply);
     vv.addEventListener("scroll", apply);
     window.addEventListener("focusout", () => setTimeout(apply, 50));
     return () => {
+      window.clearTimeout(fixTimer);
       vv.removeEventListener("resize", apply);
       vv.removeEventListener("scroll", apply);
+      window.removeEventListener("resize", onResize);
+      document.removeEventListener("visibilitychange", onResize);
     };
   }, []);
 
