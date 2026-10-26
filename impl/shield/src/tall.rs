@@ -980,4 +980,234 @@ mod tests {
         assert!(crate::is_mainnet_grade(), "shipped FRI constants must be mainnet-grade");
         crate::assert_mainnet_grade(); // must NOT panic
     }
+
+    // ---- constraint mutation tests -------------------------------------------------
+    // Each test builds a VALID tall trace, mutates exactly the cells a dishonest prover
+    // would need to change for one specific attack, and asserts the AIR rejects it. They
+    // run the debug constraint checker directly (no FRI), so they test the constraints,
+    // not the proof system. A constraint that stops biting fails here, not on mainnet.
+
+    fn valid_trace() -> (RowMajorMatrix<BabyBear>, Vec<BabyBear>, Vec<SpendWitness>) {
+        let (ins, _root) = with_tree(vec![inp(100, 11, 7), inp(50, 22, 8)]);
+        let outs = [oc(90, 33, 1), oc(55, 44, 2), oc(0, 0xE1, 0xE2)];
+        let (trace, pis, _o, _n, _r) = tall_trace(&ins, &outs, 5, CHAIN, &[0u64; 8]).expect("valid witness");
+        (trace, pis, ins)
+    }
+
+    fn constraints_hold(trace: &RowMajorMatrix<BabyBear>, pis: &[BabyBear]) -> bool {
+        std::panic::catch_unwind(|| p3_air::check_constraints(&CoinsAirTall, trace, pis)).is_ok()
+    }
+
+    fn set(t: &mut RowMajorMatrix<BabyBear>, row: usize, col: usize, v: u64) {
+        t.values[row * TALL_W + col] = BabyBear::from_u64(v);
+    }
+
+    /// The 16 input lanes of column group `g` on `row`.
+    fn block_state(t: &RowMajorMatrix<BabyBear>, row: usize, g: usize) -> [BabyBear; WIDTH] {
+        core::array::from_fn(|k| t.values[row * TALL_W + g * BLK + k])
+    }
+
+    /// Overwrite column group `g` of `row` with a consistent Poseidon2 trace of `state`, so
+    /// the permutation constraints still hold and only the wiring rules can fail.
+    fn set_block(t: &mut RowMajorMatrix<BabyBear>, row: usize, g: usize, state: [BabyBear; WIDTH]) {
+        let constants = RoundConstants::<BabyBear, WIDTH, HFR, PR>::new(RC_EI, RC_I, RC_EF);
+        let m = generate_trace_rows::<BabyBear, LL, WIDTH, SD, SR, HFR, PR>(vec![state], &constants, 0);
+        for c in 0..BLK {
+            t.values[row * TALL_W + g * BLK + c] = m.values[c];
+        }
+    }
+
+    fn set_pi_limbs(pis: &mut [BabyBear], off: usize, c: &Commitment) {
+        for (k, &x) in c.iter().enumerate() {
+            pis[off + k] = BabyBear::from_u64(x);
+        }
+    }
+
+    #[test]
+    fn mutation_unmodified_trace_satisfies_every_constraint() {
+        let (t, pis, _) = valid_trace();
+        assert!(constraints_hold(&t, &pis));
+    }
+
+    #[test]
+    fn mutation_inactive_input_cannot_carry_value() {
+        // Attack: mark a real 100-value input inactive so its Merkle membership is not
+        // checked, while still counting its value in conservation.
+        let (mut t, pis, _) = valid_trace();
+        set(&mut t, ROW_CORE, R_ACT, 0);
+        for r in 0..HEIGHT {
+            set(&mut t, r, R_CACT, 0);
+        }
+        assert!(!constraints_hold(&t, &pis), "an inactive input with non-zero value must be rejected");
+    }
+
+    #[test]
+    fn mutation_value_limb_bits_are_bound_to_the_commitment_lane() {
+        let (mut t, pis, _) = valid_trace();
+        let bit0 = t.values[ROW_CORE * TALL_W + R_RANGE];
+        set(&mut t, ROW_CORE, R_RANGE, if bit0 == BabyBear::ZERO { 1 } else { 0 });
+        assert!(!constraints_hold(&t, &pis));
+    }
+
+    #[test]
+    fn mutation_range_bits_must_be_boolean() {
+        let (mut t, pis, _) = valid_trace();
+        set(&mut t, ROW_CORE, R_RANGE + 3, 2);
+        assert!(!constraints_hold(&t, &pis));
+    }
+
+    #[test]
+    fn mutation_carry_is_range_checked() {
+        let (mut t, pis, _) = valid_trace();
+        let b = t.values[ROW_CORE * TALL_W + R_CARRY];
+        set(&mut t, ROW_CORE, R_CARRY, if b == BabyBear::ZERO { 1 } else { 0 });
+        assert!(!constraints_hold(&t, &pis));
+    }
+
+    #[test]
+    fn mutation_path_direction_must_be_boolean() {
+        let (mut t, pis, _) = valid_trace();
+        set(&mut t, PATH_FIRST + 3, R_PDIR, 2);
+        assert!(!constraints_hold(&t, &pis));
+    }
+
+    #[test]
+    fn mutation_carried_leaf_is_input_ones_own_commitment() {
+        // Attack: feed input 0's leaf into input 1's path, so a single real coin could
+        // "prove" two memberships.
+        let (mut t, pis, ins) = valid_trace();
+        let leaf0 = commit_asset(ins[0].value, &ins[0].blind, &spend_pubkey(&ins[0].spend_secret), ins[0].asset_id);
+        for r in 0..HEIGHT {
+            for j in 0..8 {
+                set(&mut t, r, R_CLEAF + j, leaf0[j]);
+            }
+        }
+        assert!(!constraints_hold(&t, &pis));
+    }
+
+    #[test]
+    fn mutation_carries_must_be_constant_down_the_trace() {
+        let (mut t, pis, _) = valid_trace();
+        let v = t.values[(PATH_FIRST + 5) * TALL_W + R_CACT + 1];
+        set(&mut t, PATH_FIRST + 5, R_CACT + 1, if v == BabyBear::ZERO { 1 } else { 0 });
+        assert!(!constraints_hold(&t, &pis));
+    }
+
+    #[test]
+    fn mutation_outputs_share_the_inputs_asset() {
+        // Rebuild output 2's commit block with asset 1 (inputs are asset 0) and publish its
+        // new digest, so ONLY the single-asset rule can fail.
+        let (mut t, mut pis, _) = valid_trace();
+        let g = S - 1;
+        let mut st = block_state(&t, ROW_CORE, g);
+        st[14] = BabyBear::ONE;
+        set_block(&mut t, ROW_CORE, g, st);
+        set_pi_limbs(&mut pis, (g - N_IN) * 8, &native_commit(&st));
+        assert!(!constraints_hold(&t, &pis));
+    }
+
+    #[test]
+    fn mutation_commitment_zero_lanes_are_enforced() {
+        let (mut t, mut pis, _) = valid_trace();
+        let g = S - 1;
+        let mut st = block_state(&t, ROW_CORE, g);
+        st[12] = BabyBear::ONE;
+        set_block(&mut t, ROW_CORE, g, st);
+        set_pi_limbs(&mut pis, (g - N_IN) * 8, &native_commit(&st));
+        assert!(!constraints_hold(&t, &pis));
+    }
+
+    #[test]
+    fn mutation_commitment_role_tag_is_enforced() {
+        let (mut t, mut pis, _) = valid_trace();
+        let g = S - 1;
+        let mut st = block_state(&t, ROW_CORE, g);
+        st[15] = BabyBear::from_u64(TAG_NF);
+        set_block(&mut t, ROW_CORE, g, st);
+        set_pi_limbs(&mut pis, (g - N_IN) * 8, &native_commit(&st));
+        assert!(!constraints_hold(&t, &pis));
+    }
+
+    #[test]
+    fn mutation_nullifier_binds_the_spent_value() {
+        // Attack: publish a nullifier computed over a different value than the coin holds
+        // (a second, "fresh" nullifier for the same coin). Only the value binding can fail.
+        let (mut t, mut pis, _) = valid_trace();
+        let g = S; // outer nullifier block of input 0
+        let mut st = block_state(&t, ROW_CORE, g);
+        st[8] += BabyBear::ONE;
+        set_block(&mut t, ROW_CORE, g, st);
+        set_pi_limbs(&mut pis, N_OUT * 8 + 1, &native_commit(&st));
+        assert!(!constraints_hold(&t, &pis));
+    }
+
+    #[test]
+    fn mutation_nullifier_binds_the_asset() {
+        let (mut t, mut pis, _) = valid_trace();
+        let g = S;
+        let mut st = block_state(&t, ROW_CORE, g);
+        st[14] = BabyBear::ONE;
+        set_block(&mut t, ROW_CORE, g, st);
+        set_pi_limbs(&mut pis, N_OUT * 8 + 1, &native_commit(&st));
+        assert!(!constraints_hold(&t, &pis));
+    }
+
+    #[test]
+    fn mutation_spend_secret_is_one_key_across_pk_and_nullifier() {
+        // Attack: hash a different spend secret in the pk block than the nullifier uses.
+        let (mut t, pis, _) = valid_trace();
+        let g = S + N_IN; // pk block of input 0
+        let mut st = block_state(&t, ROW_CORE, g);
+        st[0] += BabyBear::ONE;
+        set_block(&mut t, ROW_CORE, g, st);
+        assert!(!constraints_hold(&t, &pis));
+    }
+
+    #[test]
+    fn mutation_inner_blind_is_shared_by_commitment_and_nullifier() {
+        // Attack: open the commitment under one blind and derive the nullifier under
+        // another, which would give one coin two nullifiers.
+        let (mut t, mut pis, _) = valid_trace();
+        let g = S; // inner nullifier block of input 0 lives in group S on the inner row
+        let mut st = block_state(&t, ROW_INNER, g);
+        st[8] += BabyBear::ONE;
+        set_block(&mut t, ROW_INNER, g, st);
+        // Keep the outer nullifier consistent with the new inner digest, so only the
+        // shared-blind rule can fail.
+        let inner = native_commit(&st);
+        let mut outer = block_state(&t, ROW_CORE, S);
+        for k in 0..8 {
+            outer[k] = BabyBear::from_u64(inner[k]);
+        }
+        set_block(&mut t, ROW_CORE, S, outer);
+        set_pi_limbs(&mut pis, N_OUT * 8 + 1, &native_commit(&outer));
+        assert!(!constraints_hold(&t, &pis));
+    }
+
+    #[test]
+    fn mutation_fee_bits_are_bound_to_the_public_fee() {
+        let (mut t, pis, _) = valid_trace();
+        let b = t.values[ROW_CORE * TALL_W + R_FEE + 1];
+        set(&mut t, ROW_CORE, R_FEE + 1, if b == BabyBear::ZERO { 1 } else { 0 });
+        assert!(!constraints_hold(&t, &pis));
+    }
+
+    #[test]
+    fn mutation_sibling_column_must_match_the_block_lanes() {
+        let (mut t, pis, _) = valid_trace();
+        let v = t.values[(PATH_FIRST + 7) * TALL_W + R_PSIB + 2];
+        set(&mut t, PATH_FIRST + 7, R_PSIB + 2, v.as_canonical_u64() ^ 1);
+        assert!(!constraints_hold(&t, &pis));
+    }
+
+    #[test]
+    fn review_degenerate_blind_makes_inner_nullifier_equal_pk() {
+        // Review 2026-10-26: the inner nullifier block [ss ‖ blind] and the pk block
+        // [ss ‖ 0×7 ‖ TAG_PK] share one tagless permutation, so the blind (0,…,0,TAG_PK)
+        // makes inner_nf == pk. A sender chooses the recipient's blind.
+        let s = ss(7);
+        let degenerate: Blind = [0, 0, 0, 0, 0, 0, 0, TAG_PK];
+        let inner = native_commit(&inner_nf_input(&s, &degenerate));
+        assert_eq!(inner, spend_pubkey(&s));
+    }
 }
