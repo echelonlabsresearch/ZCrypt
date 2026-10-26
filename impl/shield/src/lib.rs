@@ -55,18 +55,17 @@ use rand::{SeedableRng, TryRng};
 /// ChaCha20 CSPRNG — so there is NO bespoke RNG algorithm in the proving path. The
 /// only reason for this newtype is the hiding MMCS's `R: Rng + Clone + Send` bound
 /// (`p3-merkle-tree`): upstream deliberately does not implement `Clone` on its
-/// CSPRNGs (to discourage duplicating a keystream), so we add a faithful `Clone`
-/// that reconstructs the generator's exact state from its public seed + stream +
-/// word position via the crate's own accessors. Generation is 100% the vetted
-/// implementation; only state reconstruction is ours (and is covered by a test).
+/// CSPRNGs, to discourage duplicating a keystream. A clone here is therefore NOT a
+/// copy: it is a fresh generator seeded from operating-system entropy. Two proofs
+/// that share masking randomness would let the two openings be subtracted and the
+/// witness recovered, so a copied keystream is exactly the failure this type must
+/// make impossible, whatever a future caller does with a config (review
+/// 2026-10-26, L2). The prover never relies on a clone reproducing anything.
 struct MaskRng(ChaCha20Rng);
 
 impl Clone for MaskRng {
     fn clone(&self) -> Self {
-        let mut r = ChaCha20Rng::from_seed(self.0.get_seed());
-        r.set_stream(self.0.get_stream());
-        r.set_word_pos(self.0.get_word_pos());
-        MaskRng(r)
+        os_rng()
     }
 }
 impl SeedableRng for MaskRng {
@@ -1676,19 +1675,21 @@ mod tests {
     }
 
     #[test]
-    fn mask_rng_clone_reproduces_keystream() {
+    fn mask_rng_clone_never_reproduces_keystream() {
         // The masking RNG's ONLY bespoke code is its `Clone` impl (generation is the
-        // audited ChaCha20Rng). Prove that a clone faithfully reproduces the exact
-        // subsequent keystream — i.e. the state reconstruction is correct — and that
-        // two independent OS-seeded generators diverge.
+        // audited ChaCha20Rng). A clone must be a fresh OS-seeded generator, never a
+        // copy of the keystream: reused masking randomness across two proofs would
+        // expose the witness (review 2026-10-26, L2). Even a deterministically seeded
+        // generator clones to something independent of it.
         let mut a = MaskRng::seed_from_u64(0xC0FFEE);
-        let mut warm = [0u8; 40]; // advance past a block boundary so word_pos matters
-        a.try_fill_bytes(&mut warm).unwrap();
         let mut b = a.clone();
-        let (mut xa, mut xb) = ([0u8; 96], [0u8; 96]);
+        let mut c = a.clone();
+        let (mut xa, mut xb, mut xc) = ([0u8; 96], [0u8; 96], [0u8; 96]);
         a.try_fill_bytes(&mut xa).unwrap();
         b.try_fill_bytes(&mut xb).unwrap();
-        assert_eq!(xa, xb, "clone must reproduce the audited RNG's exact keystream");
+        c.try_fill_bytes(&mut xc).unwrap();
+        assert_ne!(xa, xb, "a clone must not reproduce the source keystream");
+        assert_ne!(xb, xc, "two clones must not share a keystream");
 
         let (mut o1, mut o2) = (os_rng(), os_rng());
         let (mut y1, mut y2) = ([0u8; 32], [0u8; 32]);
