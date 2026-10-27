@@ -79,6 +79,8 @@ function AddressTile({
   /** Shown in place of the QR and address when there is no address yet. */
   empty?: React.ReactNode;
 }) {
+  const [expanded, setExpanded] = useState(false);
+  const short = address.length > 24 ? `${address.slice(0, 12)}…${address.slice(-8)}` : address;
   return (
     <div className="card addr-tile">
       <div className="addr-tile-title" style={{ color }}>
@@ -88,10 +90,17 @@ function AddressTile({
       {address ? (
         <>
           <div className="qr-tile">{qr ? <img src={qr} alt={`QR code: ${title}`} /> : null}</div>
-          <div className="addr-box" style={{ width: "100%", boxSizing: "border-box" }}>
-            <code title={address} style={{ color }}>{address}</code>
+          <div className="addr-line">
+            <code title={address} style={{ color }} className={expanded ? "full" : ""}>
+              {expanded ? address : short}
+            </code>
+            <span className="addr-actions">
+              <button className="copy-btn" onClick={() => setExpanded((e) => !e)}>
+                {expanded ? "Collapse" : "Expand"}
+              </button>
+              <CopyButton text={address} label="⧉ Copy" />
+            </span>
           </div>
-          <CopyButton text={address} label="⧉ Copy address" />
         </>
       ) : (
         <div className="addr-tile-empty">{empty ?? <span style={{ opacity: 0.5 }}>…</span>}</div>

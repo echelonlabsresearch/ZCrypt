@@ -1043,8 +1043,30 @@ details.card.guide[open] > summary {
   opacity: 0.55;
   margin-top: -0.3rem;
 }
-.addr-tile .addr-box code {
+.addr-line {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.5rem;
+}
+.addr-line code {
+  font-size: 0.86rem;
+  word-break: break-all;
+  line-height: 1.5;
+}
+.addr-line code.full {
+  background: var(--color-bg);
+  border: 1px solid var(--color-border);
+  border-radius: 8px;
+  padding: 0.6rem 0.7rem;
   font-size: 0.78rem;
+  width: 100%;
+  box-sizing: border-box;
+}
+.addr-actions {
+  display: flex;
+  gap: 0.4rem;
 }
 .addr-tile-empty {
   min-height: 200px;
