@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState, DragEvent } from "react";
+import React, { useCallback, useEffect, useState, DragEvent } from "react";
 import QRCode from "qrcode";
 import { call, fmtAsset, saveFile } from "../lib/api";
 import { CopyButton } from "./Share";
@@ -65,6 +65,42 @@ function useQr(text: string, width: number): string {
   return qr;
 }
 
+/** One address with its QR code, the address text and a copy button. */
+function AddressTile({
+  icon, title, tag, color, address, qr, note, empty,
+}: {
+  icon: string;
+  title: string;
+  tag: string;
+  color: string;
+  address: string;
+  qr: string;
+  note: string;
+  /** Shown in place of the QR and address when there is no address yet. */
+  empty?: React.ReactNode;
+}) {
+  return (
+    <div className="card addr-tile">
+      <div className="addr-tile-title" style={{ color }}>
+        {icon} {title}
+      </div>
+      <div className="addr-tile-tag">{tag}</div>
+      {address ? (
+        <>
+          <div className="qr-tile">{qr ? <img src={qr} alt={`QR code: ${title}`} /> : null}</div>
+          <div className="addr-box" style={{ width: "100%", boxSizing: "border-box" }}>
+            <code title={address} style={{ color }}>{address}</code>
+          </div>
+          <CopyButton text={address} label="⧉ Copy address" />
+        </>
+      ) : (
+        <div className="addr-tile-empty">{empty ?? <span style={{ opacity: 0.5 }}>…</span>}</div>
+      )}
+      <div className="addr-tile-note">{note}</div>
+    </div>
+  );
+}
+
 /**
  * Receive: everything about getting paid in one place. Your addresses (normal, stealth,
  * Bitcoin), the drop zone that claims a coin file or an encrypted note, and the view key.
@@ -94,8 +130,10 @@ export default function Receive({
   const [saved, setSaved] = useState("");
   const [stealthBusy, setStealthBusy] = useState(false);
   const [err, setErr] = useState("");
+  const latestStealth = stealth[stealth.length - 1]?.address ?? "";
   const normalQr = useQr(normal, 480);
-  const btcQr = useQr(btcAddr, 240);
+  const stealthQr = useQr(latestStealth, 480);
+  const btcQr = useQr(btcAddr, 480);
 
   // Drop zone
   const [blob, setBlob] = useState("");
@@ -216,73 +254,65 @@ export default function Receive({
     <div>
       <h2 className="view-title">📥 Receive</h2>
 
-      <div className="receive-grid">
-        {/* Your addresses: the thing every wallet shows first under Receive. */}
-        <div className="card">
-          <h2>🏷️ Your address</h2>
-          <div style={{ fontSize: "0.8rem", opacity: 0.7, marginBottom: "0.5rem" }}>
-            Share this to get paid in ZCRYPT or any shielded asset. Payments arrive on-chain and
-            credit on Refresh. Your view key can see them; nobody else can.
-          </div>
-          <div className="qr-row">
-            <div className="qr-tile">{normalQr ? <img src={normalQr} alt="QR code of your address" /> : null}</div>
-            <div style={{ flex: 1, minWidth: 0 }}>
-              <div className="addr-box">
-                <code title={normal}>{normal || "…"}</code>
-              </div>
-              <div style={{ display: "flex", gap: "0.4rem", marginTop: "0.5rem", flexWrap: "wrap" }}>
-                <CopyButton text={normal} label="⧉ Copy address" />
-              </div>
-              <div style={{ fontSize: "0.74rem", opacity: 0.6, marginTop: "0.5rem" }}>
-                Scan the code with the mobile wallet to pay this address.
-              </div>
-            </div>
-          </div>
-
-          <div className="card-row" style={{ marginTop: "0.9rem", alignItems: "flex-start" }}>
-            <div style={{ flex: 1, minWidth: 0 }}>
-              <div style={{ color: "var(--color-text-dim)", fontWeight: "bold" }}>₿ Bitcoin deposit address</div>
-              <div style={{ fontSize: "0.76rem", opacity: 0.65, margin: "0.2rem 0 0.4rem" }}>
-                Real BTC, derived from the same phrase. Deposit here, then shield it into zBTC under <b>Bridge</b>.
-              </div>
-              <code style={{ color: "var(--color-cyan)", wordBreak: "break-all" }}>{btcAddr || "—"}</code>
-              {btcAddr && (
-                <div style={{ marginTop: "0.5rem" }}>
-                  <CopyButton text={btcAddr} />
-                </div>
-              )}
-            </div>
-            {btcQr && (
-              <div className="qr-tile small">
-                <img src={btcQr} alt="QR code of your Bitcoin deposit address" />
-              </div>
-            )}
-          </div>
-        </div>
-
-        {/* The drop zone: a coin file, an encrypted note, or a receipt to check. */}
-        <div className={`dropzone compact ${cls}`} onDragOver={onDragOver} onDragEnter={onDragOver} onDragLeave={onDragLeave} onDrop={onDrop}>
-          <div className="drop-icon">{dragging ? "⬇️" : state === "ok" ? "✓" : state === "err" ? "✗" : "💎"}</div>
-          <div style={{ fontWeight: "bold", color: dragging ? "var(--color-cyan)" : undefined }}>
-            {dragging ? "Drop the coin to receive it" : "Got a coin file or a note? Drop it here"}
-          </div>
-          <div style={{ width: "100%", padding: "0 1.2rem", boxSizing: "border-box" }}>
-            <textarea
-              className="mnemonic-input"
-              value={blob}
-              onChange={(e) => setBlob(e.target.value)}
-              placeholder="or paste a bearer coin file, an encrypted stealth note, or a payment receipt"
-              style={{ minHeight: 90 }}
-            />
-            <button className="btn-primary btn-block" style={{ marginTop: "0.6rem" }} disabled={busy} onClick={() => receive(blob)}>
-              {busy ? "Verifying…" : "Receive"}
+      {/* Your addresses: one tile per address, each with its QR code and the address text.
+          Whitelisted assets with a native chain get a tile here as they are added. */}
+      <div className="addr-tiles">
+        <AddressTile
+          icon="🏷️"
+          title="Your ZCRYPT recoverable address"
+          tag="zc1… · restored by your recovery phrase"
+          color="var(--color-cyan)"
+          address={normal}
+          qr={normalQr}
+          note="Share this to get paid in ZCRYPT or any shielded asset. Your view key can see what arrives here; nobody else can."
+        />
+        <AddressTile
+          icon="🕶️"
+          title="Your ZCRYPT shielded address"
+          tag="zc1… (stealth) · NOT recoverable from your phrase"
+          color="var(--color-purple)"
+          address={latestStealth}
+          qr={stealthQr}
+          note="Maximum privacy: paid with an encrypted file, invisible even to your own view key. Back up its private key below."
+          empty={
+            <button className="btn-secondary" disabled={stealthBusy} onClick={newStealth}>
+              {stealthBusy ? "Creating…" : "Create a shielded address"}
             </button>
-            {state !== "idle" && !dragging && (
-              <div className={`msg ${state === "ok" ? "ok" : state === "warn" ? "warn" : "err"}`}>{msg}</div>
-            )}
-            <div style={{ fontSize: "0.74rem", opacity: 0.6, marginTop: "0.5rem" }}>
-              A receipt pasted here is checked against the chain; it moves nothing. Never drop a coin into anything but your own wallet.
-            </div>
+          }
+        />
+        <AddressTile
+          icon="₿"
+          title="Your Bitcoin address"
+          tag="bc1… · restored by your recovery phrase"
+          color="var(--color-yellow)"
+          address={btcAddr}
+          qr={btcQr}
+          note="Real BTC on the Bitcoin chain. Deposit here, then shield it into zBTC under Bridge."
+        />
+      </div>
+
+      {/* The drop zone: a coin file, an encrypted note, or a receipt to check. */}
+      <div className={`dropzone compact ${cls}`} style={{ marginTop: "1.2rem" }} onDragOver={onDragOver} onDragEnter={onDragOver} onDragLeave={onDragLeave} onDrop={onDrop}>
+        <div className="drop-icon">{dragging ? "⬇️" : state === "ok" ? "✓" : state === "err" ? "✗" : "💎"}</div>
+        <div style={{ fontWeight: "bold", color: dragging ? "var(--color-cyan)" : undefined }}>
+          {dragging ? "Drop the coin to receive it" : "Got a coin file or a note? Drop it here"}
+        </div>
+        <div style={{ width: "100%", padding: "0 1.2rem", boxSizing: "border-box" }}>
+          <textarea
+            className="mnemonic-input"
+            value={blob}
+            onChange={(e) => setBlob(e.target.value)}
+            placeholder="or paste a bearer coin file, an encrypted stealth note, or a payment receipt"
+            style={{ minHeight: 90 }}
+          />
+          <button className="btn-primary btn-block" style={{ marginTop: "0.6rem" }} disabled={busy} onClick={() => receive(blob)}>
+            {busy ? "Verifying…" : "Receive"}
+          </button>
+          {state !== "idle" && !dragging && (
+            <div className={`msg ${state === "ok" ? "ok" : state === "warn" ? "warn" : "err"}`}>{msg}</div>
+          )}
+          <div style={{ fontSize: "0.74rem", opacity: 0.6, marginTop: "0.5rem" }}>
+            A receipt pasted here is checked against the chain; it moves nothing. Never drop a coin into anything but your own wallet.
           </div>
         </div>
       </div>
@@ -290,7 +320,7 @@ export default function Receive({
       {/* Stealth addresses: persisted list */}
       <div className="card" style={{ marginTop: "1.2rem" }}>
         <div className="card-row" style={{ borderTop: "none", paddingTop: 0 }}>
-          <h2 style={{ margin: 0 }}>🕶️ Stealth addresses</h2>
+          <h2 style={{ margin: 0 }}>🕶️ Shielded (stealth) addresses</h2>
           <button className="copy-btn" disabled={stealthBusy} onClick={newStealth}>
             {stealthBusy ? "…" : "+ New stealth address"}
           </button>

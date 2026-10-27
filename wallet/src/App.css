@@ -805,17 +805,6 @@ label {
 }
 
 /* ---------- receive: addresses beside the drop zone ---------- */
-.receive-grid {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
-  gap: 1.2rem;
-  align-items: stretch;
-}
-@media (max-width: 860px) {
-  .receive-grid {
-    grid-template-columns: 1fr;
-  }
-}
 .addr-box {
   background: var(--color-bg);
   border: 1px solid var(--color-border);
@@ -1028,5 +1017,49 @@ details.card.guide[open] > summary {
   .qr-row {
     flex-direction: column;
     align-items: center;
+  }
+}
+
+/* Receive: one tile per address, QR above the address text. */
+.addr-tiles {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 1.2rem;
+  align-items: stretch;
+}
+.addr-tile {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.6rem;
+  text-align: center;
+}
+.addr-tile-title {
+  font-weight: bold;
+  font-size: 1rem;
+}
+.addr-tile-tag {
+  font-size: 0.72rem;
+  opacity: 0.55;
+  margin-top: -0.3rem;
+}
+.addr-tile .addr-box code {
+  font-size: 0.78rem;
+}
+.addr-tile-empty {
+  min-height: 200px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.addr-tile-note {
+  font-size: 0.74rem;
+  opacity: 0.6;
+  line-height: 1.45;
+  margin-top: auto;
+}
+@media (max-width: 1100px) {
+  .addr-tiles {
+    grid-template-columns: 1fr;
   }
 }
