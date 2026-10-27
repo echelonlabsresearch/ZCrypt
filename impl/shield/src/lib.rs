@@ -1760,4 +1760,32 @@ mod tests {
         // ZCRYPT helpers equal the explicit asset-0 form (backward compatibility).
         assert_eq!(commit(100, &bl(11), &pk), commit_asset(100, &bl(11), &pk, ASSET_ZCRYPT));
     }
+
+    /// The Lean parameter model (`formal/Zcrypt/Fri.lean`) pins the same FRI constants as
+    /// this crate. If either side changes, this test fails until both agree, so the
+    /// machine-checked figures (132 Johnson bits, 244 conjectured, mainnet floor 128)
+    /// cannot drift from the compiled proof format.
+    #[test]
+    fn lean_fri_model_matches_compiled_constants() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../formal/Zcrypt/Fri.lean");
+        let src = std::fs::read_to_string(path).expect("formal/Zcrypt/Fri.lean is in the tree");
+        let pinned = |name: &str| -> usize {
+            let line = src
+                .lines()
+                .find(|l| l.trim_start().starts_with(&format!("def {name} : Nat := ")))
+                .unwrap_or_else(|| panic!("Fri.lean defines {name}"));
+            line.split(":=").nth(1).unwrap().split_whitespace().next().unwrap().parse().unwrap()
+        };
+        assert_eq!(pinned("numQueries"), FRI_NUM_QUERIES);
+        assert_eq!(pinned("powBits"), FRI_POW_BITS);
+        assert_eq!(pinned("logBlowup"), FRI_LOG_BLOWUP);
+        assert_eq!(pinned("logFinalPolyLen"), FRI_LOG_FINAL_POLY_LEN);
+        assert_eq!(pinned("maxLogArity"), FRI_MAX_LOG_ARITY);
+        assert_eq!(pinned("mainnetMinQueries"), MAINNET_MIN_QUERIES);
+        assert_eq!(pinned("mainnetMinPowBits"), MAINNET_MIN_POW_BITS);
+        assert_eq!(pinned("mainnetMinBits"), MAINNET_MIN_SOUNDNESS_BITS);
+        // The figures the Lean file proves equal 132 and 244 are this crate's formulas.
+        assert_eq!(johnson_soundness_bits(), 132);
+        assert_eq!(conjectured_soundness_bits(), 244);
+    }
 }

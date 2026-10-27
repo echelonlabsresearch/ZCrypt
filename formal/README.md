@@ -84,6 +84,17 @@ they abstract each field to one integer. `Corollaries.inner_nf_eq_pk_iff` is tha
 as a theorem over the fixed layout: the two blocks coincide exactly when the inner commit
 digest equals the constant pk padding, which is a preimage of `H`, not a free choice.
 
+### `Zcrypt/Fri.lean`: the FRI parameters (2026-10-27)
+Pins the compiled proof format (112 queries, 20 grinding bits, rate 2^-2) and proves the
+arithmetic behind the two figures the crate reports: `johnsonBits = 132`,
+`conjecturedBits = 244`, the mainnet floor of 128 is met, and the per-query compounding
+(`compound`: a per-query pass probability of at most 1/k gives at most 1/k^q over q
+queries), evaluated at the Johnson radius 1/2 and the conjectured radius 3/4. A test in
+`shield/src/lib.rs` fails if the Lean constants drift from the Rust ones. What it does
+not prove is FRI itself: that a far oracle is rejected per query with those probabilities
+is the Reed-Solomon proximity-gap theorem, which is ArkLib's programme and the planned
+next step.
+
 ### `Zcrypt/Spec.lean` — Phase 0: the transparent VM spec
 Models `shield/src/zvm.rs::execute` (the `OP_CHECK_RANGE` and `OP_CHECK_CONSERVATION`
 guards over cleartext witness values, modeled at N_IN = N_OUT = 2).

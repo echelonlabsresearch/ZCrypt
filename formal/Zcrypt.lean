@@ -33,3 +33,4 @@ import Zcrypt.Air.Soundness
 import Zcrypt.Air.Corollaries
 import Zcrypt.Carry
 import Zcrypt.Binding
+import Zcrypt.Fri
