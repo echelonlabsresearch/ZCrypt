@@ -28,6 +28,10 @@
 //!   BTC_NETWORK          bitcoin|signet|testnet|regtest (default bitcoin)
 //!   ZCRYPT_CHAIN_ID      chain id to bind txs to     (default zcrypt-1)
 //!
+//!   zcrypt_sale --new-phrase <file>   write a fresh 24-word phrase to <file> (0400, refuses to
+//!                           overwrite), print its ZCrypt address and Bitcoin xpub, and exit.
+//!                           The phrase itself is never printed: read the file once, copy it
+//!                           to paper, keep the file as the daemon's secret.
 //!   zcrypt_sale --address   print the desk's ZCrypt address (fund it here) and its Bitcoin
 //!                           account xpub (watch the sales in any wallet), then exit.
 //!
@@ -411,6 +415,32 @@ fn main() {
         eprintln!("{e}");
         std::process::exit(2)
     });
+    if let Some(i) = args.iter().position(|a| a == "--new-phrase") {
+        let Some(out) = args.get(i + 1) else {
+            eprintln!("usage: zcrypt_sale --new-phrase <file>");
+            std::process::exit(2)
+        };
+        let phrase = zeroize::Zeroizing::new(keys::generate_mnemonic());
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o400)
+                .open(out)
+                .unwrap_or_else(|e| {
+                    eprintln!("cannot create {out}: {e} (an existing file is never overwritten)");
+                    std::process::exit(2)
+                });
+            writeln!(f, "{}", phrase.as_str()).expect("write phrase");
+        }
+        let account = Account::from_mnemonic(&phrase, "").expect("fresh phrase is valid");
+        let hd = HdWallet::from_mnemonic(&phrase, "", network).expect("fresh phrase is valid");
+        println!("Phrase written to {out} (24 words, mode 0400). Copy it to paper now; it is the desk's only key.");
+        println!("ZCrypt address (send the ZCRYPT stock here):\n{}", account.normal_address().to_bech32());
+        println!("Bitcoin account xpub (BIP-84, buyers pay m/84'/coin'/0'/0/<n>):\n{}", hd.account_xpub());
+        return;
+    }
     let phrase_path = env("SALE_MNEMONIC_FILE", "");
     if phrase_path.is_empty() {
         eprintln!("SALE_MNEMONIC_FILE is required (the desk's BIP-39 phrase)");

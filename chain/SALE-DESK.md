@@ -19,10 +19,19 @@ order). Generate it in the desktop wallet (Create wallet) or any BIP-39 tool, an
 like a treasury key: whoever has it can spend every Bitcoin ever paid and every ZCRYPT in
 stock.
 
-Put it in a file only the daemon's user can read:
+The daemon makes one for you, straight into a 0400 file, and never prints it:
 
 ```
-install -m 0400 /dev/stdin /srv/zcrypt-sale/phrase.txt <<< "word word … word"
+docker compose run --rm -v $PWD/secrets:/secrets sale zcrypt_sale --new-phrase /secrets/sale-phrase.txt
+# or, with the binary on any machine:  zcrypt_sale --new-phrase secrets/sale-phrase.txt
+cat secrets/sale-phrase.txt      # once: copy the 24 words to paper, two places
+```
+
+It refuses to overwrite an existing file. The paper copy is the backup; the file is
+what the daemon reads. If you already have a phrase, put it in that file yourself:
+
+```
+install -m 0400 /dev/stdin secrets/sale-phrase.txt <<< "word word … word"
 ```
 
 Print the funding address and the Bitcoin xpub:
@@ -67,7 +76,7 @@ ssh root@<vps>
 cd zcrypt-v2 && git pull && cd chain
 
 umask 077; mkdir -p secrets
-printf '%s\n' "word word … word" > secrets/sale-phrase.txt     # the desk's phrase
+docker compose run --rm -v $PWD/secrets:/secrets sale zcrypt_sale --new-phrase /secrets/sale-phrase.txt
 chown 10001:10001 secrets/sale-phrase.txt; chmod 400 secrets/sale-phrase.txt
 
 # .env: add
