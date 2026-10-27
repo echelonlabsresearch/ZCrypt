@@ -62,7 +62,7 @@ const ROW_CORE: usize = 1;
 const PATH_FIRST: usize = 2;
 const PATH_ROWS: usize = N_IN * DEPTH;
 /// Trace height: 1 inner row + 1 core row + all path rows, padded up to a power of two.
-/// DEPTH 32: 2 + N_IN*32 = 2 + 64 = 66 -> 128.
+/// DEPTH 62: 2 + N_IN*62 = 2 + 124 = 126 -> 128 (two padding rows).
 const HEIGHT: usize = 128;
 const DEGREE_BITS: usize = 7; // log2(HEIGHT)
 // Geometry guards: if DEPTH changes, these fail at compile time until HEIGHT/DEGREE_BITS
@@ -703,7 +703,7 @@ mod tests {
     const CHAIN: &[u8] = b"zcrypt-devnet";
     /// Hex of `postcard(preprocessed vk commitment)`; update ONLY with a deliberate,
     /// coordinated circuit change (it is a proof-format change).
-    const PINNED_PREPROCESSED_COMMITMENT: &str = "0187ec94e4dbb685d8c501fdb989e3e38a8cf5f101f5f3eaadcff3e9c202b6a2d9e1ffcfcde2e001";
+    const PINNED_PREPROCESSED_COMMITMENT: &str = "01a1cfa39b94a9cc89f801cb978fbdb2868880af01c4c3a781edd0c4cb13f1d9f4e8a0919fdaf601";
 
     fn bl(b: u64) -> Blind {
         core::array::from_fn(|i| field_limb(b.wrapping_add(0x9e37u64.wrapping_mul(i as u64 + 1))))

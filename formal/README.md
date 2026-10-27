@@ -35,7 +35,7 @@ Hand-modeled faithfully from the Rust, with `file:line` provenance in each file.
 The production circuit `CoinsAirTall` (`shield/src/tall.rs`), constraint by constraint,
 and its soundness theorem. This is the model the earlier phases led to: not one
 constraint family at a time, but every `assert_zero` site of `eval`, with the real
-geometry (128 rows, 9 Poseidon2 groups per row, two inputs, three outputs, 32-level
+geometry (128 rows, 9 Poseidon2 groups per row, two inputs, three outputs, 62-level
 paths), the real row gating (the preprocessed selectors), the real lane layout, and the
 real public-input indices.
 
@@ -60,7 +60,7 @@ real public-input indices.
   `H(nfBlock (H[ss ‖ H[pk ‖ blind]]) v asset)` of that input's opening, nothing else;
 - active flags are boolean and a dummy input has value 0;
 - membership: every active input's commitment sits under the public root along a
-  32-level Merkle path (siblings and directions read from the path rows).
+  62-level Merkle path (siblings and directions read from the path rows).
 
 **Poseidon2 is abstracted.** The model does not re-prove the permutation's round
 constraints (`p3_poseidon2_air`, run on every group of every row); it takes

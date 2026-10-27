@@ -122,18 +122,18 @@ theorem path_step {H : V16 → V8} {tr : Trace} {pis : Pub} (hp : EuclidP) (wf :
   · rw [if_pos hd, decide_eq_true hd, if_pos rfl]
   · rw [if_neg hd, decide_eq_false hd, if_neg (by decide)]
 
-/-- A chain of 32 path rows starting at `first`, fed with `leaf` and ending on `root`,
+/-- A chain of 62 path rows starting at `first`, fed with `leaf` and ending on `root`,
     is a Merkle path from `leaf` to `root`. -/
 theorem merkle_of_rows {H : V16 → V8} {tr : Trace} {pis : Pub} (hp : EuclidP) (wf : WF tr pis)
     (sat : Sat H tr pis) (first : Nat) (leaf root : V8)
-    (hpath : ∀ k, k < 32 → isPath (first + k))
-    (hchain : ∀ k, k < 31 → isChain (first + k))
+    (hpath : ∀ k, k < 62 → isPath (first + k))
+    (hchain : ∀ k, k < 61 → isChain (first + k))
     (hleaf : runV (tr first) = leaf)
-    (hroot : (tr (first + 31)).out 0 = root) :
+    (hroot : (tr (first + 61)).out 0 = root) :
     ∃ (sibs : Nat → V8) (dirs : Nat → Bool), merkle H leaf sibs dirs DEPTH = root := by
   refine ⟨fun k => (tr (first + k)).psib, fun k => decide ((tr (first + k)).pdir = 1), ?_⟩
   -- invariant: level k's node is row (first + k)'s running node.
-  have inv : ∀ k, k < 32 →
+  have inv : ∀ k, k < 62 →
       merkle H leaf (fun k => (tr (first + k)).psib) (fun k => decide ((tr (first + k)).pdir = 1)) k
         = runV (tr (first + k)) := by
     intro k
@@ -161,9 +161,9 @@ theorem merkle_of_rows {H : V16 → V8} {tr : Trace} {pis : Pub} (hp : EuclidP) 
       rw [show first + (n + 1) = first + n + 1 by omega]
       exact this.symm
   have h32 : merkle H leaf (fun k => (tr (first + k)).psib) (fun k => decide ((tr (first + k)).pdir = 1)) DEPTH
-      = step H (merkle H leaf (fun k => (tr (first + k)).psib) (fun k => decide ((tr (first + k)).pdir = 1)) 31)
-          (tr (first + 31)).psib (decide ((tr (first + 31)).pdir = 1)) := rfl
-  rw [h32, inv 31 (by omega), ← path_step hp wf sat (first + 31) (hpath 31 (by omega))]
+      = step H (merkle H leaf (fun k => (tr (first + k)).psib) (fun k => decide ((tr (first + k)).pdir = 1)) 61)
+          (tr (first + 61)).psib (decide ((tr (first + 61)).pdir = 1)) := rfl
+  rw [h32, inv 61 (by omega), ← path_step hp wf sat (first + 61) (hpath 61 (by omega))]
   exact hroot
 
 -- ---- the core row ----
@@ -454,28 +454,28 @@ def soundness {H : V16 → V8} {tr : Trace} {pis : Pub} (wf : WF tr pis) (sat : 
           · rw [hd, sel_zero]; exact wf.inp 2 0 _ (by decide) (by decide)
           · rw [hd, sel_one]; exact wf.inp 2 0 _ (by decide) (by decide)
         exact eq_of_dvd hrun (wf.out 1 0 j h1 (by decide)) h
-      · -- root binding on row 33
+      · -- root binding on row 63
         funext j
-        exact eq_of_gate (hcact 33 (by omega) (by decide)) (wf.out 33 0 j (by decide) (by decide)) (hroot j)
-          (sat.root0 33 rfl j)
-    · apply merkle_of_rows hp wf sat 34 _ _
+        exact eq_of_gate (hcact 63 (by omega) (by decide)) (wf.out 63 0 j (by decide) (by decide)) (hroot j)
+          (sat.root0 63 rfl j)
+    · apply merkle_of_rows hp wf sat 64 _ _
         (fun k hk => by unfold isPath; omega) (fun k hk => by unfold isChain; omega)
       · -- leaf feed from the carried leaf
         funext j
-        have h := sat.leaf1 34 rfl j
-        have hrun : InF (running (tr 34) j) := by
+        have h := sat.leaf1 64 rfl j
+        have hrun : InF (running (tr 64) j) := by
           unfold running
-          rcases path_dir hp wf sat 34 (by unfold isPath; omega) with hd | hd
-          · rw [hd, sel_zero]; exact wf.inp 34 0 _ (by decide) (by decide)
-          · rw [hd, sel_one]; exact wf.inp 34 0 _ (by decide) (by decide)
-        have h34 := eq_of_dvd hrun (wf.cleaf 34 j (by decide)) h
-        rw [cleaf_const wf sat j 34 (by omega) (by decide)] at h34
+          rcases path_dir hp wf sat 64 (by unfold isPath; omega) with hd | hd
+          · rw [hd, sel_zero]; exact wf.inp 64 0 _ (by decide) (by decide)
+          · rw [hd, sel_one]; exact wf.inp 64 0 _ (by decide) (by decide)
+        have h64 := eq_of_dvd hrun (wf.cleaf 64 j (by decide)) h
+        rw [cleaf_const wf sat j 64 (by omega) (by decide)] at h64
         have hl := eq_of_dvd (wf.cleaf 1 j h1) (wf.out 1 1 j h1 (by decide)) (sat.load_leaf 1 rfl j)
-        show running (tr 34) j = (tr 1).out 1 j
-        rw [h34, hl]
+        show running (tr 64) j = (tr 1).out 1 j
+        rw [h64, hl]
       · funext j
-        exact eq_of_gate (hcact 65 (by omega) (by decide)) (wf.out 65 0 j (by decide) (by decide)) (hroot j)
-          (sat.root1 65 rfl j)
+        exact eq_of_gate (hcact 125 (by omega) (by decide)) (wf.out 125 0 j (by decide) (by decide)) (hroot j)
+          (sat.root1 125 rfl j)
 
 /-- Every well-formed satisfying trace of the tall shield AIR proves the transfer statement. -/
 theorem soundness_prop {H : V16 → V8} {tr : Trace} {pis : Pub} (wf : WF tr pis) (sat : Sat H tr pis) :

@@ -3,8 +3,8 @@
   constraint.
 
   Geometry (tall.rs:47-96): HEIGHT 128 rows. Row 0 is the INNER row, row 1 the CORE row,
-  rows 2..65 the Merkle-path rows (input 0: rows 2..33, input 1: rows 34..65, DEPTH 32),
-  rows 66..127 padding. Every row carries CORE = S + 2·N_IN = 9 Poseidon2 column groups
+  rows 2..125 the Merkle-path rows (input 0: rows 2..63, input 1: rows 64..125, DEPTH 62),
+  rows 126..127 padding. Every row carries CORE = S + 2·N_IN = 9 Poseidon2 column groups
   (S = 5 coins: N_IN = 2 inputs then N_OUT = 3 outputs):
 
       group 0..4  commit blocks     group 5..6  nullifier blocks     group 7..8  pk blocks
@@ -64,7 +64,7 @@ abbrev Trace := Nat → Row
 abbrev Pub := Nat → Int
 
 def HEIGHT : Nat := 128
-def DEPTH : Nat := 32
+def DEPTH : Nat := 62
 def S : Nat := 5
 def N_IN : Nat := 2
 def CORE : Nat := 9
@@ -81,14 +81,14 @@ def rootOff : Nat := 41
 -- ---- preprocessed selectors (tall.rs:116-141) ----
 def isInner (r : Nat) : Prop := r = 0
 def isCore (r : Nat) : Prop := r = 1
-def isPath (r : Nat) : Prop := 2 ≤ r ∧ r < 66
-/-- Every path row of an input except its last: rows 2..32 and 34..64. -/
-def isChain (r : Nat) : Prop := (2 ≤ r ∧ r < 33) ∨ (34 ≤ r ∧ r < 65)
-def isP1First (r : Nat) : Prop := r = 34
-def isP0Last (r : Nat) : Prop := r = 33
-def isP1Last (r : Nat) : Prop := r = 65
+def isPath (r : Nat) : Prop := 2 ≤ r ∧ r < 126
+/-- Every path row of an input except its last: rows 2..62 and 64..124. -/
+def isChain (r : Nat) : Prop := (2 ≤ r ∧ r < 63) ∨ (64 ≤ r ∧ r < 125)
+def isP1First (r : Nat) : Prop := r = 64
+def isP0Last (r : Nat) : Prop := r = 63
+def isP1Last (r : Nat) : Prop := r = 125
 /-- First path row of input i. -/
-def pathFirst (i : Nat) : Nat := 2 + 32 * i
+def pathFirst (i : Nat) : Nat := 2 + 62 * i
 
 /-- The `running` node a path row feeds in (tall.rs:350-357): `(1−dir)·left + dir·right`. -/
 def running (row : Row) (j : Fin 8) : Int :=

@@ -194,7 +194,7 @@ family, not of the compiled width.
 ## Full AIR model (2026-10-27 update)
 
 Tier 3 is no longer open at the hand-model level. `formal/Zcrypt/Air/` models the whole
-production AIR (`CoinsAirTall::eval`) at the compiled geometry (N_IN = 2, N_OUT = 3, DEPTH = 32,
+production AIR (`CoinsAirTall::eval`) at the compiled geometry (N_IN = 2, N_OUT = 3, DEPTH = 62,
 HEIGHT = 128) and proves `soundness`: every well-formed satisfying trace yields the transfer
 statement (range, integer conservation, output commitments, ownership, canonical nullifiers,
 boolean active flags, Merkle membership of every active input). Poseidon2 is an arbitrary

@@ -49,7 +49,7 @@
 
 \title{\bfseries Cash Is a File}
 
-\date{October 2026\\ \small Version 9.6}
+\date{October 2026\\ \small Version 9.7}
 
 \begin{document}
 
@@ -89,7 +89,7 @@ Echelon Labs LLC\\[4pt]
 
 \vspace{18pt}
 
-{\small\itshape October 2026 · Version 9.6}\par
+{\small\itshape October 2026 · Version 9.7}\par
 
 \vspace{0.4in}
 {\color{zcryptrule}\rule{\textwidth}{0.5pt}}\\[6pt]
@@ -224,7 +224,7 @@ A transfer publishes two nullifiers (one per input slot), three output commitmen
 The proof has 62 public field elements: the three output commitments, the fee, the two nullifiers, the anchor root, a five-limb chain-domain tag, and an eight-limb auxiliary digest. The digest binds the transaction's encrypted notes into the proof; for escrow and staking transactions it binds their plaintext parameters as well. A bundled gas proof binds, in that same digest, a domain-separated hash of the transaction it pays for (\S\ref{sec:gas}). Against those inputs the proof says that the prover knows openings $(v_i, b_i, s_i, a)$ for each input and $(v'_j, b'_j, \mathit{pk}'_j, a)$ for each output such that:
 
 \begin{enumerate}
-\item \textbf{Membership.} Each active input's commitment is a leaf of the depth-32 commitment tree under the public anchor root, shown by an in-circuit Merkle path of Poseidon2 compressions. The path proves existence and position and reveals neither.
+\item \textbf{Membership.} Each active input's commitment is a leaf of the depth-62 commitment tree under the public anchor root, shown by an in-circuit Merkle path of Poseidon2 compressions. The path proves existence and position and reveals neither.
 \item \textbf{Ownership.} Each input commitment opens to $\mathit{pk}_i = \mathsf{P2}(s_i)$; the prover knows the spend secret.
 \item \textbf{Nullifier correctness.} Each published nullifier equals $\mathsf{P2}(s_i, v_i, b_i, a)$ for the same witness values, so a nullifier cannot be forged or detached from its coin.
 \item \textbf{Output correctness.} Each public output commitment opens to its witness values with a well-formed layout.
@@ -243,11 +243,9 @@ The tree is append-only, so its root changes in every block that adds coins. A p
 \subsection{Tree Capacity and Generation Rollover}
 \label{sec:capacity}
 
-The membership circuit fixes the Merkle depth, so a tree holds a bounded number of leaves. At depth 32 that is about 4.29 billion. Every output commitment takes a leaf, three per proof (the value-zero phantom is an input and never enters the tree), so a native ZCRYPT transfer adds three leaves and a bundled asset transfer six, and a depth-32 tree holds on the order of a billion transfers. Still, it is finite, and that is handled at two levels.
+The membership circuit fixes the Merkle depth, so a tree holds a bounded number of leaves. At depth 62 that is $2^{62}$, about $4.6 \times 10^{18}$. Every output commitment takes a leaf, three per proof (the value-zero phantom is an input and never enters the tree), so a native ZCRYPT transfer adds three leaves and a bundled asset transfer six, and the tree holds about $1.5 \times 10^{18}$ transfers. At a sustained million transfers per second it fills in roughly fifty thousand years; at the throughput of every payment network on Earth combined, on the order of $10^{12}$ a year, in about a million years. There is no rollover mechanism and none is planned: the bound is real but not reachable, and the ledger keeps a single whole-history anonymity set for its lifetime.
 
-First, depth is a launch parameter. Each level adds one Poseidon2 compression per input to the authentication path, so depth trades directly against proof cost. Going from depth 20 to depth 32, a 4096-fold capacity increase, costs about 2.4\% in proof size and roughly 30\% in proving time, with verification unchanged (\S\ref{sec:perf}). A deployment picks a depth for the lifetime it expects.
-
-Second, the reference implementation does not yet roll over. If the tree fills, the chain halts rather than dropping a coin or quietly moving it somewhere else, and continuing past that point is a coordinated upgrade. The intended mechanism is a fresh tree of the same depth, a new generation, whose root the public anchor identifies. The nullifier set would stay global, one sparse tree across all generations, so a coin could not be respent by hopping between them, and the root window would straddle the boundary so no wallet stalls. The cost would be that a spend hides among its own generation's coins rather than all of history. Recursive aggregation, which folds sealed generations into one accumulator a spend can prove against without an ever-longer path, is the way back to a single whole-history set. Both are future work. At three to six leaves per transfer the depth-32 tree is not going to fill soon.
+The depth is free in the production circuit. The tall trace (\S\ref{sec:stark}) is 128 rows, of which the inner and core rows take two and each input's authentication path takes one row per level, so two inputs at depth 62 occupy rows 2 to 125 and two rows remain padding. The prover evaluates every row and every Poseidon2 group on it whether the row is a path row or padding, so proof size, proving time and verification cost are those of the 128-row trace at any depth up to 63. What grows with depth is the private witness (62 siblings and direction bits per input, hashed once by the wallet when it builds the path), the per-leaf append cost on the node (one compression per level), and the wide reference circuit used in testing. An earlier launch parameter of depth 32, with about 4.3 billion leaves, would have filled in months at payment-network throughput and would have required a generation rollover with a per-generation anonymity set; raising the depth before genesis removed both the mechanism and the halt.
 
 \subsection{The Nullifier Set}
 
@@ -290,7 +288,7 @@ Transparent transactions (staking, claims, asset registration, authority rotatio
 
 \subsection{Circuit Engineering}
 
-The transfer circuit exists in two differentially tested forms that prove the same statement with the same public inputs. The wide reference trace is 32 rows by 24\,708 columns, all 80 Poseidon2 permutations side by side. The production tall trace is 128 rows by 2\,993 columns plus 7 preprocessed selector columns, and it runs the 64 Merkle-path compressions one per row. Proof size in a STARK grows linearly with width and only logarithmically with height, which is why the tall layout produces much smaller proofs for the same statement. The wide circuit is kept as the reference the tall one is checked against; cross-verification between the two, and against the VM, is part of the test suite. These are the depth-32 dimensions from \S\ref{sec:capacity}. The permutation and compression counts scale with tree depth; the tall column count does not.
+The transfer circuit exists in two differentially tested forms that prove the same statement with the same public inputs. The wide reference trace is 32 rows by 43\,128 columns, all 140 Poseidon2 permutations side by side. The production tall trace is 128 rows by 2\,993 columns plus 7 preprocessed selector columns, and it runs the 124 Merkle-path compressions one per row. Proof size in a STARK grows linearly with width and only logarithmically with height, which is why the tall layout produces much smaller proofs for the same statement. The wide circuit is kept as the reference the tall one is checked against; cross-verification between the two, and against the VM, is part of the test suite. These are the depth-62 dimensions from \S\ref{sec:capacity}. The permutation and compression counts scale with tree depth; the tall column count and, up to depth 63, the tall row count do not.
 
 \subsection{Measured Performance}
 \label{sec:perf}

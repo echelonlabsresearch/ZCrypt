@@ -19,11 +19,15 @@ pub enum AppendError {
     Duplicate,
 }
 
-/// Tree depth: 2^DEPTH leaf slots. Depth 32 gives ~4.29 billion slots, sized as a
-/// generous launch parameter (~1 billion transfers at ~4 output leaves each) so the
-/// commitment tree does not exhaust in any near-term horizon; when even this fills, the
-/// ledger rolls over to a fresh generation (see the whitepaper, "Tree Capacity").
-pub const DEPTH: usize = 32;
+/// Tree depth: 2^DEPTH leaf slots. Depth 62 gives about 4.6e18 slots: at three leaves
+/// per transfer and a million transfers per second the tree fills in roughly 50,000
+/// years, so there is no rollover and no halt to plan for. The depth is free in the
+/// production circuit: the tall trace is 128 rows and the path rows of both inputs
+/// (2 + 2·DEPTH = 126) fit inside them, so proof size, proving time and verification
+/// are unchanged from the depth-32 launch parameter (see the whitepaper, "Tree
+/// Capacity"). Only the private witness (siblings and direction bits) and the
+/// test-only wide reference circuit grow.
+pub const DEPTH: usize = 62;
 
 /// An append-only Merkle tree of coin commitments.
 ///
