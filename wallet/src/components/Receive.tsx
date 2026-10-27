@@ -53,15 +53,20 @@ const TYPES = [
   },
 ];
 
-/** The text as a QR image (data URL), or "" while it renders or when there is no text. */
-function useQr(text: string, width: number): string {
+/**
+ * The text as a QR image (data URL), or "" while it renders or when there is no text.
+ * Rendered at an integer number of pixels per module and shown at its natural size, so
+ * every module is a crisp square on screen (a fixed CSS width resamples the grid, and a
+ * phone camera then fails to lock on). `scale` is CSS pixels per module.
+ */
+function useQr(text: string, scale: number): string {
   const [qr, setQr] = useState("");
   useEffect(() => {
     if (!text) return setQr("");
-    QRCode.toDataURL(text, { margin: 4, width, errorCorrectionLevel: "M", color: { dark: "#0b0f19", light: "#ffffff" } })
+    QRCode.toDataURL(text, { margin: 4, scale, errorCorrectionLevel: "M", color: { dark: "#0b0f19", light: "#ffffff" } })
       .then(setQr)
       .catch(() => setQr(""));
-  }, [text, width]);
+  }, [text, scale]);
   return qr;
 }
 
@@ -140,9 +145,9 @@ export default function Receive({
   const [stealthBusy, setStealthBusy] = useState(false);
   const [err, setErr] = useState("");
   const latestStealth = stealth[stealth.length - 1]?.address ?? "";
-  const normalQr = useQr(normal, 480);
-  const stealthQr = useQr(latestStealth, 480);
-  const btcQr = useQr(btcAddr, 480);
+  const normalQr = useQr(normal, 5);
+  const stealthQr = useQr(latestStealth, 5);
+  const btcQr = useQr(btcAddr, 5);
 
   // Drop zone
   const [blob, setBlob] = useState("");

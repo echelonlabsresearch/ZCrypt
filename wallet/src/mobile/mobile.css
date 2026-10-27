@@ -926,17 +926,19 @@
   background: #fff;
   border-radius: 18px;
   padding: 4px;
-  width: 208px;
-  height: 208px;
+  width: fit-content;
+  height: auto;
   margin: 2px auto 12px;
   display: flex;
   align-items: center;
   justify-content: center;
 }
 .m-qr img {
-  width: 200px;
-  height: 200px;
+  width: auto;
+  height: auto;
+  max-width: 100%;
   display: block;
+  image-rendering: pixelated;
 }
 .m-kv {
   display: flex;

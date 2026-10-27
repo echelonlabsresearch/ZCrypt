@@ -987,8 +987,8 @@ details.card.guide[open] > summary {
 }
 .qr-tile {
   flex: 0 0 auto;
-  width: 200px;
-  height: 200px;
+  width: auto;
+  height: auto;
   padding: 4px;
   box-sizing: border-box;
   background: #fff;
@@ -998,20 +998,12 @@ details.card.guide[open] > summary {
   justify-content: center;
 }
 .qr-tile img {
-  width: 192px;
-  height: 192px;
+  /* natural size: an integer number of CSS pixels per module, never resampled */
+  width: auto;
+  height: auto;
+  max-width: 100%;
   display: block;
   image-rendering: pixelated;
-}
-.qr-tile.small {
-  width: 96px;
-  height: 96px;
-  padding: 6px;
-  border-radius: 10px;
-}
-.qr-tile.small img {
-  width: 84px;
-  height: 84px;
 }
 @media (max-width: 560px) {
   .qr-row {

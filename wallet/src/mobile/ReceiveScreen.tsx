@@ -52,7 +52,7 @@ export default function ReceiveScreen({
   const address = which === "normal" ? normal : stealth[stealth.length - 1]?.address ?? "";
   useEffect(() => {
     if (!address) return setQr("");
-    QRCode.toDataURL(address, { margin: 4, width: 480, errorCorrectionLevel: "M", color: { dark: "#0b0f19", light: "#ffffff" } })
+    QRCode.toDataURL(address, { margin: 4, scale: 4, errorCorrectionLevel: "M", color: { dark: "#0b0f19", light: "#ffffff" } })
       .then(setQr)
       .catch(() => setQr(""));
   }, [address]);
