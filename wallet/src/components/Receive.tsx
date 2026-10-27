@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useState, DragEvent } from "react";
+import QRCode from "qrcode";
 import { call, fmtAsset, saveFile } from "../lib/api";
 import { CopyButton } from "./Share";
 
@@ -52,6 +53,18 @@ const TYPES = [
   },
 ];
 
+/** The text as a QR image (data URL), or "" while it renders or when there is no text. */
+function useQr(text: string, width: number): string {
+  const [qr, setQr] = useState("");
+  useEffect(() => {
+    if (!text) return setQr("");
+    QRCode.toDataURL(text, { margin: 0, width, errorCorrectionLevel: "M", color: { dark: "#0b0f19", light: "#ffffff" } })
+      .then(setQr)
+      .catch(() => setQr(""));
+  }, [text, width]);
+  return qr;
+}
+
 /**
  * Receive: everything about getting paid in one place. Your addresses (normal, stealth,
  * Bitcoin), the drop zone that claims a coin file or an encrypted note, and the view key.
@@ -81,6 +94,8 @@ export default function Receive({
   const [saved, setSaved] = useState("");
   const [stealthBusy, setStealthBusy] = useState(false);
   const [err, setErr] = useState("");
+  const normalQr = useQr(normal, 360);
+  const btcQr = useQr(btcAddr, 240);
 
   // Drop zone
   const [blob, setBlob] = useState("");
@@ -209,11 +224,19 @@ export default function Receive({
             Share this to get paid in ZCRYPT or any shielded asset. Payments arrive on-chain and
             credit on Refresh. Your view key can see them; nobody else can.
           </div>
-          <div className="addr-box">
-            <code title={normal}>{normal || "…"}</code>
-          </div>
-          <div style={{ display: "flex", gap: "0.4rem", marginTop: "0.5rem", flexWrap: "wrap" }}>
-            <CopyButton text={normal} label="⧉ Copy address" />
+          <div className="qr-row">
+            <div className="qr-tile">{normalQr ? <img src={normalQr} alt="QR code of your address" /> : null}</div>
+            <div style={{ flex: 1, minWidth: 0 }}>
+              <div className="addr-box">
+                <code title={normal}>{normal || "…"}</code>
+              </div>
+              <div style={{ display: "flex", gap: "0.4rem", marginTop: "0.5rem", flexWrap: "wrap" }}>
+                <CopyButton text={normal} label="⧉ Copy address" />
+              </div>
+              <div style={{ fontSize: "0.74rem", opacity: 0.6, marginTop: "0.5rem" }}>
+                Scan the code with the mobile wallet to pay this address.
+              </div>
+            </div>
           </div>
 
           <div className="card-row" style={{ marginTop: "0.9rem", alignItems: "flex-start" }}>
@@ -223,8 +246,17 @@ export default function Receive({
                 Real BTC, derived from the same phrase. Deposit here, then shield it into zBTC under <b>Bridge</b>.
               </div>
               <code style={{ color: "var(--color-cyan)", wordBreak: "break-all" }}>{btcAddr || "—"}</code>
+              {btcAddr && (
+                <div style={{ marginTop: "0.5rem" }}>
+                  <CopyButton text={btcAddr} />
+                </div>
+              )}
             </div>
-            {btcAddr && <CopyButton text={btcAddr} />}
+            {btcQr && (
+              <div className="qr-tile small">
+                <img src={btcQr} alt="QR code of your Bitcoin deposit address" />
+              </div>
+            )}
           </div>
         </div>
 
