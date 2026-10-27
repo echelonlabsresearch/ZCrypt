@@ -455,7 +455,24 @@ fn main() {
             println!("[6] UNDELEGATE accepted (stake locked for the 10-day unbonding period)");
 
             let idx = staking_u64(&zc, &format!("/staking/claim_index/{}", pk_hex(&rewarder.pubkey())));
-            zc.broadcast(&claim_tx(&rewarder.pubkey(), owed)).expect("CLAIM mints reward coins");
+            // A CLAIM must name the FULL claimable balance, and that balance grows at every
+            // epoch boundary. `owed` was read several epochs ago (the delegate / undelegate
+            // steps above take minutes on a slow runner), so re-read it right before the
+            // broadcast and retry if an epoch still slipped in between.
+            let mut owed = owed;
+            let mut claimed = false;
+            for _ in 0..5 {
+                owed = staking_u64(&zc, &pkh);
+                match zc.broadcast(&claim_tx(&rewarder.pubkey(), owed)) {
+                    Ok(_) => {
+                        claimed = true;
+                        break;
+                    }
+                    Err(e) if e.contains("must equal the full claimable balance") => continue,
+                    Err(e) => panic!("CLAIM mints reward coins: {e}"),
+                }
+            }
+            assert!(claimed, "CLAIM kept racing the epoch boundary");
             // Claiming is gasless. A large claim is split by `claim_chunks` (gas coin + rest on
             // first claim), each chunk minted at a monotonic index from `idx` — reconstruct the
             // SAME chunks and spend the first real on-chain coin (a single-coin assumption breaks

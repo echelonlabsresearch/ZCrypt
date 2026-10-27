@@ -419,7 +419,7 @@ mod tests {
 
     #[test]
     fn coin_selection_and_stock() {
-        let coins = [(5 * ATOMIC, false), (50 * ATOMIC, true), (20 * ATOMIC, false), (1 * ATOMIC, false)];
+        let coins = [(5 * ATOMIC, false), (50 * ATOMIC, true), (20 * ATOMIC, false), (ATOMIC, false)];
         assert_eq!(select_inputs(&coins, 24 * ATOMIC, 2), Some(vec![2, 0]));
         assert_eq!(select_inputs(&coins, 20 * ATOMIC, 2), Some(vec![2]));
         assert_eq!(select_inputs(&coins, 26 * ATOMIC, 2), None); // spent coin not usable, 3rd coin not allowed
