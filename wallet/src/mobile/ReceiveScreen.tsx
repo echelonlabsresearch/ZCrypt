@@ -11,7 +11,33 @@ function fitScale(text: string, px: number): number {
   return Math.max(1, Math.floor(px / n));
 }
 import { call, copy, fmtAsset, saveFile } from "../lib/api";
-import { Banner, Btn, Icon, Segmented, shareFile, short, Spinner } from "./ui";
+import { Banner, Btn, Icon, overlay, Segmented, shareFile, short, Spinner } from "./ui";
+
+/**
+ * Full-screen code for another phone to scan. Sized in DEVICE pixels, not CSS pixels: on a
+ * 3x screen the modules can be 8 device pixels each (a third larger than the in-card code,
+ * which is held to whole CSS pixels) and still land on the pixel grid the camera sees.
+ */
+function QrFull({ text, onClose }: { text: string; onClose: () => void }) {
+  const [src, setSrc] = useState("");
+  const [css, setCss] = useState(0);
+  useEffect(() => {
+    const dpr = Math.max(1, Math.round(window.devicePixelRatio || 1));
+    const n = QRCode.create(qrText(text), { errorCorrectionLevel: "L" }).modules.size + 8;
+    const avail = Math.min(window.innerWidth, window.innerHeight - 150) * dpr;
+    const scale = Math.max(1, Math.floor(avail / n));
+    setCss((n * scale) / dpr);
+    QRCode.toDataURL(qrText(text), { margin: 4, scale, errorCorrectionLevel: "L", color: { dark: "#000000", light: "#ffffff" } })
+      .then(setSrc)
+      .catch(() => setSrc(""));
+  }, [text]);
+  return overlay(
+    <div className="m-qrfull" onClick={onClose} role="button" aria-label="Close">
+      {src ? <img src={src} alt="Address QR code" style={{ width: css, height: css }} /> : <Spinner />}
+      <div className="m-qrfull-hint">Turn screen brightness up. Tap to close.</div>
+    </div>
+  );
+}
 import Success from "./Success";
 import { useAuth } from "./MobileApp";
 
@@ -41,6 +67,7 @@ export default function ReceiveScreen({
   const [normal, setNormal] = useState("");
   const [stealth, setStealth] = useState<Stealth[]>([]);
   const [qr, setQr] = useState("");
+  const [big, setBig] = useState(false);
   const [copied, setCopied] = useState(false);
   const [newBusy, setNewBusy] = useState(false);
   const [text, setText] = useState("");
@@ -200,7 +227,11 @@ export default function ReceiveScreen({
       <div className="m-card" style={{ marginTop: 14, textAlign: "center" }}>
         {address ? (
           <>
-            <div className="m-qr">{qr ? <img src={qr} alt="" /> : <Spinner />}</div>
+            <div className="m-qr" onClick={() => qr && setBig(true)} role="button" aria-label="Show the code full screen">
+              {qr ? <img src={qr} alt="" /> : <Spinner />}
+            </div>
+            <div className="m-hint" style={{ marginTop: -6, marginBottom: 8 }}>Tap the code to enlarge it for another phone's camera</div>
+            {big && <QrFull text={address} onClose={() => setBig(false)} />}
             <div className="m-addr" title={address}>{short(address, 10, 8)}</div>
             <div className="m-btnrow">
               <Btn kind="secondary" onClick={async () => { await copy(address); setCopied(true); setTimeout(() => setCopied(false), 1500); }}>
