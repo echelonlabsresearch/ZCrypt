@@ -22,10 +22,15 @@ stock.
 The daemon makes one for you, straight into a 0400 file, and never prints it:
 
 ```
-docker compose run --rm -v $PWD/secrets:/secrets sale zcrypt_sale --new-phrase /secrets/sale-phrase.txt
+mkdir -p secrets && chown 10001:10001 secrets && chmod 700 secrets   # the container's uid
+docker compose run --rm --no-deps -v $PWD/secrets:/secrets abci \
+  zcrypt_sale --new-phrase /secrets/sale-phrase.txt
 # or, with the binary on any machine:  zcrypt_sale --new-phrase secrets/sale-phrase.txt
 cat secrets/sale-phrase.txt      # once: copy the 24 words to paper, two places
 ```
+
+(It runs through the `abci` service only because the `sale` service cannot start until
+this file exists; the image is the same.)
 
 It refuses to overwrite an existing file. The paper copy is the backup; the file is
 what the daemon reads. If you already have a phrase, put it in that file yourself:
@@ -75,9 +80,10 @@ the node, with Caddy terminating TLS at `https://$SALE_DOMAIN`.
 ssh root@<vps>
 cd zcrypt-v2 && git pull && cd chain
 
-umask 077; mkdir -p secrets
-docker compose run --rm -v $PWD/secrets:/secrets sale zcrypt_sale --new-phrase /secrets/sale-phrase.txt
-chown 10001:10001 secrets/sale-phrase.txt; chmod 400 secrets/sale-phrase.txt
+mkdir -p secrets && chown 10001:10001 secrets && chmod 700 secrets
+docker compose run --rm --no-deps -v $PWD/secrets:/secrets abci \
+  zcrypt_sale --new-phrase /secrets/sale-phrase.txt     # prints the desk's ZCrypt address
+cat secrets/sale-phrase.txt                             # copy the 24 words to paper, two places
 
 # .env: add
 #   SALE_DOMAIN=buy.zcrypt.network
