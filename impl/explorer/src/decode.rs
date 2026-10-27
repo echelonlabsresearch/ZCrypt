@@ -702,28 +702,6 @@ fn op_gate(op: u8) -> (&'static str, &'static str) {
     }
 }
 
-#[cfg(test)]
-mod op_table_tests {
-    use super::op_gate;
-    use zcrypt_core::zvm as g;
-
-    /// Every opcode that appears in a consensus-gate program has a name in the explorer's
-    /// table, so a program can never render as "unknown opcode".
-    #[test]
-    fn every_gate_program_opcode_is_named() {
-        let programs: &[&[u8]] = &[
-            g::SWAP_LOCK_NATIVE, g::BOND, g::CLAIM, g::CLAIM_FEE, g::REGISTER, g::HTLC_OPEN,
-            g::HTLC_CLAIM, g::HTLC_EXPIRE, g::HTLC_BURN_LOCK, g::ROTATE_AUTH, g::HTLC_OPEN_SPV,
-            g::ZCRYPT_TRANSFER,
-        ];
-        for prog in programs {
-            for &op in *prog {
-                assert_ne!(op_gate(op).0, "?", "gate opcode 0x{op:02X} has no explorer name");
-            }
-        }
-    }
-}
-
 fn disasm(program: &[u8], shield: bool) -> Vec<Value> {
     program
         .iter()
@@ -947,4 +925,26 @@ fn rules(tag: u8, main: Option<&ShieldTx>, body: &[u8], chain_id: &[u8], height:
         );
     }
     Some(v)
+}
+
+#[cfg(test)]
+mod op_table_tests {
+    use super::op_gate;
+    use zcrypt_core::zvm as g;
+
+    /// Every opcode that appears in a consensus-gate program has a name in the explorer's
+    /// table, so a program can never render as "unknown opcode".
+    #[test]
+    fn every_gate_program_opcode_is_named() {
+        let programs: &[&[u8]] = &[
+            g::SWAP_LOCK_NATIVE, g::BOND, g::CLAIM, g::CLAIM_FEE, g::REGISTER, g::HTLC_OPEN,
+            g::HTLC_CLAIM, g::HTLC_EXPIRE, g::HTLC_BURN_LOCK, g::ROTATE_AUTH, g::HTLC_OPEN_SPV,
+            g::ZCRYPT_TRANSFER,
+        ];
+        for prog in programs {
+            for &op in *prog {
+                assert_ne!(op_gate(op).0, "?", "gate opcode 0x{op:02X} has no explorer name");
+            }
+        }
+    }
 }
