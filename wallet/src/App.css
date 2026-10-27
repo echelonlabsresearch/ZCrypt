@@ -1109,3 +1109,27 @@ details.card.guide[open] > summary {
   font-size: 0.8rem;
   opacity: 0.6;
 }
+
+/* Shielded tile: address picker, key reveal and new-address controls. */
+.stealth-tools {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.5rem;
+}
+.stealth-tools select {
+  max-width: 100%;
+  font-size: 0.78rem;
+}
+.stealth-reveal {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.4rem;
+  width: 100%;
+}
+.stealth-reveal input {
+  width: 100%;
+  box-sizing: border-box;
+}

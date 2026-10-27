@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { call, copySensitive } from "../lib/api";
+import ViewKeyCard from "./ViewKey";
 
 interface ProverSelftest {
   prove_ms: number;
@@ -357,6 +358,8 @@ export default function Settings() {
           </div>
         )}
       </div>
+
+      <ViewKeyCard />
 
       <div className="card" style={{ marginTop: "1.2rem" }}>
         <h2>🔑 Recovery Seed Phrase</h2>

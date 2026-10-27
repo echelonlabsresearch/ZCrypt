@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useState, DragEvent } from "react";
 import QRCode from "qrcode";
-import { call, fmtAsset, saveFile } from "../lib/api";
+import { call, fmtAsset } from "../lib/api";
 import { CopyButton } from "./Share";
 
 export interface ReceivedInfo {
@@ -42,7 +42,7 @@ const TYPES = [
     name: "View key",
     color: "--color-green",
     tag: "read-only · for auditors",
-    body: "A key you can GIVE someone so they can see the amounts of payments to your NORMAL address, and nothing else. It can never spend, and cannot see stealth or bearer coins.",
+    body: "A key you can GIVE someone so they can see the amounts of payments to your NORMAL address, and nothing else. It can never spend, and cannot see stealth or bearer coins. Find it under Settings.",
   },
   {
     icon: "₿",
@@ -115,7 +115,7 @@ function QrOverlay({ text, title, onClose }: { text: string; title: string; onCl
 
 /** One address with its QR code, the address text and a copy button. */
 function AddressTile({
-  icon, title, tag, color, address, qr, note, empty, onShowQr,
+  icon, title, tag, color, address, qr, note, empty, extra, onShowQr,
 }: {
   icon: string;
   title: string;
@@ -126,6 +126,8 @@ function AddressTile({
   note: string;
   /** Shown in place of the QR and address when there is no address yet. */
   empty?: React.ReactNode;
+  /** Controls specific to this address, rendered under the address line. */
+  extra?: React.ReactNode;
   onShowQr: (text: string, title: string) => void;
 }) {
   const [expanded, setExpanded] = useState(false);
@@ -153,6 +155,7 @@ function AddressTile({
               <CopyButton text={address} label="⧉ Copy" />
             </span>
           </div>
+          {extra}
         </>
       ) : (
         <div className="addr-tile-empty">{empty ?? <span style={{ opacity: 0.5 }}>…</span>}</div>
@@ -180,18 +183,18 @@ export default function Receive({
   const [normal, setNormal] = useState("");
   const [btcAddr, setBtcAddr] = useState("");
   const [stealth, setStealth] = useState<Stealth[]>([]);
-  const [viewKey, setViewKey] = useState("");
-  const [showVk, setShowVk] = useState(false);
   // Backup seeds are spend secrets: they are never bulk-fetched. Each is revealed one at a
   // time, behind a fresh password check (reveal_stealth_backup), and held only in local state.
   const [revealed, setRevealed] = useState<Record<number, string>>({});
   const [pwFor, setPwFor] = useState<number | null>(null);
   const [pw, setPw] = useState("");
   const [revealErr, setRevealErr] = useState("");
-  const [saved, setSaved] = useState("");
   const [stealthBusy, setStealthBusy] = useState(false);
   const [err, setErr] = useState("");
-  const latestStealth = stealth[stealth.length - 1]?.address ?? "";
+  // The shielded tile shows one stealth address at a time: the newest, or the one picked.
+  const [stealthIdx, setStealthIdx] = useState<number | null>(null);
+  const shown = stealth.find((x) => x.index === stealthIdx) ?? stealth[stealth.length - 1];
+  const latestStealth = shown?.address ?? "";
   const [bigQr, setBigQr] = useState<{ text: string; title: string } | null>(null);
   const showQr = useCallback((text: string, title: string) => setBigQr({ text, title }), []);
   const hideQr = useCallback(() => setBigQr(null), []);
@@ -211,7 +214,6 @@ export default function Receive({
   const load = useCallback(() => {
     call<string>("get_address").then(setNormal).catch(() => {});
     call<Stealth[]>("list_stealth_addresses").then(setStealth).catch(() => {});
-    call<string>("get_view_key").then(setViewKey).catch(() => {});
     // Derived locally from the phrase: no network call, nothing revealed to anyone.
     call<string>("btc_deposit_address").then(setBtcAddr).catch(() => setBtcAddr(""));
   }, []);
@@ -341,12 +343,58 @@ export default function Receive({
           address={latestStealth}
           qr={stealthQr}
           onShowQr={showQr}
-          note="Maximum privacy: paid with an encrypted file, invisible even to your own view key. Back up its private key below."
+          note="Maximum privacy: paid with an encrypted file, invisible even to your own view key. Your recovery phrase will NOT restore it: back up its private key."
           empty={
             <button className="btn-secondary" disabled={stealthBusy} onClick={newStealth}>
               {stealthBusy ? "Creating…" : "Create a shielded address"}
             </button>
           }
+          extra={shown && (
+            <div className="stealth-tools">
+              {stealth.length > 1 && (
+                <select value={shown.index} onChange={(e) => setStealthIdx(Number(e.target.value))}>
+                  {stealth.map((x) => (
+                    <option key={x.index} value={x.index}>
+                      Shielded #{x.index} · {x.address.slice(0, 10)}…{x.address.slice(-6)}
+                    </option>
+                  ))}
+                </select>
+              )}
+              {revealed[shown.index] ? (
+                <>
+                  <div className="mono-box" style={{ color: "var(--color-yellow)", wordBreak: "break-all", fontSize: "0.74rem", textAlign: "left" }}>
+                    {revealed[shown.index]}
+                  </div>
+                  <CopyButton text={revealed[shown.index]} label="⧉ Copy private key" />
+                </>
+              ) : pwFor === shown.index ? (
+                <div className="stealth-reveal">
+                  <input
+                    type="password"
+                    placeholder="Password to reveal"
+                    value={pw}
+                    autoFocus
+                    onChange={(e) => setPw(e.target.value)}
+                    onKeyDown={(e) => e.key === "Enter" && revealBackup(shown.index)}
+                  />
+                  <span className="addr-actions">
+                    <button className="copy-btn" onClick={() => revealBackup(shown.index)}>Reveal</button>
+                    <button className="btn-link" onClick={cancelReveal}>Cancel</button>
+                  </span>
+                  {revealErr && <span style={{ color: "var(--color-red, #e66)", fontSize: "0.78rem" }}>{revealErr}</span>}
+                </div>
+              ) : (
+                <span className="addr-actions">
+                  <button className="btn-link" onClick={() => { setPwFor(shown.index); setPw(""); setRevealErr(""); }}>
+                    🔑 Reveal private key
+                  </button>
+                  <button className="btn-link" disabled={stealthBusy} onClick={newStealth}>
+                    {stealthBusy ? "…" : "+ New shielded address"}
+                  </button>
+                </span>
+              )}
+            </div>
+          )}
         />
         <AddressTile
           icon="₿"
@@ -383,118 +431,6 @@ export default function Receive({
           <div style={{ fontSize: "0.74rem", opacity: 0.6, marginTop: "0.5rem" }}>
             A receipt pasted here is checked against the chain; it moves nothing. Never drop a coin into anything but your own wallet.
           </div>
-        </div>
-      </div>
-
-      {/* Stealth addresses: persisted list */}
-      <div className="card" style={{ marginTop: "1.2rem" }}>
-        <div className="card-row" style={{ borderTop: "none", paddingTop: 0 }}>
-          <h2 style={{ margin: 0 }}>🕶️ Shielded (stealth) addresses</h2>
-          <button className="copy-btn" disabled={stealthBusy} onClick={newStealth}>
-            {stealthBusy ? "…" : "+ New stealth address"}
-          </button>
-        </div>
-        {stealth.length === 0 && (
-          <div style={{ opacity: 0.6, fontSize: "0.85rem" }}>
-            None yet. A stealth address is paid with an encrypted file and is invisible even to your own view key.
-          </div>
-        )}
-        {stealth.map((s) => (
-          <div key={s.index} className="card-row" style={{ alignItems: "flex-start" }}>
-            <div style={{ flex: 1, minWidth: 0 }}>
-              <div style={{ fontSize: "0.72rem", opacity: 0.5 }}>Stealth #{s.index}</div>
-              <code style={{ color: "var(--color-purple)", wordBreak: "break-all" }}>{s.address}</code>
-              <div style={{ marginTop: "0.4rem" }}>
-                {revealed[s.index] ? (
-                  <div className="mono-box" style={{ color: "var(--color-yellow)", wordBreak: "break-all" }}>
-                    {revealed[s.index]}
-                  </div>
-                ) : pwFor === s.index ? (
-                  <div style={{ display: "flex", gap: "0.4rem", alignItems: "center", flexWrap: "wrap" }}>
-                    <input
-                      type="password"
-                      placeholder="Password to reveal"
-                      value={pw}
-                      autoFocus
-                      onChange={(e) => setPw(e.target.value)}
-                      onKeyDown={(e) => e.key === "Enter" && revealBackup(s.index)}
-                    />
-                    <button className="copy-btn" onClick={() => revealBackup(s.index)}>
-                      Reveal
-                    </button>
-                    <button className="btn-link" onClick={cancelReveal}>
-                      Cancel
-                    </button>
-                    {revealErr && <span style={{ color: "var(--color-red, #e66)", fontSize: "0.78rem" }}>{revealErr}</span>}
-                  </div>
-                ) : (
-                  <button className="btn-link" onClick={() => { setPwFor(s.index); setPw(""); setRevealErr(""); }}>
-                    🔑 Reveal private key
-                  </button>
-                )}
-              </div>
-              <div style={{ display: "flex", gap: "0.4rem", marginTop: "0.5rem", flexWrap: "wrap" }}>
-                <CopyButton text={s.address} label="⧉ Copy address" />
-                {revealed[s.index] && <CopyButton text={revealed[s.index]} label="⧉ Copy private key" />}
-              </div>
-            </div>
-          </div>
-        ))}
-        <div className="warn" style={{ marginTop: "0.8rem" }}>
-          ⚠️ Your recovery phrase will <b>not</b> restore stealth addresses. Back up each private key
-          separately. Every stealth address you generate is saved here.
-        </div>
-      </div>
-
-      {/* View key */}
-      <div className="card" style={{ marginTop: "1.2rem" }}>
-        <h2>🔎 View key</h2>
-        <div style={{ fontSize: "0.85rem", opacity: 0.85, lineHeight: 1.5, marginBottom: "0.6rem" }}>
-          Give this to an auditor to let them <b>see the amounts</b> of payments to your normal address,
-          and nothing more. It can never spend, and it cannot see stealth or bearer coins.
-        </div>
-        {showVk ? (
-          <>
-            <div className="mono-box" style={{ color: "var(--color-green)", wordBreak: "break-all" }}>
-              {viewKey}
-            </div>
-            <div style={{ display: "flex", gap: "0.4rem", marginTop: "0.5rem", flexWrap: "wrap" }}>
-              <CopyButton text={viewKey} label="⧉ Copy view key" />
-              <button
-                className="copy-btn"
-                onClick={async () => {
-                  try {
-                    setSaved(await saveFile("zcrypt-view-key.txt", viewKey));
-                  } catch (e) {
-                    setSaved(`error: ${e}`);
-                  }
-                }}
-              >
-                💾 Save file
-              </button>
-              <button className="btn-link" onClick={() => setShowVk(false)}>
-                Hide
-              </button>
-            </div>
-            {saved && (
-              <div style={{ fontSize: "0.78rem", opacity: 0.7, marginTop: "0.4rem" }}>
-                {saved.startsWith("error") ? (
-                  <span style={{ color: "var(--color-red, #e66)" }}>{saved}</span>
-                ) : (
-                  <>
-                    ✓ Saved to <code>{saved}</code>
-                  </>
-                )}
-              </div>
-            )}
-          </>
-        ) : (
-          <button className="btn-secondary" onClick={() => setShowVk(true)}>
-            👁 Reveal my view key
-          </button>
-        )}
-        <div className="warn" style={{ marginTop: "0.8rem" }}>
-          A view key is a disclosure, and it cannot be un-shared.
         </div>
       </div>
 
