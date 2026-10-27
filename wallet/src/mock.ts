@@ -101,6 +101,29 @@ const DATA: Record<string, unknown> = {
   btc_max_send: { amount_sats: 1_528_882, fee_sats: 1_118, fee_rate_sat_vb: 7.3, inputs: 2 },
 };
 
+// The sale desk ("send Bitcoin, get ZCRYPT"): an order advances waiting -> seen -> paid on
+// successive polls so the Buy screen's whole life can be viewed.
+const SALE_QUOTE = { price_sats: 2_500, min_sats: 20_000, max_sats: 100_000_000, stock_atomic: 184_250_000_000, min_conf: 1, network: "bitcoin", ttl_secs: 86_400 };
+const saleOrders: Record<string, { sats: number; polls: number; created: number }> = {};
+function saleView(id: string) {
+  const o = saleOrders[id];
+  const status = o.polls < 2 ? "waiting" : o.polls < 4 ? "seen" : "paid";
+  return {
+    id,
+    btc_address: "bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh",
+    sats: o.sats,
+    price_sats: SALE_QUOTE.price_sats,
+    created: o.created,
+    expires: o.created + SALE_QUOTE.ttl_secs,
+    status,
+    paid_sats: status === "waiting" ? 0 : o.sats,
+    confirmations: status === "paid" ? 1 : 0,
+    min_conf: SALE_QUOTE.min_conf,
+    zcrypt_atomic: status === "paid" ? Math.floor((o.sats * 1_000_000) / SALE_QUOTE.price_sats) : 0,
+    zc_txhash: status === "paid" ? "9f1c…e2" : "",
+  };
+}
+
 export function installMock() {
   const w = window as unknown as { __TAURI_INTERNALS__?: unknown };
   if (w.__TAURI_INTERNALS__) return;
@@ -115,6 +138,23 @@ export function installMock() {
       if (cmd === "plugin:barcode-scanner|cancel") return null;
       if (cmd.startsWith("plugin:")) return 1; // event listen/unlisten ids
       console.log("[mock]", cmd, args ?? "");
+      if (cmd === "buy_quote") return { success: true, data: SALE_QUOTE } satisfies Resp;
+      if (cmd === "buy_order") {
+        const id = Math.random().toString(16).slice(2).padEnd(32, "0").slice(0, 32);
+        saleOrders[id] = { sats: Number(args?.sats ?? 0), polls: 0, created: Math.floor(Date.now() / 1000) };
+        return { success: true, data: saleView(id) } satisfies Resp;
+      }
+      if (cmd === "buy_status") {
+        const id = String(args?.id ?? "");
+        if (!saleOrders[id]) return { success: false, error: "no such order" } satisfies Resp;
+        saleOrders[id].polls += 1;
+        return { success: true, data: saleView(id) } satisfies Resp;
+      }
+      if (cmd === "buy_orders") return { success: true, data: Object.keys(saleOrders).reverse().map((id) => ({ id, sale_url: "mock", created: saleOrders[id].created })) } satisfies Resp;
+      if (cmd === "buy_forget") {
+        delete saleOrders[String(args?.id ?? "")];
+        return { success: true, data: true } satisfies Resp;
+      }
       if (cmd in DATA) return { success: true, data: DATA[cmd] } satisfies Resp;
       return { success: false, error: `mock: no canned answer for ${cmd}` } satisfies Resp;
     },

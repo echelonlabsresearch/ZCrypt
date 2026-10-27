@@ -8,9 +8,10 @@ import History from "./components/History";
 import Mint from "./components/Mint";
 import Rewards from "./components/Rewards";
 import Bridge from "./components/Bridge";
+import Buy from "./components/Buy";
 import Settings from "./components/Settings";
 
-type Tab = "balance" | "receive" | "send" | "history" | "mint" | "rewards" | "bridge" | "settings";
+type Tab = "balance" | "buy" | "receive" | "send" | "history" | "mint" | "rewards" | "bridge" | "settings";
 type Mode = "loading" | "choose" | "create" | "restore" | "seed" | "unlock" | "ready";
 
 interface Toast {
@@ -356,7 +357,7 @@ export default function App() {
   }
 
   // ---------- main app ----------
-  const tabs: Tab[] = ["balance", "receive", "send", "history", "mint", "rewards", "bridge", "settings"];
+  const tabs: Tab[] = ["balance", "buy", "receive", "send", "history", "mint", "rewards", "bridge", "settings"];
   return (
     <div className="app">
       <header className="header">
@@ -424,6 +425,9 @@ export default function App() {
       <main className="main">
         <div style={{ display: tab === "balance" ? "block" : "none" }}>
           <Balance balance={balance} onRefresh={refresh} />
+        </div>
+        <div style={{ display: tab === "buy" ? "block" : "none" }}>
+          <Buy active={tab === "buy"} onBought={(a) => { refresh(); toast("ZCRYPT Bought", `+${fmt(a)} ZCRYPT arrived from the sale desk`); }} />
         </div>
         <div style={{ display: tab === "receive" ? "block" : "none" }}>
           <Receive

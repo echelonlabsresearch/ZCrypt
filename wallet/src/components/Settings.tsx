@@ -32,6 +32,7 @@ interface WalletSettings {
   tor_enabled: boolean;
   tor_proxy: string;
   broadcast_jitter: boolean;
+  sale_url: string;
 }
 
 export default function Settings() {
@@ -84,6 +85,8 @@ export default function Settings() {
   // Bitcoin (self-custody): which network, and which Esplora server answers for it.
   const [btcNetwork, setBtcNetwork] = useState("bitcoin");
   const [esploraUrl, setEsploraUrl] = useState("");
+  // The foundation's sale desk the Buy tab talks to ("send Bitcoin, get ZCRYPT").
+  const [saleUrl, setSaleUrl] = useState("");
   const [btcSaved, setBtcSaved] = useState(false);
   const [btcErr, setBtcErr] = useState("");
 
@@ -97,6 +100,7 @@ export default function Settings() {
         setJitter(s.broadcast_jitter !== false);
         setBtcNetwork(s.btc_network || "bitcoin");
         setEsploraUrl(s.esplora_url || "");
+        setSaleUrl(s.sale_url || "");
       })
       .catch(() => {});
     checkNode();
@@ -118,6 +122,7 @@ export default function Settings() {
       tor_enabled: torEnabled,
       tor_proxy: torProxy.trim() || "127.0.0.1:9050",
       broadcast_jitter: jitter,
+      sale_url: full?.sale_url ?? "https://buy.zcrypt.network",
       ...next,
     };
     setErr("");
@@ -152,6 +157,7 @@ export default function Settings() {
         tor_enabled: torEnabled,
         tor_proxy: torProxy.trim() || "127.0.0.1:9050",
         broadcast_jitter: jitter,
+        sale_url: "https://buy.zcrypt.network",
       }),
       btc_network: btcNetwork,
       esplora_url: esploraUrl.trim(),
@@ -268,6 +274,19 @@ export default function Settings() {
             <option value="testnet4">Testnet4 (test coins)</option>
             <option value="regtest">Regtest (local bitcoind)</option>
           </select>
+        </div>
+        <div className="field">
+          <label>Sale desk URL (Buy tab)</label>
+          <input
+            value={saleUrl}
+            onChange={(e) => setSaleUrl(e.target.value)}
+            onBlur={() => saveSettings({ sale_url: saleUrl.trim() })}
+            placeholder="https://buy.zcrypt.network"
+          />
+          <div style={{ fontSize: "0.76rem", opacity: 0.6, marginTop: "0.3rem" }}>
+            Where the Buy tab gets its price and payment address. The foundation runs <code>https://buy.zcrypt.network</code>;
+            a desk of your own is <code>zcrypt_sale</code> from the repo. Remote desks must be <code>https://</code> or <code>.onion</code>.
+          </div>
         </div>
         <div className="field">
           <label>Esplora URL</label>

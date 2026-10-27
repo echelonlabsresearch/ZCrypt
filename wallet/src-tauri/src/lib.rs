@@ -2039,9 +2039,16 @@ struct Settings {
     /// is not the time the network first sees the transaction. Default on.
     #[serde(default = "default_true")]
     broadcast_jitter: bool,
+    /// The foundation's sale desk ("send Bitcoin, get ZCRYPT"): the Buy tab asks it for a
+    /// quote and an order. Remote desks must be https (same policy as the node URL).
+    #[serde(default = "default_sale_url")]
+    sale_url: String,
 }
 fn default_true() -> bool {
     true
+}
+fn default_sale_url() -> String {
+    "https://buy.zcrypt.network".into()
 }
 fn default_btc_url() -> String {
     "http://localhost:18443".into()
@@ -2087,6 +2094,7 @@ impl Default for Settings {
             tor_enabled: default_tor_enabled(),
             tor_proxy: default_tor_proxy(),
             broadcast_jitter: true,
+            sale_url: default_sale_url(),
         }
     }
 }
@@ -2516,12 +2524,140 @@ async fn save_settings(settings: Settings, state: State<'_, AppState>) -> R<bool
     chain::check_node_url(&settings.node_url)?;
     // Same rule for the Esplora endpoint in self-custody mode.
     check_esplora_policy(&settings)?;
+    if !settings.sale_url.trim().is_empty() {
+        chain::check_node_url(settings.sale_url.trim()).map_err(|e| format!("sale desk URL: {e}"))?;
+    }
     let dir = state.data_dir.lock().unwrap().clone();
     let json = serde_json::to_string(&settings).map_err(|e| e.to_string())?;
     // 0600: settings carry the bitcoind RPC password (regtest/bitcoind mode only).
     privfs::write_private(&settings_path(&dir), json.as_bytes()).map_err(|e| e.to_string())?;
     // Apply the transport preferences immediately (don't wait for the next settings read).
     apply_transport(&settings);
+    ok(true)
+}
+
+// ---------------------------------------------------------------------------
+// Buy: the foundation's sale desk ("send Bitcoin, get ZCRYPT"). The wallet only relays:
+// it asks the desk for a quote, opens an order against this wallet's own address, and
+// polls the order. The Bitcoin is paid from any Bitcoin wallet to the address the desk
+// hands back; the ZCRYPT arrives as an ordinary shielded transfer and is picked up by the
+// normal scan. Open order ids are kept in the data dir so a relaunch still shows them.
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize, Deserialize, Clone)]
+struct SavedOrder {
+    id: String,
+    sale_url: String,
+    created: u64,
+}
+
+fn buy_orders_path(dir: &str) -> std::path::PathBuf {
+    std::path::Path::new(dir).join("buy-orders.json")
+}
+
+fn load_buy_orders(dir: &str) -> Vec<SavedOrder> {
+    std::fs::read_to_string(buy_orders_path(dir))
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+fn save_buy_orders(dir: &str, list: &[SavedOrder]) -> Result<(), String> {
+    let json = serde_json::to_string(list).map_err(|e| e.to_string())?;
+    privfs::write_private(&buy_orders_path(dir), json.as_bytes()).map_err(|e| e.to_string())
+}
+
+fn sale_url(state: &State<'_, AppState>) -> Result<String, String> {
+    let dir = state.data_dir.lock().unwrap().clone();
+    let url = load_settings(&dir).sale_url.trim().trim_end_matches('/').to_string();
+    if url.is_empty() {
+        return Err("no sale desk configured (Settings)".to_string());
+    }
+    chain::check_node_url(&url).map_err(|e| format!("sale desk URL: {e}"))?;
+    Ok(url)
+}
+
+/// GET/POST JSON against the desk. Errors from the desk arrive as `{"error": "..."}` with a
+/// 4xx status; surface that message rather than the HTTP code.
+fn sale_call(url: &str, body: Option<serde_json::Value>) -> Result<serde_json::Value, String> {
+    let agent = chain::agent_with_timeout(25);
+    let resp = match body {
+        Some(b) => agent.post(url).send_json(b),
+        None => agent.get(url).call(),
+    };
+    let v: serde_json::Value = match resp {
+        Ok(r) => r.into_json().map_err(|e| format!("sale desk: bad reply: {e}"))?,
+        Err(ureq::Error::Status(code, r)) => {
+            let v: serde_json::Value = r.into_json().unwrap_or(serde_json::Value::Null);
+            return Err(v["error"].as_str().map(str::to_string).unwrap_or_else(|| format!("sale desk returned HTTP {code}")));
+        }
+        Err(e) => return Err(format!("sale desk unreachable: {e}")),
+    };
+    if let Some(e) = v["error"].as_str() {
+        return Err(e.to_string());
+    }
+    Ok(v)
+}
+
+/// The desk's posted terms: price (sats per ZCRYPT), limits, stock, confirmations.
+#[tauri::command]
+async fn buy_quote(state: State<'_, AppState>) -> R<serde_json::Value> {
+    let url = sale_url(&state)?;
+    sale_call(&format!("{url}/quote"), None).and_then(ok)
+}
+
+/// Open an order for `sats` against this wallet's recoverable address. Returns the order
+/// (with the Bitcoin address to pay) and remembers its id.
+#[tauri::command]
+async fn buy_order(sats: u64, state: State<'_, AppState>) -> R<serde_json::Value> {
+    let url = sale_url(&state)?;
+    let address = with_wallet(&state, |w| Ok(w.account.normal_address().to_bech32()))?;
+    let v = sale_call(&format!("{url}/order"), Some(serde_json::json!({ "address": address, "sats": sats })))?;
+    if let Some(id) = v["id"].as_str() {
+        let dir = state.data_dir.lock().unwrap().clone();
+        let mut list = load_buy_orders(&dir);
+        let created = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        list.push(SavedOrder { id: id.to_string(), sale_url: url.clone(), created });
+        save_buy_orders(&dir, &list)?;
+    }
+    ok(v)
+}
+
+/// Current status of one order.
+#[tauri::command]
+async fn buy_status(id: String, state: State<'_, AppState>) -> R<serde_json::Value> {
+    let dir = state.data_dir.lock().unwrap().clone();
+    let url = load_buy_orders(&dir)
+        .into_iter()
+        .find(|o| o.id == id)
+        .map(|o| o.sale_url)
+        .map(Ok)
+        .unwrap_or_else(|| sale_url(&state))?;
+    if !id.chars().all(|c| c.is_ascii_hexdigit()) || id.len() != 32 {
+        return Err("bad order id".to_string());
+    }
+    sale_call(&format!("{url}/order/{id}"), None).and_then(ok)
+}
+
+/// Orders this wallet opened, newest first (ids only; the desk holds the state).
+#[tauri::command]
+async fn buy_orders(state: State<'_, AppState>) -> R<Vec<SavedOrder>> {
+    let dir = state.data_dir.lock().unwrap().clone();
+    let mut list = load_buy_orders(&dir);
+    list.reverse();
+    ok(list)
+}
+
+/// Drop an order from the local list (paid or abandoned). The desk keeps its own record.
+#[tauri::command]
+async fn buy_forget(id: String, state: State<'_, AppState>) -> R<bool> {
+    let dir = state.data_dir.lock().unwrap().clone();
+    let mut list = load_buy_orders(&dir);
+    list.retain(|o| o.id != id);
+    save_buy_orders(&dir, &list)?;
     ok(true)
 }
 
@@ -9017,6 +9153,11 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            buy_quote,
+            buy_order,
+            buy_status,
+            buy_orders,
+            buy_forget,
             wallet_exists,
             create_wallet,
             restore_wallet,

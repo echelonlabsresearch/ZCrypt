@@ -990,6 +990,7 @@ impl Btc {
 }
 
 pub mod esplora;
+pub mod sale;
 pub mod hdwallet;
 pub mod selfcustody;
 pub mod swap;
