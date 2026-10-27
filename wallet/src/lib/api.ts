@@ -24,11 +24,33 @@ export const fmtAsset = (base: number, decimals = ZCRYPT_DECIMALS): string =>
   (base / Math.pow(10, decimals)).toLocaleString(undefined, { maximumFractionDigits: decimals });
 
 /**
+ * Bring a typed amount into the plain `digits.digits` form the parser expects. The iOS
+ * decimal keypad inserts the REGION's separator, so a phone set to a European region
+ * types "0,5" (and an Arabic-region one "0٫5"); some keyboards also pad with a no-break
+ * space. A lone comma with no dot is the decimal separator; when both appear, the last
+ * one is the decimal separator and the other is thousands grouping.
+ */
+export function normalizeAmount(amount: string): string {
+  let s = amount.replace(/[\s\u00a0\u202f'_]/g, "").replace(/[\u066b\u2396]/g, ".");
+  const dot = s.lastIndexOf(".");
+  const comma = s.lastIndexOf(",");
+  const grouped = (sep: string) => new RegExp(`^\\d{1,3}(\\${sep}\\d{3})+$`);
+  if (comma >= 0 && dot < 0) {
+    if (grouped(",").test(s)) s = s.replace(/,/g, "");
+    else if (s.split(",").length === 2) s = s.replace(",", ".");
+  } else if (comma >= 0 && dot >= 0) {
+    const [whole, frac, sep] = comma > dot ? [s.slice(0, comma), s.slice(comma + 1), "."] : [s.slice(0, dot), s.slice(dot + 1), ","];
+    if (grouped(sep).test(whole)) s = `${whole.replace(/[.,]/g, "")}.${frac}`;
+  }
+  return s;
+}
+
+/**
  * Parse a decimal amount string into integer base units without IEEE float.
  * Accepts "1", "1.5", ".5", "0.00000001". Rejects scientific notation and empty.
  */
 export function toBaseAsset(amount: string, decimals = ZCRYPT_DECIMALS): number {
-  const s = amount.trim();
+  const s = normalizeAmount(amount);
   if (!s || !/^\d*\.?\d+$/.test(s)) {
     throw new Error(`invalid amount: ${amount}`);
   }
