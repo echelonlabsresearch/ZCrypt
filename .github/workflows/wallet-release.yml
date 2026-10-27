@@ -491,8 +491,8 @@ jobs:
 
           seen = {}
           fragments = list(pathlib.Path("sums").rglob("SHA256SUMS.fragment"))
-          if len(fragments) != 3:
-              sys.exit(f"expected 3 checksum fragments, found {len(fragments)}")
+          if len(fragments) != 4:
+              sys.exit(f"expected 4 checksum fragments (macos, macos-intel, linux, windows), found {len(fragments)}")
           for fragment in fragments:
               for line in fragment.read_text().splitlines():
                   if not line.strip():
