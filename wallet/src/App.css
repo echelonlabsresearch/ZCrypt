@@ -998,9 +998,9 @@ details.card.guide[open] > summary {
 }
 .qr-tile {
   flex: 0 0 auto;
-  width: 150px;
-  height: 150px;
-  padding: 8px;
+  width: 200px;
+  height: 200px;
+  padding: 4px;
   box-sizing: border-box;
   background: #fff;
   border-radius: 12px;
@@ -1009,8 +1009,8 @@ details.card.guide[open] > summary {
   justify-content: center;
 }
 .qr-tile img {
-  width: 134px;
-  height: 134px;
+  width: 192px;
+  height: 192px;
   display: block;
   image-rendering: pixelated;
 }

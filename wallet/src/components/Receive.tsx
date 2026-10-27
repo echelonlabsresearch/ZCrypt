@@ -58,7 +58,7 @@ function useQr(text: string, width: number): string {
   const [qr, setQr] = useState("");
   useEffect(() => {
     if (!text) return setQr("");
-    QRCode.toDataURL(text, { margin: 0, width, errorCorrectionLevel: "M", color: { dark: "#0b0f19", light: "#ffffff" } })
+    QRCode.toDataURL(text, { margin: 4, width, errorCorrectionLevel: "M", color: { dark: "#0b0f19", light: "#ffffff" } })
       .then(setQr)
       .catch(() => setQr(""));
   }, [text, width]);
@@ -94,7 +94,7 @@ export default function Receive({
   const [saved, setSaved] = useState("");
   const [stealthBusy, setStealthBusy] = useState(false);
   const [err, setErr] = useState("");
-  const normalQr = useQr(normal, 360);
+  const normalQr = useQr(normal, 480);
   const btcQr = useQr(btcAddr, 240);
 
   // Drop zone

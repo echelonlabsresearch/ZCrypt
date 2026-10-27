@@ -925,17 +925,17 @@
 .m-qr {
   background: #fff;
   border-radius: 18px;
-  padding: 10px;
-  width: 172px;
-  height: 172px;
+  padding: 4px;
+  width: 208px;
+  height: 208px;
   margin: 2px auto 12px;
   display: flex;
   align-items: center;
   justify-content: center;
 }
 .m-qr img {
-  width: 152px;
-  height: 152px;
+  width: 200px;
+  height: 200px;
   display: block;
 }
 .m-kv {
