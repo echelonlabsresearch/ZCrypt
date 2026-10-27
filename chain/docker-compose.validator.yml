@@ -32,7 +32,7 @@ services:
     # Digest-pinned published image so downloaders need no source and cannot be served a
     # different binary under the same tag. `ZCRYPT_ABCI_IMAGE` overrides (e.g. a local build).
     # PLACEHOLDER DIGEST: replace with the digest of the first signed release image.
-    image: ${ZCRYPT_ABCI_IMAGE:-ghcr.io/echelonlabsresearch/zcrypt-abci@sha256:02d2e410b70856ff1ee41852b83ac4e70205c454ea9203f0f68cf905c7b9aa18}
+    image: ${ZCRYPT_ABCI_IMAGE:-ghcr.io/echelonlabsresearch/zcrypt-abci@sha256:a3574e5ac58a58f08522eaae3ddfe18394bc6bacff4ef1fc90b3dde0a6a76abe}
     build:
       context: ..
       dockerfile: chain/docker/Dockerfile
