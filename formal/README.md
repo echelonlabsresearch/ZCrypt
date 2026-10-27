@@ -17,14 +17,72 @@ Confirm no proof depends on `sorry` (only Lean's standard foundational axioms):
 
 ```sh
 echo 'import Zcrypt
+#print axioms Zcrypt.Air.soundness_prop
 #print axioms Zcrypt.Carry.conservation_of_limb_constraints' > /tmp/ax.lean
 ~/.elan/bin/lake env lean /tmp/ax.lean
-# => depends on axioms: [propext, Quot.sound]   (no sorryAx)
+# => depends on axioms: [propext, Classical.choice, Quot.sound]   (no sorryAx)
 ```
+
+The full build, including the kernel-checked primality of the BabyBear modulus, takes
+about 15 seconds.
 
 ## What is proved
 
 Hand-modeled faithfully from the Rust, with `file:line` provenance in each file.
+
+### `Zcrypt/Air/`: the whole tall-skinny AIR (2026-10-27)
+
+The production circuit `CoinsAirTall` (`shield/src/tall.rs`), constraint by constraint,
+and its soundness theorem. This is the model the earlier phases led to: not one
+constraint family at a time, but every `assert_zero` site of `eval`, with the real
+geometry (128 rows, 9 Poseidon2 groups per row, two inputs, three outputs, 32-level
+paths), the real row gating (the preprocessed selectors), the real lane layout, and the
+real public-input indices.
+
+| file | content |
+|---|---|
+| `Field.lean` | BabyBear as integers mod p; the four lemmas that turn `p ∣ expr` back into integer facts; bit recomposition and its bounds. |
+| `Prime.lean` | `p = 2013265921` is prime, kernel-checked by trial division (`decide` on a log-depth checker), hence Euclid's lemma. Nothing is assumed about the field. |
+| `Layout.lean` | The trace (`Row`, `Trace`), the selectors (`isInner`, `isCore`, `isPath`, `isChain`, ...), well-formedness (`WF`: every cell is a field element), and `Sat`: the 40 constraint sites of `eval`, in source order, each with its gating and lanes. |
+| `Statement.lean` | The spec side: `commitBlock`, `pkBlock`, `nfBlock`, `cat`, `merkle`, and `Statement`, the transfer statement a trace proves. |
+| `Soundness.lean` | `soundness`: any `WF` trace satisfying `Sat` yields a `Statement`. The witness is read off the trace. |
+| `Corollaries.lean` | What the protocol gets from `Statement`: no inflation, canonical nullifiers, domain separation, the review M1 lemma, the arity-leak fix. |
+
+**`Statement`** (what a valid proof establishes, for an arbitrary hash `H`):
+
+- range: every value limb and the fee is a 26-bit integer;
+- conservation over the integers: in₀ + in₁ = out₀ + out₁ + out₂ + fee;
+- the three published output commitments are `H(commitBlock v (H[pk ‖ blind]) asset)`
+  with one shared asset;
+- ownership: each input's committed pk is `H(pkBlock ss)` for a spend secret `ss` the
+  trace holds;
+- nullifiers: each published nullifier is the canonical
+  `H(nfBlock (H[ss ‖ H[pk ‖ blind]]) v asset)` of that input's opening, nothing else;
+- active flags are boolean and a dummy input has value 0;
+- membership: every active input's commitment sits under the public root along a
+  32-level Merkle path (siblings and directions read from the path rows).
+
+**Poseidon2 is abstracted.** The model does not re-prove the permutation's round
+constraints (`p3_poseidon2_air`, run on every group of every row); it takes
+`out = H(inp)` for an arbitrary `H` and proves everything the wiring of those digests
+implies. Every theorem therefore holds for the real hash, and nothing about `H` is
+assumed, not even injectivity: the corollaries that need a hash property say so
+(`nfBlock_injective` is about the block layout, not about `H`).
+
+**What `Statement` does not cover.** The chain-domain and encrypted-notes-digest public
+inputs are not constrained by the AIR at all; they are bound only through the Fiat-Shamir
+transcript (tall.rs:140-147), so the model has nothing to say about them. FRI soundness
+and the choice of security parameters are outside any AIR-level model. And this is still
+a hand model: `Layout.lean` was written from `tall.rs` by reading it, and a relayout of
+the circuit invalidates it until it is updated. That is the intended failure mode: the
+build breaks, loudly, on the model that pins the layout.
+
+**Why this matters.** The review of 2026-10-26 found M1: the inner nullifier block then
+absorbed the blind directly, so a sender-chosen blind could make that block equal the pk
+block and publish the nullifier of a known key. The value-level models could not see it;
+they abstract each field to one integer. `Corollaries.inner_nf_eq_pk_iff` is that finding
+as a theorem over the fixed layout: the two blocks coincide exactly when the inner commit
+digest equals the constant pk padding, which is a preimage of `H`, not a free choice.
 
 ### `Zcrypt/Spec.lean` — Phase 0: the transparent VM spec
 Models `shield/src/zvm.rs::execute` (the `OP_CHECK_RANGE` and `OP_CHECK_CONSERVATION`

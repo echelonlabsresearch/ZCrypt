@@ -190,3 +190,21 @@ conjunction over the output slots and holds unchanged at three, but the Lean fil
 `vm-core` extract were written and checked at `N_OUT = 2` and have not been regenerated.
 Until they are, read them as a model of the two-output instance of the same constraint
 family, not of the compiled width.
+
+## Full AIR model (2026-10-27 update)
+
+Tier 3 is no longer open at the hand-model level. `formal/Zcrypt/Air/` models the whole
+production AIR (`CoinsAirTall::eval`) at the compiled geometry (N_IN = 2, N_OUT = 3, DEPTH = 32,
+HEIGHT = 128) and proves `soundness`: every well-formed satisfying trace yields the transfer
+statement (range, integer conservation, output commitments, ownership, canonical nullifiers,
+boolean active flags, Merkle membership of every active input). Poseidon2 is an arbitrary
+function; the BabyBear modulus is proved prime inside Lean so no field fact is assumed. Zero
+`sorry`, standard axioms only. See `formal/README.md`.
+
+This supersedes the arity note above for the AIR: the `Air` model is at three outputs. The
+older `Spec`, `Carry` and the `vm-core` extract remain at two outputs as historical models of
+the same constraint family. What stays open is the automatic link from `tall.rs` to the model
+(the Charon wall on the Plonky3 generics), the Poseidon2 round constraints themselves, and
+everything outside the AIR: FRI parameters, the prover and verifier code, and the transcript
+binding of the chain-domain and encrypted-notes-digest public inputs, which the AIR does not
+constrain.

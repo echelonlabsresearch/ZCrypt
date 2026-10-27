@@ -6,7 +6,7 @@
 //! trace WIDTH but only log in height, so this shrinks it substantially.
 //!
 //! **Design (hybrid, chosen for safety):**
-//!   * ROW 1 (the CORE row) holds the 8 outer Poseidon2 blocks (commit×S, nf×N_IN,
+//!   * ROW 1 (the CORE row) holds the 9 outer Poseidon2 blocks (commit×S, nf×N_IN,
 //!     pk×N_IN) side by side, and its constraints mirror the audited wide AIR
 //!     (nullifier construction, conservation, range, active/dummy, single-asset,
 //!     published nullifiers/outputs). Only the row gating changes.
@@ -46,10 +46,10 @@ use super::*;
 
 // ---- layout -------------------------------------------------------------------
 // Core blocks in the core row's column groups 0..CORE, in the SAME order as the wide AIR:
-//   [commit_0..commit_S) ‖ [nf_0..nf_N_IN) ‖ [pk_0..pk_N_IN)  (S + 2·N_IN = 8 groups).
+//   [commit_0..commit_S) ‖ [nf_0..nf_N_IN) ‖ [pk_0..pk_N_IN)  (S + 2·N_IN = 9 groups).
 const CORE: usize = S + 2 * N_IN;
 // Inner blocks in the inner row's column groups 0..INNER, in the wide AIR's order:
-//   [inner_commit_0..inner_commit_S) ‖ [inner_nf_0..inner_nf_N_IN)  (S + N_IN = 6 groups).
+//   [inner_commit_0..inner_commit_S) ‖ [inner_nf_0..inner_nf_N_IN)  (S + N_IN = 7 groups).
 const INNER: usize = S + N_IN;
 const _: () = assert!(INNER <= CORE, "inner blocks must fit the core row's column groups");
 /// Row holding the inner (pk ‖ blind / spend_secret ‖ blind) blocks.
