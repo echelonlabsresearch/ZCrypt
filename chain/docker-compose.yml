@@ -112,6 +112,7 @@ services:
     environment:
       EXPLORER_DOMAIN: ${EXPLORER_DOMAIN:-explorer.localhost}
       RPC_DOMAIN: ${RPC_DOMAIN:-rpc.localhost}
+      SALE_DOMAIN: ${SALE_DOMAIN:-buy.localhost}
       ACME_EMAIL: ${ACME_EMAIL:-}
     volumes:
       - ./docker/Caddyfile:/etc/caddy/Caddyfile:ro
@@ -176,6 +177,47 @@ services:
     networks:
       - zcrypt-net
 
+  # The sale desk ("send Bitcoin, get ZCRYPT", chain/SALE-DESK.md): NOT started by default.
+  #   1. put the desk's BIP-39 phrase in ./secrets/sale-phrase.txt
+  #      (umask 077; chown 10001:10001; chmod 400; never commit it)
+  #   2. set SALE_DOMAIN and SALE_PRICE_SATS in .env (DNS A record for buy.* -> this VPS)
+  #   3. docker compose --profile sale up -d --build
+  # Caddy terminates TLS at https://$SALE_DOMAIN and forwards to this container.
+  sale:
+    profiles: ["sale"]
+    build:
+      context: ..
+      dockerfile: chain/docker/Dockerfile
+      args:
+        ABCI_FEATURES: ${ABCI_FEATURES:-}
+    container_name: zcrypt-sale
+    restart: unless-stopped
+    depends_on:
+      - cometbft
+    command: ["zcrypt_sale"]
+    secrets:
+      - sale_phrase
+    environment:
+      ZC_URL: http://cometbft:26657
+      ZCRYPT_CHAIN_ID: ${CHAIN_ID:-zcrypt-1}
+      SALE_MNEMONIC_FILE: /run/secrets/sale_phrase
+      SALE_STATE: /data/zcrypt-sale-state.json
+      SALE_LISTEN: 0.0.0.0:8787
+      # Satoshis per whole ZCRYPT. 0 keeps the desk closed. Change it and
+      # `docker compose --profile sale up -d` again (no rebuild).
+      SALE_PRICE_SATS: ${SALE_PRICE_SATS:-0}
+      SALE_MIN_SATS: ${SALE_MIN_SATS:-20000}
+      SALE_MAX_SATS: ${SALE_MAX_SATS:-100000000}
+      SALE_MIN_CONF: ${SALE_MIN_CONF:-1}
+      SALE_TTL_SECS: ${SALE_TTL_SECS:-86400}
+      SALE_POLL_SECS: ${SALE_POLL_SECS:-20}
+      ESPLORA_URL: ${SALE_ESPLORA_URL:-https://blockstream.info/api}
+      BTC_NETWORK: ${BTC_NETWORK:-bitcoin}
+    volumes:
+      - sale-data:/data
+    networks:
+      - zcrypt-net
+
   # Regtest bitcoind: LOCAL demos only (profile dev). Bound to 127.0.0.1 on the host and
   # reachable inside the compose network; credentials come from .env, never defaults on a
   # public interface.
@@ -210,12 +252,17 @@ secrets:
     # ZCRYPT_RESERVE_WALLET_SEED_FILE instead; the daemon then derives the key.)
     # Create with: umask 077; mkdir -p secrets; reserve_pubkey --wallet-seed-file <custody seed> --write-derived-key secrets/reserve.key
     file: ${ZCRYPT_RESERVE_KEY_PATH:-./secrets/reserve.key}
+  sale_phrase:
+    # The sale desk's BIP-39 phrase (one line). It spends every Bitcoin buyers paid and
+    # every ZCRYPT in stock: keep ./secrets out of git and off-host backups.
+    file: ${ZCRYPT_SALE_PHRASE_PATH:-./secrets/sale-phrase.txt}
 
 volumes:
   cometbft-data:
   abci-data:
   bitcoind-data:
   watcher-data:
+  sale-data:
   caddy-data:
   caddy-config:
 

@@ -56,6 +56,37 @@ address is converted at that price, rounded down, so overpaying or underpaying i
 
 ## 4. Run it
 
+### On the foundation VPS (docker compose, the normal way)
+
+The desk is a `sale` profile in `chain/docker-compose.yml`, built from the same image as
+the node, with Caddy terminating TLS at `https://$SALE_DOMAIN`.
+
+```
+# DNS first: A record  buy.zcrypt.network -> the VPS public IP (same as rpc.*)
+ssh root@<vps>
+cd zcrypt-v2 && git pull && cd chain
+
+umask 077; mkdir -p secrets
+printf '%s\n' "word word … word" > secrets/sale-phrase.txt     # the desk's phrase
+chown 10001:10001 secrets/sale-phrase.txt; chmod 400 secrets/sale-phrase.txt
+
+# .env: add
+#   SALE_DOMAIN=buy.zcrypt.network
+#   SALE_PRICE_SATS=2500            (0 keeps it closed while you fund it)
+docker compose --profile sale up -d --build      # builds the image, (re)starts caddy + sale
+docker compose logs -f sale                      # prints the desk's ZCrypt address: fund it
+curl -s https://buy.zcrypt.network/quote         # from anywhere: the posted terms
+```
+
+Change the price: edit `SALE_PRICE_SATS` in `.env`, then `docker compose --profile sale
+up -d` (a restart, no rebuild). The state file lives in the `sale-data` volume; back it up
+with the other volumes, it holds the desk's coin secrets.
+
+The wallet's default desk is `https://buy.zcrypt.network`, so once this answers, every
+wallet's Buy tab works with no setting changed.
+
+### By hand (any machine)
+
 ```
 ZC_URL=http://localhost:36657            # a node you run
 ESPLORA_URL=https://blockstream.info/api # or your own Esplora; it only ever sees addresses

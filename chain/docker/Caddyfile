@@ -25,6 +25,39 @@
 	reverse_proxy explorer:8080
 }
 
+# The sale desk (profile `sale`): three small JSON routes. Only started with the profile;
+# without it this vhost answers 502, which is harmless.
+{$SALE_DOMAIN:buy.localhost} {
+	header -Server
+	request_body {
+		max_size 16KB
+	}
+	rate_limit {
+		zone sale_orders {
+			match {
+				method POST
+			}
+			key {client_ip}
+			events 10
+			window 1m
+		}
+		zone sale_read {
+			key {client_ip}
+			events 120
+			window 1m
+		}
+	}
+	@allowed {
+		path /quote /order /order/*
+	}
+	handle @allowed {
+		reverse_proxy sale:8787
+	}
+	handle {
+		respond "not found" 404
+	}
+}
+
 {$RPC_DOMAIN:rpc.localhost} {
 	header -Server
 	request_body {
