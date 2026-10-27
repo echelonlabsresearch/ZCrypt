@@ -198,6 +198,13 @@ jobs:
             runner: macos-latest
             bundles: dmg
             cargo_jobs: "1"
+          # Intel Macs: cross-compiled on the same Apple Silicon runner. Signed, notarized
+          # and stapled like the arm64 image; tauri names it *_x64.dmg.
+          - id: macos-intel
+            runner: macos-latest
+            bundles: dmg
+            cargo_jobs: "1"
+            target: x86_64-apple-darwin
           - id: linux
             runner: ubuntu-22.04
             bundles: appimage,deb
@@ -284,6 +291,12 @@ jobs:
         shell: bash
         run: rustup show
 
+      - name: Cross-compilation target
+        if: matrix.target
+        working-directory: wallet
+        shell: bash
+        run: rustup target add "${{ matrix.target }}"
+
       - name: Cache cargo build
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
@@ -302,7 +315,7 @@ jobs:
         run: npm ci
 
       - name: Apple signing secrets are present
-        if: matrix.id == 'macos'
+        if: startsWith(matrix.id, 'macos')
         shell: bash
         env:
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
@@ -370,21 +383,21 @@ jobs:
           AZURE_TENANT_ID: ${{ matrix.id == 'windows' && secrets.AZURE_TENANT_ID || '' }}
           AZURE_CLIENT_ID: ${{ matrix.id == 'windows' && secrets.AZURE_CLIENT_ID || '' }}
           AZURE_CLIENT_SECRET: ${{ matrix.id == 'windows' && secrets.AZURE_CLIENT_SECRET || '' }}
-          APPLE_CERTIFICATE: ${{ matrix.id == 'macos' && secrets.APPLE_CERTIFICATE || '' }}
-          APPLE_CERTIFICATE_PASSWORD: ${{ matrix.id == 'macos' && secrets.APPLE_CERTIFICATE_PASSWORD || '' }}
-          APPLE_SIGNING_IDENTITY: ${{ matrix.id == 'macos' && secrets.APPLE_SIGNING_IDENTITY || '' }}
-          APPLE_ID: ${{ matrix.id == 'macos' && secrets.APPLE_ID || '' }}
-          APPLE_PASSWORD: ${{ matrix.id == 'macos' && secrets.APPLE_PASSWORD || '' }}
-          APPLE_TEAM_ID: ${{ matrix.id == 'macos' && secrets.APPLE_TEAM_ID || '' }}
+          APPLE_CERTIFICATE: ${{ startsWith(matrix.id, 'macos') && secrets.APPLE_CERTIFICATE || '' }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ startsWith(matrix.id, 'macos') && secrets.APPLE_CERTIFICATE_PASSWORD || '' }}
+          APPLE_SIGNING_IDENTITY: ${{ startsWith(matrix.id, 'macos') && secrets.APPLE_SIGNING_IDENTITY || '' }}
+          APPLE_ID: ${{ startsWith(matrix.id, 'macos') && secrets.APPLE_ID || '' }}
+          APPLE_PASSWORD: ${{ startsWith(matrix.id, 'macos') && secrets.APPLE_PASSWORD || '' }}
+          APPLE_TEAM_ID: ${{ startsWith(matrix.id, 'macos') && secrets.APPLE_TEAM_ID || '' }}
         with:
           projectPath: wallet
           releaseId: ${{ needs.prepare.outputs.release_id }}
           includeUpdaterJson: false
           uploadPlainBinary: false
-          args: --bundles ${{ matrix.bundles }} ${{ env.SIGN_CONFIG_ARGS }} -- --locked
+          args: --bundles ${{ matrix.bundles }} ${{ matrix.target && format('--target {0}', matrix.target) || '' }} ${{ env.SIGN_CONFIG_ARGS }} -- --locked
 
       - name: Notarize the disk image
-        if: matrix.id == 'macos'
+        if: startsWith(matrix.id, 'macos')
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -395,7 +408,7 @@ jobs:
         run: bash .github/workflows/staple-dmg.sh --built '*.dmg' "$TAG"
 
       - name: Drop the raw .app archive
-        if: matrix.id == 'macos'
+        if: startsWith(matrix.id, 'macos')
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
