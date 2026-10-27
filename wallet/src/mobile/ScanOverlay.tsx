@@ -10,6 +10,8 @@ export function addressFromQr(text: string): string | null {
   let s = text.trim();
   if (/^zcrypt:/i.test(s)) s = s.slice("zcrypt:".length);
   s = s.split("?")[0].trim();
+  // Addresses are shown in upper case in QR codes (alphanumeric mode); bech32 is case-insensitive.
+  if (/^[A-Z0-9]+$/.test(s)) s = s.toLowerCase();
   return /^zc1[a-z0-9]+$/i.test(s) ? s : null;
 }
 

@@ -1,5 +1,15 @@
 import { useCallback, useEffect, useState } from "react";
 import QRCode from "qrcode";
+
+/** Upper case takes the QR alphanumeric mode: a 2,008-character address drops from version 40 to about 30. */
+function qrText(text: string): string {
+  return /^[a-z0-9]+$/.test(text) ? text.toUpperCase() : text;
+}
+/** Largest integer pixels-per-module that fits the code (with its quiet zone) into `px`. */
+function fitScale(text: string, px: number): number {
+  const n = QRCode.create(qrText(text), { errorCorrectionLevel: "L" }).modules.size + 8;
+  return Math.max(1, Math.floor(px / n));
+}
 import { call, copy, fmtAsset, saveFile } from "../lib/api";
 import { Banner, Btn, Icon, Segmented, shareFile, short, Spinner } from "./ui";
 import Success from "./Success";
@@ -52,7 +62,7 @@ export default function ReceiveScreen({
   const address = which === "normal" ? normal : stealth[stealth.length - 1]?.address ?? "";
   useEffect(() => {
     if (!address) return setQr("");
-    QRCode.toDataURL(address, { margin: 4, scale: 4, errorCorrectionLevel: "M", color: { dark: "#0b0f19", light: "#ffffff" } })
+    QRCode.toDataURL(qrText(address), { margin: 4, scale: fitScale(address, window.innerWidth - 48), errorCorrectionLevel: "L", color: { dark: "#0b0f19", light: "#ffffff" } })
       .then(setQr)
       .catch(() => setQr(""));
   }, [address]);

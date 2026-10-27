@@ -53,6 +53,24 @@ const TYPES = [
   },
 ];
 
+const QR_COLOR = { dark: "#0b0f19", light: "#ffffff" };
+
+/**
+ * QR-friendly form of an address. A `zc1…` address is 2,008 characters (it carries a
+ * 1,184-byte ML-KEM key), and bech32 is case-insensitive, so it is encoded in upper case:
+ * the QR alphanumeric mode then spends 5.5 bits per character instead of 8, and the code
+ * drops from version 40 to about version 30. The scanner lowercases it again.
+ */
+function qrText(text: string): string {
+  return /^[a-z0-9]+$/.test(text) ? text.toUpperCase() : text;
+}
+
+/** Pixels per module that fit `n` modules (quiet zone included) into `px` pixels. */
+function fitScale(text: string, px: number): number {
+  const n = QRCode.create(qrText(text), { errorCorrectionLevel: "L" }).modules.size + 8;
+  return Math.max(1, Math.floor(px / n));
+}
+
 /**
  * The text as a QR image (data URL), or "" while it renders or when there is no text.
  * Rendered at an integer number of pixels per module and shown at its natural size, so
@@ -63,16 +81,41 @@ function useQr(text: string, scale: number): string {
   const [qr, setQr] = useState("");
   useEffect(() => {
     if (!text) return setQr("");
-    QRCode.toDataURL(text, { margin: 4, scale, errorCorrectionLevel: "M", color: { dark: "#0b0f19", light: "#ffffff" } })
+    QRCode.toDataURL(qrText(text), { margin: 4, scale, errorCorrectionLevel: "L", color: QR_COLOR })
       .then(setQr)
       .catch(() => setQr(""));
   }, [text, scale]);
   return qr;
 }
 
+/**
+ * Full-window QR for scanning. An address code has about 150 modules a side, so the
+ * tile preview is far too small for a phone camera; this renders it at the largest
+ * integer scale that fits the window, on white, and closes on any click or Escape.
+ */
+function QrOverlay({ text, title, onClose }: { text: string; title: string; onClose: () => void }) {
+  const [src, setSrc] = useState("");
+  useEffect(() => {
+    const px = Math.min(window.innerWidth, window.innerHeight - 120) * 0.92;
+    QRCode.toDataURL(qrText(text), { margin: 4, scale: fitScale(text, px), errorCorrectionLevel: "L", color: QR_COLOR })
+      .then(setSrc)
+      .catch(() => setSrc(""));
+    const onKey = (e: KeyboardEvent) => e.key === "Escape" && onClose();
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [text, onClose]);
+  return (
+    <div className="qr-overlay" onClick={onClose} role="dialog" aria-label={title}>
+      <div className="qr-overlay-title">{title}</div>
+      {src ? <img src={src} alt={`QR code: ${title}`} /> : null}
+      <div className="qr-overlay-hint">Scan it with the mobile wallet. Click anywhere, or press Escape, to close.</div>
+    </div>
+  );
+}
+
 /** One address with its QR code, the address text and a copy button. */
 function AddressTile({
-  icon, title, tag, color, address, qr, note, empty,
+  icon, title, tag, color, address, qr, note, empty, onShowQr,
 }: {
   icon: string;
   title: string;
@@ -83,6 +126,7 @@ function AddressTile({
   note: string;
   /** Shown in place of the QR and address when there is no address yet. */
   empty?: React.ReactNode;
+  onShowQr: (text: string, title: string) => void;
 }) {
   const [expanded, setExpanded] = useState(false);
   const short = address.length > 24 ? `${address.slice(0, 12)}…${address.slice(-8)}` : address;
@@ -94,7 +138,10 @@ function AddressTile({
       <div className="addr-tile-tag">{tag}</div>
       {address ? (
         <>
-          <div className="qr-tile">{qr ? <img src={qr} alt={`QR code: ${title}`} /> : null}</div>
+          <button className="qr-tile qr-tile-btn" onClick={() => onShowQr(address, title)} title="Show a large QR code for scanning">
+            {qr ? <img src={qr} alt={`QR code: ${title}`} /> : null}
+          </button>
+          <button className="btn-link" onClick={() => onShowQr(address, title)}>⛶ Show large QR to scan</button>
           <div className="addr-line">
             <code title={address} style={{ color }} className={expanded ? "full" : ""}>
               {expanded ? address : short}
@@ -145,9 +192,14 @@ export default function Receive({
   const [stealthBusy, setStealthBusy] = useState(false);
   const [err, setErr] = useState("");
   const latestStealth = stealth[stealth.length - 1]?.address ?? "";
-  const normalQr = useQr(normal, 5);
-  const stealthQr = useQr(latestStealth, 5);
-  const btcQr = useQr(btcAddr, 5);
+  const [bigQr, setBigQr] = useState<{ text: string; title: string } | null>(null);
+  const showQr = useCallback((text: string, title: string) => setBigQr({ text, title }), []);
+  const hideQr = useCallback(() => setBigQr(null), []);
+  // Tile previews: a 2,008-character address needs about 150 modules a side, so the
+  // preview is 1 px per module and only the overlay (QrOverlay) is meant to be scanned.
+  const normalQr = useQr(normal, 1);
+  const stealthQr = useQr(latestStealth, 1);
+  const btcQr = useQr(btcAddr, 4);
 
   // Drop zone
   const [blob, setBlob] = useState("");
@@ -278,6 +330,7 @@ export default function Receive({
           color="var(--color-cyan)"
           address={normal}
           qr={normalQr}
+          onShowQr={showQr}
           note="Share this to get paid in ZCRYPT or any shielded asset. Your view key can see what arrives here; nobody else can."
         />
         <AddressTile
@@ -287,6 +340,7 @@ export default function Receive({
           color="var(--color-purple)"
           address={latestStealth}
           qr={stealthQr}
+          onShowQr={showQr}
           note="Maximum privacy: paid with an encrypted file, invisible even to your own view key. Back up its private key below."
           empty={
             <button className="btn-secondary" disabled={stealthBusy} onClick={newStealth}>
@@ -301,6 +355,7 @@ export default function Receive({
           color="var(--color-yellow)"
           address={btcAddr}
           qr={btcQr}
+          onShowQr={showQr}
           note="Real BTC on the Bitcoin chain. Deposit here, then shield it into zBTC under Bridge."
         />
       </div>
@@ -460,6 +515,7 @@ export default function Receive({
       </details>
 
       {err && <div className="msg err">{err}</div>}
+      {bigQr && <QrOverlay text={bigQr.text} title={bigQr.title} onClose={hideQr} />}
     </div>
   );
 }
