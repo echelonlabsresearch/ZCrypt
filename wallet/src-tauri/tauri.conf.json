@@ -61,7 +61,7 @@
     "iOS": {
       "developmentTeam": "HKWCZHR3TM",
       "minimumSystemVersion": "15.0",
-      "bundleVersion": "4"
+      "bundleVersion": "5"
     }
   }
 }
