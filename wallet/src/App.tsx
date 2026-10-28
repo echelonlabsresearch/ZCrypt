@@ -90,6 +90,13 @@ export default function App() {
     }
   }, []);
 
+  // Settings' "Rescan from genesis" asks for a balance refresh once its scan is done.
+  useEffect(() => {
+    const h = () => void refresh();
+    window.addEventListener("zc-refresh", h);
+    return () => window.removeEventListener("zc-refresh", h);
+  }, [refresh]);
+
   useEffect(() => {
     (async () => {
       const exists = await call<boolean>("wallet_exists").catch(() => false);

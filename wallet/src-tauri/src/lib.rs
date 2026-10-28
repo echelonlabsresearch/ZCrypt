@@ -2233,6 +2233,19 @@ mod scan_tests {
     }
 
     #[test]
+    fn a_full_rescan_revives_coins_the_old_chain_had_spent() {
+        // Dropped-stale coins revive whenever their nullifier was never seen.
+        assert!(revivable(true, true, false, false));
+        assert!(!revivable(true, true, true, false));
+        // A coin marked spent for another reason revives only after a scan from genesis.
+        assert!(!revivable(true, false, false, false));
+        assert!(revivable(true, false, false, true));
+        assert!(!revivable(true, false, true, true));
+        // An unspent coin needs no reviving.
+        assert!(!revivable(false, false, false, true));
+    }
+
+    #[test]
     fn fresh_coins_survive_a_racing_reconcile_but_observed_or_old_ones_do_not() {
         // N3: a coin born at (or after) the scan's starting tip is never dropped.
         let (acct, _m) = keys::new_account();
@@ -4264,6 +4277,15 @@ fn gap_needs_widening(max_index_seen: Option<u32>, change_hi: u32) -> bool {
     max_index_seen.is_some_and(|m| m + 1 > change_hi.saturating_sub(20))
 }
 
+/// May a coin that IS a leaf of the current tree be put back into the spendable set? Always
+/// when an earlier reconcile dropped it as stale and no spend of it was ever seen. After a
+/// scan from genesis (which saw every nullifier the chain ever published) also when it was
+/// marked spent for any other reason: a relaunch re-mints deterministic claim coins, and the
+/// store still remembers spending them on the chain that no longer exists.
+fn revivable(spent: bool, dropped_stale: bool, nullifier_seen: bool, full_rescan: bool) -> bool {
+    spent && !nullifier_seen && (dropped_stale || full_rescan)
+}
+
 /// May the reconcile drop `c` (unspent, absent from the leaf snapshot, not pending)? Only a
 /// coin this wallet has already seen as a leaf (so its absence means a chain reset), or one
 /// older than the grace window (so its inclusion could not have raced this scan).
@@ -4288,6 +4310,19 @@ fn next_scan_height(widen_pending: bool, prev: i64, covered_to: i64) -> i64 {
 /// nullifiers appear on-chain. Fully local: the node only ever serves blocks and leaves.
 /// Rescan the chain for this wallet's coins. Async like every other command so the
 /// webview stays responsive; the work itself is synchronous inside.
+/// Forget the scan cursor and read the whole chain again. The result is authoritative: coins
+/// that are leaves and were never spent on this chain come back, whatever the store said.
+#[tauri::command]
+async fn rescan_from_genesis(state: State<'_, AppState>) -> R<usize> {
+    with_wallet(&state, |w| {
+        w.scan_height = 0;
+        w.claim_counters.clear();
+        w.fee_claim_counters.clear();
+        Ok(())
+    })?;
+    scan_onchain(state).await
+}
+
 #[tauri::command]
 async fn scan_onchain(state: State<'_, AppState>) -> R<usize> {
     scan_onchain_inner(state)
@@ -4332,6 +4367,12 @@ fn scan_onchain_inner(state: State<AppState>) -> R<usize> {
         )
     };
     let prev_scan_height = from;
+    // A scan from genesis sees EVERY nullifier this chain ever published, so it is the
+    // authority on what is spent: a coin that is a leaf and whose nullifier never appeared
+    // is unspent here, whatever an older chain generation did with it. This matters because
+    // claim coins are deterministic (pk, value, claim index): a relaunch mints the same
+    // commitments again, and the store may still hold them marked spent from the old chain.
+    let full_rescan = from == 0;
     let scan_notes = from < tip;
     if !scan_notes {
         from = tip;
@@ -4361,7 +4402,7 @@ fn scan_onchain_inner(state: State<AppState>) -> R<usize> {
             let own_nf: HashMap<[u8; 32], zcrypt_shield::Commitment> = w
                 .coins
                 .iter()
-                .filter(|c| !c.spent || c.dropped_stale)
+                .filter(|c| !c.spent || c.dropped_stale || full_rescan)
                 .map(|c| (shield_tx::nf_registry_key(&c.coin.nullifier()), c.coin.commitment()))
                 .collect();
             (
@@ -4483,7 +4524,7 @@ fn scan_onchain_inner(state: State<AppState>) -> R<usize> {
             let com = c.coin.commitment();
             if let Some(&i) = leaf_pos.get(&com) {
                 c.leaf_index = Some(i);
-                if c.dropped_stale && c.spent && !spent_seen.contains(&com) {
+                if revivable(c.spent, c.dropped_stale, spent_seen.contains(&com), full_rescan) {
                     c.spent = false;
                     c.dropped_stale = false;
                     revived += 1;
@@ -9153,6 +9194,7 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            rescan_from_genesis,
             buy_quote,
             buy_order,
             buy_status,

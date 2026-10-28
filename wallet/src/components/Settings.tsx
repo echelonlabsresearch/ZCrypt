@@ -87,6 +87,21 @@ export default function Settings() {
   const [esploraUrl, setEsploraUrl] = useState("");
   // The foundation's sale desk the Buy tab talks to ("send Bitcoin, get ZCRYPT").
   const [saleUrl, setSaleUrl] = useState("");
+  const [rescanBusy, setRescanBusy] = useState(false);
+  const [rescanMsg, setRescanMsg] = useState("");
+  async function rescan() {
+    setRescanBusy(true);
+    setRescanMsg("");
+    try {
+      const n = await call<number>("rescan_from_genesis");
+      setRescanMsg(`Done: ${n} coin(s) found. The balance is refreshed.`);
+      window.dispatchEvent(new Event("zc-refresh"));
+    } catch (e) {
+      setRescanMsg(`Rescan failed: ${String((e as Error)?.message ?? e)}`);
+    } finally {
+      setRescanBusy(false);
+    }
+  }
   const [btcSaved, setBtcSaved] = useState(false);
   const [btcErr, setBtcErr] = useState("");
 
@@ -376,6 +391,21 @@ export default function Settings() {
             connection that would reveal your IP.
           </div>
         )}
+      </div>
+
+      <div className="card" style={{ marginTop: "1.2rem" }}>
+        <h2>🔁 Rescan</h2>
+        <div style={{ fontSize: "0.82rem", opacity: 0.75, marginBottom: "0.7rem" }}>
+          Reads the whole chain again from block 1 and rebuilds the coin list from what is actually on chain. Use it
+          after a chain relaunch or whenever the balance looks wrong: coins that are on chain and unspent come back,
+          coins that are not are dropped.
+        </div>
+        <div style={{ display: "flex", gap: "0.6rem", alignItems: "center", flexWrap: "wrap" }}>
+          <button className="btn-secondary" disabled={rescanBusy} onClick={rescan}>
+            {rescanBusy ? "Rescanning…" : "Rescan from genesis"}
+          </button>
+          {rescanMsg && <span style={{ fontSize: "0.82rem" }}>{rescanMsg}</span>}
+        </div>
       </div>
 
       <ViewKeyCard />
