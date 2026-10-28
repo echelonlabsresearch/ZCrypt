@@ -12,6 +12,7 @@ interface Quote {
   min_conf: number;
   network: string;
   ttl_secs: number;
+  btc_usd: number;
 }
 
 interface Order {
@@ -39,6 +40,11 @@ const SATS = 100_000_000;
 const ATOMIC = 1_000_000;
 const btc = (sats: number) => (sats / SATS).toFixed(8).replace(/0+$/, "").replace(/\.$/, "");
 const zcryptFor = (sats: number, price: number) => (price > 0 ? Math.floor((sats * ATOMIC) / price) : 0);
+function usd(sats: number, btcUsd: number): string {
+  if (!(btcUsd > 0)) return "";
+  const v = (sats / SATS) * btcUsd;
+  return v >= 100 ? `$${Math.round(v).toLocaleString()}` : `$${v.toFixed(2)}`;
+}
 
 /**
  * Buy: "send Bitcoin, get ZCRYPT". Shows the desk's price, opens an order for the amount
@@ -183,7 +189,9 @@ export default function BuyScreen({ active, onBack, onBought }: { active: boolea
         <div className="m-card">
           <div className="m-kv">
             <span>Price</span>
-            <span className="m-num">1 ZCRYPT = {quote.price_sats.toLocaleString()} sats</span>
+            <span className="m-num">
+              1 ZCRYPT = {quote.price_sats.toLocaleString()} sats{usd(quote.price_sats, quote.btc_usd) && <> (≈ {usd(quote.price_sats, quote.btc_usd)})</>}
+            </span>
           </div>
           <div className="m-kv">
             <span>Available</span>
@@ -198,7 +206,7 @@ export default function BuyScreen({ active, onBack, onBought }: { active: boolea
 
       {!order && quote && !closed && (
         <>
-          <Field label="You pay" hint={`Between ${btc(quote.min_sats)} and ${btc(quote.max_sats)} BTC`}>
+          <Field label="You pay" hint={`Between ${btc(quote.min_sats)} and ${btc(quote.max_sats)} BTC${usd(sats, quote.btc_usd) ? `. About ${usd(sats, quote.btc_usd)} at today's rate` : ""}`}>
             <div className="m-input-wrap" style={{ paddingLeft: 16 }}>
               <input className="m-input big" value={amount} onChange={(e) => setAmount(e.target.value)} placeholder="0.001" inputMode="decimal" autoCorrect="off" />
               <span style={{ color: "var(--text-2)", fontWeight: 600 }}>BTC</span>
@@ -234,7 +242,7 @@ export default function BuyScreen({ active, onBack, onBought }: { active: boolea
               <div className="m-card">
                 <div className="m-kv">
                   <span>Send</span>
-                  <span className="m-num">{btc(order.sats)} BTC</span>
+                  <span className="m-num">{btc(order.sats)} BTC{quote && usd(order.sats, quote.btc_usd) && <> (≈ {usd(order.sats, quote.btc_usd)})</>}</span>
                 </div>
                 <div className="m-kv">
                   <span>Rate</span>

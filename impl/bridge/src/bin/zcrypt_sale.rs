@@ -25,6 +25,10 @@
 //!   SALE_POLL_SECS       seconds between passes      (default 20)
 //!   ZC_URL               ZCrypt CometBFT RPC         (default http://localhost:36657)
 //!   ESPLORA_URL          Esplora REST base           (default https://blockstream.info/api)
+//!   SALE_BTC_USD_URL     JSON price feed with a "USD" field, polled every 5 minutes so the
+//!                        quote carries an implied dollar price
+//!                        (default https://mempool.space/api/v1/prices; empty disables)
+//!   SALE_BTC_USD         fixed dollars-per-bitcoin instead of a feed (overrides the URL)
 //!   BTC_NETWORK          bitcoin|signet|testnet|regtest (default bitcoin)
 //!   ZCRYPT_CHAIN_ID      chain id to bind txs to     (default zcrypt-1)
 //!
@@ -100,9 +104,13 @@ struct Desk {
     account: Account,
     hd: HdWallet,
     state: State,
+    /// Dollars per bitcoin from the feed, and when it was fetched (unix secs).
+    btc_usd: (f64, u64),
 }
 
 struct Config {
+    btc_usd_url: String,
+    btc_usd_fixed: f64,
     price_sats: u64,
     price_file: Option<PathBuf>,
     min_sats: u64,
@@ -140,6 +148,24 @@ impl Desk {
             min_conf: self.cfg.min_conf,
             network: network_name(self.cfg.network).to_string(),
             ttl_secs: self.cfg.ttl_secs,
+            btc_usd: if self.cfg.btc_usd_fixed > 0.0 { self.cfg.btc_usd_fixed } else { self.btc_usd.0 },
+        }
+    }
+
+    /// Refresh the dollar price from the feed when it is older than five minutes. A feed
+    /// failure keeps the last value; the quote never blocks on it.
+    fn refresh_btc_usd(&mut self) {
+        if self.cfg.btc_usd_fixed > 0.0 || self.cfg.btc_usd_url.is_empty() || now() < self.btc_usd.1 + 300 {
+            return;
+        }
+        self.btc_usd.1 = now();
+        let agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(10)).build();
+        match agent.get(&self.cfg.btc_usd_url).call().and_then(|r| Ok(r.into_json::<serde_json::Value>()?)) {
+            Ok(v) => match v["USD"].as_f64() {
+                Some(p) if p.is_finite() && p > 0.0 => self.btc_usd.0 = p,
+                _ => eprintln!("[sale] price feed: no USD field"),
+            },
+            Err(e) => eprintln!("[sale] price feed: {e}"),
         }
     }
 
@@ -273,6 +299,7 @@ fn parse_network(s: &str) -> Result<Network, String> {
 
 /// One pass: new coins, then every open order.
 fn tick(desk: &Arc<Mutex<Desk>>, zc: &Zcrypt, esplora: &Esplora) {
+    desk.lock().unwrap().refresh_btc_usd();
     if let Err(e) = desk.lock().unwrap().scan(zc) {
         eprintln!("[sale] scan: {e}");
     }
@@ -467,6 +494,8 @@ fn main() {
     }
 
     let cfg = Config {
+        btc_usd_url: env("SALE_BTC_USD_URL", "https://mempool.space/api/v1/prices"),
+        btc_usd_fixed: env("SALE_BTC_USD", "0").parse().unwrap_or(0.0),
         price_sats: env("SALE_PRICE_SATS", "0").parse().unwrap_or(0),
         price_file: std::env::var("SALE_PRICE_FILE").ok().filter(|s| !s.is_empty()).map(PathBuf::from),
         min_sats: env("SALE_MIN_SATS", "20000").parse().unwrap_or(20_000),
@@ -488,14 +517,16 @@ fn main() {
     let zc = Zcrypt::new(&env("ZC_URL", "http://localhost:36657"));
     let esplora = Esplora::new(&env("ESPLORA_URL", "https://blockstream.info/api"));
 
-    let desk = Arc::new(Mutex::new(Desk { cfg, account, hd, state }));
+    let desk = Arc::new(Mutex::new(Desk { cfg, account, hd, state, btc_usd: (0.0, 0) }));
+    desk.lock().unwrap().refresh_btc_usd();
     {
         let d = desk.lock().unwrap();
         let q = d.quote();
         println!("[sale] desk address {}", d.account.normal_address().to_bech32());
         println!(
-            "[sale] price {} sats/ZCRYPT, stock {} ZCRYPT, {} coin(s), {} order(s), min_conf {}, network {}",
+            "[sale] price {} sats/ZCRYPT (BTC at ${:.0}), stock {} ZCRYPT, {} coin(s), {} order(s), min_conf {}, network {}",
             q.price_sats,
+            q.btc_usd,
             q.stock_atomic / zcrypt_core::emission::ATOMIC,
             d.state.coins.iter().filter(|c| !c.spent).count(),
             d.state.orders.len(),

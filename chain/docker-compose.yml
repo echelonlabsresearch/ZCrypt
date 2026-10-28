@@ -212,6 +212,10 @@ services:
       SALE_TTL_SECS: ${SALE_TTL_SECS:-86400}
       SALE_POLL_SECS: ${SALE_POLL_SECS:-20}
       ESPLORA_URL: ${SALE_ESPLORA_URL:-https://blockstream.info/api}
+      # Dollars per bitcoin for the implied dollar price wallets show: a JSON feed with a
+      # "USD" field, polled every 5 minutes, or a fixed number in SALE_BTC_USD.
+      SALE_BTC_USD_URL: ${SALE_BTC_USD_URL:-https://mempool.space/api/v1/prices}
+      SALE_BTC_USD: ${SALE_BTC_USD:-0}
       BTC_NETWORK: ${BTC_NETWORK:-bitcoin}
     volumes:
       - sale-data:/data

@@ -54,7 +54,7 @@ pub fn sats_for_zcrypt(atomic: u64, price_sats: u64) -> Option<u64> {
 }
 
 /// The desk's posted terms, as `GET /quote` returns them.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Quote {
     /// Satoshis per whole ZCRYPT. `0` means the desk is closed.
     pub price_sats: u64,
@@ -69,6 +69,10 @@ pub struct Quote {
     pub network: String,
     /// Seconds an unpaid order stays open.
     pub ttl_secs: u64,
+    /// US dollars per bitcoin, as the desk last saw it (so wallets can show an implied
+    /// dollar price without calling a price service themselves). `0` = unknown.
+    #[serde(default)]
+    pub btc_usd: f64,
 }
 
 /// Where an order is in its life.
@@ -315,6 +319,7 @@ mod tests {
             min_conf: 1,
             network: "bitcoin".into(),
             ttl_secs: 86_400,
+            btc_usd: 80_000.0,
         }
     }
 

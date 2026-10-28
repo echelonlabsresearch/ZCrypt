@@ -65,6 +65,12 @@ SALE_MIN_CONF=1             # Bitcoin confirmations before paying; 0 pays on fir
 SALE_TTL_SECS=86400         # an unpaid order stays open this long (a late payment is still honoured)
 ```
 
+The desk sells in sats. The dollar figure wallets show next to it comes from a price feed
+the desk polls every five minutes (`SALE_BTC_USD_URL`, default mempool.space; or a fixed
+`SALE_BTC_USD`), so wallets never call a price service themselves. At $80,815 per BTC a
+$0.50 ZCRYPT is 619 sats; since the posted price is in sats, re-post it when Bitcoin moves
+more than you care about.
+
 A buyer's order locks the price it was quoted at. Whatever they actually send to the
 address is converted at that price, rounded down, so overpaying or underpaying is fine.
 

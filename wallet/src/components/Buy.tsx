@@ -11,6 +11,8 @@ interface Quote {
   min_conf: number;
   network: string;
   ttl_secs: number;
+  /** Dollars per bitcoin as the desk last saw it; 0 = unknown. Display only. */
+  btc_usd: number;
 }
 
 interface Order {
@@ -38,6 +40,12 @@ const SATS = 100_000_000;
 const ATOMIC = 1_000_000;
 
 const btc = (sats: number) => (sats / SATS).toFixed(8).replace(/0+$/, "").replace(/\.$/, "");
+/** "$0.50" for `sats` at `btcUsd` dollars per bitcoin; empty when the desk gave no rate. */
+function usd(sats: number, btcUsd: number): string {
+  if (!(btcUsd > 0)) return "";
+  const v = (sats / SATS) * btcUsd;
+  return v >= 100 ? `$${Math.round(v).toLocaleString()}` : `$${v.toFixed(2)}`;
+}
 /** ZCRYPT (atomic) that `sats` buys at `price` sats per ZCRYPT, as the desk computes it. */
 const zcryptFor = (sats: number, price: number) => (price > 0 ? Math.floor((sats * ATOMIC) / price) : 0);
 
@@ -195,8 +203,12 @@ export default function Buy({ active, onBought }: { active: boolean; onBought: (
           <div className="buy-terms">
             <div className="buy-term">
               <span className="buy-term-label">Price</span>
-              <span className="buy-term-value">1 ZCRYPT = {quote.price_sats.toLocaleString()} sats</span>
-              <span className="buy-term-sub">{btc(quote.price_sats)} BTC</span>
+              <span className="buy-term-value">
+                1 ZCRYPT = {quote.price_sats.toLocaleString()} sats{usd(quote.price_sats, quote.btc_usd) && <> (≈ {usd(quote.price_sats, quote.btc_usd)})</>}
+              </span>
+              <span className="buy-term-sub">
+                {btc(quote.price_sats)} BTC{quote.btc_usd > 0 && <>, bitcoin at ${Math.round(quote.btc_usd).toLocaleString()}</>}
+              </span>
             </div>
             <div className="buy-term">
               <span className="buy-term-label">Available now</span>
@@ -220,7 +232,7 @@ export default function Buy({ active, onBought }: { active: boolean; onBought: (
             <label>You pay (BTC)</label>
             <input value={amount} onChange={(e) => setAmount(e.target.value)} inputMode="decimal" placeholder="0.001" />
             <div className="buy-hint">
-              Between {btc(quote.min_sats)} and {btc(quote.max_sats)} BTC
+              Between {btc(quote.min_sats)} and {btc(quote.max_sats)} BTC{usd(sats, quote.btc_usd) && <>. About {usd(sats, quote.btc_usd)} at today's rate</>}
             </div>
           </div>
           <div className="buy-receive">
@@ -250,7 +262,7 @@ export default function Buy({ active, onBought }: { active: boolean; onBought: (
               )}
               <div className="buy-pay-text">
                 <div className="buy-pay-amount">
-                  Send <b>{btc(order.sats)} BTC</b>
+                  Send <b>{btc(order.sats)} BTC</b>{quote && usd(order.sats, quote.btc_usd) && <> (≈ {usd(order.sats, quote.btc_usd)})</>}
                 </div>
                 <div className="buy-hint">
                   to this {networkLabel(quote?.network ?? "bitcoin")} address. Any amount you send is converted at{" "}

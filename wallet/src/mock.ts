@@ -105,7 +105,7 @@ const DATA: Record<string, unknown> = {
 
 // The sale desk ("send Bitcoin, get ZCRYPT"): an order advances waiting -> seen -> paid on
 // successive polls so the Buy screen's whole life can be viewed.
-const SALE_QUOTE = { price_sats: 2_500, min_sats: 20_000, max_sats: 100_000_000, stock_atomic: 184_250_000_000, min_conf: 1, network: "bitcoin", ttl_secs: 86_400 };
+const SALE_QUOTE = { price_sats: 619, min_sats: 20_000, max_sats: 100_000_000, stock_atomic: 184_250_000_000, min_conf: 1, network: "bitcoin", ttl_secs: 86_400, btc_usd: 80_815 };
 const saleOrders: Record<string, { sats: number; polls: number; created: number }> = {};
 function saleView(id: string) {
   const o = saleOrders[id];
