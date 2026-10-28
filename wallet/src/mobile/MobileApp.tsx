@@ -8,7 +8,6 @@ import Home from "./Home";
 import SendScreen from "./SendScreen";
 import ReceiveScreen from "./ReceiveScreen";
 import HistoryScreen from "./HistoryScreen";
-import BuyScreen from "./BuyScreen";
 
 export interface AuthStatus {
   wallet: boolean;
@@ -44,7 +43,7 @@ const AuthContext = createContext<AuthApi>({
 export const useAuth = () => useContext(AuthContext);
 
 type Phase = "loading" | "onboard" | "adopt" | "lock" | "ready";
-type Tab = "home" | "send" | "receive" | "history" | "buy";
+type Tab = "home" | "send" | "receive" | "history";
 const TABS: { id: Tab; label: string; icon: IconName }[] = [
   { id: "home", label: "Portfolio", icon: "home" },
   { id: "send", label: "Send", icon: "send" },
@@ -239,10 +238,7 @@ export default function MobileApp() {
         {phase === "ready" && (
           <>
             <div className="m-screen" style={{ display: tab === "home" ? "block" : "none" }}>
-              <Home refreshTick={refreshTick} onSend={() => setTab("send")} onReceive={() => setTab("receive")} onBuy={() => setTab("buy")} />
-            </div>
-            <div className="m-screen" style={{ display: tab === "buy" ? "block" : "none" }}>
-              <BuyScreen active={tab === "buy"} onBack={() => setTab("home")} onBought={() => setRefreshTick((t) => t + 1)} />
+              <Home refreshTick={refreshTick} onSend={() => setTab("send")} onReceive={() => setTab("receive")} />
             </div>
             <div className="m-screen" style={{ display: tab === "send" ? "block" : "none" }}>
               <SendScreen active={tab === "send"} onSent={() => setRefreshTick((t) => t + 1)} />

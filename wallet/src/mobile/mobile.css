@@ -1272,17 +1272,6 @@
   margin-top: 20px;
 }
 
-/* Buy entry on the portfolio: full width under Send / Receive. */
-.m-action.buy {
-  width: 100%;
-  margin-top: 12px;
-}
-.m-buy-mark {
-  font-weight: 700;
-  font-size: 18px;
-  color: #f7931a;
-}
-
 /* Full-screen QR for phone-to-phone scanning (Receive). White edge to edge: the quiet
    zone is inside the image, the rest is just more white for the camera to lock on. */
 .m-qrfull {

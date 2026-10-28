@@ -19,7 +19,7 @@ interface PendingSecret {
 const initials = (t: string) => t.replace(/^z/i, "").slice(0, 3).toUpperCase();
 
 /** The portfolio: what this wallet holds, with Send and Receive one tap away. */
-export default function Home({ refreshTick, onSend, onReceive, onBuy }: { refreshTick: number; onSend: () => void; onReceive: () => void; onBuy: () => void }) {
+export default function Home({ refreshTick, onSend, onReceive }: { refreshTick: number; onSend: () => void; onReceive: () => void }) {
   const [assets, setAssets] = useState<HeldAsset[]>([]);
   const [whitelist, setWhitelist] = useState<string[]>([]);
   const [coins, setCoins] = useState(0);
@@ -141,9 +141,6 @@ export default function Home({ refreshTick, onSend, onReceive, onBuy }: { refres
           <Icon name="receive" size={20} stroke={2.2} /> Receive
         </button>
       </div>
-      <button className="m-action buy" onClick={onBuy}>
-        <span className="m-buy-mark">₿</span> Buy ZCRYPT with Bitcoin
-      </button>
 
       {secrets.length > 0 && (
         <div className="m-banner warn" style={{ alignItems: "center" }}>

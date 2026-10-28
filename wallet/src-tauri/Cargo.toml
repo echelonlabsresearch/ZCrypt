@@ -60,6 +60,12 @@ p3-util = { path = "../../impl/vendor/p3-util" }
 [profile.release]
 opt-level = 3
 
+# `tauri dev` is a debug build. The STARK prover (zcrypt-shield, plonky3) is ~30x slower
+# unoptimized, so every dependency, the prover included, is built optimized even in dev;
+# only the wallet crate itself stays a debug build. Release builds are unaffected.
+[profile.dev.package."*"]
+opt-level = 3
+
 [target.'cfg(any(target_os = "ios", target_os = "android"))'.dependencies]
 tauri-plugin-barcode-scanner = "2"
 tauri-plugin-biometric = "2"   # Face ID / Touch ID prompt, raised from Rust
