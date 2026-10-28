@@ -157,6 +157,11 @@ impl SelfCustodyBtc {
         self.esplora.wait_confirmed(&txid.to_string(), self.conf_target())
     }
 
+    /// [`Self::confirm`] reporting `(have, need)` confirmations on every poll.
+    pub fn confirm_with(&self, txid: &Txid, on_conf: &dyn Fn(u32, u32)) -> Result<(), String> {
+        self.esplora.wait_confirmed_with(&txid.to_string(), self.conf_target(), on_conf)
+    }
+
     /// Fund an HTLC: build a tx from our own UTXOs paying `amount` to the HTLC's P2WSH
     /// address (change back to a FRESH change address), sign locally, broadcast via
     /// Esplora, and block until confirmed. Returns the funding UTXO (output 0).
@@ -339,6 +344,9 @@ impl crate::BtcBackend for SelfCustodyBtc {
     }
     fn confirm(&self, txid: &Txid) -> Result<(), String> {
         SelfCustodyBtc::confirm(self, txid)
+    }
+    fn confirm_with(&self, txid: &Txid, on_conf: &dyn Fn(u32, u32)) -> Result<(), String> {
+        SelfCustodyBtc::confirm_with(self, txid, on_conf)
     }
     fn fee_rate_sat_vb(&self, target: u32) -> Result<f64, String> {
         self.esplora.fee_rate_sat_vb(target)

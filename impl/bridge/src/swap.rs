@@ -1790,6 +1790,26 @@ pub fn find_funded_htlc(backend: &dyn BtcBackend, script: &ScriptBuf, min_value:
 /// deposit back up from the funding UTXO alone (bridge L3). `zc_timeout` is the ZC escrow
 /// timeout to request; pass the value from [`shield_timeouts`] at the current tip.
 #[allow(clippy::too_many_arguments)]
+/// Progress text for a Bitcoin confirmation wait: "Bitcoin confirmations: 3/6 (about 30 min left)".
+pub fn confirmation_phase(have: u32, need: u32) -> String {
+    let left = need.saturating_sub(have);
+    if left == 0 {
+        format!("Bitcoin confirmations: {need}/{need}")
+    } else {
+        format!("Bitcoin confirmations: {have}/{need} (about {} min left)", left * 10)
+    }
+}
+
+#[cfg(test)]
+mod confirmation_phase_tests {
+    #[test]
+    fn counts_and_eta() {
+        assert_eq!(super::confirmation_phase(0, 6), "Bitcoin confirmations: 0/6 (about 60 min left)");
+        assert_eq!(super::confirmation_phase(4, 6), "Bitcoin confirmations: 4/6 (about 20 min left)");
+        assert_eq!(super::confirmation_phase(6, 6), "Bitcoin confirmations: 6/6");
+    }
+}
+
 pub fn resume_public_shield(
     zc: &Zcrypt,
     user_btc: &dyn BtcBackend,
@@ -1819,8 +1839,11 @@ pub fn resume_public_shield(
             utxo.value.to_sat()
         ));
     }
-    // Confirmed enough for the mint gate? (A resumed deposit may still be shallow.)
-    user_btc.confirm(&utxo.outpoint.txid)?;
+    // Confirmed enough for the mint gate? (A resumed deposit may still be shallow.) Report
+    // the count as it climbs so the wallet can show "3/6 confirmations" rather than a blind wait.
+    user_btc.confirm_with(&utxo.outpoint.txid, &|have, need| {
+        progress(20 + (18 * have / need.max(1)) as u8, &confirmation_phase(have, need));
+    })?;
 
     // 2. Prove the deposit. The proof pins the OPERATOR's reserve_pk (which must match the
     //    zBTC asset's registered authority) and the user's refund_pk. Consensus re-verifies

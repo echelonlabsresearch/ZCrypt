@@ -273,12 +273,20 @@ impl Esplora {
     /// Block until `txid` has `min_conf` confirmations (no-op if `min_conf` == 0).
     /// Polls every 15s, times out after ~3h (a dropped/replaced tx won't hang forever).
     pub fn wait_confirmed(&self, txid: &str, min_conf: u32) -> Result<(), String> {
+        self.wait_confirmed_with(txid, min_conf, &|_, _| {})
+    }
+
+    /// [`Self::wait_confirmed`] that reports `(have, need)` to `on_conf` on every poll, so a
+    /// UI can show "3/6 confirmations" instead of a blind wait.
+    pub fn wait_confirmed_with(&self, txid: &str, min_conf: u32, on_conf: &dyn Fn(u32, u32)) -> Result<(), String> {
         if min_conf == 0 {
             return Ok(());
         }
         let deadline = std::time::Instant::now() + Duration::from_secs(3 * 60 * 60);
         loop {
-            if self.confirmations(txid).unwrap_or(0) >= min_conf {
+            let have = self.confirmations(txid).unwrap_or(0);
+            on_conf(have.min(min_conf), min_conf);
+            if have >= min_conf {
                 return Ok(());
             }
             if std::time::Instant::now() >= deadline {

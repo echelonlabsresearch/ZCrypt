@@ -756,6 +756,11 @@ pub trait BtcBackend {
     fn preimage_from_claim(&self, txid: &Txid) -> Option<Vec<u8>>;
     /// Wait until `txid` is confirmed (mines on regtest; waits for real confs otherwise).
     fn confirm(&self, txid: &Txid) -> Result<(), String>;
+    /// [`Self::confirm`] that reports `(have, need)` confirmations as it polls, for UIs.
+    /// Default: a blind wait (regtest mines instantly; the operator node has no UI).
+    fn confirm_with(&self, txid: &Txid, _on_conf: &dyn Fn(u32, u32)) -> Result<(), String> {
+        self.confirm(txid)
+    }
     /// Estimated fee rate (sat/vB) for confirmation within ~`target` blocks. Used to
     /// price HTLC claim/refund spends dynamically — a hardcoded fee can fall below the
     /// mempool min-relay rate on a busy mainnet and strand a claim past its CLTV timelock.

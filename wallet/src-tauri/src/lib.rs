@@ -7868,7 +7868,10 @@ fn swap_shield_btc_impl(
         Ok(())
     })?;
     progress(20, "Funding broadcast; waiting for Bitcoin confirmations…");
-    if let Err(e) = alice_bk.confirm(&utxo.outpoint.txid) {
+    let on_conf = |have: u32, need: u32| {
+        progress(20 + (18 * have / need.max(1)) as u8, &bswap::confirmation_phase(have, need));
+    };
+    if let Err(e) = alice_bk.confirm_with(&utxo.outpoint.txid, &on_conf) {
         return Err(format!(
             "the funding tx {} is broadcast but not confirmed yet: {e}. Your BTC is in the HTLC and the deposit stays \
              pending: 'Diagnose & fix a stuck swap' resumes the mint once it confirms, and offers a Refund once \
@@ -8282,6 +8285,58 @@ fn resume_pending_deposits(state: &State<AppState>, notes: &mut Vec<String>) -> 
             ));
             continue;
         }
+        // The mint escrow may already exist on chain (an earlier run died after the open, or
+        // the deposit was finished from another wallet on the same seed). Re-opening would be
+        // refused by consensus ("this BTC deposit already minted"), so look for it first: the
+        // block scanner records every 0x64 whose claim key is ours, keyed by hashlock.
+        let lock_hex = hex::encode(lock);
+        let prior = {
+            let g = lock_active_wallet(state);
+            let w = g.get().ok_or("wallet locked")?;
+            w.escrows
+                .iter()
+                .find(|e| e.role == "claim" && e.hashlock_hex == lock_hex && (e.kind == "mint" || e.spv))
+                .map(|e| e.id_hex.clone())
+        };
+        if let Some(id_hex) = prior {
+            let id: Option<[u8; 32]> = hex::decode(&id_hex).ok().and_then(|v| v.try_into().ok());
+            let info = id.and_then(|id| bswap::query_escrow(&zc, &id).ok().flatten());
+            match (id, info) {
+                (Some(_), Some(info)) if info.state == "claimed" => {
+                    let note = format!(
+                        "deposit #{} ({} sats): already minted and claimed (escrow {}); the zBTC is credited by the chain scan",
+                        p.index, p.value_sats, &id_hex[..16]
+                    );
+                    notes.push(note);
+                    let _ = with_wallet(state, |w| {
+                        w.pending_deposits.retain(|d| d.index != p.index);
+                        Ok(())
+                    });
+                    resumed += 1;
+                    continue;
+                }
+                (Some(id), Some(info)) if info.state == "open" => {
+                    // Opened but never claimed: claim now (the preimage is ours), then let the
+                    // scan credit the coin from the escrow's note.
+                    match zc.broadcast(&bswap::claim_tx(&id, &preimage)) {
+                        Ok(_) => {
+                            notes.push(format!(
+                                "deposit #{} ({} sats): the mint escrow was open but unclaimed; zBTC claimed now, credited on the next scan",
+                                p.index, p.value_sats
+                            ));
+                            let _ = with_wallet(state, |w| {
+                                w.pending_deposits.retain(|d| d.index != p.index);
+                                Ok(())
+                            });
+                            resumed += 1;
+                        }
+                        Err(e) => notes.push(format!("deposit #{}: mint escrow {} is open but the claim failed: {e}", p.index, &id_hex[..16])),
+                    }
+                    continue;
+                }
+                _ => {} // expired or unknown: fall through to the normal resume (consensus decides)
+            }
+        }
         let (_, zc_timeout) = bswap::shield_timeouts(net, btc_tip_now, zc_tip)?;
         let progress = |_pct: u8, _phase: &str| {};
         match bswap::resume_public_shield(
@@ -8306,6 +8361,10 @@ fn resume_pending_deposits(state: &State<AppState>, notes: &mut Vec<String>) -> 
                 })?;
                 resumed += 1;
             }
+            Err(e) if e.contains("already minted") => notes.push(format!(
+                "deposit #{}: the chain says this BTC deposit already minted, but no matching mint escrow is in this wallet's records; run 'Rebuild index from genesis' in Settings so the scan picks up the escrow and its zBTC",
+                p.index
+            )),
             Err(e) => notes.push(format!("deposit #{}: found the funding but could not finish it: {e}", p.index)),
         }
     }

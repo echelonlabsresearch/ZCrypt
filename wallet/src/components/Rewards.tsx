@@ -17,6 +17,9 @@ export default function Rewards({
   type FeeYield = { asset_id: string; ticker: string; decimals: number; amount: string };
   const [fees, setFees] = useState<FeeYield[]>([]);
   const [feeBusy, setFeeBusy] = useState("");
+  // Last successful fee claim, shown in place of the empty-state text (the list empties
+  // right after a claim, which used to read as if nothing had happened).
+  const [feeMsg, setFeeMsg] = useState("");
   // Pending unbonding (validator unbond or undelegate): persists until the 10-day timer ends.
   type Unbonding = { stake: string; release_time: string };
   const [unbonding, setUnbonding] = useState<Unbonding[]>([]);
@@ -112,9 +115,14 @@ export default function Rewards({
 
   async function claimFee(assetId: string) {
     setErr("");
+    setFeeMsg("");
     setFeeBusy(assetId);
+    const f = fees.find((x) => x.asset_id === assetId);
     try {
-      await call<number>("claim_fees", { assetId });
+      const claimed = await call<number>("claim_fees", { assetId });
+      const dec = f?.decimals ?? 0;
+      const amount = (Number(claimed) / 10 ** dec).toFixed(Math.min(dec, 8));
+      setFeeMsg(`Claimed ${amount} ${f?.ticker ?? ""}: the coins are in your wallet and spendable. New yield accrues with bridge volume.`);
       await load();
     } catch (e) {
       setErr(String(e));
@@ -263,8 +271,11 @@ export default function Rewards({
           <b>and delegators</b> by stake × participation, net of commission. Separate from
           ZCRYPT block rewards above.
         </div>
+        {feeMsg && <div className="msg ok" style={{ marginBottom: "0.6rem" }}>{feeMsg}</div>}
         {fees.length === 0 ? (
-          <div className="warn">No bridge-fee yield to claim yet.</div>
+          <div className="warn">
+            {feeMsg ? "Nothing further to claim right now." : "No bridge-fee yield to claim yet."}
+          </div>
         ) : (
           fees.map((f) => (
             <div
