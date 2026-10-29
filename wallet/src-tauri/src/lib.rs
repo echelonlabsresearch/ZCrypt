@@ -8099,7 +8099,7 @@ fn swap_redeem_btc_impl(btc: &str, progress: &dyn Fn(u8, &str), state: &State<Ap
     let (utxo, _lt) = loop {
         let zc_tip = zc.height()? as u64;
         if let Some((utxo, lt)) = zcrypt_bridge::wallet_flows::find_operator_redeem_htlc(
-            alice_bk.as_ref(), zc_tip, info.timeout_height, &lock, &alice_key.pk, &reserve_pk,
+            alice_bk.as_ref(), &zc, zc_tip_now, zc_tip, info.timeout_height, &lock, &alice_key.pk, &reserve_pk,
             bitcoin::Amount::from_sat(round_value),
         )? {
             let _ = with_wallet(state, |w| {
@@ -8539,7 +8539,7 @@ fn resume_pending_redeems(state: &State<AppState>, notes: &mut Vec<String>) -> R
                     alice_key_at(&g.get().ok_or("wallet locked")?.account, r.index)
                 };
                 match zcrypt_bridge::wallet_flows::find_operator_redeem_htlc(
-                    alice_bk.as_ref(), zc_tip, info.timeout_height, &lock, &alice_key.pk, &reserve_pk,
+                    alice_bk.as_ref(), &zc, r.started_height, zc_tip, info.timeout_height, &lock, &alice_key.pk, &reserve_pk,
                     bitcoin::Amount::from_sat(r.value_sats),
                 )? {
                     Some((utxo, lt)) => {

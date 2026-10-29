@@ -5,6 +5,7 @@
 use bitcoin::{Amount, PublicKey, ScriptBuf};
 
 use crate::swap::{self, find_funded_htlc};
+use crate::zcrypt::ZcNode;
 use crate::{htlc_script, BtcBackend, HtlcUtxo};
 
 /// How far (in Bitcoin blocks, either side) the operator's chosen CLTV may sit from the value
@@ -33,12 +34,42 @@ pub fn redeem_candidate_scripts(
     (lo..=hi).map(|lt| (lt, htlc_script(hashlock, user_btc_pk, reserve_pk, lt))).collect()
 }
 
+/// The candidate CLTVs (and scripts) for a burn escrow derived the way the OPERATOR derives
+/// them (bridge/swap audit 2026-10 H5): from the Bitcoin anchor of the ZC block that carried
+/// the burn (`anchor_btc`, see [`swap::redeem_anchor_for_block`]) and that block's height,
+/// not from the current tips. The centre is byte-for-byte the operator's lock; the radius
+/// covers a wallet that only knows the height it broadcast at (the burn lands a block or
+/// two later, which can move the anchor by at most one Bitcoin block).
+pub fn redeem_candidate_scripts_anchored(
+    network: bitcoin::Network,
+    anchor_btc: u64,
+    lock_height: u64,
+    zc_timeout: u64,
+    hashlock: &[u8; 32],
+    user_btc_pk: &PublicKey,
+    reserve_pk: &PublicKey,
+) -> Vec<(u32, ScriptBuf)> {
+    let Ok(centre) = swap::redeem_btc_locktime_for(network, anchor_btc, lock_height, zc_timeout) else {
+        return Vec::new();
+    };
+    let lo = centre.saturating_sub(REDEEM_LOCKTIME_SEARCH_RADIUS);
+    let hi = centre.saturating_add(REDEEM_LOCKTIME_SEARCH_RADIUS);
+    (lo..=hi).map(|lt| (lt, htlc_script(hashlock, user_btc_pk, reserve_pk, lt))).collect()
+}
+
 /// Look for the operator's funded HTLC for a burn escrow: any candidate script holding at
 /// least `value`. Returns the UTXO and the CLTV it was built with, or `None` if nothing is
 /// funded yet. The caller polls this with a bounded wait.
+///
+/// `lock_height` is the ZC height the burn was included at (or broadcast at: a few blocks
+/// of slack are tolerated). The operator's lock is anchored to that block, so those
+/// candidates are tried first; the tip-derived window is kept as a fallback for a node
+/// that cannot serve block times. Pass `lock_height <= 0` when it is unknown.
 #[allow(clippy::too_many_arguments)]
 pub fn find_operator_redeem_htlc(
     user_btc: &dyn BtcBackend,
+    zc: &dyn ZcNode,
+    lock_height: i64,
     zc_tip: u64,
     zc_timeout: u64,
     hashlock: &[u8; 32],
@@ -46,10 +77,22 @@ pub fn find_operator_redeem_htlc(
     reserve_pk: &PublicKey,
     value: Amount,
 ) -> Result<Option<(HtlcUtxo, u32)>, String> {
+    let net = user_btc.network();
     let btc_tip = user_btc.height()?;
-    for (lt, script) in
-        redeem_candidate_scripts(user_btc.network(), btc_tip, zc_tip, zc_timeout, hashlock, user_btc_pk, reserve_pk)
-    {
+    let mut candidates = Vec::new();
+    if lock_height > 0 {
+        if let Ok(anchor) = swap::redeem_anchor_for_block(zc, user_btc, lock_height, btc_tip) {
+            candidates = redeem_candidate_scripts_anchored(
+                net, anchor, lock_height as u64, zc_timeout, hashlock, user_btc_pk, reserve_pk,
+            );
+        }
+    }
+    candidates.extend(redeem_candidate_scripts(net, btc_tip, zc_tip, zc_timeout, hashlock, user_btc_pk, reserve_pk));
+    let mut tried = std::collections::HashSet::new();
+    for (lt, script) in candidates {
+        if !tried.insert(lt) {
+            continue;
+        }
         if let Some(u) = find_funded_htlc(user_btc, &script, value)? {
             return Ok(Some((u, lt)));
         }
@@ -297,6 +340,27 @@ mod tests {
         // A too-short escrow yields no candidates (the operator would refuse to fund it).
         let short = zc_tip + swap::min_redeem_margin_blocks(net) - 1;
         assert!(redeem_candidate_scripts(net, btc_tip, zc_tip, short, &lock, &user, &reserve).is_empty());
+    }
+
+    #[test]
+    fn anchored_window_is_centred_on_the_operators_lock() {
+        // The operator plans `redeem_btc_locktime_for(net, anchor, burn_height, timeout)`
+        // (swap::plan_redeems_in). The wallet's anchored window must contain exactly that
+        // CLTV at its centre, independent of how far the tips have moved since the burn.
+        let net = bitcoin::Network::Bitcoin;
+        let user = Key::from_bytes(&[1u8; 32]).pk;
+        let reserve = Key::from_bytes(&[2u8; 32]).pk;
+        let lock = [3u8; 32];
+        let (anchor, burn_height) = (973_580u64, 74_946u64);
+        let timeout = burn_height + swap::zc_redeem_timeout_blocks(net);
+        let operator = swap::redeem_btc_locktime_for(net, anchor, burn_height, timeout).unwrap();
+        let c = redeem_candidate_scripts_anchored(net, anchor, burn_height, timeout, &lock, &user, &reserve);
+        assert_eq!(c.len(), 2 * REDEEM_LOCKTIME_SEARCH_RADIUS as usize + 1);
+        assert_eq!(c[REDEEM_LOCKTIME_SEARCH_RADIUS as usize].0, operator);
+        // The tip-derived window, evaluated a day later, no longer contains the operator's
+        // lock: this is why the anchored window exists.
+        let later = redeem_candidate_scripts(net, anchor + 144, burn_height + 86_400, timeout, &lock, &user, &reserve);
+        assert!(later.iter().all(|(lt, _)| *lt != operator));
     }
 
     fn dummy_stx() -> zcrypt_core::shield_tx::ShieldTx {
