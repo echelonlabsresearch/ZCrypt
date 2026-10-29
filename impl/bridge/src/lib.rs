@@ -24,7 +24,7 @@ use bitcoin::{
     Address, Amount, CompressedPublicKey, EcdsaSighashType as _Sht, Network, OutPoint, PublicKey,
     Sequence, Transaction, TxIn, TxOut, Txid, Witness,
 };
-use bitcoincore_rpc::{Auth, Client, RpcApi};
+use bitcoincore_rpc::{Client, RpcApi};
 use std::str::FromStr;
 
 /// SOCKS proxy for the bridge's outbound HTTP (the ZCrypt node RPC in `zcrypt.rs` and the
@@ -289,12 +289,50 @@ pub struct Btc {
     pub network: Network,
 }
 
+/// How long one bitcoind RPC call may take. The transport's default is 15 s, but
+/// `scantxoutset` walks the whole UTXO set (about 90 s on a 4-core mainnet node, and
+/// growing); a client that gives up early leaves the scan running, and every later scan
+/// then fails with "Scan already in progress" until it ends, so on mainnet the redeem
+/// funding lookup could never succeed. Nothing else the bridge calls takes more than a
+/// few seconds, so a long ceiling costs nothing.
+const BTC_RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+
+/// A bitcoind RPC client with [`BTC_RPC_TIMEOUT`] instead of the transport default.
+fn rpc_client(url: &str, user: &str, pass: &str) -> Result<Client, String> {
+    let transport = jsonrpc::minreq_http::Builder::new()
+        .url(url)
+        .map_err(|e| format!("bitcoind url: {e}"))?
+        .basic_auth(user.to_string(), Some(pass.to_string()))
+        .timeout(BTC_RPC_TIMEOUT)
+        .build();
+    Ok(Client::from_jsonrpc(jsonrpc::client::Client::with_transport(transport)))
+}
+
 impl Btc {
     pub fn connect(url: &str, user: &str, pass: &str, wallet: &str, network: Network) -> Result<Self, String> {
         let full = format!("{}/wallet/{}", url.trim_end_matches('/'), wallet);
-        let rpc = Client::new(&full, Auth::UserPass(user.into(), pass.into()))
-            .map_err(|e| e.to_string())?;
+        let rpc = rpc_client(&full, user, pass)?;
         Ok(Btc { rpc, network })
+    }
+
+    /// `scantxoutset start` for one descriptor. A scan that another caller (or an earlier,
+    /// abandoned call of ours) is still running makes bitcoind refuse with "Scan already in
+    /// progress": wait for it to finish, then run ours, rather than fail the whole tick.
+    fn scan_utxos(&self, desc: &str) -> Result<serde_json::Value, String> {
+        use serde_json::json;
+        let deadline = std::time::Instant::now() + BTC_RPC_TIMEOUT;
+        loop {
+            match self.rpc.call::<serde_json::Value>("scantxoutset", &[json!("start"), json!([{ "desc": desc }])]) {
+                Ok(v) => return Ok(v),
+                Err(e) if e.to_string().contains("Scan already in progress") => {
+                    if std::time::Instant::now() >= deadline {
+                        return Err(format!("scantxoutset: another scan never finished: {e}"));
+                    }
+                    std::thread::sleep(std::time::Duration::from_secs(5));
+                }
+                Err(e) => return Err(e.to_string()),
+            }
+        }
     }
 
     /// True on regtest, where the bridge may mine its own blocks. On real networks
@@ -307,8 +345,7 @@ impl Btc {
     /// Best-effort create/load a bitcoind wallet by name (idempotent). Used to make
     /// a `bridge`/LP wallet distinct from the user's `demo` wallet.
     pub fn ensure_wallet(url: &str, user: &str, pass: &str, name: &str) -> Result<(), String> {
-        let rpc = Client::new(url.trim_end_matches('/'), Auth::UserPass(user.into(), pass.into()))
-            .map_err(|e| e.to_string())?;
+        let rpc = rpc_client(url.trim_end_matches('/'), user, pass)?;
         let _ = rpc.create_wallet(name, None, None, None, None);
         let _ = rpc.load_wallet(name);
         Ok(())
@@ -440,15 +477,11 @@ impl Btc {
         expected: Amount,
         timeout_secs: u64,
     ) -> Result<HtlcUtxo, String> {
-        use serde_json::json;
         let addr = htlc_address(script, self.network);
         let desc = format!("addr({addr})");
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
         loop {
-            let res: serde_json::Value = self
-                .rpc
-                .call("scantxoutset", &[json!("start"), json!([{ "desc": desc }])])
-                .map_err(|e| e.to_string())?;
+            let res = self.scan_utxos(&desc)?;
             if let Some(unspents) = res["unspents"].as_array() {
                 for u in unspents {
                     // scantxoutset reports amounts in BTC; compare in sats to avoid float drift.
@@ -530,10 +563,7 @@ impl Btc {
         use serde_json::json;
         let addr = htlc_address(script, self.network);
         let desc = format!("addr({addr})");
-        let res: serde_json::Value = self
-            .rpc
-            .call("scantxoutset", &[json!("start"), json!([{ "desc": desc }])])
-            .map_err(|e| e.to_string())?;
+        let res = self.scan_utxos(&desc)?;
         let mut out = Vec::new();
         for u in res["unspents"].as_array().into_iter().flatten() {
             let sats = (u["amount"].as_f64().unwrap_or(0.0) * 1e8).round() as u64;

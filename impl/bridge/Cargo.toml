@@ -9,6 +9,7 @@ bitcoin = { version = "0.32", features = ["rand-std"] }
 bip39 = { version = "2", features = ["zeroize"] }   # wipe mnemonics on drop
 rand = { workspace = true }
 bitcoincore-rpc = "0.19"
+jsonrpc = { version = "0.18", features = ["minreq_http"] }   # same transport bitcoincore-rpc uses, built with a scan-length timeout
 ureq = { version = "2", features = ["json", "socks-proxy"] }
 base64 = "0.22"
 hex = { workspace = true }
