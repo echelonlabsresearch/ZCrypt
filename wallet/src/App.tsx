@@ -76,10 +76,11 @@ export default function App() {
       setAddress(a);
       const b = await call<{ total: number }>("get_balance");
       setBalance(b.total);
-      // Scan the chain for incoming coins in the BACKGROUND (no-op if no node), then
-      // refresh the balance. Never blocks showing the wallet — the scan holds no lock
+      // Scan the chain for incoming coins (no-op if no node), then refresh the balance.
+      // Awaited here so a Refresh button can spin until the number is final; the start-up
+      // call does not await it, so showing the wallet never blocks — the scan holds no lock
       // across its network I/O, so the UI stays responsive while it runs.
-      call("scan_onchain")
+      await call("scan_onchain")
         .then(async () => {
           const b2 = await call<{ total: number }>("get_balance");
           setBalance(b2.total);

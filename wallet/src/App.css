@@ -581,6 +581,14 @@ label {
   animation: spin 0.9s linear infinite;
   margin: 1rem auto;
 }
+.spinner.small {
+  display: inline-block;
+  width: 20px;
+  height: 20px;
+  border-width: 2px;
+  margin: 0.2rem 0;
+  vertical-align: middle;
+}
 
 .mono-box {
   background: var(--color-bg);

@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
+import type React from "react";
 import { call, fmt, fmtAsset, HeldAsset, isWhitelisted, whitelistName } from "../lib/api";
 
 interface BtcWallet {
@@ -14,42 +15,48 @@ const btcFmt = (n: number) => n.toLocaleString(undefined, { minimumFractionDigit
  * in Receive, actions in Send. The Bitcoin tile asks the Esplora server about the deposit
  * address, which tells that server the address is yours, so it only runs on a click.
  */
-export default function Balance({ balance, onRefresh }: { balance: number; onRefresh: () => void }) {
+export default function Balance({ balance, onRefresh }: { balance: number; onRefresh: () => Promise<void> }) {
   const [count, setCount] = useState(0);
   const [spinning, setSpinning] = useState(false);
   const [assets, setAssets] = useState<HeldAsset[]>([]);
   const [btc, setBtc] = useState<BtcWallet | null>(null);
-  const [btcBusy, setBtcBusy] = useState(false);
   const [whitelist, setWhitelist] = useState<string[]>([]);
 
-  const load = useCallback(() => {
-    call<{ coin_count: number }>("get_balance").then((b) => setCount(b.coin_count)).catch(() => {});
-    call<HeldAsset[]>("held_assets").then(setAssets).catch(() => {});
-    call<string[]>("whitelisted_assets").then(setWhitelist).catch(() => {});
+  const load = useCallback(async () => {
+    await Promise.all([
+      call<{ coin_count: number }>("get_balance").then((b) => setCount(b.coin_count)).catch(() => {}),
+      call<HeldAsset[]>("held_assets").then(setAssets).catch(() => {}),
+      call<string[]>("whitelisted_assets").then(setWhitelist).catch(() => {}),
+    ]);
   }, []);
 
   async function checkBtc() {
-    setBtcBusy(true);
     try {
       setBtc(await call<BtcWallet>("btc_wallet_info"));
     } catch {
       setBtc({ connected: false, balance: 0, deposit_address: "" });
-    } finally {
-      setBtcBusy(false);
     }
   }
 
   useEffect(() => {
-    load();
+    void load();
   }, [balance, load]);
 
+  /**
+   * The one refresh: every tile spins until its own number is back. The chain scan
+   * (ZCRYPT and shielded assets) and the Bitcoin lookup (every address of the wallet, via
+   * the Esplora server) run side by side.
+   */
   async function refresh() {
+    if (spinning) return;
     setSpinning(true);
-    await onRefresh();
-    load();
-    if (btc?.connected) checkBtc();
-    setTimeout(() => setSpinning(false), 400);
+    try {
+      await Promise.all([Promise.resolve(onRefresh()).then(load), checkBtc()]);
+    } finally {
+      setSpinning(false);
+    }
   }
+  const amount = (node: React.ReactNode) => (spinning ? <div className="asset-amount"><span className="spinner small" /></div> : node);
 
   // Non-native shielded assets (zBTC, …) with a positive balance.
   const shielded = assets.filter((a) => a.asset_id !== "0" && a.balance > 0);
@@ -61,7 +68,7 @@ export default function Balance({ balance, onRefresh }: { balance: number; onRef
     <div>
       <div className="dash-head">
         <h2 className="view-title" style={{ margin: 0 }}>💰 Portfolio</h2>
-        <button className="btn-secondary" onClick={refresh}>{spinning ? "⟳ …" : "🔄 Refresh"}</button>
+        <button className="btn-secondary" onClick={refresh} disabled={spinning}>{spinning ? "⟳ Refreshing…" : "🔄 Refresh"}</button>
       </div>
 
       <div className="asset-grid">
@@ -70,7 +77,7 @@ export default function Balance({ balance, onRefresh }: { balance: number; onRef
             <span className="asset-ticker" style={{ color: "var(--color-green)" }}>ZCRYPT</span>
             <span className="asset-kind">native · gas</span>
           </div>
-          <div className="asset-amount" style={{ color: "var(--color-green)", textShadow: "var(--glow-green)" }}>{fmt(balance)}</div>
+          {amount(<div className="asset-amount" style={{ color: "var(--color-green)", textShadow: "var(--glow-green)" }}>{fmt(balance)}</div>)}
           <div className="asset-sub">
             {count} coin{count === 1 ? "" : "s"} · all spendable
           </div>
@@ -84,7 +91,7 @@ export default function Balance({ balance, onRefresh }: { balance: number; onRef
                 {isWhitelisted(a.ticker, whitelist) && <span className="whitelisted">whitelisted</span>} shielded
               </span>
             </div>
-            <div className="asset-amount">{fmtAsset(a.balance, a.decimals)}</div>
+            {amount(<div className="asset-amount">{fmtAsset(a.balance, a.decimals)}</div>)}
             <div className="asset-sub">private · anonymous among the whole pool</div>
           </div>
         ))}
@@ -94,25 +101,22 @@ export default function Balance({ balance, onRefresh }: { balance: number; onRef
             <span className="asset-ticker" style={{ color: "var(--color-cyan)" }}>₿ BTC</span>
             <span className="asset-kind">bitcoin L1</span>
           </div>
-          {btc === null ? (
+          {spinning ? (
+            <>
+              {amount(null)}
+              <div className="asset-sub">asking your Esplora server…</div>
+            </>
+          ) : btc === null ? (
             <>
               <div className="asset-amount dim">—</div>
-              <div className="asset-sub">
-                <button className="btn-link" style={{ padding: 0 }} disabled={btcBusy} onClick={checkBtc}>
-                  {btcBusy ? "Checking…" : "Check balance"}
-                </button>
-                <span title="Checking asks your Esplora server about your deposit address, which reveals that address to it. It never runs on its own."> · reveals your address to the Esplora server</span>
+              <div className="asset-sub" title="Refresh asks your Esplora server about your addresses, which reveals them to it. It never runs on its own.">
+                press Refresh to check · reveals your addresses to the Esplora server
               </div>
             </>
           ) : btc.connected ? (
             <>
               <div className="asset-amount">{btcFmt(btc.balance)}</div>
-              <div className="asset-sub">
-                on the deposit address ·{" "}
-                <button className="btn-link" style={{ padding: 0 }} disabled={btcBusy} onClick={checkBtc}>
-                  {btcBusy ? "…" : "re-check"}
-                </button>
-              </div>
+              <div className="asset-sub">across all your addresses</div>
             </>
           ) : (
             <>
