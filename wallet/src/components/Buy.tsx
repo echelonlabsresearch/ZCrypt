@@ -36,6 +36,37 @@ interface SavedOrder {
   created: number;
 }
 
+interface BtcWallet {
+  connected: boolean;
+  balance: number; // BTC
+  deposit_address: string;
+}
+
+interface BtcQuote {
+  amount_sats: number;
+  fee_sats: number;
+  fee_rate_sat_vb: number;
+  inputs: number;
+}
+
+/// Payments this wallet made for its own orders (order id -> txid), so a reopened order
+/// shows "paid from this wallet" instead of the address to pay.
+const PAID_KEY = "buy.paidFromWallet";
+function loadPaid(): Record<string, string> {
+  try {
+    return JSON.parse(localStorage.getItem(PAID_KEY) || "{}");
+  } catch {
+    return {};
+  }
+}
+function rememberPaid(id: string, txid: string) {
+  try {
+    localStorage.setItem(PAID_KEY, JSON.stringify({ ...loadPaid(), [id]: txid }));
+  } catch {
+    /* best effort */
+  }
+}
+
 const SATS = 100_000_000;
 const ATOMIC = 1_000_000;
 
@@ -48,6 +79,8 @@ function usd(sats: number, btcUsd: number): string {
 }
 /** ZCRYPT (atomic) that `sats` buys at `price` sats per ZCRYPT, as the desk computes it. */
 const zcryptFor = (sats: number, price: number) => (price > 0 ? Math.floor((sats * ATOMIC) / price) : 0);
+/** Sats needed so that the desk's floor rounding still yields `atomic` ZCRYPT (the inverse of `zcryptFor`). */
+const satsFor = (atomic: number, price: number) => (price > 0 ? Math.ceil((atomic * price) / ATOMIC) : 0);
 
 function networkLabel(n: string): string {
   return n === "bitcoin" ? "Bitcoin" : n === "signet" ? "Bitcoin signet (test coins)" : n === "regtest" ? "Bitcoin regtest" : `Bitcoin ${n}`;
@@ -81,12 +114,21 @@ export default function Buy({ active, onBought }: { active: boolean; onBought: (
   const [quote, setQuote] = useState<Quote | null>(null);
   const [qErr, setQErr] = useState("");
   const [amount, setAmount] = useState("0.001");
+  // The ZCRYPT field as the user typed it; cleared when the BTC field is edited so the two
+  // inputs never fight (the BTC amount is the one the order is placed with).
+  const [want, setWant] = useState("");
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState("");
   const [order, setOrder] = useState<Order | null>(null);
   const [qr, setQr] = useState("");
   const [saved, setSaved] = useState<SavedOrder[]>([]);
   const [copied, setCopied] = useState(false);
+  // This wallet's own Bitcoin: when it holds some, the order is paid from it directly.
+  const [btcw, setBtcw] = useState<BtcWallet | null>(null);
+  const [payFrom, setPayFrom] = useState<"wallet" | "external">("wallet");
+  const [paying, setPaying] = useState(false);
+  const [payErr, setPayErr] = useState("");
+  const [paid, setPaid] = useState<Record<string, string>>(loadPaid);
   // The parent passes a fresh callback on every render; keep the latest in a ref so the
   // polling interval below is not torn down and restarted before it ever fires.
   const onBoughtRef = useRef(onBought);
@@ -105,14 +147,18 @@ export default function Buy({ active, onBought }: { active: boolean; onBought: (
   const loadSaved = useCallback(() => {
     call<SavedOrder[]>("buy_orders").then(setSaved).catch(() => {});
   }, []);
+  const loadBtc = useCallback(() => {
+    call<BtcWallet>("btc_wallet_info").then(setBtcw).catch(() => setBtcw(null));
+  }, []);
 
   useEffect(() => {
     if (!active) return;
     loadQuote();
     loadSaved();
+    loadBtc();
     const t = setInterval(loadQuote, 60_000);
     return () => clearInterval(t);
-  }, [active, loadQuote, loadSaved]);
+  }, [active, loadQuote, loadSaved, loadBtc]);
 
   // Resume the newest unfinished order on open.
   useEffect(() => {
@@ -157,23 +203,66 @@ export default function Buy({ active, onBought }: { active: boolean; onBought: (
   const willGet = quote ? zcryptFor(sats, quote.price_sats) : 0;
   const closed = !!quote && quote.price_sats === 0;
   const soldOut = !!quote && !closed && quote.stock_atomic < ATOMIC;
+  const walletSats = btcw?.connected ? Math.round(btcw.balance * SATS) : 0;
+  const canPayFromWallet = walletSats > 0;
+  const fromWallet = canPayFromWallet && payFrom === "wallet";
+
+  /** Pay an open order out of this wallet's own Bitcoin (self-custody send to the desk). */
+  async function payFromWallet(o: Order) {
+    setPayErr("");
+    setPaying(true);
+    try {
+      const amt = btc(o.sats);
+      const q = await call<BtcQuote>("estimate_btc_send", { address: o.btc_address, btc: amt, speed: "normal" });
+      if (q.amount_sats + q.fee_sats > walletSats) {
+        throw new Error(
+          `This wallet holds ${btc(walletSats)} BTC; paying ${amt} BTC plus the ${q.fee_sats.toLocaleString()} sat network fee needs ${btc(q.amount_sats + q.fee_sats)}. Pay from another wallet using the address below, or cancel and lower the amount.`,
+        );
+      }
+      const txid = await call<string>("withdraw_btc", { address: o.btc_address, btc: amt, speed: "normal" });
+      rememberPaid(o.id, txid);
+      setPaid(loadPaid());
+      loadBtc();
+    } catch (e) {
+      setPayErr(String((e as Error)?.message ?? e));
+    } finally {
+      setPaying(false);
+    }
+  }
+
+  /** Put everything this wallet can send (after the fee) into the BTC field. */
+  async function useAll() {
+    setErr("");
+    try {
+      const q = await call<BtcQuote>("btc_max_send", { speed: "normal" });
+      const cap = quote ? Math.min(q.amount_sats, quote.max_sats) : q.amount_sats;
+      setAmount(btc(cap));
+      setWant("");
+    } catch (e) {
+      setErr(String((e as Error)?.message ?? e));
+    }
+  }
 
   async function start() {
     if (!quote) return;
     setErr("");
+    setPayErr("");
     if (sats < quote.min_sats) return setErr(`Minimum is ${btc(quote.min_sats)} BTC.`);
     if (sats > quote.max_sats) return setErr(`Maximum is ${btc(quote.max_sats)} BTC.`);
     if (willGet > quote.stock_atomic) return setErr(`Only ${fmt(quote.stock_atomic)} ZCRYPT available right now.`);
     setBusy(true);
+    let o: Order;
     try {
-      const o = await call<Order>("buy_order", { sats });
+      o = await call<Order>("buy_order", { sats });
       setOrder(o);
       loadSaved();
     } catch (e) {
       setErr(String((e as Error)?.message ?? e));
-    } finally {
       setBusy(false);
+      return;
     }
+    setBusy(false);
+    if (fromWallet) await payFromWallet(o);
   }
 
   async function doCopy() {
@@ -230,21 +319,63 @@ export default function Buy({ active, onBought }: { active: boolean; onBought: (
         <div className="card">
           <div className="field">
             <label>You pay (BTC)</label>
-            <input value={amount} onChange={(e) => setAmount(e.target.value)} inputMode="decimal" placeholder="0.001" />
+            <input
+              value={amount}
+              onChange={(e) => {
+                setAmount(e.target.value);
+                setWant("");
+              }}
+              inputMode="decimal"
+              placeholder="0.001"
+            />
             <div className="buy-hint">
               Between {btc(quote.min_sats)} and {btc(quote.max_sats)} BTC{usd(sats, quote.btc_usd) && <>. About {usd(sats, quote.btc_usd)} at today's rate</>}
             </div>
           </div>
+          <div className="field">
+            <label>You get (ZCRYPT)</label>
+            <input
+              value={want !== "" ? want : willGet > 0 ? String(willGet / ATOMIC) : ""}
+              onChange={(e) => {
+                const v = e.target.value;
+                setWant(v);
+                const atomic = Math.round((parseFloat(v.replace(/,/g, "")) || 0) * ATOMIC);
+                setAmount(atomic > 0 ? btc(satsFor(atomic, quote.price_sats)) : "0");
+              }}
+              inputMode="decimal"
+              placeholder="10000"
+            />
+            <div className="buy-hint">Type the ZCRYPT you want and the BTC to send is worked out at today's price.</div>
+          </div>
+          {btcw?.connected && (
+            <div className="buy-hint" style={{ marginBottom: "0.6rem" }}>
+              Bitcoin in this wallet: <b>{btc(walletSats)} BTC</b>
+              {canPayFromWallet && (
+                <>
+                  {" "}
+                  <button className="btn-link" onClick={useAll}>
+                    Use all
+                  </button>
+                  {" · "}
+                  <button className="btn-link" onClick={() => setPayFrom(payFrom === "wallet" ? "external" : "wallet")}>
+                    {payFrom === "wallet" ? "Pay from another wallet instead" : "Pay from this wallet"}
+                  </button>
+                </>
+              )}
+            </div>
+          )}
           <div className="buy-receive">
-            You get <b>{fmt(willGet)} ZCRYPT</b>
+            {fromWallet ? "Pay" : "Send"} <b>{btc(sats)} BTC</b> and you get <b>{fmt(willGet)} ZCRYPT</b>
           </div>
           {err && <div className="msg err">{err}</div>}
           <button className="btn-primary btn-block" disabled={busy || soldOut || sats <= 0} onClick={start}>
-            {busy ? "Opening order…" : soldOut ? "Sold out" : "Buy"}
+            {busy ? "Opening order…" : soldOut ? "Sold out" : fromWallet ? `Buy with ${btc(sats)} BTC from this wallet` : "Buy"}
           </button>
           <p className="dim" style={{ marginTop: "0.8rem", fontSize: "0.8rem" }}>
-            You will get a Bitcoin address to pay from any Bitcoin wallet. The ZCRYPT is sent to this wallet's
-            recoverable address once the payment confirms. No account, no email.
+            {fromWallet
+              ? "The Bitcoin is sent from this wallet to the sale desk in one step (plus the network fee). "
+              : "You will get a Bitcoin address to pay from any Bitcoin wallet. "}
+            The ZCRYPT is sent to this wallet's recoverable address once the payment confirms. No account, no email.
           </p>
         </div>
       )}
@@ -253,7 +384,26 @@ export default function Buy({ active, onBought }: { active: boolean; onBought: (
         <div className="card">
           <h3 style={{ marginTop: 0 }}>Order {order.id.slice(0, 8)}</h3>
           <div className={`buy-status ${st.tone}`}>{st.text}</div>
-          {order.status !== "paid" && (
+          {paying && <div className="msg">Paying from this wallet…</div>}
+          {payErr && <div className="msg err">{payErr}</div>}
+          {order.status !== "paid" && paid[order.id] && (
+            <div className="buy-pay-text">
+              <div className="buy-pay-amount">
+                Paid <b>{btc(order.sats)} BTC</b> from this wallet.
+              </div>
+              <div className="buy-hint">
+                Bitcoin transaction <code>{paid[order.id]}</code>. The desk credits the order once it confirms
+                {order.min_conf > 0 && <> ({order.min_conf} confirmation{order.min_conf === 1 ? "" : "s"})</>}.
+              </div>
+              {order.paid_sats > 0 && (
+                <div className="buy-hint">
+                  Received {btc(order.paid_sats)} BTC, you get {fmt(zcryptFor(order.paid_sats, order.price_sats))} ZCRYPT.
+                </div>
+              )}
+              <div className="buy-hint">Open until {new Date(order.expires * 1000).toLocaleString()}</div>
+            </div>
+          )}
+          {order.status !== "paid" && !paid[order.id] && (
             <div className="buy-pay">
               {qr && (
                 <div className="qr-tile">
@@ -270,6 +420,11 @@ export default function Buy({ active, onBought }: { active: boolean; onBought: (
                 </div>
                 <code className="buy-addr">{order.btc_address}</code>
                 <div className="addr-actions">
+                  {canPayFromWallet && !paying && (
+                    <button className="btn-primary" onClick={() => payFromWallet(order)}>
+                      Pay {btc(order.sats)} BTC from this wallet
+                    </button>
+                  )}
                   <button className="btn-secondary" onClick={doCopy}>
                     {copied ? "Copied" : "Copy address"}
                   </button>
