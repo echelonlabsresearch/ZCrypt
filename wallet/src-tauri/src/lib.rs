@@ -7645,6 +7645,33 @@ fn find_shield_funding(
     Ok(None)
 }
 
+/// A shield deposit's HTLC output that the operator has already SWEPT via the claim branch
+/// with `preimage` (this deposit's own): `(funding outpoint, sweep txid)`. Looks at every
+/// output at the candidate HTLC addresses, spent ones included. `None` when the backend
+/// cannot list history, nothing is funded, or the spend is not a claim with our preimage.
+fn find_swept_shield(
+    backend: &dyn zcrypt_bridge::BtcBackend,
+    p: &PendingDeposit,
+    net: bitcoin::Network,
+    lock: &[u8; 32],
+    reserve_pk: &bitcoin::PublicKey,
+    refund_pk: &bitcoin::PublicKey,
+    preimage: &[u8],
+) -> Option<(bitcoin::OutPoint, bitcoin::Txid)> {
+    for t in shield_locktime_candidates(p, net) {
+        let script = zcrypt_bridge::htlc_script(lock, reserve_pk, refund_pk, t as u32);
+        let outputs = backend.htlc_outputs_all(&script).ok()?;
+        for u in outputs.into_iter().filter(|u| u.value.to_sat() >= p.value_sats) {
+            if let Ok(Some((txid, zcrypt_bridge::HtlcSpend::Claimed(pre)))) = backend.htlc_spender(&u) {
+                if pre.as_slice() == preimage {
+                    return Some((u.outpoint, txid));
+                }
+            }
+        }
+    }
+    None
+}
+
 #[derive(Serialize)]
 struct PendingDepositView {
     index: u32,
@@ -8231,6 +8258,27 @@ fn resume_pending_deposits(state: &State<AppState>, notes: &mut Vec<String>) -> 
         };
         let horizon = shield_locktime_candidates(&p, net).into_iter().max().unwrap_or(0);
         let Some((utxo, btc_locktime)) = find_shield_funding(alice_bk.as_ref(), &p, net, &lock, &reserve_pk, &refund.pk)? else {
+            // No UNSPENT funding. The deposit may be finished: the operator sweeps the HTLC
+            // with the preimage the mint revealed, so a claim-branch spend carrying OUR
+            // preimage is proof the zBTC was minted (the record was lost after the fact, e.g.
+            // a second wallet instance saving over this one).
+            if let Some((fund, sweep)) = find_swept_shield(alice_bk.as_ref(), &p, net, &lock, &reserve_pk, &refund.pk, &preimage) {
+                let minted_on_chain = zcrypt_bridge::zcrypt::ZcNode::spv_claimed(&zc, &bitcoin::hashes::Hash::to_byte_array(fund.txid), fund.vout).unwrap_or(false);
+                let note = format!(
+                    "deposit #{} ({} sats): the operator already swept your deposit ({}) with your preimage{}, so its zBTC was minted; the zBTC is credited by the chain scan (Rebuild index if it is missing); record closed",
+                    p.index,
+                    p.value_sats,
+                    short(&sweep.to_string()),
+                    if minted_on_chain { " and the chain lists the deposit as minted" } else { "" }
+                );
+                notes.push(note);
+                let _ = with_wallet(state, |w| {
+                    w.pending_deposits.retain(|d| d.index != p.index);
+                    Ok(())
+                });
+                resumed += 1;
+                continue;
+            }
             if p.funding.is_none() && btc_tip_now >= horizon.saturating_add(2016) {
                 // Two weeks past the lock with no funding ever seen: the HTLC was never broadcast.
                 let note = format!(
