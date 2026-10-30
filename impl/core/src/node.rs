@@ -2371,9 +2371,20 @@ impl Node {
         &mut self,
         pk: &zcrypt_shield::PubKey,
         amount: u64,
+        claim_index: Option<u64>,
     ) -> Result<Vec<Commitment>, String> {
         let addr = crate::keys::reward_address(pk);
         let bal = self.staking.claimable_of(&addr, self.current_height);
+        // Nonce: a claim that names its claim index is bound to one point in the ledger's
+        // history. Without it two claims of the same amount are byte-identical, so the
+        // mempool cache refuses the second as a replay of the first (seen on mainnet).
+        // Legacy claims (`None`) stay accepted until every wallet sends the index.
+        if let Some(idx) = claim_index {
+            let cur = self.staking.claim_index_of(&addr);
+            if idx != cur {
+                return Err(format!("claim index {idx} is stale: the next coin index for this key is {cur}"));
+            }
+        }
         // VM gate: program CLAIM = [CHECK_AMOUNT_POSITIVE, CHECK_AMOUNT_EQ_CLAIMABLE]. Claims
         // are unauthenticated (coins go to `pk` regardless of who sends), so they must take
         // the whole balance: a partial claim let anyone shred a victim's balance into dust.

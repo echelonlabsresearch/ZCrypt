@@ -40,7 +40,7 @@ fn validator_claims_rewards_into_a_reconstructable_coin() {
 
     // First claim reserves a small gas coin so the balance is immediately spendable,
     // then the rest: 14 ZCRYPT → [1 ZCRYPT gas coin, 13 ZCRYPT] = 2 coins.
-    let minted = node.claim_rewards(&account.pubkey(), owed).unwrap();
+    let minted = node.claim_rewards(&account.pubkey(), owed, None).unwrap();
     let chunks = keys::claim_chunks(owed, true);
     assert_eq!(minted.len(), chunks.len());
     assert_eq!(chunks[0], keys::CLAIM_GAS_COIN, "first coin is the gas reserve");
@@ -78,17 +78,17 @@ fn claimed_reward_coins_are_spendable() {
 
     // Claims must take the FULL balance (a partial claim is rejected: consensus C2). So
     // simulate two claims by claiming after each epoch's accrual instead of splitting one.
-    assert!(node.claim_rewards(&account.pubkey(), per_epoch).is_err(), "partial claims are refused");
+    assert!(node.claim_rewards(&account.pubkey(), per_epoch, None).is_err(), "partial claims are refused");
     // Rewind: claim the two-epoch balance in one go, then accrue a third epoch and claim
     // again. First claim reserves a gas coin: chunks [gas, rest] at tree indices [0, 1].
     // Second claim (already holds coins) is a single coin at tree index 2.
-    let claim1 = node.claim_rewards(&account.pubkey(), 2 * per_epoch).unwrap();
+    let claim1 = node.claim_rewards(&account.pubkey(), 2 * per_epoch, None).unwrap();
     for h in (2 * emission::EPOCH + 1)..=(3 * emission::EPOCH) {
         node.set_height(h);
         node.record_block_signers(&[b"validator-consensus-2".to_vec()]);
         node.maybe_distribute_rewards(h);
     }
-    let claim2 = node.claim_rewards(&account.pubkey(), per_epoch).unwrap();
+    let claim2 = node.claim_rewards(&account.pubkey(), per_epoch, None).unwrap();
     let chunks1 = keys::claim_chunks(2 * per_epoch, true);
     let chunks2 = keys::claim_chunks(per_epoch, false);
     // (value, tree index) of every minted coin, appended in order.
@@ -170,12 +170,12 @@ fn foundation_claims_vest_on_schedule_end_to_end() {
     assert_eq!(node.claimable(&stranger.pubkey()), 0);
 
     // Claiming ahead of the schedule is rejected outright.
-    assert!(node.claim_rewards(&foundation.pubkey(), emission::FOUNDATION_LIQUID + 1).is_err());
+    assert!(node.claim_rewards(&foundation.pubkey(), emission::FOUNDATION_LIQUID + 1, None).is_err());
 
     // Claim the liquid tranche into coins the foundation wallet can reconstruct. As the
     // FIRST claim it reserves a gas coin so the 50k is immediately spendable:
     // 50,000 ZCRYPT → [1 ZCRYPT gas coin, 49,999 ZCRYPT].
-    let minted = node.claim_rewards(&foundation.pubkey(), emission::FOUNDATION_LIQUID).unwrap();
+    let minted = node.claim_rewards(&foundation.pubkey(), emission::FOUNDATION_LIQUID, None).unwrap();
     let chunks = keys::claim_chunks(emission::FOUNDATION_LIQUID, true);
     assert_eq!(minted.len(), chunks.len());
     assert_eq!(chunks[0], keys::CLAIM_GAS_COIN, "first coin is the gas reserve");
@@ -183,7 +183,7 @@ fn foundation_claims_vest_on_schedule_end_to_end() {
         assert_eq!(foundation.reward_coin(chunk, i as u64).commitment(), minted[i], "rebuild coin {i}");
     }
     assert_eq!(node.claimable(&foundation.pubkey()), 0, "nothing more until the cliff");
-    assert!(node.claim_rewards(&foundation.pubkey(), 1).is_err());
+    assert!(node.claim_rewards(&foundation.pubkey(), 1, None).is_err());
 
     // Just before the cliff: still locked. At the cliff: 25% cumulative unlocks.
     node.set_height(emission::VESTING_CLIFF - 1);
@@ -191,7 +191,7 @@ fn foundation_claims_vest_on_schedule_end_to_end() {
     node.set_height(emission::VESTING_CLIFF);
     let at_cliff = emission::VESTING_CLIFF_AMOUNT - emission::FOUNDATION_LIQUID;
     assert_eq!(node.claimable(&foundation.pubkey()), at_cliff);
-    node.claim_rewards(&foundation.pubkey(), at_cliff).unwrap();
+    node.claim_rewards(&foundation.pubkey(), at_cliff, None).unwrap();
 
     // A month later: exactly one monthly unlock more.
     node.set_height(emission::VESTING_CLIFF + emission::BLOCKS_PER_MONTH);
@@ -200,10 +200,10 @@ fn foundation_claims_vest_on_schedule_end_to_end() {
     // At the end of the schedule the whole 4.2M has been claimable, no more.
     node.set_height(u64::MAX);
     let rest = node.claimable(&foundation.pubkey());
-    node.claim_rewards(&foundation.pubkey(), rest).unwrap();
+    node.claim_rewards(&foundation.pubkey(), rest, None).unwrap();
     assert_eq!(node.foundation_claimed(), emission::FOUNDATION);
     assert_eq!(node.claimable(&foundation.pubkey()), 0);
-    assert!(node.claim_rewards(&foundation.pubkey(), 1).is_err(), "allocation exhausted forever");
+    assert!(node.claim_rewards(&foundation.pubkey(), 1, None).is_err(), "allocation exhausted forever");
 
     // Issuance accounting: vested foundation + nothing emitted.
     assert_eq!(node.total_issued(), emission::FOUNDATION);

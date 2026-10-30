@@ -155,7 +155,7 @@ fn full_product_surface_happy_path() {
     // [1 ZCRYPT gas coin, rest]. Reconstruct and spend both (≤ N_IN inputs) as the reward.
     let reward_start = node.claim_index(&alice.pubkey());
     let claimed_val = owed;
-    let minted = node.claim_rewards(&alice.pubkey(), owed).unwrap();
+    let minted = node.claim_rewards(&alice.pubkey(), owed, None).unwrap();
     let chunks = keys::claim_chunks(owed, reward_start == 0);
     assert_eq!(minted.len(), chunks.len());
     let reward_coins: Vec<_> = chunks
@@ -567,7 +567,7 @@ fn coin_backed_bond_pledges_coins_and_unbonding_returns_them() {
     assert_eq!(node.total_unbonding(), 0);
 
     // ...which the bonder withdraws into a real spendable coin (claiming is gasless).
-    let coins = node.claim_rewards(&bonder.pubkey(), stake).expect("claim returned stake into a coin");
+    let coins = node.claim_rewards(&bonder.pubkey(), stake, None).expect("claim returned stake into a coin");
     assert!(!coins.is_empty());
     eprintln!("[ok] coin-backed bond: pledged {stake}, locked, returned + claimed after unbonding");
 }

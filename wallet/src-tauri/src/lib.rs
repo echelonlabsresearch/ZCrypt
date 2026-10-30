@@ -5410,11 +5410,13 @@ async fn claim_rewards(state: State<'_, AppState>) -> R<ClaimResult> {
             continue;
         }
         let start = chain::staking_u64(&url, &format!("/staking/claim_index/{pk_h}"))?;
-        // CLAIM tx: 0x58 ‖ pk(64) ‖ amount(8 LE). Consensus requires the FULL balance.
+        // CLAIM tx: 0x58 ‖ pk(64) ‖ amount(8 LE) ‖ claim_index(8 LE). Consensus requires the
+        // FULL balance; the index is the nonce that keeps two equal claims distinct.
         let claim_tx = |amount: u64| {
             let mut tx = vec![0x58u8];
             tx.extend_from_slice(&hex::decode(&pk_h).unwrap());
             tx.extend_from_slice(&amount.to_le_bytes());
+            tx.extend_from_slice(&start.to_le_bytes());
             tx
         };
         let mut claimable = claimable;

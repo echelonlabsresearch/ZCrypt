@@ -238,6 +238,13 @@ swap (same hashlock, keys crossed), named exactly this lock, and has not sponsor
 transparent income (auditable rewards / foundation vesting). Privacy begins at the coin's first SPEND, \
 which hides among the whole pool", hex_at(0, 64)));
             r.push(row("[65..73]".into(), "amount (u64 LE) -> Ctx.amount", rd_u64(body, 64).map(zcry)?));
+            if body.len() >= 80 {
+                r.push(row(
+                    "[73..81]".into(),
+                    "claim index (u64 LE): the nonce; must equal the key's next reward-coin index",
+                    rd_u64(body, 72).map(|v| v.to_string())?,
+                ));
+            }
         }
         0x59 => {
             let dec = *body.first()?;

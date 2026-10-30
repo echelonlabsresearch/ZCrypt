@@ -727,13 +727,17 @@ fn pubkey_bytes(pk: &[u64; 8]) -> Vec<u8> {
     b
 }
 
-fn parse_claim(b: &[u8]) -> Option<([u64; 8], u64)> {
-    if b.len() != 72 {
+/// Parse a claim payload: `pk(64) ‖ amount(8)` (legacy, 72 bytes) or
+/// `pk(64) ‖ amount(8) ‖ claim_index(8)` (80 bytes). The index is the nonce that makes two
+/// claims of the same amount distinct transactions.
+fn parse_claim(b: &[u8]) -> Option<([u64; 8], u64, Option<u64>)> {
+    if b.len() != 72 && b.len() != 80 {
         return None;
     }
     let pk = parse_pubkey(&b[0..64])?;
     let amount = u64::from_le_bytes(b[64..72].try_into().ok()?);
-    Some((pk, amount))
+    let index = if b.len() == 80 { Some(u64::from_le_bytes(b[72..80].try_into().ok()?)) } else { None };
+    Some((pk, amount, index))
 }
 
 /// Parse an 80-byte fee-claim payload into (pk, asset_id, amount).
@@ -1552,8 +1556,9 @@ impl ZcryptApp {
             }
         } else if tx.first() == Some(&CLAIM_TAG) {
             match parse_claim(&tx[1..]) {
-                Some((pk, amount)) => {
+                Some((pk, amount, index)) => {
                     let bal = s.node.claimable(&pk);
+                    let cur = s.node.claim_index(&pk);
                     // Full-balance claims only (consensus C2: partial claims shred balances),
                     // and never below the 1 ZCRYPT floor (a forced claim per epoch would
                     // otherwise still dust a small staker).
@@ -1561,6 +1566,8 @@ impl ZcryptApp {
                         Err(format!("claimable {bal} is below the 1 ZCRYPT claim minimum (rewards keep accruing)"))
                     } else if amount == 0 || amount != bal {
                         Err(format!("claim {amount} must equal the full claimable balance {bal}"))
+                    } else if index.is_some_and(|i| i != cur) {
+                        Err(format!("claim index {} is stale: the next coin index for this key is {cur}", index.unwrap_or(0)))
                     } else {
                         Ok(())
                     }
@@ -2105,7 +2112,7 @@ impl ZcryptApp {
                 }
             } else if bytes.first() == Some(&CLAIM_TAG) {
                 match parse_claim(&bytes[1..]) {
-                    Some((pk, amount)) => match s.node.claim_rewards(&pk, amount) {
+                    Some((pk, amount, index)) => match s.node.claim_rewards(&pk, amount, index) {
                         Ok(coins) => {
                             // Report the minted coinbase commitments so the
                             // claimer can find their new coins' tree indices.

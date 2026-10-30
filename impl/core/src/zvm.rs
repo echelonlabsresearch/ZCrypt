@@ -240,18 +240,52 @@ mod tests {
         // valid: claim exactly the balance
         let ctx = Ctx { amount: claimable, claimable, ..Default::default() };
         // (clone node's staking state by re-deriving claimable; call on a fresh copy path)
-        let ok_node = node.claim_rewards(&account.pubkey(), claimable).is_ok();
+        let ok_node = node.claim_rewards(&account.pubkey(), claimable, None).is_ok();
         assert_eq!(evaluate(CLAIM, &ctx).accept, ok_node);
 
         // adversarial: over-claim (fresh account, no balance)
         let (a2, _) = keys::new_account();
         let mut n2 = Node::new();
         let ctx = Ctx { amount: 1, claimable: n2.claimable(&a2.pubkey()), ..Default::default() };
-        assert_eq!(evaluate(CLAIM, &ctx).accept, n2.claim_rewards(&a2.pubkey(), 1).is_ok());
+        assert_eq!(evaluate(CLAIM, &ctx).accept, n2.claim_rewards(&a2.pubkey(), 1, None).is_ok());
         assert!(!evaluate(CLAIM, &ctx).accept);
         // adversarial: a PARTIAL claim (dust-shredding, consensus C2) is rejected by both.
         let ctx = Ctx { amount: 1, claimable: 1_000, ..Default::default() };
         assert!(!evaluate(CLAIM, &ctx).accept, "partial claims are refused");
+    }
+
+    #[test]
+    fn claim_index_is_a_nonce() {
+        // Two claims of the same amount must be different transactions: the claim index
+        // names the ledger point a claim is bound to, and a stale one is refused.
+        let (account, _mn) = keys::new_account();
+        let mut node = Node::new();
+        node.bond(pk(1), pk(1), MIN_STAKE, account.reward_address(), crate::staking::DEFAULT_COMMISSION_BPS).unwrap();
+        let mut h = 0;
+        let mut accrue = |node: &mut Node| {
+            for _ in 0..emission::EPOCH {
+                h += 1;
+                node.set_height(h);
+                node.record_block_signers(&[pk(1)]);
+                node.maybe_distribute_rewards(h);
+            }
+        };
+        accrue(&mut node);
+        let first = node.claimable(&account.pubkey());
+        assert_eq!(node.claim_index(&account.pubkey()), 0);
+        assert!(node.claim_rewards(&account.pubkey(), first, Some(1)).is_err(), "wrong index refused");
+        let coins = node.claim_rewards(&account.pubkey(), first, Some(0)).unwrap();
+        let next = coins.len() as u64;
+        assert_eq!(node.claim_index(&account.pubkey()), next);
+        accrue(&mut node);
+        let second = node.claimable(&account.pubkey());
+        assert_eq!(second, first, "same amount accrues per epoch: the amount alone cannot distinguish the claims");
+        assert!(node.claim_rewards(&account.pubkey(), second, Some(0)).is_err(), "the first claim's index is stale");
+        assert!(node.claim_rewards(&account.pubkey(), second, Some(next)).is_ok());
+        // Legacy form without an index still works.
+        accrue(&mut node);
+        let third = node.claimable(&account.pubkey());
+        assert!(node.claim_rewards(&account.pubkey(), third, None).is_ok());
     }
 
     #[test]
