@@ -126,6 +126,7 @@ export default function Buy({ active, onBought }: { active: boolean; onBought: (
   // This wallet's own Bitcoin: when it holds some, the order is paid from it directly.
   const [btcw, setBtcw] = useState<BtcWallet | null>(null);
   const [paying, setPaying] = useState(false);
+  const [payStep, setPayStep] = useState<"checking" | "sending" | null>(null);
   const [payErr, setPayErr] = useState("");
   const [paid, setPaid] = useState<Record<string, string>>(loadPaid);
   // The parent passes a fresh callback on every render; keep the latest in a ref so the
@@ -214,10 +215,12 @@ export default function Buy({ active, onBought }: { active: boolean; onBought: (
     if (walletSats === 0) return;
     setPayErr("");
     setPaying(true);
+    setPayStep("checking");
     try {
       const amt = btc(o.sats);
       const q = await call<BtcQuote>("estimate_btc_send", { address: o.btc_address, btc: amt, speed: "normal" });
       if (q.amount_sats + q.fee_sats > walletSats) return;
+      setPayStep("sending");
       const txid = await call<string>("withdraw_btc", { address: o.btc_address, btc: amt, speed: "normal" });
       rememberPaid(o.id, txid);
       setPaid(loadPaid());
@@ -226,7 +229,63 @@ export default function Buy({ active, onBought }: { active: boolean; onBought: (
       setPayErr(`Could not pay from this wallet (${String((e as Error)?.message ?? e)}). Pay the address below from another wallet.`);
     } finally {
       setPaying(false);
+      setPayStep(null);
     }
+  }
+
+  /**
+   * The wallet-funded payment as one obvious progress strip: balance check, withdrawal,
+   * sent (txid), seen by the desk (confirmations), ZCRYPT received. Replaces the address
+   * and QR, which only matter when another wallet has to pay.
+   */
+  function WalletPayProgress({ o, txid }: { o: Order; txid: string | null }) {
+    const sent = !!txid;
+    const seen = o.status === "seen" || o.status === "paid";
+    const done = o.status === "paid";
+    const confs = Math.min(o.confirmations, o.min_conf);
+    const pct = done
+      ? 100
+      : seen
+        ? 55 + (o.min_conf > 0 ? Math.round((confs / o.min_conf) * 40) : 40)
+        : sent
+          ? 50
+          : payStep === "sending"
+            ? 30
+            : 10;
+    const headline = done
+      ? `Done: ${fmt(o.zcrypt_atomic)} ZCRYPT received`
+      : seen
+        ? o.min_conf === 0
+          ? "Payment seen, the desk is sending your ZCRYPT"
+          : `Payment received by the desk (${confs}/${o.min_conf} confirmation${o.min_conf === 1 ? "" : "s"})`
+        : sent
+          ? "Sent from your Bitcoin balance, waiting for the desk to see it"
+          : payStep === "sending"
+            ? "Withdrawing from your Bitcoin balance…"
+            : "Checking your Bitcoin balance…";
+    const steps: [string, boolean][] = [
+      [`Withdraw ${btc(o.sats)} BTC from your Bitcoin balance`, sent],
+      [txid ? `Sent, transaction ${txid}` : "Sent", sent],
+      [o.min_conf > 0 ? `Received by the desk (${o.min_conf} confirmation${o.min_conf === 1 ? "" : "s"})` : "Received by the desk", done || (seen && confs >= o.min_conf)],
+      [`${fmt(zcryptFor(o.paid_sats > 0 ? o.paid_sats : o.sats, o.price_sats))} ZCRYPT sent to this wallet`, done],
+    ];
+    return (
+      <div className="progress-container" style={{ padding: "1.4rem" }}>
+        {!done && <div className="spinner" />}
+        <div style={{ fontSize: "1.15rem", fontWeight: 600 }}>{headline}</div>
+        <div className="progress-bar">
+          <div className="progress-fill" style={{ width: `${pct}%` }} />
+        </div>
+        <ul style={{ listStyle: "none", padding: 0, margin: "0.4rem 0 0", textAlign: "left" }}>
+          {steps.map(([label, ok], i) => (
+            <li key={i} className={ok ? "" : "dim"} style={{ padding: "0.15rem 0", wordBreak: "break-all" }}>
+              {ok ? "✓" : "○"} {label}
+            </li>
+          ))}
+        </ul>
+        {!done && <div className="buy-hint" style={{ marginTop: "0.6rem" }}>Open until {new Date(o.expires * 1000).toLocaleString()}</div>}
+      </div>
+    );
   }
 
   async function start() {
@@ -356,27 +415,10 @@ export default function Buy({ active, onBought }: { active: boolean; onBought: (
       {order && st && (
         <div className="card">
           <h3 style={{ marginTop: 0 }}>Order {order.id.slice(0, 8)}</h3>
-          <div className={`buy-status ${st.tone}`}>{st.text}</div>
-          {paying && <div className="msg">Paying from this wallet…</div>}
+          {!(paying || paid[order.id]) && <div className={`buy-status ${st.tone}`}>{st.text}</div>}
           {payErr && <div className="msg err">{payErr}</div>}
-          {order.status !== "paid" && paid[order.id] && (
-            <div className="buy-pay-text">
-              <div className="buy-pay-amount">
-                Paid <b>{btc(order.sats)} BTC</b> from this wallet.
-              </div>
-              <div className="buy-hint">
-                Bitcoin transaction <code>{paid[order.id]}</code>. The desk credits the order once it confirms
-                {order.min_conf > 0 && <> ({order.min_conf} confirmation{order.min_conf === 1 ? "" : "s"})</>}.
-              </div>
-              {order.paid_sats > 0 && (
-                <div className="buy-hint">
-                  Received {btc(order.paid_sats)} BTC, you get {fmt(zcryptFor(order.paid_sats, order.price_sats))} ZCRYPT.
-                </div>
-              )}
-              <div className="buy-hint">Open until {new Date(order.expires * 1000).toLocaleString()}</div>
-            </div>
-          )}
-          {order.status !== "paid" && !paid[order.id] && (
+          {(paying || paid[order.id]) && <WalletPayProgress o={order} txid={paid[order.id] ?? null} />}
+          {order.status !== "paid" && !paying && !paid[order.id] && (
             <div className="buy-pay">
               {qr && (
                 <div className="qr-tile">
