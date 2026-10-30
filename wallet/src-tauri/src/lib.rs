@@ -8580,6 +8580,29 @@ fn resume_pending_redeems(state: &State<AppState>, notes: &mut Vec<String>) -> R
                         }
                     }
                     None => {
+                        // The lock may be gone because THIS wallet already claimed it and the
+                        // record was never updated: close it from the claim on chain.
+                        let recorded = r.funding.as_ref().and_then(|(t, v)| {
+                            t.parse::<bitcoin::Txid>().ok().map(|txid| bitcoin::OutPoint { txid, vout: *v })
+                        });
+                        let claimed = zcrypt_bridge::wallet_flows::find_user_redeem_claim(
+                            alice_bk.as_ref(), &zc, r.started_height, zc_tip, info.timeout_height, &lock, &alice_key.pk,
+                            &reserve_pk, bitcoin::Amount::from_sat(r.value_sats), recorded, &preimage,
+                        )
+                        .unwrap_or(None);
+                        if let Some(txid) = claimed {
+                            notes.push(format!(
+                                "redeem #{}: your claim of the operator's BTC ({txid}) is confirmed; the BTC was paid to this wallet; record closed",
+                                r.index
+                            ));
+                            let _ = with_wallet(state, |w| {
+                                mark_redeem_claimed(w, r.index, &txid.to_string());
+                                w.pending_redeems.retain(|x| x.index != r.index);
+                                Ok(())
+                            });
+                            done += 1;
+                            continue;
+                        }
                         if zc_tip >= info.timeout_height {
                             // Consensus expires the escrow at the end of this block on its own; the
                             // 0x5C only hurries it, and "not open" afterwards is success.

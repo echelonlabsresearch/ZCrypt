@@ -357,6 +357,28 @@ impl crate::BtcBackend for SelfCustodyBtc {
     fn htlc_utxos(&self, script: &ScriptBuf) -> Result<Vec<HtlcUtxo>, String> {
         SelfCustodyBtc::htlc_utxos(self, script)
     }
+    fn htlc_outputs_all(&self, script: &ScriptBuf) -> Result<Vec<HtlcUtxo>, String> {
+        let addr = htlc_address(script, self.network).to_string();
+        let mut out = Vec::new();
+        for u in self.esplora.address_outputs(&addr)? {
+            let txid = Txid::from_str(&u.txid).map_err(|e| e.to_string())?;
+            out.push(HtlcUtxo {
+                outpoint: bitcoin::OutPoint { txid, vout: u.vout },
+                value: Amount::from_sat(u.value),
+                script: script.clone(),
+            });
+        }
+        Ok(out)
+    }
+    fn htlc_spender(&self, utxo: &HtlcUtxo) -> Result<Option<(Txid, crate::HtlcSpend)>, String> {
+        match self.esplora.outspend_status(&utxo.outpoint.txid.to_string(), utxo.outpoint.vout)? {
+            Some(spend) if spend.confirmed => {
+                let txid = Txid::from_str(&spend.txid).map_err(|e| e.to_string())?;
+                Ok(Some((txid, self.htlc_spend_in_tx(&txid, &utxo.outpoint)?)))
+            }
+            _ => Ok(None),
+        }
+    }
     fn refund(&self, utxo: &HtlcUtxo, key: &Key, locktime: u32, dest: &Address, fee: Amount) -> Result<Txid, String> {
         SelfCustodyBtc::refund(self, utxo, key, locktime, dest, fee)
     }

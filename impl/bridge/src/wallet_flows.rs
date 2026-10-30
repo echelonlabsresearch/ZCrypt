@@ -100,6 +100,69 @@ pub fn find_operator_redeem_htlc(
     Ok(None)
 }
 
+/// The user's own CONFIRMED claim of the operator's lock for a burn escrow, if any: the
+/// claim txid. Looked up from the recorded funding outpoint when the wallet has one, else
+/// from every output (spent or not) at the candidate HTLC addresses. Only a claim-branch
+/// spend whose revealed preimage is `preimage` counts: a refund by the operator, or a spend
+/// of some other output at the address, is `None`. Lets Diagnose close a redeem whose claim
+/// went out but whose record was never updated (a crash, or a second wallet instance saving
+/// over the first), instead of reporting the gone UTXO as "waiting for the operator".
+#[allow(clippy::too_many_arguments)]
+pub fn find_user_redeem_claim(
+    user_btc: &dyn BtcBackend,
+    zc: &dyn ZcNode,
+    lock_height: i64,
+    zc_tip: u64,
+    zc_timeout: u64,
+    hashlock: &[u8; 32],
+    user_btc_pk: &PublicKey,
+    reserve_pk: &PublicKey,
+    value: Amount,
+    recorded_funding: Option<bitcoin::OutPoint>,
+    preimage: &[u8],
+) -> Result<Option<bitcoin::Txid>, String> {
+    let claimed_by_us = |utxo: &HtlcUtxo| -> Result<Option<bitcoin::Txid>, String> {
+        Ok(match user_btc.htlc_spender(utxo)? {
+            Some((txid, crate::HtlcSpend::Claimed(pre))) if pre.as_slice() == preimage => Some(txid),
+            _ => None,
+        })
+    };
+    if let Some(outpoint) = recorded_funding {
+        let utxo = HtlcUtxo { outpoint, value, script: ScriptBuf::new() };
+        if let Some(txid) = claimed_by_us(&utxo)? {
+            return Ok(Some(txid));
+        }
+    }
+    let net = user_btc.network();
+    let btc_tip = user_btc.height()?;
+    let mut candidates = Vec::new();
+    if lock_height > 0 {
+        if let Ok(anchor) = swap::redeem_anchor_for_block(zc, user_btc, lock_height, btc_tip) {
+            candidates = redeem_candidate_scripts_anchored(
+                net, anchor, lock_height as u64, zc_timeout, hashlock, user_btc_pk, reserve_pk,
+            );
+        }
+    }
+    candidates.extend(redeem_candidate_scripts(net, btc_tip, zc_tip, zc_timeout, hashlock, user_btc_pk, reserve_pk));
+    let mut tried = std::collections::HashSet::new();
+    for (lt, script) in candidates {
+        if !tried.insert(lt) {
+            continue;
+        }
+        let outputs = match user_btc.htlc_outputs_all(&script) {
+            Ok(o) => o,
+            Err(e) if e.contains("not supported") => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        for u in outputs.into_iter().filter(|u| u.value >= value) {
+            if let Some(txid) = claimed_by_us(&u)? {
+                return Ok(Some(txid));
+            }
+        }
+    }
+    Ok(None)
+}
+
 /// The exact Bitcoin HTLC script a public shield funded, rebuilt from persisted parameters
 /// (no dependence on current chain state: the reserve key may rotate later).
 pub fn shield_script(hashlock: &[u8; 32], reserve_pk: &PublicKey, refund_pk: &PublicKey, btc_locktime: u32) -> ScriptBuf {

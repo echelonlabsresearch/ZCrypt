@@ -117,6 +117,32 @@ impl Esplora {
         Ok(out)
     }
 
+    /// Every CONFIRMED output paying `addr` in its recent history (`/address/:addr/txs`,
+    /// the newest 25 confirmed txs plus the mempool), spent or not. Lets a wallet find an
+    /// HTLC funding that has already been spent, which `/utxo` no longer lists.
+    pub fn address_outputs(&self, addr: &str) -> Result<Vec<Utxo>, String> {
+        let v = self.get_json(&format!("/address/{addr}/txs"))?;
+        let arr = v.as_array().ok_or("esplora: /txs did not return an array")?;
+        let mut out = Vec::new();
+        for tx in arr {
+            let txid = tx["txid"].as_str().ok_or("tx: missing txid")?.to_string();
+            let confirmed = tx["status"]["confirmed"].as_bool().unwrap_or(false);
+            let block_height = tx["status"]["block_height"].as_u64();
+            for (i, o) in tx["vout"].as_array().into_iter().flatten().enumerate() {
+                if o["scriptpubkey_address"].as_str() == Some(addr) {
+                    out.push(Utxo {
+                        txid: txid.clone(),
+                        vout: i as u32,
+                        value: o["value"].as_u64().ok_or("vout: missing value")?,
+                        confirmed,
+                        block_height,
+                    });
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// Whether an address has any transaction history (used for the gap-limit scan).
     pub fn address_used(&self, addr: &str) -> Result<bool, String> {
         let v = self.get_json(&format!("/address/{addr}"))?;

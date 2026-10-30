@@ -805,6 +805,17 @@ pub trait BtcBackend {
     fn htlc_utxos(&self, _script: &ScriptBuf) -> Result<Vec<HtlcUtxo>, String> {
         Err("htlc_utxos not supported by this backend".to_string())
     }
+    /// Every output locked to `script`'s P2WSH address, SPENT ONES INCLUDED, if this backend
+    /// can look them up. Lets a user wallet recognise an operator lock it already claimed
+    /// (the UTXO is gone, so [`Self::htlc_utxos`] no longer lists it).
+    fn htlc_outputs_all(&self, _script: &ScriptBuf) -> Result<Vec<HtlcUtxo>, String> {
+        Err("htlc_outputs_all not supported by this backend".to_string())
+    }
+    /// The CONFIRMED spend of `utxo`, as the spending txid and how it spent the HTLC, or
+    /// `None` while unspent. Default: unsupported.
+    fn htlc_spender(&self, _utxo: &HtlcUtxo) -> Result<Option<(Txid, HtlcSpend)>, String> {
+        Err("htlc_spender not supported by this backend".to_string())
+    }
     /// Spend an HTLC's REFUND branch after `locktime` with `key`, paying `dest`. Lets the
     /// operator watcher recover BTC it locked for a redeem the user never claimed (bridge M5).
     fn refund(&self, _utxo: &HtlcUtxo, _key: &Key, _locktime: u32, _dest: &Address, _fee: Amount) -> Result<Txid, String> {
