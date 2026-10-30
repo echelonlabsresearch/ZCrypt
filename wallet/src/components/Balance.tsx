@@ -1,5 +1,4 @@
 import { useCallback, useEffect, useState } from "react";
-import type React from "react";
 import { call, fmt, fmtAsset, HeldAsset, isWhitelisted, whitelistName } from "../lib/api";
 
 interface BtcWallet {
@@ -18,23 +17,37 @@ const btcFmt = (n: number) => n.toLocaleString(undefined, { minimumFractionDigit
 export default function Balance({ balance, onRefresh }: { balance: number; onRefresh: () => Promise<void> }) {
   const [count, setCount] = useState(0);
   const [spinning, setSpinning] = useState(false);
+  // Per-tile spinners: each tile shows its number the moment its own lookup is back.
+  const [zcBusy, setZcBusy] = useState(false);
+  const [assetsBusy, setAssetsBusy] = useState(false);
+  const [btcBusy, setBtcBusy] = useState(false);
+  const [scanning, setScanning] = useState(false);
   const [assets, setAssets] = useState<HeldAsset[]>([]);
   const [btc, setBtc] = useState<BtcWallet | null>(null);
   const [whitelist, setWhitelist] = useState<string[]>([]);
 
   const load = useCallback(async () => {
     await Promise.all([
-      call<{ coin_count: number }>("get_balance").then((b) => setCount(b.coin_count)).catch(() => {}),
-      call<HeldAsset[]>("held_assets").then(setAssets).catch(() => {}),
+      call<{ coin_count: number }>("get_balance")
+        .then((b) => setCount(b.coin_count))
+        .catch(() => {})
+        .finally(() => setZcBusy(false)),
+      call<HeldAsset[]>("held_assets")
+        .then(setAssets)
+        .catch(() => {})
+        .finally(() => setAssetsBusy(false)),
       call<string[]>("whitelisted_assets").then(setWhitelist).catch(() => {}),
     ]);
   }, []);
 
   async function checkBtc() {
+    setBtcBusy(true);
     try {
       setBtc(await call<BtcWallet>("btc_wallet_info"));
     } catch {
       setBtc({ connected: false, balance: 0, deposit_address: "" });
+    } finally {
+      setBtcBusy(false);
     }
   }
 
@@ -43,20 +56,31 @@ export default function Balance({ balance, onRefresh }: { balance: number; onRef
   }, [balance, load]);
 
   /**
-   * The one refresh: every tile spins until its own number is back. The chain scan
-   * (ZCRYPT and shielded assets) and the Bitcoin lookup (every address of the wallet, via
-   * the Esplora server) run side by side.
+   * The one refresh, with every lookup independent: the locally known ZCRYPT and shielded
+   * balances come back at once and are shown while the Bitcoin lookup (every address of
+   * the wallet, via the Esplora server) and the chain scan are still running. The scan
+   * updates the numbers quietly when it lands; a tile only spins while its own value is
+   * unknown.
    */
   async function refresh() {
     if (spinning) return;
     setSpinning(true);
+    setZcBusy(true);
+    setAssetsBusy(true);
+    setScanning(true);
     try {
-      await Promise.all([Promise.resolve(onRefresh()).then(load), checkBtc()]);
+      await Promise.all([
+        load(),
+        checkBtc(),
+        Promise.resolve(onRefresh())
+          .then(load)
+          .finally(() => setScanning(false)),
+      ]);
     } finally {
       setSpinning(false);
     }
   }
-  const amount = (node: React.ReactNode) => (spinning ? <div className="asset-amount"><span className="spinner small" /></div> : node);
+  const spin = <div className="asset-amount"><span className="spinner small" /></div>;
 
   // Non-native shielded assets (zBTC, …) with a positive balance.
   const shielded = assets.filter((a) => a.asset_id !== "0" && a.balance > 0);
@@ -77,9 +101,9 @@ export default function Balance({ balance, onRefresh }: { balance: number; onRef
             <span className="asset-ticker" style={{ color: "var(--color-green)" }}>ZCRYPT</span>
             <span className="asset-kind">native · gas</span>
           </div>
-          {amount(<div className="asset-amount" style={{ color: "var(--color-green)", textShadow: "var(--glow-green)" }}>{fmt(balance)}</div>)}
+          {zcBusy ? spin : <div className="asset-amount" style={{ color: "var(--color-green)", textShadow: "var(--glow-green)" }}>{fmt(balance)}</div>}
           <div className="asset-sub">
-            {count} coin{count === 1 ? "" : "s"} · all spendable
+            {count} coin{count === 1 ? "" : "s"} · all spendable{scanning && " · scanning the chain…"}
           </div>
         </div>
 
@@ -91,8 +115,8 @@ export default function Balance({ balance, onRefresh }: { balance: number; onRef
                 {isWhitelisted(a.ticker, whitelist) && <span className="whitelisted">whitelisted</span>} shielded
               </span>
             </div>
-            {amount(<div className="asset-amount">{fmtAsset(a.balance, a.decimals)}</div>)}
-            <div className="asset-sub">private · anonymous among the whole pool</div>
+            {assetsBusy ? spin : <div className="asset-amount">{fmtAsset(a.balance, a.decimals)}</div>}
+            <div className="asset-sub">private · anonymous among the whole pool{scanning && " · scanning…"}</div>
           </div>
         ))}
 
@@ -101,9 +125,9 @@ export default function Balance({ balance, onRefresh }: { balance: number; onRef
             <span className="asset-ticker" style={{ color: "var(--color-cyan)" }}>₿ BTC</span>
             <span className="asset-kind">bitcoin L1</span>
           </div>
-          {spinning ? (
+          {btcBusy ? (
             <>
-              {amount(null)}
+              {spin}
               <div className="asset-sub">asking your Esplora server…</div>
             </>
           ) : btc === null ? (
