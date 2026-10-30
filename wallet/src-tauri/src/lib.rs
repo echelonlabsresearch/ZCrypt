@@ -5411,10 +5411,39 @@ async fn claim_rewards(state: State<'_, AppState>) -> R<ClaimResult> {
         }
         let start = chain::staking_u64(&url, &format!("/staking/claim_index/{pk_h}"))?;
         // CLAIM tx: 0x58 ‖ pk(64) ‖ amount(8 LE). Consensus requires the FULL balance.
-        let mut tx = vec![0x58u8];
-        tx.extend_from_slice(&hex::decode(&pk_h).unwrap());
-        tx.extend_from_slice(&claimable.to_le_bytes());
-        chain::broadcast(&url, &tx)?;
+        let claim_tx = |amount: u64| {
+            let mut tx = vec![0x58u8];
+            tx.extend_from_slice(&hex::decode(&pk_h).unwrap());
+            tx.extend_from_slice(&amount.to_le_bytes());
+            tx
+        };
+        let mut claimable = claimable;
+        if let Err(e) = chain::broadcast(&url, &claim_tx(claimable)) {
+            // The tx carries no nonce, so a claim for exactly the amount of an earlier,
+            // successful claim is byte-identical to it and the node's mempool cache refuses
+            // it as a duplicate. Rewards accrue every epoch: wait for the balance to move
+            // and send the new amount instead.
+            if !e.contains("already exists in cache") {
+                return Err(e);
+            }
+            let mut sent = false;
+            for _ in 0..18 {
+                std::thread::sleep(std::time::Duration::from_secs(10));
+                let now = chain::staking_u64(&url, &format!("/staking/claimable/{pk_h}")).unwrap_or(claimable);
+                if now != claimable && now > 0 {
+                    claimable = now;
+                    chain::broadcast(&url, &claim_tx(claimable))?;
+                    sent = true;
+                    break;
+                }
+            }
+            if !sent {
+                return Err(format!(
+                    "the node already holds an identical claim of {:.6} ZCRYPT from earlier (same key, same amount); rewards accrue every epoch, so try again in a few minutes",
+                    claimable as f64 / 1e6
+                ));
+            }
+        }
         // Reconstruct the minted coins and add any that landed on-chain to our spendable
         // set. The node splits a claim via `claim_chunks` (reserving a gas coin on the
         // first claim so the balance is immediately spendable); the SAME function here
