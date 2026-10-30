@@ -824,6 +824,16 @@ pub trait BtcBackend {
     fn tx_block_hash(&self, _txid: &Txid) -> Result<Option<[u8; 32]>, String> {
         Err("tx_block_hash not supported by this backend".to_string())
     }
+    /// The output of `txid` that pays `script`'s P2WSH address, as `(vout, value)`, or
+    /// `None` when the tx has no such output. Default: read the raw tx. A fee bump rebuilds
+    /// the funding tx and bitcoind's `bumpfee` does NOT keep the output order, so the HTLC's
+    /// vout must be re-located in the replacement rather than carried over.
+    fn htlc_output_in_tx(&self, txid: &Txid, script: &ScriptBuf) -> Result<Option<(u32, Amount)>, String> {
+        let raw = self.raw_tx(txid)?;
+        let tx: bitcoin::Transaction = bitcoin::consensus::encode::deserialize(&raw).map_err(|e| e.to_string())?;
+        let spk = script.to_p2wsh();
+        Ok(tx.output.iter().enumerate().find(|(_, o)| o.script_pubkey == spk).map(|(i, o)| (i as u32, o.value)))
+    }
     /// Whether `utxo` is still unspent on the CONFIRMED chain: `Some(true)` unspent,
     /// `Some(false)` spent, `None` if this backend cannot tell. Lets the redeem watcher skip
     /// block scans for outputs nobody has touched (bridge N8) and drives the refund-versus-

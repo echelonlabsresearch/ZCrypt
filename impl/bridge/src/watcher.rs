@@ -817,7 +817,20 @@ pub fn watcher_tick_persisting(
                     if btc_tip >= since.saturating_add(FUNDING_BUMP_AFTER_BLOCKS) {
                         match Txid::from_str(&txid_s).map_err(|e| e.to_string()).and_then(|t| b.bump_fee(&t)) {
                             Ok(new_txid) => {
-                                report.errors.push(format!("redeem-fund {eid}: funding {txid_s} stale, fee-bumped as {new_txid}"));
+                                // bumpfee rebuilds the tx and may reorder its outputs: find the
+                                // HTLC output in the replacement, never assume the old vout.
+                                let vout = match intent.script().and_then(|s| operator_btc.htlc_output_in_tx(&new_txid, &s)) {
+                                    Ok(Some((v, _))) => v,
+                                    Ok(None) => {
+                                        report.errors.push(format!("redeem-fund {eid}: fee-bumped tx {new_txid} has no HTLC output; keeping vout {vout}"));
+                                        vout
+                                    }
+                                    Err(e) => {
+                                        report.errors.push(format!("redeem-fund {eid}: cannot read fee-bumped tx {new_txid} ({e}); keeping vout {vout}"));
+                                        vout
+                                    }
+                                };
+                                report.errors.push(format!("redeem-fund {eid}: funding {txid_s} stale, fee-bumped as {new_txid}:{vout}"));
                                 report.bumped += 1;
                                 intent.funding = Some((new_txid.to_string(), vout));
                                 intent.last_bump_btc = btc_tip;
@@ -855,7 +868,7 @@ pub fn watcher_tick_persisting(
     let refund_confs = funding_confs_needed(operator_btc).max(1);
     let mut still_pending = Vec::new();
     for mut p in std::mem::take(&mut state.pending) {
-        let utxo = match p.utxo() {
+        let mut utxo = match p.utxo() {
             Ok(u) => u,
             Err(e) => {
                 // Keep corrupt entries for operator inspection: never silently drop a funded
@@ -865,6 +878,22 @@ pub fn watcher_tick_persisting(
                 continue;
             }
         };
+        // The recorded vout must be the HTLC output of the recorded tx. A fee bump written by
+        // an older daemon carried the pre-bump vout over, and bumpfee reorders outputs: the
+        // watcher then polls the operator's own change (forever unspent), never sees the
+        // user's claim, and the escrow refunds the zBTC on top of the BTC already paid.
+        if let Ok(Some((v, value))) = operator_btc.htlc_output_in_tx(&utxo.outpoint.txid, &utxo.script) {
+            if v != p.vout {
+                report.errors.push(format!(
+                    "finalize {}: HTLC output of {} is vout {v}, not {} (fee bump reordered outputs); corrected",
+                    p.escrow_id, p.funding_txid, p.vout
+                ));
+                p.vout = v;
+                p.value_sat = value.to_sat();
+                utxo.outpoint.vout = v;
+                utxo.value = value;
+            }
+        }
         // A refund we broadcast: done once it is buried past the confirmation floor. Until
         // then the claim detection below keeps running: if a reorg mines the user's claim
         // instead, the burn is finalized, not forgotten.
@@ -1492,6 +1521,8 @@ mod tests {
         /// Block hashes reported by tx_block_hash, per txid (reorg simulation).
         block_of: RefCell<HashMap<Txid, [u8; 32]>>,
         proof_for: RefCell<HashMap<Txid, Vec<u8>>>,
+        /// Raw tx bodies served by `raw_tx` (fee-bump replacements in tests).
+        raw_txs: RefCell<HashMap<Txid, Vec<u8>>>,
         net: Network,
     }
     impl SimBtc {
@@ -1506,6 +1537,7 @@ mod tests {
                 fail_readback_once: Cell::new(false),
                 block_of: RefCell::new(HashMap::new()),
                 proof_for: RefCell::new(HashMap::new()),
+                raw_txs: RefCell::new(HashMap::new()),
                 net: Network::Signet,
             }
         }
@@ -1633,8 +1665,8 @@ mod tests {
         fn block_header(&self, _: u64) -> Result<[u8; 80], String> {
             Err("sim".into())
         }
-        fn raw_tx(&self, _: &Txid) -> Result<Vec<u8>, String> {
-            Err("sim".into())
+        fn raw_tx(&self, txid: &Txid) -> Result<Vec<u8>, String> {
+            self.raw_txs.borrow().get(txid).cloned().ok_or_else(|| "sim".to_string())
         }
         fn txout_proof(&self, txid: &Txid) -> Result<Vec<u8>, String> {
             self.proof_for.borrow().get(txid).cloned().ok_or("sim: no proof".into())
@@ -2312,6 +2344,93 @@ mod tests {
         assert_eq!(st.tracked.len(), 1);
     }
 
+    /// A serialized two-output tx: `[change, HTLC]` when `htlc_last`, else `[HTLC, change]`.
+    fn two_output_tx(script: &ScriptBuf, value: u64, htlc_last: bool) -> Vec<u8> {
+        let htlc = bitcoin::TxOut { value: Amount::from_sat(value), script_pubkey: script.to_p2wsh() };
+        let change = bitcoin::TxOut { value: Amount::from_sat(777), script_pubkey: ScriptBuf::new_op_return(&[]) };
+        let output = if htlc_last { vec![change, htlc] } else { vec![htlc, change] };
+        let tx = bitcoin::Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![],
+            output,
+        };
+        bitcoin::consensus::encode::serialize(&tx)
+    }
+
+    #[test]
+    fn a_fee_bump_relocates_the_htlc_vout_and_finalize_corrects_a_stale_one() {
+        // bitcoind's bumpfee rebuilds the tx and may reorder outputs. The first mainnet
+        // redeem was funded at vout 1, bumped into a tx whose HTLC sat at vout 0, and the
+        // watcher kept polling vout 1 (its own change): the user's claim was never seen.
+        struct Bumper;
+        impl FeeBumper for Bumper {
+            fn bump_fee(&self, _txid: &Txid) -> Result<Txid, String> {
+                Ok(Txid::from_byte_array([0xBC; 32]))
+            }
+        }
+        let d = deposit(18);
+        let zc = FakeZc::new();
+        let btc = SimBtc::new(100);
+        zc.set_escrow(d.eid, ASSET, VALUE, d.lock, 100_000, "open");
+        zc.push_block(vec![]);
+        let script = d.utxo.script.clone();
+        let bumped = Txid::from_byte_array([0xBC; 32]);
+        btc.raw_txs.borrow_mut().insert(bumped, two_output_tx(&script, VALUE, false));
+        let locktime = 100 + swap::min_user_claim_blocks(Network::Signet) as u32 + 10;
+        let mut st = WatcherState::default();
+        st.funding.push(FundingIntent {
+            escrow_id: hex::encode(d.eid),
+            hashlock: hex::encode(d.lock),
+            script_hex: hex::encode(script.as_bytes()),
+            value_sat: VALUE,
+            locktime,
+            funding: Some((Txid::from_byte_array([0xAA; 32]).to_string(), 1)),
+            funding_value_sat: Some(VALUE),
+            funding_height: Some(101),
+            zc_timeout: 100_000,
+            last_bump_btc: 0,
+            bumps: 0,
+        });
+        st.funded.push(hex::encode(d.eid));
+        btc.tip.set(101 + FUNDING_BUMP_AFTER_BLOCKS);
+        let r = watcher_tick_persisting(&mut st, &zc, &btc, &swap::ReserveKeys::single(&d.reserve), &dest(), ASSET, swap::default_finalize_margin(Network::Signet), 3, Some(&Bumper), &|_| Ok(())).unwrap();
+        assert_eq!(r.bumped, 1, "{:?}", r.errors);
+        assert_eq!(st.funding[0].funding, Some((bumped.to_string(), 0)), "vout re-located in the replacement");
+
+        // A pending record written by the old daemon (wrong vout) is corrected on the next
+        // tick, and the user's claim at the real vout is then seen and finalized.
+        let mut st = WatcherState::default();
+        let funded = HtlcUtxo { outpoint: OutPoint { txid: bumped, vout: 0 }, value: Amount::from_sat(VALUE), script: script.clone() };
+        btc.add_confirmed(funded.clone(), 102);
+        btc.utxos.borrow_mut().push(SimUtxo { outpoint: OutPoint { txid: bumped, vout: 1 }, value: Amount::from_sat(777), script: ScriptBuf::new(), mined_at: Some(102), spend: None });
+        for u in btc.utxos.borrow_mut().iter_mut().filter(|u| u.outpoint == funded.outpoint) {
+            u.spend = Some((Some(103), Some(d.preimage.to_vec())));
+        }
+        st.pending.push(PendingRedeem {
+            escrow_id: hex::encode(d.eid),
+            funding_txid: bumped.to_string(),
+            vout: 1,
+            value_sat: VALUE,
+            script_hex: hex::encode(script.as_bytes()),
+            hashlock: hex::encode(d.lock),
+            funded_at_btc: 102,
+            funding_height: 102,
+            scanned_to: 101,
+            locktime,
+            refund_txid: None,
+            refund_at_btc: 0,
+            refund_seen_height: None,
+            rescanned_from_funding: false,
+            claim_preimage_hex: None,
+        });
+        st.funded.push(hex::encode(d.eid));
+        let r = tick(&mut st, &zc, &btc, &d.reserve);
+        assert!(r.errors.iter().any(|e| e.contains("corrected")), "{:?}", r.errors);
+        assert_eq!(r.finalized, 1, "{:?}", r.errors);
+        assert!(st.pending.is_empty());
+    }
+
     #[test]
     fn an_unconfirmed_funding_is_bumped_then_promoted_at_its_deadline() {
         // M6: the funding sits in the mempool. After FUNDING_BUMP_AFTER_BLOCKS the wallet is
@@ -2362,7 +2481,7 @@ mod tests {
         assert_eq!(r.bumped, 1, "{:?}", r.errors);
         assert_eq!(bumper.calls.get(), 1);
         assert_ne!(st.funding[0].funding.clone().unwrap().0, first_txid, "new txid recorded");
-        assert_eq!(st.funding[0].funding.clone().unwrap().1, 0, "same vout");
+        assert_eq!(st.funding[0].funding.clone().unwrap().1, 0, "same vout (replacement unreadable in the sim)");
         assert_eq!(st.funding[0].bumps, 1);
         let r = run(&mut st);
         assert_eq!(r.bumped, 0, "not bumped again before another FUNDING_BUMP_AFTER_BLOCKS");
