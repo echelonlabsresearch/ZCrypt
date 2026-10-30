@@ -125,7 +125,6 @@ export default function Buy({ active, onBought }: { active: boolean; onBought: (
   const [copied, setCopied] = useState(false);
   // This wallet's own Bitcoin: when it holds some, the order is paid from it directly.
   const [btcw, setBtcw] = useState<BtcWallet | null>(null);
-  const [payFrom, setPayFrom] = useState<"wallet" | "external">("wallet");
   const [paying, setPaying] = useState(false);
   const [payErr, setPayErr] = useState("");
   const [paid, setPaid] = useState<Record<string, string>>(loadPaid);
@@ -204,42 +203,29 @@ export default function Buy({ active, onBought }: { active: boolean; onBought: (
   const closed = !!quote && quote.price_sats === 0;
   const soldOut = !!quote && !closed && quote.stock_atomic < ATOMIC;
   const walletSats = btcw?.connected ? Math.round(btcw.balance * SATS) : 0;
-  const canPayFromWallet = walletSats > 0;
-  const fromWallet = canPayFromWallet && payFrom === "wallet";
 
-  /** Pay an open order out of this wallet's own Bitcoin (self-custody send to the desk). */
+  /**
+   * Pay an open order out of this wallet's own Bitcoin when it covers the amount plus the
+   * network fee; otherwise leave the order on the address + QR for another wallet to pay.
+   * A send that was attempted and refused is reported; a plain shortfall is silent, the
+   * balance line already says what the wallet holds.
+   */
   async function payFromWallet(o: Order) {
+    if (walletSats === 0) return;
     setPayErr("");
     setPaying(true);
     try {
       const amt = btc(o.sats);
       const q = await call<BtcQuote>("estimate_btc_send", { address: o.btc_address, btc: amt, speed: "normal" });
-      if (q.amount_sats + q.fee_sats > walletSats) {
-        throw new Error(
-          `This wallet holds ${btc(walletSats)} BTC; paying ${amt} BTC plus the ${q.fee_sats.toLocaleString()} sat network fee needs ${btc(q.amount_sats + q.fee_sats)}. Pay from another wallet using the address below, or cancel and lower the amount.`,
-        );
-      }
+      if (q.amount_sats + q.fee_sats > walletSats) return;
       const txid = await call<string>("withdraw_btc", { address: o.btc_address, btc: amt, speed: "normal" });
       rememberPaid(o.id, txid);
       setPaid(loadPaid());
       loadBtc();
     } catch (e) {
-      setPayErr(String((e as Error)?.message ?? e));
+      setPayErr(`Could not pay from this wallet (${String((e as Error)?.message ?? e)}). Pay the address below from another wallet.`);
     } finally {
       setPaying(false);
-    }
-  }
-
-  /** Put everything this wallet can send (after the fee) into the BTC field. */
-  async function useAll() {
-    setErr("");
-    try {
-      const q = await call<BtcQuote>("btc_max_send", { speed: "normal" });
-      const cap = quote ? Math.min(q.amount_sats, quote.max_sats) : q.amount_sats;
-      setAmount(btc(cap));
-      setWant("");
-    } catch (e) {
-      setErr(String((e as Error)?.message ?? e));
     }
   }
 
@@ -262,7 +248,7 @@ export default function Buy({ active, onBought }: { active: boolean; onBought: (
       return;
     }
     setBusy(false);
-    if (fromWallet) await payFromWallet(o);
+    await payFromWallet(o);
   }
 
   async function doCopy() {
@@ -350,32 +336,19 @@ export default function Buy({ active, onBought }: { active: boolean; onBought: (
           {btcw?.connected && (
             <div className="buy-hint" style={{ marginBottom: "0.6rem" }}>
               Bitcoin in this wallet: <b>{btc(walletSats)} BTC</b>
-              {canPayFromWallet && (
-                <>
-                  {" "}
-                  <button className="btn-link" onClick={useAll}>
-                    Use all
-                  </button>
-                  {" · "}
-                  <button className="btn-link" onClick={() => setPayFrom(payFrom === "wallet" ? "external" : "wallet")}>
-                    {payFrom === "wallet" ? "Pay from another wallet instead" : "Pay from this wallet"}
-                  </button>
-                </>
-              )}
             </div>
           )}
           <div className="buy-receive">
-            {fromWallet ? "Pay" : "Send"} <b>{btc(sats)} BTC</b> and you get <b>{fmt(willGet)} ZCRYPT</b>
+            Pay <b>{btc(sats)} BTC</b> and you get <b>{fmt(willGet)} ZCRYPT</b>
           </div>
           {err && <div className="msg err">{err}</div>}
           <button className="btn-primary btn-block" disabled={busy || soldOut || sats <= 0} onClick={start}>
-            {busy ? "Opening order…" : soldOut ? "Sold out" : fromWallet ? `Buy with ${btc(sats)} BTC from this wallet` : "Buy"}
+            {busy ? "Opening order…" : soldOut ? "Sold out" : "Buy"}
           </button>
           <p className="dim" style={{ marginTop: "0.8rem", fontSize: "0.8rem" }}>
-            {fromWallet
-              ? "The Bitcoin is sent from this wallet to the sale desk in one step (plus the network fee). "
-              : "You will get a Bitcoin address to pay from any Bitcoin wallet. "}
-            The ZCRYPT is sent to this wallet's recoverable address once the payment confirms. No account, no email.
+            If this wallet holds enough Bitcoin for the amount plus the network fee, it pays the sale desk
+            itself. Otherwise you get a Bitcoin address to pay from any Bitcoin wallet. The ZCRYPT is sent to
+            this wallet's recoverable address once the payment confirms. No account, no email.
           </p>
         </div>
       )}
@@ -420,11 +393,6 @@ export default function Buy({ active, onBought }: { active: boolean; onBought: (
                 </div>
                 <code className="buy-addr">{order.btc_address}</code>
                 <div className="addr-actions">
-                  {canPayFromWallet && !paying && (
-                    <button className="btn-primary" onClick={() => payFromWallet(order)}>
-                      Pay {btc(order.sats)} BTC from this wallet
-                    </button>
-                  )}
                   <button className="btn-secondary" onClick={doCopy}>
                     {copied ? "Copied" : "Copy address"}
                   </button>
