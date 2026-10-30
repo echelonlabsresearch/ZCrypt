@@ -7260,8 +7260,11 @@ fn btc_wallet_snapshot(state: &State<AppState>) -> BtcWallet {
             Err(_) => return none(),
         };
         let deposit_address = sc.receive_address().map(|a| a.to_string()).unwrap_or_default();
-        // Fast deposit-address balance (one Esplora call); reachability = "connected".
-        let (connected, balance) = match sc.deposit_balance_sats() {
+        // The whole wallet (gap-limit scan over both chains), not just receive/0: redeem
+        // payouts and deposit change land on fresh addresses of the same seed, and a balance
+        // that ignored them showed 0 BTC after a successful redeem. Falls back to the
+        // deposit address alone if the scan fails part-way; reachability = "connected".
+        let (connected, balance) = match sc.balance_sats().or_else(|_| sc.deposit_balance_sats()) {
             Ok(sats) => (true, sats as f64 / 1e8),
             Err(_) => (false, 0.0),
         };

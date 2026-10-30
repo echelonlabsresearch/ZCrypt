@@ -279,11 +279,11 @@ export default function Bridge({
             <div className="reward-amount" style={{ fontSize: "1.5rem", color: "var(--color-cyan)" }}>
               {status?.btc_checked
                 ? status.btc_connected
-                  ? `${status.btc_balance.toFixed(4)} BTC`
+                  ? `${status.btc_balance.toFixed(8).replace(/0+$/, "").replace(/\.$/, ".0")} BTC`
                   : "— not connected"
                 : "not checked"}
             </div>
-            <button className="btn-secondary" style={{ marginTop: 6 }} onClick={() => load(true)} title="Asks your Esplora server about your deposit address (reveals it to that server)">
+            <button className="btn-secondary" style={{ marginTop: 6 }} onClick={() => load(true)} title="Asks your Esplora server about your wallet's addresses (reveals them to that server)">
               {status?.btc_checked ? "🔄 Re-check Bitcoin" : "Check Bitcoin"}
             </button>
           </div>
