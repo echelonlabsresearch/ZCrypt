@@ -71,6 +71,15 @@ pub struct WalletUtxo {
     pub address: String,
 }
 
+/// How long a gap-limit scan result is reused (see [`Esplora::wallet_utxos`]).
+const SCAN_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(20);
+
+type ScanCache = std::sync::Mutex<std::collections::HashMap<String, (std::time::Instant, Vec<WalletUtxo>)>>;
+fn scan_cache() -> &'static ScanCache {
+    static CACHE: std::sync::OnceLock<ScanCache> = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
 impl Esplora {
     pub fn new(base: &str) -> Self {
         Esplora { base: base.trim_end_matches('/').to_string() }
@@ -82,22 +91,39 @@ impl Esplora {
         crate::proxied_agent(&self.base, 30)
     }
 
+    /// GET `path`, retrying a rate-limit or overload answer (429, 502, 503) with a growing
+    /// pause: public Esplora servers throttle the burst a gap-limit scan makes, and giving
+    /// up on the first 429 turned a routine send into "could not pay". A `Retry-After`
+    /// header is honoured (capped); otherwise 2 s, 4 s, 8 s, 16 s.
+    fn get(&self, path: &str) -> Result<ureq::Response, String> {
+        const RETRIES: u32 = 4;
+        let url = format!("{}{path}", self.base);
+        let mut wait = std::time::Duration::from_secs(2);
+        for attempt in 0..=RETRIES {
+            match self.agent().get(&url).call() {
+                Ok(r) => return Ok(r),
+                Err(ureq::Error::Status(code @ (429 | 502 | 503), r)) if attempt < RETRIES => {
+                    let hinted = r
+                        .header("Retry-After")
+                        .and_then(|h| h.trim().parse::<u64>().ok())
+                        .map(std::time::Duration::from_secs);
+                    let pause = hinted.unwrap_or(wait).min(std::time::Duration::from_secs(20));
+                    let _ = code;
+                    std::thread::sleep(pause);
+                    wait *= 2;
+                }
+                Err(e) => return Err(e.to_string()),
+            }
+        }
+        unreachable!("the loop returns on the last attempt")
+    }
+
     fn get_json(&self, path: &str) -> Result<Value, String> {
-        self.agent()
-            .get(&format!("{}{path}", self.base))
-            .call()
-            .map_err(|e| e.to_string())?
-            .into_json()
-            .map_err(|e| e.to_string())
+        self.get(path)?.into_json().map_err(|e| e.to_string())
     }
 
     fn get_text(&self, path: &str) -> Result<String, String> {
-        self.agent()
-            .get(&format!("{}{path}", self.base))
-            .call()
-            .map_err(|e| e.to_string())?
-            .into_string()
-            .map_err(|e| e.to_string())
+        self.get(path)?.into_string().map_err(|e| e.to_string())
     }
 
     /// UTXOs at a single address.
@@ -180,6 +206,7 @@ impl Esplora {
 
     /// Broadcast a raw (hex) transaction; returns the txid.
     pub fn broadcast(&self, tx_hex: &str) -> Result<String, String> {
+        scan_cache().lock().unwrap().clear(); // the coin set changes with this tx
         let resp = self.agent()
             .post(&format!("{}/tx", self.base))
             .send_string(tx_hex)
@@ -326,6 +353,21 @@ impl Esplora {
     /// scanning the receive (0) and change (1) chains until `GAP` consecutive unused
     /// addresses. (A Blockbook `xpub` query would return the same set in one call.)
     pub fn wallet_utxos(&self, wallet: &HdWallet) -> Result<Vec<WalletUtxo>, String> {
+        // One scan is ~45 requests. A send prices its fee and then builds the tx, and the
+        // UI shows the balance beside it: three scans in a row trip public rate limits.
+        // Serve a recent scan again; a broadcast from this process invalidates it.
+        let key = format!("{}|{}", self.base, wallet.address(0, 0)?);
+        if let Some(hit) = scan_cache().lock().unwrap().get(&key) {
+            if hit.0.elapsed() < SCAN_CACHE_TTL {
+                return Ok(hit.1.clone());
+            }
+        }
+        let out = self.wallet_utxos_uncached(wallet)?;
+        scan_cache().lock().unwrap().insert(key, (std::time::Instant::now(), out.clone()));
+        Ok(out)
+    }
+
+    fn wallet_utxos_uncached(&self, wallet: &HdWallet) -> Result<Vec<WalletUtxo>, String> {
         const GAP: u32 = 20;
         let mut out = Vec::new();
         for change in [0u32, 1u32] {
