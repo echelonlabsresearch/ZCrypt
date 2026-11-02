@@ -112,7 +112,7 @@ Bitcoin solved double-spending without a central party by making the ledger publ
 
 ZCrypt is built so that the ledger records as little as a banknote does. It also has a bearer instrument that is a file (\S\ref{sec:addresses}): a coin's secret and the gas to move it, handed over on any channel. Unlike a banknote, the file can be copied, but the coin cannot be double spent: it can only be swept once, and it belongs to whoever sweeps it first.
 
-Earlier systems went part of the way. Ring signatures~\cite{monero2013} hide a spend among a few sampled decoys, and the hiding erodes as rings overlap. Shielded pools~\cite{hopwood2016zcash} hide far more; their trusted setup was later removed~\cite{halo}, and multi-asset pools with in-pool exchange exist today~\cite{penumbra,namada}. All of them rest on discrete-logarithm assumptions, which are precisely the assumptions a quantum computer breaks. Most also run a transparent ledger beside the private one, and since most value stays on the transparent side, the pool is smaller than it looks. Zcash Orchard proves membership against its whole note tree~\cite{orchard}, and Monero's FCMP++ replaces sampled rings with full-set membership~\cite{fcmp}. Neptune Cash is a proof-of-work chain whose transactions are STARKs over a hash-only virtual machine, with notes under lattice keys~\cite{neptune}.
+Earlier systems went part of the way. Ring signatures~\cite{monero2013} hide a spend among a few sampled decoys, and the hiding erodes as rings overlap. Shielded pools~\cite{hopwood2016zcash} hide far more; Zcash's newest pool dropped the trusted setup in 2022 with Halo 2, the production descendant of~\cite{halo}, and multi-asset pools with in-pool exchange exist today~\cite{penumbra,namada}. All of them rest on discrete-logarithm assumptions, which are precisely the assumptions a quantum computer breaks. Most also run a transparent ledger beside the private one, and since most value stays on the transparent side, the pool is smaller than it looks. Zcash Orchard proves membership against its whole note tree~\cite{orchard}, and Monero's FCMP++ is set to replace sampled rings with full-set membership~\cite{fcmp}. Neptune Cash is a proof-of-work chain whose transactions are hash-based STARKs over the Triton VM, with notes under lattice keys~\cite{neptune}.
 
 ZCrypt is a proof-of-stake ledger with one shielded pool and no transparent transfer beside it. Gas is a fixed burn of the native coin. Bitcoin enters through a light client that lives inside consensus. And a payment can be a file rather than an address. Four decisions shape everything else in this paper.
 
@@ -195,7 +195,7 @@ The nullifier appears when the coin is spent:
 \]
 Its inner block absorbs the spend secret beside the commitment's own inner digest rather than beside the raw blind, and the reason is worth recording. The sender of a coin chooses its blind. When the blind sat directly in the nullifier's inner block, the blind $(0,\ldots,0,\mathrm{tag}_{pk})$ turned that block into the public-key block and let a sender compute the recipient's nullifier. Absorbing the digest leaves no such lane.
 
-The same opening always produces the same nullifier, and producing it requires $s$, so spending one coin twice collides in the public nullifier set and the second spend is rejected. The leaf position is not an input. Zcash closed the ``Faerie Gold'' attack, in which the same opening is placed at two leaves, by hashing the position into the nullifier~\cite{hopwood2016zcash}. This nullifier has no free lane for a position, so ZCrypt closes it at the tree: consensus refuses a commitment that is already a leaf, including two copies in one transaction, and a snapshot with repeated leaves does not load. Nobody without the spend secret can connect a nullifier to its commitment.
+The same opening always produces the same nullifier, and producing it requires $s$, so spending one coin twice collides in the public nullifier set and the second spend is rejected. The leaf position is not an input. Zcash's ``Faerie Gold'' attack, in which two notes are built to share one nullifier, was closed by making the nullifier seed unique per transaction in Sprout and by binding it to the note's tree position in Sapling~\cite{hopwood2016zcash}. This nullifier has no free lane for a position, so ZCrypt closes the equivalent attack at the tree: consensus refuses a commitment that is already a leaf, including two copies in one transaction, and a snapshot with repeated leaves does not load. Nobody without the spend secret can connect a nullifier to its commitment.
 
 Values are capped at $2^{52}-1$ atomic units per coin. With six decimals that is about 4.5 billion ZCRYPT, far more than will ever exist, so the cap never binds.
 
@@ -206,7 +206,7 @@ An account comes from a 24-word BIP-39 mnemonic~\cite{bip39} carrying 256 bits o
 \subsection{Addresses and Payment Instruments}
 \label{sec:addresses}
 
-An address is a kind tag, the 64-byte spend public key and the 1,184-byte ML-KEM encapsulation key, encoded in bech32m~\cite{bip350} with human-readable part \texttt{zc}. The payload is 1,249 bytes and the string is 2,008 characters, past the 1,023-character limit of BIP-350, so the encoder is a ZCrypt-specific long form: the same character set and checksum polynomial with the length limit removed. Inside the BIP-350 limit the checksum detects up to four substitutions; at 2,008 characters that guarantee becomes probabilistic, and a random corruption passes with probability $2^{-30}$. The decoder checks the exact payload length, rejects any limb at or above the field order, and rejects an ML-KEM key that does not re-encode to itself, so an address has exactly one byte string and one encoded string.
+An address is a kind tag, the 64-byte spend public key and the 1,184-byte ML-KEM encapsulation key, encoded in bech32m~\cite{bip350} with human-readable part \texttt{zc}. The payload is 1,249 bytes and the string is 2,008 characters, far past the 90-character limit that BIP-350 inherits from BIP-173, so the encoder is a ZCrypt-specific long form: the same character set and checksum polynomial with the length limit removed. Within the 90-character limit the checksum detects up to four substitutions, and the code is designed for strings up to 1,023 characters; at 2,008 characters that guarantee becomes probabilistic, and a random corruption passes with probability $2^{-30}$. The decoder checks the exact payload length, rejects any limb at or above the field order, and rejects an ML-KEM key that does not re-encode to itself, so an address has exactly one byte string and one encoded string.
 
 Three payment instruments share this machinery. A \emph{normal address} is the account's primary address; payments to it carry a real encrypted note on chain, are found by scanning, and are recoverable from the mnemonic.
 
@@ -534,7 +534,7 @@ The protocol described here is neutral: a shielded pool with hash-based proofs o
 
 \subsection{Central Bank Digital Currency}
 
-CBDC design is caught between two demands. Monetary authorities need control over issuance and compliance; citizens have a legitimate expectation of transactional privacy, which is what physical cash has always given them. A recent BIS working paper~\cite{bis1242} puts it this way: ``better technological solutions offering hard privacy need to emerge.'' The primitives here happen to fit. The threshold mint authority (\S\ref{sec:mintauth}) is an exclusive, consensus-enforced issuance mechanism that spreads signing power across $M$-of-$N$ institutions and can be rotated without redeploying anything. The shielded pool keeps ordinary commerce private. The nullifier registry gives the global double-spend prevention a monetary authority needs. The consensus layer can be run by the issuer or by licensed delegates, and the transfer layer stays private regardless.
+CBDC design is caught between two demands. Monetary authorities need control over issuance and compliance; citizens have a legitimate expectation of transactional privacy, which is what physical cash has always given them. A recent BIS working paper~\cite{bis1242} puts it this way: ``While some technological solutions for hard privacy show significant promise, further development is necessary.'' The primitives here happen to fit. The threshold mint authority (\S\ref{sec:mintauth}) is an exclusive, consensus-enforced issuance mechanism that spreads signing power across $M$-of-$N$ institutions and can be rotated without redeploying anything. The shielded pool keeps ordinary commerce private. The nullifier registry gives the global double-spend prevention a monetary authority needs. The consensus layer can be run by the issuer or by licensed delegates, and the transfer layer stays private regardless.
 
 A CBDC on these primitives would get privacy-preserving compliance through tiered disclosure, the inverse of designs that start from full visibility and carve out a little privacy. Routine transactions are fully private, like cash. The issuer sees aggregate nullifier volume, a privacy-preserving proxy for velocity, and not individual transactions. Where policy demands more, disclosure is additive and scoped to keys: view keys (\S\ref{sec:addresses}) let a wallet show its incoming flows to a designated auditor or, under a court order, to a financial intelligence unit, without giving up the ability to spend. Privacy is the base layer, and compliance goes on top of it.
 
@@ -563,17 +563,17 @@ Thanks to Vasily Pozdyshev for his feedback on institutional adoption, Jameson L
 
 \bibitem{hopwood2016zcash} D. Hopwood, S. Bowe, T. Hornby, N. Wilcox, ``Zcash Protocol Specification,'' 2016.
 
-\bibitem{orchard} Zcash, ``Zcash Protocol Specification,'' version 2024.5.1, Orchard note commitments and the in-circuit Merkle path, \url{https://zips.z.cash/protocol/protocol.pdf}.
+\bibitem{orchard} D. Hopwood, S. Bowe, T. Hornby, N. Wilcox, ``Zcash Protocol Specification,'' version 2024.5.1 (September 2024) and later, Orchard action statement and Merkle path validity, \url{https://zips.z.cash/protocol/protocol.pdf} (serves the current build).
 
-\bibitem{fcmp} L. Parker, ``Full-Chain Membership Proofs,'' Monero, April 2024, \url{https://www.getmonero.org/2024/04/27/fcmps.html}.
+\bibitem{fcmp} L. Parker, ``Full-Chain Membership Proofs Development,'' Monero Project blog, April 2024, \url{https://www.getmonero.org/2024/04/27/fcmps.html}.
 
-\bibitem{neptune} A. Szepieniec and T. V{\ae}rge, ``Neptune,'' April 2021, \url{https://neptune.cash/whitepaper}. The live network encrypts notes under lattice keys (\url{https://neptune.cash}).
+\bibitem{neptune} A. Szepieniec and T. V{\ae}rge, ``Neptune White Paper,'' April 2021, \url{https://neptune.cash/whitepaper}. The live network's generation addresses use lattice-based public-key encryption (\url{https://docs.neptune.cash/neptune-core/keys.html}).
 
 \bibitem{halo} S. Bowe, J. Grigg, D. Hopwood, ``Recursive Proof Composition without a Trusted Setup,'' IACR ePrint 2019/1021.
 
 \bibitem{penumbra} Penumbra Labs, ``The Penumbra Protocol,'' protocol specification, \url{https://protocol.penumbra.zone}, accessed September 2026.
 
-\bibitem{namada} C. Goes, A. Sun Yin, A. Brink, ``Namada: Interchain Asset-Agnostic Privacy,'' 2022.
+\bibitem{namada} A. Sun Yin, ``Introducing Namada: Interchain Asset-agnostic Privacy,'' Namada blog, May 2022, since retitled ``Multichain Asset-Agnostic Data Protection,'' \url{https://namada.net/blog/introducing-namada-multichain-asset-agnostic-data-protection}.
 
 \bibitem{poseidon2} L. Grassi, D. Khovratovich, M. Schofnegger, ``Poseidon2: A Faster Version of the Poseidon Hash Function,'' AFRICACRYPT 2023.
 
@@ -583,9 +583,9 @@ Thanks to Vasily Pozdyshev for his feedback on institutional adoption, Jameson L
 
 \bibitem{fri} E. Ben-Sasson, I. Bentov, Y. Horesh, M. Riabzev, ``Fast Reed--Solomon Interactive Oracle Proofs of Proximity,'' ICALP 2018.
 
-\bibitem{crites2025} E. Crites, A. Stewart, ``On Reed--Solomon Proximity Gaps Conjectures,'' IACR ePrint 2025/2046.
+\bibitem{crites2025} E. Crites, A. Stewart, ``On Reed--Solomon Proximity Gaps Conjectures,'' IACR ePrint 2025/2046, 2025.
 
-\bibitem{plonky3} Polygon Zero and contributors, ``Plonky3: A Toolkit for Polynomial IOPs,'' \url{https://github.com/Plonky3/Plonky3}, 2024.
+\bibitem{plonky3} Polygon Zero and contributors, ``Plonky3: A Toolkit for Polynomial IOPs,'' \url{https://github.com/Plonky3/Plonky3}, 2024; release 0.6.1, June 2026.
 
 \bibitem{fips203} National Institute of Standards and Technology, ``FIPS 203: Module-Lattice-Based Key-Encapsulation Mechanism Standard,'' 2024.
 
