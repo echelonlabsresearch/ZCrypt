@@ -713,6 +713,10 @@ struct AppState {
     /// their text, queued until the UI is ready to credit them. Each is also announced
     /// with a `zcrypt-open` event.
     opened_files: Mutex<Vec<String>>,
+    /// Android: `<app data>/inbox`, where `MainActivity` drops a file handed to the app.
+    /// Resolved once in setup: the path plugin runs through Java and must not be called from
+    /// a command's worker thread.
+    inbox_dir: Mutex<Option<std::path::PathBuf>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -3472,9 +3476,36 @@ fn export_dir() -> Option<std::path::PathBuf> {
 /// Write `content` to a real file in the user's Downloads (fallback ~/.zcrypt/exports)
 /// and return its absolute path. Used to save a bearer coin / stealth note as a file.
 #[tauri::command]
-async fn save_export(filename: String, content: String) -> R<String> {
-    let dir = export_dir().ok_or("no HOME")?;
-    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+async fn save_export(filename: String, content: String, webview: tauri::Webview) -> R<String> {
+    let name = export_file_name(&filename);
+    // Android: the public Downloads folder through MediaStore (no permission needed on
+    // Android 10+), where the Files app shows it. Returns a display path, not an absolute one.
+    #[cfg(target_os = "android")]
+    {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (n, c) = (name.clone(), content.clone());
+        webview
+            .with_webview(move |pw| {
+                pw.jni_handle().exec(move |env, activity, _wv| {
+                    let _ = tx.send(android_share::save_download(env, activity, &n, c.as_bytes()));
+                })
+            })
+            .map_err(|e| e.to_string())?;
+        let shown = rx
+            .recv_timeout(std::time::Duration::from_secs(15))
+            .map_err(|_| "save: no response from Android".to_string())??;
+        ok(shown)
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = &webview;
+        save_export_to_disk(name, content)
+    }
+}
+
+/// A safe basename for an export: alphanumerics, `.`, `-`, `_` only, and a `.txt`
+/// suffix unless the name already ends in a plain-text extension (never .html/.sh/.app).
+fn export_file_name(filename: &str) -> String {
     // sanitize the filename to a safe basename
     let safe: String = filename
         .chars()
@@ -3490,6 +3521,14 @@ async fn save_export(filename: String, content: String) -> R<String> {
     if !ext_ok {
         name.push_str(".txt");
     }
+    name
+}
+
+/// Desktop: write a new file `name` under the export directory and return its path.
+#[cfg(not(target_os = "android"))]
+fn save_export_to_disk(name: String, content: String) -> R<String> {
+    let dir = export_dir().ok_or("no HOME")?;
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let path = dir.join(name);
     if path.exists() {
         return Err(format!("{} already exists; pick another file name", path.display()));
@@ -9099,10 +9138,182 @@ async fn share_file(filename: String, content: String, webview: tauri::Webview) 
             .map_err(|e| e.to_string())?;
         return ok(true);
     }
-    #[cfg(not(target_os = "ios"))]
+    #[cfg(target_os = "android")]
+    {
+        let safe: String = filename.chars().filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_')).collect();
+        if safe.is_empty() || content.len() > 256 * 1024 {
+            return Err("nothing to share".into());
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        webview
+            .with_webview(move |pw| {
+                pw.jni_handle().exec(move |env, activity, _wv| {
+                    let _ = tx.send(android_share::share(env, activity, &safe, content.as_bytes()));
+                })
+            })
+            .map_err(|e| e.to_string())?;
+        rx.recv_timeout(std::time::Duration::from_secs(15))
+            .map_err(|_| "share: no response from Android".to_string())??;
+        return ok(true);
+    }
+    #[cfg(not(any(target_os = "ios", target_os = "android")))]
     {
         let _ = (filename, content, webview);
-        Err("the share sheet is only available on iOS".into())
+        Err("the share sheet is only available on a phone".into())
+    }
+}
+
+/// Android counterparts of `ios_share`: the system share sheet (ACTION_SEND through the
+/// app's FileProvider) and a save into the public Downloads folder (MediaStore on Android
+/// 10+, the app's external Download dir below that). Both run on the webview thread with
+/// the JNI environment tauri hands out, so no Kotlin is needed.
+#[cfg(target_os = "android")]
+mod android_share {
+    use jni::objects::{JByteArray, JClass, JObject, JString, JValue};
+    use jni::JNIEnv;
+
+    type Res<T> = Result<T, String>;
+    fn je(e: jni::errors::Error) -> String {
+        format!("android: {e}")
+    }
+
+    fn string_of(env: &mut JNIEnv, o: JObject) -> Res<String> {
+        let js = JString::from(o);
+        let s: String = env.get_string(&js).map_err(je)?.into();
+        Ok(s)
+    }
+
+    /// Loads an app (androidx) class through the activity's class loader; `FindClass` from a
+    /// native frame only sees the system classes.
+    fn load_class<'a>(env: &mut JNIEnv<'a>, activity: &JObject, name: &str) -> Res<JClass<'a>> {
+        let loader = env.call_method(activity, "getClassLoader", "()Ljava/lang/ClassLoader;", &[]).map_err(je)?.l().map_err(je)?;
+        let n = env.new_string(name).map_err(je)?;
+        let c = env
+            .call_method(&loader, "loadClass", "(Ljava/lang/String;)Ljava/lang/Class;", &[JValue::Object(&n)])
+            .map_err(je)?
+            .l()
+            .map_err(je)?;
+        Ok(JClass::from(c))
+    }
+
+    fn mime_for(filename: &str) -> &'static str {
+        if filename.ends_with(".zcrypt") { "application/x-zcrypt" } else { "text/plain" }
+    }
+
+    /// Writes `content` to the app cache and opens the share sheet on it.
+    pub fn share(env: &mut JNIEnv, activity: &JObject, filename: &str, content: &[u8]) -> Res<()> {
+        let cache = env.call_method(activity, "getCacheDir", "()Ljava/io/File;", &[]).map_err(je)?.l().map_err(je)?;
+        let cache = env.call_method(&cache, "getAbsolutePath", "()Ljava/lang/String;", &[]).map_err(je)?.l().map_err(je)?;
+        let dir = std::path::Path::new(&string_of(env, cache)?).join("share");
+        std::fs::create_dir_all(&dir).map_err(|e| format!("share: {e}"))?;
+        let path = dir.join(filename);
+        std::fs::write(&path, content).map_err(|e| format!("share: {e}"))?;
+
+        let jpath = env.new_string(path.to_string_lossy().to_string()).map_err(je)?;
+        let file = env.new_object("java/io/File", "(Ljava/lang/String;)V", &[JValue::Object(&jpath)]).map_err(je)?;
+        let pkg = env.call_method(activity, "getPackageName", "()Ljava/lang/String;", &[]).map_err(je)?.l().map_err(je)?;
+        let pkg = string_of(env, pkg)?;
+        let authority = env.new_string(format!("{pkg}.fileprovider")).map_err(je)?;
+        let provider = load_class(env, activity, "androidx.core.content.FileProvider")?;
+        let uri = env
+            .call_static_method(
+                &provider,
+                "getUriForFile",
+                "(Landroid/content/Context;Ljava/lang/String;Ljava/io/File;)Landroid/net/Uri;",
+                &[JValue::Object(activity), JValue::Object(&authority), JValue::Object(&file)],
+            )
+            .map_err(je)?
+            .l()
+            .map_err(je)?;
+
+        let action = env.new_string("android.intent.action.SEND").map_err(je)?;
+        let intent = env.new_object("android/content/Intent", "(Ljava/lang/String;)V", &[JValue::Object(&action)]).map_err(je)?;
+        let mime = env.new_string(mime_for(filename)).map_err(je)?;
+        env.call_method(&intent, "setType", "(Ljava/lang/String;)Landroid/content/Intent;", &[JValue::Object(&mime)]).map_err(je)?;
+        let extra = env.new_string("android.intent.extra.STREAM").map_err(je)?;
+        env.call_method(
+            &intent,
+            "putExtra",
+            "(Ljava/lang/String;Landroid/os/Parcelable;)Landroid/content/Intent;",
+            &[JValue::Object(&extra), JValue::Object(&uri)],
+        )
+        .map_err(je)?;
+        // FLAG_GRANT_READ_URI_PERMISSION
+        env.call_method(&intent, "addFlags", "(I)Landroid/content/Intent;", &[JValue::Int(1)]).map_err(je)?;
+        let title = env.new_string(filename).map_err(je)?;
+        let chooser = env
+            .call_static_method(
+                "android/content/Intent",
+                "createChooser",
+                "(Landroid/content/Intent;Ljava/lang/CharSequence;)Landroid/content/Intent;",
+                &[JValue::Object(&intent), JValue::Object(&title)],
+            )
+            .map_err(je)?
+            .l()
+            .map_err(je)?;
+        env.call_method(activity, "startActivity", "(Landroid/content/Intent;)V", &[JValue::Object(&chooser)]).map_err(je)?;
+        Ok(())
+    }
+
+    /// Saves `content` as Download/ZCrypt/<filename>; returns the path as the Files app shows it.
+    pub fn save_download(env: &mut JNIEnv, activity: &JObject, filename: &str, content: &[u8]) -> Res<String> {
+        let sdk = env.get_static_field("android/os/Build$VERSION", "SDK_INT", "I").map_err(je)?.i().map_err(je)?;
+        if sdk < 29 {
+            // Android 9 and older: the app's own external Download folder (visible in file
+            // managers under Android/data). Nothing else is reachable without a permission.
+            let kind = env.new_string("Download").map_err(je)?;
+            let dir = env
+                .call_method(activity, "getExternalFilesDir", "(Ljava/lang/String;)Ljava/io/File;", &[JValue::Object(&kind)])
+                .map_err(je)?
+                .l()
+                .map_err(je)?;
+            if dir.is_null() {
+                return Err("save: external storage is not available".into());
+            }
+            let dir = env.call_method(&dir, "getAbsolutePath", "()Ljava/lang/String;", &[]).map_err(je)?.l().map_err(je)?;
+            let path = std::path::Path::new(&string_of(env, dir)?).join(filename);
+            if path.exists() {
+                return Err(format!("{} already exists; pick another file name", path.display()));
+            }
+            crate::privfs::write_new(&path, content).map_err(|e| e.to_string())?;
+            return Ok(path.to_string_lossy().to_string());
+        }
+        let resolver = env.call_method(activity, "getContentResolver", "()Landroid/content/ContentResolver;", &[]).map_err(je)?.l().map_err(je)?;
+        let values = env.new_object("android/content/ContentValues", "()V", &[]).map_err(je)?;
+        for (k, v) in [("_display_name", filename), ("mime_type", mime_for(filename)), ("relative_path", "Download/ZCrypt")] {
+            let (k, v) = (env.new_string(k).map_err(je)?, env.new_string(v).map_err(je)?);
+            env.call_method(&values, "put", "(Ljava/lang/String;Ljava/lang/String;)V", &[JValue::Object(&k), JValue::Object(&v)]).map_err(je)?;
+        }
+        let collection = env
+            .get_static_field("android/provider/MediaStore$Downloads", "EXTERNAL_CONTENT_URI", "Landroid/net/Uri;")
+            .map_err(je)?
+            .l()
+            .map_err(je)?;
+        let uri = env
+            .call_method(
+                &resolver,
+                "insert",
+                "(Landroid/net/Uri;Landroid/content/ContentValues;)Landroid/net/Uri;",
+                &[JValue::Object(&collection), JValue::Object(&values)],
+            )
+            .map_err(je)?
+            .l()
+            .map_err(je)?;
+        if uri.is_null() {
+            return Err("save: Android refused to create the file in Downloads".into());
+        }
+        let out = env
+            .call_method(&resolver, "openOutputStream", "(Landroid/net/Uri;)Ljava/io/OutputStream;", &[JValue::Object(&uri)])
+            .map_err(je)?
+            .l()
+            .map_err(je)?;
+        if out.is_null() {
+            return Err("save: could not open the file in Downloads".into());
+        }
+        let bytes: JByteArray = env.byte_array_from_slice(content).map_err(je)?;
+        env.call_method(&out, "write", "([B)V", &[JValue::Object(&bytes)]).map_err(je)?;
+        env.call_method(&out, "close", "()V", &[]).map_err(je)?;
+        Ok(format!("Download/ZCrypt/{filename}"))
     }
 }
 
@@ -9353,9 +9564,37 @@ fn ingest_opened_file(app: &tauri::AppHandle, url: &url::Url) {
 }
 
 /// Files the OS opened with the app that the UI has not consumed yet (drained).
+///
+/// Android has no "opened" event: `MainActivity` copies a file handed to the app into
+/// `<app data>/inbox`, and this drains that folder too (the UI calls it on every return to
+/// the foreground). Each file is read once, bounded, and deleted.
 #[tauri::command]
 async fn take_opened_files(state: State<'_, AppState>) -> R<Vec<String>> {
-    let v = std::mem::take(&mut *state.opened_files.lock().unwrap());
+    let mut v = std::mem::take(&mut *state.opened_files.lock().unwrap());
+    #[cfg(target_os = "android")]
+    {
+        const MAX: u64 = 256 * 1024;
+        let inbox = state.inbox_dir.lock().unwrap().clone();
+        if let Some(dir) = inbox {
+            if let Ok(rd) = std::fs::read_dir(&dir) {
+                let mut paths: Vec<_> = rd.flatten().map(|e| e.path()).collect();
+                paths.sort();
+                for p in paths {
+                    if let Ok(m) = std::fs::metadata(&p) {
+                        if m.is_file() && m.len() <= MAX {
+                            if let Ok(t) = std::fs::read_to_string(&p) {
+                                let t = t.trim().to_string();
+                                if !t.is_empty() {
+                                    v.push(t);
+                                }
+                            }
+                        }
+                    }
+                    let _ = std::fs::remove_file(&p);
+                }
+            }
+        }
+    }
     ok(v)
 }
 
@@ -9370,6 +9609,10 @@ pub fn run() {
         .manage(AppState::default())
         .setup(|app| {
             let dir = wallet_data_dir(app);
+            {
+                use tauri::Manager;
+                *app.state::<AppState>().inbox_dir.lock().unwrap() = Some(dir.join("inbox"));
+            }
             #[cfg(feature = "selftest-on-launch")]
             std::thread::spawn(|| {
                 // Also written to Documents/selftest.json: on iOS, stdout does not reach the host.
@@ -9932,7 +10175,7 @@ mod live_3node {
 
         let export_name = format!("zcrypt-e2e-{}-{}.txt", std::process::id(), rand::random::<u32>());
         let export_body = "zcrypt e2e export\n";
-        let export_path = v(save_export(export_name, export_body.into())).expect("save export");
+        let export_path = v(async { save_export_to_disk(export_file_name(&export_name), export_body.into()) }).expect("save export");
         assert_eq!(std::fs::read_to_string(&export_path).unwrap(), export_body);
         std::fs::remove_file(&export_path).unwrap();
         let empty_open = v(open_external(String::new())).unwrap_err();

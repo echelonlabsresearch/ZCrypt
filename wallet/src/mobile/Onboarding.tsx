@@ -1,6 +1,6 @@
 import { useRef, useState } from "react";
 import { call, copySensitive, saveFile } from "../lib/api";
-import { authError, Btn, Icon, Logo, PinPad, shareFile, Spinner } from "./ui";
+import { authError, Btn, Icon, Logo, PinPad, shareFile, Spinner, isAndroid } from "./ui";
 import { bioName, useAuth } from "./MobileApp";
 
 type Step = "welcome" | "restore" | "password" | "pin" | "pin2" | "bio" | "working" | "seed";
@@ -197,7 +197,7 @@ export default function Onboarding({ adopt, onDone }: { adopt: boolean; onDone: 
         <Btn full kind="secondary" small onClick={() => { copySensitive(seed); setCopied(true); setTimeout(() => setCopied(false), 1800); }}>
           <Icon name="copy" size={18} /> {copied ? "Copied · clears in 60 s" : "Copy phrase"}
         </Btn>
-        <Btn full kind="secondary" small onClick={async () => setSaved(await shareFile(seed + "\n", "zcrypt-recovery-phrase.txt", saveFile))}>
+        <Btn full kind="secondary" small onClick={async () => setSaved(isAndroid ? await saveFile("zcrypt-recovery-phrase.txt", seed + "\n").catch((e) => `Could not save: ${e}`) : await shareFile(seed + "\n", "zcrypt-recovery-phrase.txt", saveFile))}>
           <Icon name="share" size={18} /> {saved === "shared" ? "Saved" : "Save to Files"}
         </Btn>
       </div>

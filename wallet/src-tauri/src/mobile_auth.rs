@@ -10,6 +10,10 @@
 //! * The iOS Keychain (device-only item): read only after the OS has confirmed the
 //!   owner with Face ID / Touch ID. The prompt is raised from Rust, so the JavaScript
 //!   side never holds the secret and cannot skip the check.
+//! * On Android, `bio.key`: the secret encrypted under an Android Keystore AES-GCM key
+//!   (hardware-backed, non-exportable, usable only inside a strong-biometric prompt and
+//!   voided by a new fingerprint enrollment). The prompt and the decryption are one
+//!   operation, so a copied `bio.key` is useless without the phone and its owner.
 //!
 //! Face ID can be switched off (the Keychain copy is deleted); the PIN always works.
 
@@ -153,8 +157,9 @@ mod keychain {
 
 #[cfg(not(target_os = "ios"))]
 mod keychain {
-    //! Desktop and Android stand-in: a private file in the wallet directory. The Face ID
-    //! gate still runs in front of it on a device that has one.
+    //! A private file in the wallet directory. On Android it holds the Keystore
+    //! ciphertext of the secret (see [`store_bio`]); on the desktop biometrics are never
+    //! offered, so the file is never written.
     use std::path::{Path, PathBuf};
     fn path() -> PathBuf {
         Path::new(&super::DIR.with(|d| d.borrow().clone())).join(super::BIO_FILE)
@@ -216,7 +221,7 @@ fn biometry(_app: &tauri::AppHandle) -> (bool, String) {
 
 /// Raise the system Face ID / Touch ID sheet and wait for the answer. The app's own PIN
 /// is the fallback, so the device passcode is deliberately not offered here.
-#[cfg(mobile)]
+#[cfg(target_os = "ios")]
 async fn prompt(app: tauri::AppHandle, reason: &str) -> Result<(), String> {
     use tauri_plugin_biometric::{AuthOptions, BiometricExt};
     let reason = reason.to_string();
@@ -241,6 +246,66 @@ async fn prompt(_app: tauri::AppHandle, _reason: &str) -> Result<(), String> {
     Err("biometric:not available on this device".into())
 }
 
+/// Put the device secret behind the phone's biometric. iOS: a Keychain item. Android: the
+/// biometric plugin's Keystore key encrypts it inside a prompt (so the user confirms the
+/// biometric works before it is switched on) and the ciphertext goes to `bio.key`.
+#[cfg(target_os = "android")]
+async fn store_bio(app: tauri::AppHandle, secret: &str) -> Result<(), String> {
+    use tauri_plugin_biometric::{AuthOptions, BiometricExt};
+    let secret = secret.to_string();
+    let sealed = tauri::async_runtime::spawn_blocking(move || {
+        app.biometric()
+            .biometric_cipher(
+                String::new(), // the title carries the message; the reason would repeat it
+                AuthOptions {
+                    title: Some("Turn on biometric unlock".into()),
+                    cancel_title: Some("Cancel".into()),
+                    data_to_encrypt: Some(secret),
+                    ..Default::default()
+                },
+            )
+            .map_err(|e| format!("biometric:{e}"))
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    keychain::store(&sealed.data)
+}
+#[cfg(not(target_os = "android"))]
+async fn store_bio(_app: tauri::AppHandle, secret: &str) -> Result<(), String> {
+    keychain::store(secret)
+}
+
+/// The biometric sheet → the device secret. Android decrypts `bio.key` inside the prompt.
+#[cfg(target_os = "android")]
+async fn load_bio(app: tauri::AppHandle, reason: &str) -> Result<Zeroizing<String>, String> {
+    use tauri_plugin_biometric::{AuthOptions, BiometricExt};
+    let sealed = keychain::load()?.ok_or("biometric:not enabled")?;
+    let sealed = String::from_utf8(sealed).map_err(|_| "bio.key is corrupt".to_string())?;
+    let title = reason.to_string();
+    let out = tauri::async_runtime::spawn_blocking(move || {
+        app.biometric()
+            .biometric_cipher(
+                String::new(), // the title carries the message; the reason would repeat it
+                AuthOptions {
+                    title: Some(title),
+                    cancel_title: Some("Use PIN".into()),
+                    data_to_decrypt: Some(sealed),
+                    ..Default::default()
+                },
+            )
+            .map_err(|e| format!("biometric:{e}"))
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    Ok(Zeroizing::new(out.data))
+}
+#[cfg(not(target_os = "android"))]
+async fn load_bio(app: tauri::AppHandle, reason: &str) -> Result<Zeroizing<String>, String> {
+    prompt(app, reason).await?;
+    let bytes = keychain::load()?.ok_or("biometric:not enabled")?;
+    String::from_utf8(bytes).map(Zeroizing::new).map_err(|_| "keychain item is corrupt".to_string())
+}
+
 /// Either the PIN (`Some`) or the biometric sheet (`None`) → the device secret.
 async fn authenticate(app: tauri::AppHandle, dir: &str, pin: Option<String>, reason: &str) -> Result<Zeroizing<String>, String> {
     set_dir(dir);
@@ -253,9 +318,7 @@ async fn authenticate(app: tauri::AppHandle, dir: &str, pin: Option<String>, rea
             if !keychain::exists() {
                 return Err("biometric:not enabled".into());
             }
-            prompt(app, reason).await?;
-            let bytes = keychain::load()?.ok_or("biometric:not enabled")?;
-            String::from_utf8(bytes).map(Zeroizing::new).map_err(|_| "keychain item is corrupt".to_string())
+            load_bio(app, reason).await
         }
     }
 }
@@ -288,6 +351,7 @@ pub async fn mobile_create(
     pin: String,
     mnemonic: Option<String>,
     biometric: bool,
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> R<super::CreateResult> {
     valid_pin(&pin)?;
@@ -305,9 +369,9 @@ pub async fn mobile_create(
     .await
     .map_err(|e| e.to_string())?;
     write_pin_file(&dir, &pin_file)?;
-    if biometric {
-        keychain::store(&secret)?;
-    } else {
+    // A cancelled or failed prompt here must not cost the user the wallet just made:
+    // biometrics simply stay off and can be switched on from Settings.
+    if !biometric || store_bio(app, &secret).await.is_err() {
         let _ = keychain::delete();
     }
     Ok(created)
@@ -356,8 +420,8 @@ pub async fn mobile_set_biometric(enabled: bool, pin: Option<String>, app: tauri
     let dir = state.data_dir.lock().unwrap().clone();
     set_dir(&dir);
     if enabled {
-        let secret = authenticate(app, &dir, Some(pin.ok_or("the PIN is needed to switch Face ID on")?), "").await?;
-        keychain::store(&secret)?;
+        let secret = authenticate(app.clone(), &dir, Some(pin.ok_or("the PIN is needed to switch Face ID on")?), "").await?;
+        store_bio(app, &secret).await?;
     } else {
         keychain::delete()?;
     }
@@ -378,7 +442,7 @@ pub async fn mobile_change_pin(old: String, new: String, app: tauri::AppHandle, 
 /// app) is moved under a PIN: the mnemonic is unsealed with the password and sealed again
 /// under a fresh device secret. The password stops working afterwards.
 #[tauri::command]
-pub async fn mobile_adopt(password: String, pin: String, biometric: bool, state: State<'_, AppState>) -> R<bool> {
+pub async fn mobile_adopt(password: String, pin: String, biometric: bool, app: tauri::AppHandle, state: State<'_, AppState>) -> R<bool> {
     valid_pin(&pin)?;
     let dir = state.data_dir.lock().unwrap().clone();
     set_dir(&dir);
@@ -396,9 +460,7 @@ pub async fn mobile_adopt(password: String, pin: String, biometric: bool, state:
     .map_err(|e| e.to_string())??;
     super::write_keystore(&dir, &ks2)?;
     write_pin_file(&dir, &pin_file)?;
-    if biometric {
-        keychain::store(&secret)?;
-    } else {
+    if !biometric || store_bio(app, &secret).await.is_err() {
         let _ = keychain::delete();
     }
     super::unlock_wallet(secret.to_string(), state).await

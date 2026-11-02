@@ -131,10 +131,10 @@ export default function ReceiveScreen({
   }, [incoming]);
 
   async function share() {
-    // iOS: the app's own share sheet (a plain sheet, not WebKit's popover), as a text file
-    // the recipient can open or paste from. Elsewhere: the web share API with the address
-    // as text, then the clipboard as a last resort.
-    if (/iPhone|iPad|iPod/.test(navigator.userAgent)) {
+    // iOS and Android: the app's own share sheet (a plain sheet, not WebKit's popover), as a
+    // text file the recipient can open or paste from. Elsewhere: the web share API with the
+    // address as text, then the clipboard as a last resort.
+    if (/iPhone|iPad|iPod|Android/.test(navigator.userAgent)) {
       await shareFile(address + "\n", "zcrypt-address.txt", saveFile);
       return;
     }

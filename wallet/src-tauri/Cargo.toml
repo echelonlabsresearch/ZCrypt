@@ -70,6 +70,9 @@ opt-level = 3
 tauri-plugin-barcode-scanner = "2"
 tauri-plugin-biometric = "2"   # Face ID / Touch ID prompt, raised from Rust
 
+[target.'cfg(target_os = "android")'.dependencies]
+jni = "0.21"                   # share sheet + Downloads save through the activity (no Kotlin)
+
 [target.'cfg(target_os = "ios")'.dependencies]
 security-framework = "3"       # Keychain item holding the device secret behind Face ID
 security-framework-sys = "2"

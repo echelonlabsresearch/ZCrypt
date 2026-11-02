@@ -1,7 +1,8 @@
 import { useEffect, useRef, useState } from "react";
 import { call, copySensitive } from "../lib/api";
-import { authError, Btn, Icon, PinPad, Sheet, Switch, shareFile } from "./ui";
+import { authError, Btn, Icon, PinPad, Sheet, Switch, shareFile, isAndroid } from "./ui";
 import { saveFile } from "../lib/api";
+import pkg from "../../package.json";
 import { bioName, useAuth } from "./MobileApp";
 
 interface NodeStatus {
@@ -13,7 +14,7 @@ interface Settings {
   node_url: string;
 }
 
-const VERSION = "0.2.0";
+const VERSION: string = pkg.version;
 
 /** Security and connection, nothing else. Reached from the gear on the portfolio. */
 export default function SettingsSheet({ open, onClose }: { open: boolean; onClose: () => void }) {
@@ -84,7 +85,8 @@ export default function SettingsSheet({ open, onClose }: { open: boolean; onClos
     }
   }
   async function savePhrase() {
-    const r = await shareFile(`ZCrypt Wallet recovery phrase\n\n${phrase}\n\nAnyone with these 24 words can spend this wallet. Keep this file private.\n`, "zcrypt-recovery-phrase.txt", saveFile);
+    const text = `ZCrypt Wallet recovery phrase\n\n${phrase}\n\nAnyone with these 24 words can spend this wallet. Keep this file private.\n`;
+    const r = isAndroid ? await saveFile("zcrypt-recovery-phrase.txt", text).catch((e) => `Could not save: ${e}`) : await shareFile(text, "zcrypt-recovery-phrase.txt", saveFile);
     if (r !== "shared") toast(r.startsWith("Could not") ? "Could not save" : "Saved", r === "shared" ? "" : r);
   }
 

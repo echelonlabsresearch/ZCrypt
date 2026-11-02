@@ -360,8 +360,8 @@ export function lockMessage(secs: number): string {
 
 /** Hand a payment text to the system share sheet as a .zcrypt file; falls back to saving it. */
 export async function shareFile(text: string, filename: string, save: (f: string, t: string) => Promise<string>): Promise<string> {
-  // iOS: the native sheet, presented by the app itself, with a real .zcrypt document.
-  if (/iPhone|iPad|iPod/.test(navigator.userAgent)) {
+  // iOS and Android: the native sheet, presented by the app itself, with a real .zcrypt document.
+  if (/iPhone|iPad|iPod|Android/.test(navigator.userAgent)) {
     try {
       await call<boolean>("share_file", { filename, content: text });
       return "shared";
@@ -381,5 +381,8 @@ export async function shareFile(text: string, filename: string, save: (f: string
   }
   return save(filename, text);
 }
+
+/** Android: a secret goes straight to Download/ZCrypt rather than through a share sheet full of chat apps. */
+export const isAndroid = /Android/.test(navigator.userAgent);
 
 export const short = (a: string, head = 10, tail = 6): string => (a.length > head + tail + 1 ? `${a.slice(0, head)}…${a.slice(-tail)}` : a);

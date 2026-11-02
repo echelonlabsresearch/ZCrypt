@@ -18,7 +18,15 @@ export interface AuthStatus {
   locked_for_s: number;
 }
 
-export const bioName = (s: AuthStatus | null) => (s?.biometry_type === "touchid" ? "Touch ID" : "Face ID");
+/** What the phone calls its biometric: Apple's names on iOS, the generic ones on Android. */
+export const bioName = (s: AuthStatus | null) =>
+  /Android/.test(navigator.userAgent)
+    ? s?.biometry_type === "faceid"
+      ? "Face unlock"
+      : "Fingerprint"
+    : s?.biometry_type === "touchid"
+      ? "Touch ID"
+      : "Face ID";
 
 interface AuthApi {
   status: AuthStatus;
@@ -149,16 +157,25 @@ export default function MobileApp() {
     };
   }, []);
 
-  // Files opened with the app (AirDrop, Files, Mail): credited under Receive once unlocked.
+  // Files opened with the app (AirDrop, Files, Mail, and on Android any "Open with"):
+  // credited under Receive once unlocked. Android hands a file over by relaunching or
+  // resuming the activity, so the queue is drained again on every return to the foreground.
   useEffect(() => {
-    call<string[]>("take_opened_files")
-      .then((f) => f.length && setIncoming((q) => [...q, ...f]))
-      .catch(() => {});
+    const drain = () =>
+      call<string[]>("take_opened_files")
+        .then((f) => f.length && setIncoming((q) => [...q, ...f]))
+        .catch(() => {});
+    drain();
+    const onVisible = () => {
+      if (document.visibilityState === "visible") drain();
+    };
+    document.addEventListener("visibilitychange", onVisible);
     let un: (() => void) | null = null;
     listen<string>("zcrypt-open", (e) => setIncoming((q) => [...q, e.payload]))
       .then((u) => (un = u))
       .catch(() => {});
     return () => {
+      document.removeEventListener("visibilitychange", onVisible);
       if (un) un();
     };
   }, []);
