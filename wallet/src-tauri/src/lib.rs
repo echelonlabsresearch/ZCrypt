@@ -9782,6 +9782,10 @@ mod live_3node {
         if std::env::var("ZC_E2E_SKIP_BRIDGE").is_err() {
             let carol = W::new_bridge(&url, &btc_url);
             v(create_wallet(pw.clone(), carol.st())).expect("create carol");
+            // A redeem burns 0.01 ZCRYPT of gas through a bundled gas note (the zBTC is never
+            // the fee), so Carol needs a little ZCRYPT on hand like any wallet moving an asset.
+            assert_eq!(v(fund_onchain(2 * ZC, carol.st())).expect("fund carol gas"), 2);
+            v(scan_onchain(carol.st())).expect("scan carol gas");
             let no_progress = |_: u8, _: &str| {};
             // H1: the HTLC pays the chain's reserve key (not this wallet's own), so the SPV mint
             // is accepted and the coin lands as MATURING.
@@ -9853,7 +9857,7 @@ mod live_3node {
             op_thread.join().unwrap();
             v(scan_onchain(carol.st())).expect("scan after redeem");
             let st3 = v(bridge_status(false, carol.st())).expect("status");
-            assert_eq!(st3.zbtc_balance, net_mint - 5_000_000 - zcrypt_core::emission::MIN_FEE, "change minus the in-asset fee stays spendable");
+            assert_eq!(st3.zbtc_balance, net_mint - 5_000_000, "the zBTC change stays spendable in full; gas was ZCRYPT");
             println!("[wallet] redeemed 0.05 zBTC through the operator watcher; BTC claimed; {} sats zBTC left", st3.zbtc_balance);
 
             // The shield and redeem above call the command bodies directly. These are the
