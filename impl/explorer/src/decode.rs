@@ -417,7 +417,7 @@ whose output[0] is the locked-value burn coin.".into()));
 }
 
 /// The raw transaction: full bytes (hex) when small enough to display, otherwise the
-/// head plus total size (shield proofs run to ~1 MB), and the complete byte map of
+/// head plus total size (shield proofs run to ~2 MB), and the complete byte map of
 /// how consensus parses it.
 fn raw_view(b: &[u8], tag: u8, body: &[u8]) -> Value {
     const FULL_HEX_CAP: usize = 2048;

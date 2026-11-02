@@ -805,7 +805,7 @@ fn verify_bond(b: &[u8], chain_id: &[u8]) -> Option<(Vec<u8>, Vec<u8>, u64, [u8;
 }
 
 /// Parse a **coin-backed** BOND payload:
-///   verify_bond header (138) ‖ stake_blind (8×u64 = 64) ‖ shield_tx_bytes.
+///   verify_bond header (138 = 8 + 33 + 33 + 64) ‖ stake_blind (8×u64 = 64) ‖ shield_tx_bytes.
 /// The header authenticates the validator + stake + reward + commission (as [`verify_bond`]);
 /// the stake_blind + shield_tx are the pledge — the node checks the shield tx's `output[0]`
 /// is the burn coin `commit(stake, stake_blind, BURN_PK, ZCRYPT)` and applies the spend.

@@ -2709,13 +2709,10 @@ pub fn resume_deposit(
 // the operator must be online. The HTLC keeps it safe either way: if the operator never
 // locks, the user's burn escrow times out and REFUNDS the zBTC (no one loses).
 //
-// SECURITY NOTE (not yet hardened for mainnet): the operator locks with a BTC refund timelock
-// (`+100`) shorter than the zBTC burn-escrow timeout (`ZC_HTLC_TIMEOUT_BLOCKS`), which is the
-// correct stagger direction (the operator, who reveals second on ZCrypt, gets the longer
-// window). Re-derive both for real block times and validate a deliberate late-reveal on signet
-// before real funds. The operator learns the user's BTC claim pubkey from the redeem
-// instruction; moving it fully on-chain (a burn-lock field) would make the redeem watcher as
-// autonomous as the shield watcher — a small follow-up.
+// STAGGER: the operator's BTC refund timelock must expire before the zBTC burn escrow does
+// (the operator reveals second on ZCrypt, so it gets the longer window); the stagger rule at the
+// top of this file derives both from real block times with REDEEM_FINALIZE_SLA_SECS of slack. The user's BTC
+// claim pubkey rides on-chain in the 0x67 burn-lock, so the redeem watcher is autonomous.
 // ============================================================================
 
 /// USER side, step 1 of a redeem: lock `zbtc_value` zBTC into a burn escrow (output[0] = burn

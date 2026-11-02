@@ -1,7 +1,8 @@
 //! HTLC hashlock for cross-chain atomic swaps.
 //!
 //! Value nullifiers for transfers live in the shield path (`zcrypt_shield`), which
-//! proves `nf = Poseidon2(spend_secret, value, blind)` in zero knowledge. The only
+//! proves the two-block nullifier `nf = Poseidon2(Poseidon2(s, Poseidon2(pk, blind)),
+//! value_lo, value_hi, asset)` (see `keys.rs`) in zero knowledge. The only
 //! thing left here is the HTLC hashlock, shared with the Bitcoin leg.
 
 use crate::hash::Hash;

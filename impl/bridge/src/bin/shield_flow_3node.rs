@@ -1,6 +1,6 @@
 //! Drive a REAL shielded transaction through a LIVE chain over RPC — closing the
 //! gap the smoke test left open. Unlike the SEED smoke, this builds a full Plonky3
-//! proof (~1 MB tall-skinny STARK), broadcasts it as a `0x55` shield tx, and only succeeds if the
+//! proof (~2 MB tall-skinny STARK), broadcasts it as a `0x55` shield tx, and only succeeds if the
 //! node's consensus path VERIFIES the proof and applies it. Point it at the 3-node
 //! stack (node0 RPC) to prove a proof-bearing tx survives RPC/mempool/P2P and is
 //! independently verified by real validators.
@@ -54,7 +54,7 @@ fn main() {
     let note_chg = kem::ciphertext_to_bytes(&keys::encrypt_note(&alice.normal_address(), 1_000_000 - 900_000, bchg));
     let gas_coin = alice.own_coin(FEE, keys::random_blind());
     seed(&gas_coin.commitment(), "Alice's gas coin");
-    println!("[2] building the transfer (a ~1 MB tall-skinny STARK) + a ZCRYPT gas note...");
+    println!("[2] building the transfer (a ~2 MB tall-skinny STARK) + a ZCRYPT gas note...");
     let raw = swap::build_transfer(&zc, &[alice_coin], &[out_bob, out_chg], vec![note_bob, note_chg], &alice, &gas_coin)
         .expect("build bundled transfer");
     println!("    bundled tx (transfer + ZCRYPT gas note) is {} bytes", raw.len());

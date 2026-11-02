@@ -97,7 +97,7 @@ docker compose -f e2e/docker-compose.3node.yml up --build -d
 | node2 | `http://localhost:46677` |
 
 (`bitcoind` for this stack is on host port `28443`.) All three independently verify
-every ~1 MB shield proof and must agree on each block's `app_hash`. These genesis
+every ~2 MB shield proof and must agree on each block's `app_hash`. These genesis
 validators are the bootstrap quorum; new validators join dynamically on top.
 
 ### 2. Run a node and join a running chain
@@ -232,7 +232,7 @@ Frontend-only preview (no backend, no chain): `npm run dev`.
 ## Verify everything (live end-to-end)
 
 One script stands up a fresh 3-validator network and drives **every** real flow against
-it — consensus agreement, a real ~1 MB shield proof verified on-chain, the full product
+it — consensus agreement, a real ~2 MB shield proof verified on-chain, the full product
 surface (send/receive/spend, stealth, bearer, shielded assets, abuse cases, bond →
 rewards → claim → spend → unbond), mnemonic recover-then-spend, and BTC↔zBTC swaps both
 directions:

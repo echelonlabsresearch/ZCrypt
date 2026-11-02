@@ -1,12 +1,15 @@
 //! Address & key hierarchy for shielded coins.
 //!
-//! A shielded coin is the triple `(value, blind, spend_secret)`. The public
-//! commitment `C = Poseidon2(value, blind, pk)` — where `pk = Poseidon2(spend_secret)`
-//! — lives in the note-commitment tree, binding both the amount *and* the owner.
-//! Spending publishes the canonical nullifier `nf = Poseidon2(spend_secret, value,
-//! blind)`. Because the commitment binds `pk`, only the holder of `spend_secret`
-//! can open it (the sender knows `pk` but not the secret), and the nullifier is a
-//! deterministic function of the coin (so a re-spend collides → no double-spend).
+//! A shielded coin is `(value, blind, spend_secret, asset)`. The public commitment
+//! `C = Poseidon2(value_lo, value_hi, Poseidon2(pk, blind), asset)` with
+//! `pk = Poseidon2(spend_secret)` lives in the note-commitment tree, binding both
+//! the amount *and* the owner. Spending publishes the canonical nullifier
+//! `nf = Poseidon2(Poseidon2(spend_secret, Poseidon2(pk, blind)), value_lo, value_hi, asset)`:
+//! two blocks, the inner one absorbing the spend secret beside the commitment's own
+//! inner digest (never the raw sender-chosen blind). Because the commitment binds `pk`,
+//! only the holder of `spend_secret` can open it (the sender knows `pk` but not the
+//! secret), and the nullifier is a deterministic function of the coin (so a re-spend
+//! collides → no double-spend).
 //!
 //! Everything an account can do flows from one 32-byte `seed`:
 //!

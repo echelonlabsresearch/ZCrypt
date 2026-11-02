@@ -105,7 +105,7 @@ structure Statement (H : V16 → V8) (pis : Pub) where
   act_bool : ∀ i, i < N_IN → act i = 0 ∨ act i = 1
   dummy_zero : ∀ i, i < N_IN → act i = 0 → (coins i).vlo = 0 ∧ (coins i).vhi = 0
   -- MEMBERSHIP: every ACTIVE input's commitment is a leaf of the tree under the public
-  -- anchor root, along a 32-level path the prover supplied.
+  -- anchor root, along a DEPTH-level (62) path the prover supplied.
   membership : ∀ i, i < N_IN → act i = 1 → ∃ (sibs : Nat → V8) (dirs : Nat → Bool),
     merkle H (commitment H (coins i).vlo (coins i).vhi (coins i).pk (coins i).blind asset) sibs dirs DEPTH
       = fun k => pis (rootOff + k.val)
