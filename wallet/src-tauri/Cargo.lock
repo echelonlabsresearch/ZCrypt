@@ -5595,6 +5595,7 @@ dependencies = [
  "bitcoincore-rpc",
  "ed25519-dalek",
  "hex",
+ "jsonrpc",
  "rand 0.8.7",
  "serde",
  "serde_json",

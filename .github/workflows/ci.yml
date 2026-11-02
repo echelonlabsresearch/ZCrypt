@@ -36,6 +36,11 @@ env:
   # Two parallel rustc/link jobs keep peak memory under the 7 GB hosted-runner ceiling.
   CARGO_BUILD_JOBS: "2"
   RUST_BACKTRACE: "1"
+  # ubuntu-latest is Ubuntu 26.04 since 2026-11; its GCC no longer includes <cstdint>
+  # transitively, and the vendored RocksDB 8.10 in librocksdb-sys 0.16 relies on that
+  # (uint64_t undeclared). Pre-including it is the upstream-recommended workaround until
+  # the rocksdb crate is bumped to a RocksDB that carries the fix.
+  CXXFLAGS: "-include cstdint"
   # Baseline of clippy classes present in the tree today (see the clippy job).
   CLIPPY_BASELINE: >-
     -A clippy::cloned_ref_to_slice_refs -A clippy::needless_range_loop
