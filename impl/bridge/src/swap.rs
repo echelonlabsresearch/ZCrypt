@@ -3318,10 +3318,10 @@ pub fn zbtc_to_btc_progress(
         return Err("no zBTC coins to redeem".to_string());
     }
     let in_total: u64 = coins.iter().map(|c| c.value).sum();
-    // The coins must cover the locked value PLUS the zBTC transaction fee (the shielded
-    // pool hides asset_id, so a zBTC spend pays its fee in zBTC).
-    if zbtc_value + zcrypt_core::emission::MIN_FEE > in_total {
-        return Err("lock value + fee exceeds Alice's zBTC coins".to_string());
+    // The coins must cover the locked value. Gas is ZCRYPT, paid by a separate note, so no
+    // zBTC is burned as a fee (an in-asset fee would strand its reserve BTC).
+    if zbtc_value > in_total {
+        return Err("lock value exceeds the user's zBTC coins".to_string());
     }
 
     // 1. Alice locks zBTC into a burn escrow: output[0] = burn coin, output[1] change.
@@ -3330,7 +3330,7 @@ pub fn zbtc_to_btc_progress(
     progress(15, "Locking your zBTC in a burn escrow…");
     let burn_blind = zcrypt_core::keys::random_blind();
     let change_blind = zcrypt_core::keys::random_blind();
-    let change_value = in_total - zbtc_value - zcrypt_core::emission::MIN_FEE;
+    let change_value = in_total - zbtc_value;
     let burn_out: OutCoin = (zbtc_value, burn_blind, zcrypt_core::htlc_shield::BURN_PK, asset);
     let change_out: OutCoin = (change_value, change_blind, alice.pubkey(), asset);
     // A REAL encrypted change note to Alice's normal address, so the wallet recovers the
@@ -3363,12 +3363,29 @@ pub fn zbtc_to_btc_progress(
         zc,
         coins,
         &[burn_out, change_out],
-        zcrypt_core::emission::MIN_FEE,
+        0,
         vec![zcrypt_core::keys::cover_note_bytes(), change_note],
         &envelope,
     )?;
-    let data = zc.broadcast(&burn_lock_tx(
-        zbtc_value, &burn_blind, asset, &lock, zc_timeout, &alice.pubkey(), &stx, &refund_open,
+    // The ZCRYPT gas note, bound to the zBTC spend (this driver runs on a dev chain, so it
+    // seeds its own gas coin).
+    let gas_coin = seed_gas_coin(zc, alice)?;
+    wait_for_leaf(zc, &gas_coin.commitment());
+    let min_fee = zcrypt_core::emission::MIN_FEE;
+    let gas_blind = zcrypt_core::keys::random_blind();
+    let gas_burn: OutCoin = (min_fee, gas_blind, zcrypt_core::htlc_shield::BURN_PK, zcrypt_shield::ASSET_ZCRYPT);
+    let gas_change: OutCoin =
+        (gas_coin.value - min_fee, zcrypt_core::keys::random_blind(), alice.pubkey(), zcrypt_shield::ASSET_ZCRYPT);
+    let gas_tx = build_shield_spend_bound(
+        zc,
+        &[gas_coin],
+        &[gas_burn, gas_change],
+        0,
+        vec![zcrypt_core::keys::cover_note_bytes(), zcrypt_core::keys::cover_note_bytes()],
+        &shield_tx::gas_pay_envelope(&shield_tx::txbind(chain_id(), &stx)),
+    )?;
+    let data = zc.broadcast(&burn_lock_gas_tx(
+        zbtc_value, &burn_blind, asset, &lock, zc_timeout, &alice.pubkey(), &gas_blind, &gas_tx, &stx, &refund_open,
     ))?;
     let escrow_id = escrow_id_from(&data)?;
     println!("  [zc]  Alice locked {} zBTC in burn escrow {}", zbtc_value, hex::encode(escrow_id));

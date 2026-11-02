@@ -95,10 +95,10 @@ fn main() {
     // ===== zBTC -> BTC (redeem Alice's two coins back to BTC) =====
     println!("\n== SWAP 3: zBTC -> BTC (redeem) ==");
     // Redeem the coins Alice actually holds (each is the minted value minus the bridge
-    // fee that went to stakers) less the universal in-asset gas fee.
-    let redeem = coin_a.value + coin_b.value - zcrypt_core::emission::MIN_FEE;
+    // fee that went to stakers). Gas is ZCRYPT, so the whole zBTC value is redeemable.
+    let redeem = coin_a.value + coin_b.value;
     // The SPV bridge enforces a 1:1 peg on redeem: the BTC released must equal the zBTC
-    // burned, so the requested BTC amount is exactly `redeem` sats (both coins, net of gas).
+    // burned, so the requested BTC amount is exactly `redeem` sats (both coins).
     swap::zbtc_to_btc(&zc, &b, &alice, asset, &[coin_a, coin_b], &swap::fresh_preimage(), redeem, Amount::from_sat(redeem)).unwrap();
     let after = zc.query(&format!("/asset/id/{asset}")).unwrap();
     println!("zBTC supply after redeem: {after}");
