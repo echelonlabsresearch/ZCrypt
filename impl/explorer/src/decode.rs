@@ -307,10 +307,20 @@ which hides among the whole pool", hex_at(0, 64)));
             r.push(row("[81..113]".into(), "hashlock (SHA-256)", hex_at(16 + BB, 32)));
             r.push(row("[113..121]".into(), "timeout height (u64 LE)", format!("{}", rd_u64(body, 48 + BB)?)));
             r.push(row("[121..185]".into(), "refund shield pubkey", hex_at(56 + BB, 64)));
-            // 184-byte header, then one refund opening, then the shield spend.
+            // 184-byte header, then one refund opening, then either the ZCRYPT gas prefix and
+            // the fee-0 asset spend, or (legacy, ZCRYPT locks only) the bare spend paying gas
+            // as its own fee.
             if let Some(n) = push_opening(body, BURN_HEAD, "refund settlement", &mut r) {
                 let stx_off = BURN_HEAD + n;
-                if let Some(stx) = body.get(stx_off..).and_then(shield_tx::from_bytes) {
+                let rest = body.get(stx_off..).unwrap_or(&[]);
+                if let Some((gas, main)) = parse_transfer(rest) {
+                    let gas_len = rd_u32(rest, BB).unwrap_or(0) as usize;
+                    r.push(row(range_at(stx_off, BB), "gas blind: the PUBLIC opening of the 0.01 ZCRYPT burn (the locked asset is not charged)", hex_at(stx_off, BB)));
+                    r.push(row(range_at(stx_off + BB, 4), "gas tx length (u32 LE)", format!("{gas_len}")));
+                    let gas_tx_off = stx_off + BB + 4;
+                    shield_rows(&format!("[{}..{}] gas", gas_tx_off + 1, gas_tx_off + 1 + gas_len), &gas, &mut r);
+                    shield_rows(&format!("[{}..] lock", gas_tx_off + gas_len + 1), &main, &mut r);
+                } else if let Some(stx) = shield_tx::from_bytes(rest) {
                     shield_rows(&format!("[{}..] lock", stx_off + 1), &stx, &mut r);
                 }
             }

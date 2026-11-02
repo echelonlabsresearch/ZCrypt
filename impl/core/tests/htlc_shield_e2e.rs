@@ -249,7 +249,13 @@ fn burn_lock_tx(
     burn_blind: zcrypt_shield::Blind,
     envelope: &[u8],
 ) -> zcrypt_core::shield_tx::ShieldTx {
-    asset_lock_tx(alice, node, asset, lock_value, burn_blind, zcrypt_core::emission::MIN_FEE, envelope)
+    // Fee 0: a GOLD lock pays its gas with a ZCRYPT note (see `burn_gas`).
+    asset_lock_tx(alice, node, asset, lock_value, burn_blind, 0, envelope)
+}
+
+/// The ZCRYPT gas note of a burn lock: bound to the asset spend it pays for.
+fn burn_gas(alice: &Account, node: &mut Node, tx: &zcrypt_core::shield_tx::ShieldTx) -> (zcrypt_core::shield_tx::ShieldTx, zcrypt_shield::Blind) {
+    zcrypt_gas(alice, node, &zcrypt_core::shield_tx::txbind(CHAIN, tx))
 }
 
 /// A swap-lock asset spend: fee 0. Gas is [`zcrypt_gas`], not this proof.
@@ -341,15 +347,16 @@ fn burn_lock_then_claim_burns_zbtc() {
     let refund = zcrypt_core::htlc_shield::CoinOpening::create(&alice.normal_address(), lock_value, asset).unwrap().1;
     let tx = burn_lock_tx(&alice, &mut node, asset, lock_value, burn_blind,
         &burn_env(asset, lock_value, htlc_hashlock(x), 100, &alice, &refund.coin));
+    let gas = burn_gas(&alice, &mut node, &tx);
 
     // Declaring a value that doesn't match output[0]'s actual opening is rejected
     // (the node binds the escrow to the real coin, so you can't over-declare).
     assert!(node
-        .htlc_burn_lock(CHAIN, &tx, lock_value + 1, burn_blind, asset, htlc_hashlock(x), 100, alice.pubkey(), &[], &refund)
+        .htlc_burn_lock(CHAIN, &tx, Some((&gas.0, gas.1)), lock_value + 1, burn_blind, asset, htlc_hashlock(x), 100, alice.pubkey(), &[], &refund)
         .is_err());
 
     let id = node
-        .htlc_burn_lock(CHAIN, &tx, lock_value, burn_blind, asset, htlc_hashlock(x), 100, alice.pubkey(), &[], &refund)
+        .htlc_burn_lock(CHAIN, &tx, Some((&gas.0, gas.1)), lock_value, burn_blind, asset, htlc_hashlock(x), 100, alice.pubkey(), &[], &refund)
         .unwrap();
     // Bridge claims with the preimage -> zBTC burned, nothing minted.
     assert!(node.htlc_claim(&id, b"wrong").is_err());
@@ -367,8 +374,9 @@ fn burn_lock_then_expire_refunds_owner() {
     let refund = zcrypt_core::htlc_shield::CoinOpening::create(&alice.normal_address(), lock_value, asset).unwrap().1;
     let tx = burn_lock_tx(&alice, &mut node, asset, lock_value, burn_blind,
         &burn_env(asset, lock_value, htlc_hashlock(x), 20, &alice, &refund.coin));
+    let gas = burn_gas(&alice, &mut node, &tx);
     let id = node
-        .htlc_burn_lock(CHAIN, &tx, lock_value, burn_blind, asset, htlc_hashlock(x), 20, alice.pubkey(), &[], &refund)
+        .htlc_burn_lock(CHAIN, &tx, Some((&gas.0, gas.1)), lock_value, burn_blind, asset, htlc_hashlock(x), 20, alice.pubkey(), &[], &refund)
         .unwrap();
 
     // Before timeout, expire is rejected.
@@ -411,37 +419,38 @@ fn malleated_burn_lock_envelope_is_rejected() {
     let refund = zcrypt_core::htlc_shield::CoinOpening::create(&alice.normal_address(), value, asset).unwrap().1;
     let tx = burn_lock_tx(&alice, &mut node, asset, value, blind,
         &burn_env(asset, value, lock, timeout, &alice, &refund.coin));
+    let gas = burn_gas(&alice, &mut node, &tx);
 
     // Each of these is a distinct rewrite of the envelope the victim proved over.
     // The proof is untouched and its nullifiers are unspent, so before the fix every one of
     // them was accepted.
     assert!(
-        node.htlc_burn_lock(CHAIN, &tx, value, blind, asset, lock, timeout, attacker.pubkey(), &[], &refund).is_err(),
+        node.htlc_burn_lock(CHAIN, &tx, Some((&gas.0, gas.1)), value, blind, asset, lock, timeout, attacker.pubkey(), &[], &refund).is_err(),
         "refund key redirected to the attacker must be rejected"
     );
     // An attacker who proves their own opening still cannot spend the copied proof:
     // the envelope the victim signed includes Alice's coin, not the attacker's.
     let attacker_refund = zcrypt_core::htlc_shield::CoinOpening::create(&attacker.normal_address(), value, asset).unwrap().1;
     assert!(
-        node.htlc_burn_lock(CHAIN, &tx, value, blind, asset, lock, timeout, attacker.pubkey(), &[], &attacker_refund).is_err(),
+        node.htlc_burn_lock(CHAIN, &tx, Some((&gas.0, gas.1)), value, blind, asset, lock, timeout, attacker.pubkey(), &[], &attacker_refund).is_err(),
         "attacker-chosen refund coin must be rejected"
     );
     assert!(
-        node.htlc_burn_lock(CHAIN, &tx, value, blind, asset, htlc_hashlock(&pre("attacker")), timeout, alice.pubkey(), &[], &refund).is_err(),
+        node.htlc_burn_lock(CHAIN, &tx, Some((&gas.0, gas.1)), value, blind, asset, htlc_hashlock(&pre("attacker")), timeout, alice.pubkey(), &[], &refund).is_err(),
         "substituted hashlock must be rejected"
     );
     assert!(
-        node.htlc_burn_lock(CHAIN, &tx, value, blind, asset, lock, timeout + 1, alice.pubkey(), &[], &refund).is_err(),
+        node.htlc_burn_lock(CHAIN, &tx, Some((&gas.0, gas.1)), value, blind, asset, lock, timeout + 1, alice.pubkey(), &[], &refund).is_err(),
         "altered timeout must be rejected"
     );
     // A 0x5D envelope must not pass as a 0x67 one: the kind is domain-separated.
     assert!(
-        node.htlc_burn_lock(CHAIN, &tx, value, blind, asset, lock, timeout, alice.pubkey(), &btc_pk(3), &refund).is_err(),
+        node.htlc_burn_lock(CHAIN, &tx, Some((&gas.0, gas.1)), value, blind, asset, lock, timeout, alice.pubkey(), &btc_pk(3), &refund).is_err(),
         "a burn-lock envelope must not be replayable as a BTC redeem"
     );
     // ...and the untouched original still works, so the binding costs the honest path nothing.
     let id = node
-        .htlc_burn_lock(CHAIN, &tx, value, blind, asset, lock, timeout, alice.pubkey(), &[], &refund)
+        .htlc_burn_lock(CHAIN, &tx, Some((&gas.0, gas.1)), value, blind, asset, lock, timeout, alice.pubkey(), &[], &refund)
         .expect("the envelope the user actually proved over is accepted");
     assert_eq!(node.htlc_escrow(&id).unwrap().state, EscrowState::Open);
 }
@@ -463,18 +472,19 @@ fn malleated_redeem_payout_key_is_rejected() {
         std::slice::from_ref(&refund.coin),
     );
     let tx = burn_lock_tx(&alice, &mut node, asset, value, blind, &envelope);
+    let gas = burn_gas(&alice, &mut node, &tx);
 
     assert!(
-        node.htlc_burn_lock(CHAIN, &tx, value, blind, asset, lock, timeout, alice.pubkey(), &attacker_pk, &refund).is_err(),
+        node.htlc_burn_lock(CHAIN, &tx, Some((&gas.0, gas.1)), value, blind, asset, lock, timeout, alice.pubkey(), &attacker_pk, &refund).is_err(),
         "payout key swapped to the attacker's must be rejected"
     );
     // A malformed key is refused outright: the watcher would otherwise lock reserve BTC to an
     // address nobody can claim.
     assert!(
-        node.htlc_burn_lock(CHAIN, &tx, value, blind, asset, lock, timeout, alice.pubkey(), &[0xFFu8; 33], &refund).is_err(),
+        node.htlc_burn_lock(CHAIN, &tx, Some((&gas.0, gas.1)), value, blind, asset, lock, timeout, alice.pubkey(), &[0xFFu8; 33], &refund).is_err(),
         "malformed payout key must be rejected"
     );
-    node.htlc_burn_lock(CHAIN, &tx, value, blind, asset, lock, timeout, alice.pubkey(), &user_pk, &refund)
+    node.htlc_burn_lock(CHAIN, &tx, Some((&gas.0, gas.1)), value, blind, asset, lock, timeout, alice.pubkey(), &user_pk, &refund)
         .expect("the user's own payout key is accepted");
 }
 

@@ -492,9 +492,14 @@ fn parse_burn_lock(
     u64,
     [u64; 8],
     zcrypt_core::htlc_shield::CoinOpening,
+    Option<(Blind, zcrypt_core::shield_tx::ShieldTx)>,
     zcrypt_core::shield_tx::ShieldTx,
 )> {
-    // value(8) + blind(64) + asset(8) + hashlock(32) + timeout(8) + refund_pk(64) = 184
+    // value(8) + blind(64) + asset(8) + hashlock(32) + timeout(8) + refund_pk(64) = 184,
+    // then the refund opening, then EITHER the ZCRYPT gas prefix (`gas_blind ‖ gas_len ‖
+    // gas_tx`, the same one a transfer carries) and the fee-0 asset spend, OR (legacy, ZCRYPT
+    // locks only) the bare asset spend paying gas as its own fee. Both encodings are
+    // self-delimiting, so at most one of them parses.
     const A: usize = 8 + BB; // asset
     const H: usize = A + 8; // hashlock
     const T: usize = H + 32; // timeout
@@ -511,8 +516,14 @@ fn parse_burn_lock(
     let timeout = u64::from_le_bytes(b[T..T + 8].try_into().ok()?);
     let refund_pk = parse_pubkey(&b[R..END])?;
     let (opening, n) = zcrypt_core::htlc_shield::CoinOpening::decode(&b[END..])?;
-    let tx = zcrypt_core::shield_tx::from_bytes(&b[END + n..])?;
-    Some((value, blind, asset_id, hashlock, timeout, refund_pk, opening, tx))
+    let rest = &b[END + n..];
+    let with_gas = parse_gas_prefix(rest)
+        .and_then(|(gas_blind, gas_tx, main)| zcrypt_core::shield_tx::from_bytes(main).map(|tx| (gas_blind, gas_tx, tx)));
+    let (gas, tx) = match with_gas {
+        Some((gas_blind, gas_tx, tx)) => (Some((gas_blind, gas_tx)), tx),
+        None => (None, zcrypt_core::shield_tx::from_bytes(rest)?),
+    };
+    Some((value, blind, asset_id, hashlock, timeout, refund_pk, opening, gas, tx))
 }
 
 /// Parse a swap-lock payload into (value, blind, asset_id, hashlock, timeout,
@@ -1772,7 +1783,7 @@ impl ZcryptApp {
             }
         } else if tx.first() == Some(&HTLC_BURN_LOCK_TAG) {
             match parse_burn_lock(&tx[1..]) {
-                Some((value, blind, asset, lock, timeout, refund, opening, stx)) => {
+                Some((value, blind, asset, lock, timeout, refund, opening, gas, stx)) => {
                     if !s.node.asset_is_registered(asset) {
                         Err("asset not registered".to_string())
                     } else if let Err(e) = opening.verify(&refund, value, asset) {
@@ -1794,10 +1805,21 @@ impl ZcryptApp {
                             // Mirror the delivery-time admission rules that would otherwise
                             // only fail AFTER the pledge is applied: value bound and escrow id.
                             s.node
-                                .precheck_lock_params(zcrypt_core::htlc_shield::EscrowKind::Burn, asset, value, timeout, stx.fee, &[])
+                                .precheck_lock_params(zcrypt_core::htlc_shield::EscrowKind::Burn, asset, value, timeout, stx.fee, gas.is_some(), &[])
                                 .and_then(|()| s.node.escrow_id_available(zcrypt_core::htlc_shield::EscrowKind::Burn, asset, value, &lock, timeout, &refund, &refund, &[opening.coin.commitment]))
-                                .and_then(|()| s.node.precheck_shield(&stx))
-                                .map(|()| deferred.push((stx, env)))
+                                .and_then(|()| match &gas {
+                                    Some((gas_blind, gas_tx)) => s.node.precheck_transfer(&stx, gas_tx, *gas_blind),
+                                    None => s.node.precheck_shield(&stx),
+                                })
+                                .map(|()| {
+                                    if let Some((_, gas_tx)) = gas {
+                                        let gas_env = zcrypt_core::shield_tx::gas_pay_envelope(
+                                            &zcrypt_core::shield_tx::txbind(chain_id, &stx),
+                                        );
+                                        deferred.push((gas_tx, gas_env));
+                                    }
+                                    deferred.push((stx, env))
+                                })
                         }
                     }
                 }
@@ -1809,7 +1831,7 @@ impl ZcryptApp {
             } else {
                 let btc_claim_pk = &tx[1..1 + 33];
                 match parse_burn_lock(&tx[1 + 33..]) {
-                    Some((value, blind, asset, lock, timeout, refund, opening, stx)) => {
+                    Some((value, blind, asset, lock, timeout, refund, opening, gas, stx)) => {
                         if !s.node.asset_is_registered(asset) {
                             Err("asset not registered".to_string())
                         } else if let Err(e) = opening.verify(&refund, value, asset) {
@@ -1827,10 +1849,21 @@ impl ZcryptApp {
                                     std::slice::from_ref(&opening.coin),
                                 );
                                 s.node
-                                    .precheck_lock_params(zcrypt_core::htlc_shield::EscrowKind::Burn, asset, value, timeout, stx.fee, btc_claim_pk)
+                                    .precheck_lock_params(zcrypt_core::htlc_shield::EscrowKind::Burn, asset, value, timeout, stx.fee, gas.is_some(), btc_claim_pk)
                                     .and_then(|()| s.node.escrow_id_available(zcrypt_core::htlc_shield::EscrowKind::Burn, asset, value, &lock, timeout, &refund, &refund, &[opening.coin.commitment]))
-                                    .and_then(|()| s.node.precheck_shield(&stx))
-                                    .map(|()| deferred.push((stx, env)))
+                                    .and_then(|()| match &gas {
+                                        Some((gas_blind, gas_tx)) => s.node.precheck_transfer(&stx, gas_tx, *gas_blind),
+                                        None => s.node.precheck_shield(&stx),
+                                    })
+                                    .map(|()| {
+                                        if let Some((_, gas_tx)) = gas {
+                                            let gas_env = zcrypt_core::shield_tx::gas_pay_envelope(
+                                                &zcrypt_core::shield_tx::txbind(chain_id, &stx),
+                                            );
+                                            deferred.push((gas_tx, gas_env));
+                                        }
+                                        deferred.push((stx, env))
+                                    })
                             }
                         }
                     }
@@ -1868,7 +1901,7 @@ impl ZcryptApp {
                             // Both proofs are deferred so a bad lock is rejected before it
                             // can burn the gas.
                             s.node
-                                .precheck_lock_params(zcrypt_core::htlc_shield::EscrowKind::Swap, asset, value, timeout, stx.fee, &[])
+                                .precheck_lock_params(zcrypt_core::htlc_shield::EscrowKind::Swap, asset, value, timeout, stx.fee, true, &[])
                                 .and_then(|()| s.node.escrow_id_available(zcrypt_core::htlc_shield::EscrowKind::Swap, asset, value, &lock, timeout, &cp, &refund, &[claim_open.coin.commitment, refund_open.coin.commitment]))
                                 .and_then(|()| s.node.precheck_transfer(&stx, &gas_tx, gas_blind))
                                 .map(|()| {
@@ -2283,9 +2316,10 @@ impl ZcryptApp {
                 }
             } else if bytes.first() == Some(&HTLC_BURN_LOCK_TAG) {
                 match parse_burn_lock(&bytes[1..]) {
-                    Some((value, blind, asset, lock, timeout, refund_pk, opening, stx)) => {
+                    Some((value, blind, asset, lock, timeout, refund_pk, opening, gas, stx)) => {
+                        let gas = gas.as_ref().map(|(gb, gt)| (gt, *gb));
                         match s.node.htlc_burn_lock(
-                            chain_id, &stx, value, blind, asset, lock, timeout, refund_pk, &[], &opening,
+                            chain_id, &stx, gas, value, blind, asset, lock, timeout, refund_pk, &[], &opening,
                         ) {
                             Ok(id) => {
                                 let data =
@@ -2312,9 +2346,10 @@ impl ZcryptApp {
                 } else {
                     let btc_claim_pk = bytes[1..1 + 33].to_vec();
                     match parse_burn_lock(&bytes[1 + 33..]) {
-                        Some((value, blind, asset, lock, timeout, refund_pk, opening, stx)) => {
+                        Some((value, blind, asset, lock, timeout, refund_pk, opening, gas, stx)) => {
+                            let gas = gas.as_ref().map(|(gb, gt)| (gt, *gb));
                             match s.node.htlc_burn_lock(
-                                chain_id, &stx, value, blind, asset, lock, timeout, refund_pk,
+                                chain_id, &stx, gas, value, blind, asset, lock, timeout, refund_pk,
                                 &btc_claim_pk, &opening,
                             ) {
                                 Ok(id) => {

@@ -1165,6 +1165,10 @@ impl Node {
         &mut self,
         chain_id: &[u8],
         shield_tx: &crate::shield_tx::ShieldTx,
+        // The ZCRYPT gas note (`gas_tx`, its burn blind), the same bundle a transfer or swap
+        // lock carries. Required for every non-ZCRYPT asset: the locked asset is never the
+        // fee. A ZCRYPT lock may still pay gas as the spend's own fee (legacy form).
+        gas: Option<(&crate::shield_tx::ShieldTx, zcrypt_shield::Blind)>,
         value: u64,
         blind: zcrypt_shield::Blind,
         asset_id: u64,
@@ -1194,14 +1198,13 @@ impl Node {
             return Err("escrow value must be positive".to_string());
         }
         lock_value_ok(value)?;
-        // Anti-bypass: the lock spend must burn ≥ MIN_FEE gas (in-asset), so an escrow lock
-        // cannot be used to move value through output[1..] for free (see `bond_with_stake`).
-        if shield_tx.fee < crate::emission::MIN_FEE {
-            return Err(format!(
-                "burn-lock: spend must burn ≥ MIN_FEE ({}) gas; got {}",
-                crate::emission::MIN_FEE,
-                shield_tx.fee
-            ));
+        // Anti-bypass: every lock pays MIN_FEE of ZCRYPT gas, so an escrow lock cannot be
+        // used to move value through output[1..] for free (see `bond_with_stake`).
+        Self::burn_lock_gas_ok(asset_id, shield_tx.fee, gas.is_some())?;
+        if let Some((gas_tx, gas_blind)) = gas {
+            if gas_tx.output_commitments.first() != Some(&Self::gas_burn_coin(&gas_blind)) {
+                return Err("burn-lock: gas note output[0] is not the 0.01 ZCRYPT burn coin".to_string());
+            }
         }
         // A redeem's payout key must be a well-formed compressed secp256k1 point, or the
         // operator's watcher would lock reserve BTC to an address nobody can ever claim.
@@ -1234,9 +1237,95 @@ impl Node {
             kind, asset_id, value, &hashlock, timeout_height, &refund_pk, &refund_pk, btc_claim_pk,
             std::slice::from_ref(&refund.coin),
         );
-        // Verify + apply the shield spend (records nullifiers, appends outputs).
-        self.submit_shield_bound(chain_id, shield_tx, &envelope)?;
+        // Verify + apply the shield spend (records nullifiers, appends outputs), with its
+        // gas note when it carries one.
+        match gas {
+            Some((gas_tx, _)) => self.apply_lock_with_gas(chain_id, shield_tx, &envelope, gas_tx, "burn-lock")?,
+            None => {
+                self.submit_shield_bound(chain_id, shield_tx, &envelope)?;
+            }
+        }
         self.htlc.lock_burn(asset_id, value, hashlock, timeout_height, refund_pk, btc_claim_pk, refund.coin.clone())
+    }
+
+    /// The gas rule of a burn-lock. Gas is always ZCRYPT. A lock of ZCRYPT itself may pay it
+    /// as the spend's own in-tx fee (the legacy form) or with a gas note; a lock of any other
+    /// asset must carry the gas note and burn nothing in-asset. An in-asset fee is value the
+    /// asset's backing never gets back: a zBTC fee is reserve BTC nobody can redeem.
+    fn burn_lock_gas_ok(asset_id: u64, fee: u64, has_gas: bool) -> Result<(), String> {
+        if has_gas {
+            if fee != 0 {
+                return Err(format!("burn-lock: with a gas note the asset spend must have fee 0; got {fee}"));
+            }
+            return Ok(());
+        }
+        if asset_id != zcrypt_shield::ASSET_ZCRYPT {
+            return Err(
+                "burn-lock: a non-ZCRYPT lock must carry the 0.01 ZCRYPT gas note (the locked asset is never \
+                 the fee); update your wallet"
+                    .to_string(),
+            );
+        }
+        if fee < crate::emission::MIN_FEE {
+            return Err(format!(
+                "burn-lock: spend must burn ≥ MIN_FEE ({}) gas; got {fee}",
+                crate::emission::MIN_FEE
+            ));
+        }
+        Ok(())
+    }
+
+    /// Verify a lock's asset spend (bound to `envelope`) together with its ZCRYPT gas note
+    /// (bound to the asset spend's txbind), then apply both atomically: both proofs are checked
+    /// before either mutates state, so a bad lock never burns the gas.
+    fn apply_lock_with_gas(
+        &mut self,
+        chain_id: &[u8],
+        shield_tx: &crate::shield_tx::ShieldTx,
+        envelope: &[u8],
+        gas_tx: &crate::shield_tx::ShieldTx,
+        what: &str,
+    ) -> Result<(), String> {
+        if !self.root_is_known(&gas_tx.root) {
+            return Err(format!("{what}: gas note anchors on an unknown/expired root"));
+        }
+        if !self.root_is_known(&shield_tx.root) {
+            return Err(format!("{what}: asset spend anchors on an unknown/expired root"));
+        }
+        let gas_env = crate::shield_tx::gas_pay_envelope(&crate::shield_tx::txbind(chain_id, shield_tx));
+        let gas_nfs = crate::shield_tx::verify_bound(chain_id, gas_tx, &gas_env)?;
+        let main_nfs = crate::shield_tx::verify_bound(chain_id, shield_tx, envelope)?;
+        self.note_outputs_fresh(
+            gas_tx
+                .output_commitments
+                .iter()
+                .chain(shield_tx.output_commitments.iter())
+                .copied(),
+        )?;
+        let mut seen = std::collections::HashSet::new();
+        for nf in gas_nfs.iter().chain(main_nfs.iter()) {
+            if self.smt.contains(nf) {
+                return Err(format!("double-spend: nullifier {} already spent", hex8(nf)));
+            }
+            if !seen.insert(*nf) {
+                return Err(format!("{what}: gas note and asset spend reuse a coin"));
+            }
+        }
+        let gas_txbind = crate::shield_tx::txbind(chain_id, gas_tx);
+        let main_txbind = crate::shield_tx::txbind(chain_id, shield_tx);
+        for nf in &gas_nfs {
+            self.smt.insert(*nf, gas_txbind);
+        }
+        for nf in &main_nfs {
+            self.smt.insert(*nf, main_txbind);
+        }
+        for oc in &gas_tx.output_commitments {
+            self.append_and_record(*oc)?;
+        }
+        for oc in &shield_tx.output_commitments {
+            self.append_and_record(*oc)?;
+        }
+        Ok(())
     }
 
     /// Lock existing coins of `asset_id` into a **swap** escrow (in-pool asset↔asset). Like
@@ -1310,46 +1399,8 @@ impl Node {
             asset_id, value, &hashlock, timeout_height, &counterparty_pk, &refund_pk, &[],
             &[claim.coin.clone(), refund.coin.clone()],
         );
-        if !self.root_is_known(&gas_tx.root) {
-            return Err("swap-lock: gas note anchors on an unknown/expired root".to_string());
-        }
-        if !self.root_is_known(&shield_tx.root) {
-            return Err("swap-lock: asset spend anchors on an unknown/expired root".to_string());
-        }
         // Verify both proofs before either mutates state, so a bad lock does not burn the gas.
-        let gas_env = crate::shield_tx::gas_pay_envelope(&crate::shield_tx::txbind(chain_id, shield_tx));
-        let gas_nfs = crate::shield_tx::verify_bound(chain_id, gas_tx, &gas_env)?;
-        let main_nfs = crate::shield_tx::verify_bound(chain_id, shield_tx, &envelope)?;
-        self.note_outputs_fresh(
-            gas_tx
-                .output_commitments
-                .iter()
-                .chain(shield_tx.output_commitments.iter())
-                .copied(),
-        )?;
-        let mut seen = std::collections::HashSet::new();
-        for nf in gas_nfs.iter().chain(main_nfs.iter()) {
-            if self.smt.contains(nf) {
-                return Err(format!("double-spend: nullifier {} already spent", hex8(nf)));
-            }
-            if !seen.insert(*nf) {
-                return Err("swap-lock: gas note and asset spend reuse a coin".to_string());
-            }
-        }
-        let gas_txbind = crate::shield_tx::txbind(chain_id, gas_tx);
-        let main_txbind = crate::shield_tx::txbind(chain_id, shield_tx);
-        for nf in &gas_nfs {
-            self.smt.insert(*nf, gas_txbind);
-        }
-        for nf in &main_nfs {
-            self.smt.insert(*nf, main_txbind);
-        }
-        for oc in &gas_tx.output_commitments {
-            self.append_and_record(*oc)?;
-        }
-        for oc in &shield_tx.output_commitments {
-            self.append_and_record(*oc)?;
-        }
+        self.apply_lock_with_gas(chain_id, shield_tx, &envelope, gas_tx, "swap-lock")?;
         self.htlc.lock_swap(
             asset_id, value, hashlock, timeout_height, counterparty_pk, refund_pk,
             claim.coin.clone(), refund.coin.clone(), None,
@@ -2875,6 +2926,8 @@ impl Node {
         value: u64,
         timeout_height: u64,
         fee: u64,
+        // Whether the lock carries the ZCRYPT gas note (burn locks; a swap lock always does).
+        has_gas: bool,
         btc_claim_pk: &[u8],
     ) -> Result<(), String> {
         if !crate::asset_registry::asset_id_ok(asset_id) {
@@ -2890,12 +2943,7 @@ impl Node {
         lock_value_ok(value)?;
         match kind {
             crate::htlc_shield::EscrowKind::Burn => {
-                if fee < crate::emission::MIN_FEE {
-                    return Err(format!(
-                        "burn-lock: spend must burn ≥ MIN_FEE ({}) gas; got {fee}",
-                        crate::emission::MIN_FEE
-                    ));
-                }
+                Self::burn_lock_gas_ok(asset_id, fee, has_gas)?;
                 if !btc_claim_pk.is_empty() {
                     if btc_claim_pk.len() != 33 {
                         return Err("burn-lock: btc_claim_pk must be 33 bytes (compressed)".to_string());
@@ -3259,14 +3307,22 @@ mod tests {
         node.set_height(10);
         let asset = node.register_asset("GOLD", 8, None, 1_000_000).unwrap();
         let fee = crate::emission::MIN_FEE;
-        assert!(node.precheck_lock_params(EscrowKind::Burn, asset, 5, 100, fee, &[]).is_ok());
-        assert!(node.precheck_lock_params(EscrowKind::Burn, asset, 5, 10, fee, &[]).is_err(), "timeout not after now");
-        assert!(node.precheck_lock_params(EscrowKind::Burn, asset, 0, 100, fee, &[]).is_err(), "zero value");
-        assert!(node.precheck_lock_params(EscrowKind::Burn, asset, 5, 100, 0, &[]).is_err(), "fee below MIN_FEE");
-        assert!(node.precheck_lock_params(EscrowKind::Burn, asset, 5, 100, fee, &[1u8; 33]).is_err(), "bad payout key");
-        assert!(node.precheck_lock_params(EscrowKind::Burn, asset + 1, 5, 100, fee, &[]).is_err(), "unregistered");
-        assert!(node.precheck_lock_params(EscrowKind::Swap, asset, 5, 100, 0, &[]).is_ok());
-        assert!(node.precheck_lock_params(EscrowKind::Swap, asset, 5, 100, fee, &[]).is_err(), "swap fee must be 0");
+        let zc = zcrypt_shield::ASSET_ZCRYPT;
+        // A non-ZCRYPT lock: gas note required, in-asset fee refused.
+        assert!(node.precheck_lock_params(EscrowKind::Burn, asset, 5, 100, 0, true, &[]).is_ok());
+        assert!(node.precheck_lock_params(EscrowKind::Burn, asset, 5, 100, fee, true, &[]).is_err(), "fee must be 0 with gas");
+        assert!(node.precheck_lock_params(EscrowKind::Burn, asset, 5, 100, fee, false, &[]).is_err(), "no in-asset gas");
+        assert!(node.precheck_lock_params(EscrowKind::Burn, asset, 5, 100, 0, false, &[]).is_err(), "gas note required");
+        // A ZCRYPT lock: either form.
+        assert!(node.precheck_lock_params(EscrowKind::Burn, zc, 5, 100, fee, false, &[]).is_ok());
+        assert!(node.precheck_lock_params(EscrowKind::Burn, zc, 5, 100, 0, true, &[]).is_ok());
+        assert!(node.precheck_lock_params(EscrowKind::Burn, zc, 5, 100, 0, false, &[]).is_err(), "fee below MIN_FEE");
+        assert!(node.precheck_lock_params(EscrowKind::Burn, asset, 5, 10, 0, true, &[]).is_err(), "timeout not after now");
+        assert!(node.precheck_lock_params(EscrowKind::Burn, asset, 0, 100, 0, true, &[]).is_err(), "zero value");
+        assert!(node.precheck_lock_params(EscrowKind::Burn, asset, 5, 100, 0, true, &[1u8; 33]).is_err(), "bad payout key");
+        assert!(node.precheck_lock_params(EscrowKind::Burn, asset + 1, 5, 100, 0, true, &[]).is_err(), "unregistered");
+        assert!(node.precheck_lock_params(EscrowKind::Swap, asset, 5, 100, 0, true, &[]).is_ok());
+        assert!(node.precheck_lock_params(EscrowKind::Swap, asset, 5, 100, fee, true, &[]).is_err(), "swap fee must be 0");
     }
 
     #[test]

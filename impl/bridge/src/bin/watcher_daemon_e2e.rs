@@ -103,8 +103,10 @@ fn main() {
     let redeem_preimage = swap::fresh_preimage();
     let redeem_lock = htlc_hashlock(&redeem_preimage);
     println!("\n[user] burning {redeem_zbtc} zBTC for redeem (btc key on-chain)…");
-    let (escrow_id, _c, _b) =
-        swap::redeem_user_burn(&zc, &user, &[coin], asset, &redeem_lock, redeem_zbtc, &user_btc_key.pk).expect("burn");
+    let gas_coin = swap::seed_gas_coin(&zc, &user).expect("seed gas");
+    swap::wait_for_leaf(&zc, &gas_coin.commitment());
+    let swap::RedeemBurn { escrow_id, .. } =
+        swap::redeem_user_burn(&zc, &user, &[coin], &gas_coin, asset, &redeem_lock, redeem_zbtc, &user_btc_key.pk).expect("burn");
 
     // TICK 2: the daemon reads the on-chain btc key and locks reserve BTC autonomously.
     let r2 = run(&mut st, &zc, &operator_btc, &reserve, &shield_dest, asset);

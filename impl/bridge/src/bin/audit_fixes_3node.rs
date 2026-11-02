@@ -88,7 +88,7 @@ fn build_burn_lock_btc(
         zcrypt_core::htlc_shield::CoinOpening::create(&user.normal_address(), value, asset)?;
     let burn_blind = keys::random_blind();
     let change_blind = keys::random_blind();
-    let change = coin.value - value - FEE;
+    let change = coin.value - value;
     let burn_out: OutCoin = (value, burn_blind, BURN_PK, asset);
     let change_out: OutCoin = (change, change_blind, user.pubkey(), asset);
     let note = kem::ciphertext_to_bytes(&keys::encrypt_note_asset(&user.normal_address(), change, change_blind, asset));
@@ -104,8 +104,24 @@ fn build_burn_lock_btc(
         std::slice::from_ref(&refund_open.coin),
     );
     let stx: shield_tx::ShieldTx =
-        swap::build_shield_spend_bound(zc, &[coin], &[burn_out, change_out], FEE, vec![keys::cover_note_bytes(), note], &env)?;
-    let tx = swap::burn_lock_btc_tx(btc_pk, value, &burn_blind, asset, lock, timeout, &user.pubkey(), &stx, &refund_open);
+        swap::build_shield_spend_bound(zc, &[coin], &[burn_out, change_out], 0, vec![keys::cover_note_bytes(), note], &env)?;
+    // Gas is a ZCRYPT note bound to the zBTC spend; the zBTC spend itself burns no fee.
+    let gas_coin = swap::seed_gas_coin(zc, user)?;
+    swap::wait_for_leaf(zc, &gas_coin.commitment());
+    let gas_blind = keys::random_blind();
+    let gas_burn: OutCoin = (FEE, gas_blind, BURN_PK, zcrypt_shield::ASSET_ZCRYPT);
+    let gas_change: OutCoin = (gas_coin.value - FEE, keys::random_blind(), user.pubkey(), zcrypt_shield::ASSET_ZCRYPT);
+    let gas_tx = swap::build_shield_spend_bound(
+        zc,
+        &[gas_coin],
+        &[gas_burn, gas_change],
+        0,
+        vec![keys::cover_note_bytes(), keys::cover_note_bytes()],
+        &shield_tx::gas_pay_envelope(&shield_tx::txbind(swap::chain_id(), &stx)),
+    )?;
+    let tx = swap::burn_lock_btc_gas_tx(
+        btc_pk, value, &burn_blind, asset, lock, timeout, &user.pubkey(), &gas_blind, &gas_tx, &stx, &refund_open,
+    );
     Ok((tx, user.own_asset_coin(change, change_blind, asset)))
 }
 

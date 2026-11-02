@@ -93,8 +93,10 @@ fn main() {
 
     // USER step 1: burn the zBTC, carrying the user's BTC claim pubkey ON-CHAIN (tag 0x67).
     let h_burn = zc.height().unwrap();
-    let (escrow_id, change_value, _change_blind) =
-        swap::redeem_user_burn(&zc, &user, &[coin], asset, &redeem_lock, redeem_zbtc, &user_btc_pk).expect("burn");
+    let gas_coin = swap::seed_gas_coin(&zc, &user).expect("seed gas");
+    swap::wait_for_leaf(&zc, &gas_coin.commitment());
+    let swap::RedeemBurn { escrow_id, change_value, .. } =
+        swap::redeem_user_burn(&zc, &user, &[coin], &gas_coin, asset, &redeem_lock, redeem_zbtc, &user_btc_pk).expect("burn");
     println!("[user] burned {redeem_zbtc} zBTC into escrow {} (change {change_value}), btc key on-chain", hex::encode(escrow_id));
 
     // OPERATOR step 2: the AUTONOMOUS redeem watcher — reads the user's BTC key from the on-chain

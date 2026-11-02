@@ -3607,13 +3607,14 @@ pub fn shield_txs_in_tx(tx: &[u8]) -> Vec<shield_tx::ShieldTx> {
         }
         // bond: pk(32) stake(8) reward(32) commission(2) nonce(8) sig(64) stake_blind(64) ‖ shield
         0x57 => at(146 + zcrypt_shield::BLIND_BYTES, &mut out),
-        // burn-lock: header(184) ‖ opening ‖ shield. Pre-opening locks had the shield at 184.
+        // burn-lock: header(184) ‖ opening ‖ [gas prefix] ‖ shield. Pre-opening locks had the
+        // shield at 184; a lock of a non-ZCRYPT asset carries the ZCRYPT gas note.
         0x5D => push_lock_shield(body, 184, &mut out),
         // delegate: del_pk(32) target(20) stake(8) reward(32) sig(64) stake_blind(64) ‖ shield
         0x5F => at(156 + zcrypt_shield::BLIND_BYTES, &mut out),
         // swap-lock: header(248) ‖ claim opening ‖ refund opening ‖ gas prefix ‖ shield
         0x62 => push_swap_shields(body, &mut out),
-        // burn-lock-btc: btc key(33) ‖ header(184) ‖ opening ‖ shield
+        // burn-lock-btc: btc key(33) ‖ header(184) ‖ opening ‖ [gas prefix] ‖ shield
         0x67 => push_lock_shield(body, 33 + 184, &mut out),
         _ => {}
     }
@@ -3631,6 +3632,14 @@ fn push_lock_shield(body: &[u8], off: usize, out: &mut Vec<shield_tx::ShieldTx>)
         None => off,
     };
     if body.len() > at {
+        // Gassed form first (its change note may be ours), then the legacy bare spend.
+        if let Some((gas, main)) = parse_gas_prefix(&body[at..]) {
+            if let Some(stx) = shield_tx::from_bytes(main) {
+                out.push(gas);
+                out.push(stx);
+                return;
+            }
+        }
         if let Some(stx) = shield_tx::from_bytes(&body[at..]) {
             out.push(stx);
         }
@@ -8007,6 +8016,7 @@ fn swap_redeem_btc_impl(btc: &str, progress: &dyn Fn(u8, &str), state: &State<Ap
     if want_total == 0 {
         return Err("enter a zBTC amount to redeem".to_string());
     }
+    // Gas is 0.01 ZCRYPT from a ZCRYPT coin of this wallet; the zBTC spend burns no fee.
     let fee = zcrypt_core::emission::MIN_FEE;
     let url = node_url(state)?;
     let _op = BridgeOpGuard::enter();
@@ -8032,7 +8042,7 @@ fn swap_redeem_btc_impl(btc: &str, progress: &dyn Fn(u8, &str), state: &State<Ap
         return Err(format!("amount too large: max {} zBTC per redeem", MAX_COIN / 100_000_000));
     }
     let leaves = chain::fetch_leaves(&url)?;
-    let (idx, refund_acct, alice_key, coins, chosen, round_value, preimage, lock) = with_wallet(state, |w| {
+    let (idx, refund_acct, alice_key, coins, chosen, gas_i, gas_coin, round_value, preimage, lock) = with_wallet(state, |w| {
         let mut sel: Vec<usize> = w
             .coins
             .iter()
@@ -8049,20 +8059,22 @@ fn swap_redeem_btc_impl(btc: &str, progress: &dyn Fn(u8, &str), state: &State<Ap
                     .to_string(),
             );
         }
-        // One round spends the largest N_IN coins; it can burn up to their sum minus the fee.
+        // One round spends the largest N_IN coins; it can burn up to their sum (the gas is
+        // ZCRYPT, paid by a separate coin, so no zBTC goes to the fee).
         let chosen: Vec<usize> = sel.iter().take(zcrypt_shield::N_IN).copied().collect();
         let sum: u64 = chosen.iter().map(|&i| w.coins[i].value).sum();
-        let round_cap = sum.saturating_sub(fee);
+        let round_cap = sum;
         if round_cap < min {
             return Err(format!(
-                "your largest {} zBTC coin(s) total {:.8}, which cannot cover a {:.8}-zBTC redeem plus the {:.8} fee. \
+                "your largest {} zBTC coin(s) total {:.8}, which cannot cover a {:.8}-zBTC redeem. \
                  Shield more BTC or consolidate first.",
                 chosen.len(),
                 sum as f64 / 1e8,
                 min as f64 / 1e8,
-                fee as f64 / 1e8,
             ));
         }
+        let gas_i = pick_gas_coin(w, &leaves, &[])?;
+        let gas_coin = w.coins[gas_i].coin;
         let round_value = want_total.min(round_cap);
         let idx = w.alloc_index();
         w.note_action(idx, "redeem", "");
@@ -8094,11 +8106,11 @@ fn swap_redeem_btc_impl(btc: &str, progress: &dyn Fn(u8, &str), state: &State<Ap
         // The preimage is what claims the operator's BTC: it must be on disk BEFORE the burn.
         save_now(state, w, "redeem zBTC")?;
         let coins: Vec<Coin> = chosen.iter().map(|&i| w.coins[i].coin).collect();
-        Ok((idx, w.key_at(idx), alice_key, coins, chosen, round_value, preimage, lock))
+        Ok((idx, w.key_at(idx), alice_key, coins, chosen, gas_i, gas_coin, round_value, preimage, lock))
     })?;
     progress(10, "Burning zBTC into a redeem escrow (your Bitcoin payout key is committed on-chain)…");
-    let (escrow_id, change_value, change_blind) =
-        match bswap::redeem_user_burn(&zc, &refund_acct, &coins, asset, &lock, round_value, &alice_key.pk) {
+    let bswap::RedeemBurn { escrow_id, change_value, change_blind, gas_change_value, gas_change_blind } =
+        match bswap::redeem_user_burn(&zc, &refund_acct, &coins, &gas_coin, asset, &lock, round_value, &alice_key.pk) {
             Ok(r) => r,
             Err(e) => {
                 // H1: a broadcast error is NOT proof the burn did not commit (a timeout after
@@ -8123,15 +8135,21 @@ fn swap_redeem_btc_impl(btc: &str, progress: &dyn Fn(u8, &str), state: &State<Ap
         for &i in &chosen {
             w.coins[i].spent = true;
         }
-        // Record the change coin so an un-redeemed remainder stays spendable.
+        w.coins[gas_i].spent = true;
+        // Record the change coins so an un-redeemed remainder and the gas change stay spendable.
         if change_value > 0 {
             let change = refund_acct.own_asset_coin(change_value, change_blind, asset);
             let born = w.scan_height;
             w.coins.push(CoinRec::new(change, born));
         }
-        // L10: the burn moves `round_value` into the escrow and pays the fee separately.
+        if gas_change_value > 0 {
+            let gchange = refund_acct.own_coin(gas_change_value, gas_change_blind);
+            let born = w.scan_height;
+            w.coins.push(CoinRec::new(gchange, born));
+        }
+        // L10: the burn moves `round_value` into the escrow; the gas is ZCRYPT, booked as such.
         let hist_id = w.push_hist_id("redeem", -(round_value as i64), "zBTC→BTC (awaiting operator)".into(), asset);
-        w.push_hist("fee", -(fee as i64), "redeem fee".into(), asset);
+        w.push_hist("fee", -(fee as i64), "redeem gas".into(), zcrypt_shield::ASSET_ZCRYPT);
         if let Some(r) = w.pending_redeems.iter_mut().find(|r| r.index == idx) {
             r.escrow_id_hex = Some(hex::encode(escrow_id));
             r.hist_id = hist_id;

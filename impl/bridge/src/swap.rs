@@ -947,6 +947,47 @@ pub fn fresh_preimage() -> [u8; 32] {
     p
 }
 
+/// The body of a burn lock (the bytes after the tag): the 184-byte header, the refund
+/// opening, then the ZCRYPT gas prefix (`gas_blind ‖ gas_len ‖ gas_tx`) when the lock
+/// carries one, then the asset spend. Only a ZCRYPT lock may omit the gas note and pay gas
+/// as the spend's own fee.
+#[allow(clippy::too_many_arguments)]
+fn burn_lock_body(
+    value: u64,
+    blind: &Blind,
+    asset: u64,
+    lock: &[u8; 32],
+    timeout: u64,
+    refund_pk: &PubKey,
+    gas: Option<(&Blind, &shield_tx::ShieldTx)>,
+    stx: &shield_tx::ShieldTx,
+    refund: &zcrypt_core::htlc_shield::CoinOpening,
+) -> Vec<u8> {
+    let mut t = Vec::new();
+    t.extend_from_slice(&value.to_le_bytes());
+    for limb in blind {
+        t.extend_from_slice(&limb.to_le_bytes());
+    }
+    t.extend_from_slice(&asset.to_le_bytes());
+    t.extend_from_slice(lock);
+    t.extend_from_slice(&timeout.to_le_bytes());
+    t.extend_from_slice(&pk_bytes(refund_pk));
+    t.extend_from_slice(&refund.encode());
+    if let Some((gas_blind, gas_tx)) = gas {
+        let gas_bytes = shield_tx::to_bytes(gas_tx);
+        for limb in gas_blind {
+            t.extend_from_slice(&limb.to_le_bytes());
+        }
+        t.extend_from_slice(&(gas_bytes.len() as u32).to_le_bytes());
+        t.extend_from_slice(&gas_bytes);
+    }
+    t.extend_from_slice(&shield_tx::to_bytes(stx));
+    t
+}
+
+/// A plain `0x5D` burn lock in the legacy form: the asset spend pays gas as its own fee, which
+/// consensus accepts for a ZCRYPT lock only. Use [`burn_lock_gas_tx`] for any other asset.
+#[allow(clippy::too_many_arguments)]
 pub fn burn_lock_tx(
     value: u64,
     blind: &Blind,
@@ -958,16 +999,27 @@ pub fn burn_lock_tx(
     refund: &zcrypt_core::htlc_shield::CoinOpening,
 ) -> Vec<u8> {
     let mut t = vec![0x5Du8];
-    t.extend_from_slice(&value.to_le_bytes());
-    for limb in blind {
-        t.extend_from_slice(&limb.to_le_bytes());
-    }
-    t.extend_from_slice(&asset.to_le_bytes());
-    t.extend_from_slice(lock);
-    t.extend_from_slice(&timeout.to_le_bytes());
-    t.extend_from_slice(&pk_bytes(refund_pk));
-    t.extend_from_slice(&refund.encode());
-    t.extend_from_slice(&shield_tx::to_bytes(stx));
+    t.extend(burn_lock_body(value, blind, asset, lock, timeout, refund_pk, None, stx, refund));
+    t
+}
+
+/// A plain `0x5D` burn lock with the ZCRYPT gas note: the asset spend has fee 0 and `gas_tx`
+/// (bound to `gas_pay_envelope(txbind(stx))`) burns 0.01 ZCRYPT.
+#[allow(clippy::too_many_arguments)]
+pub fn burn_lock_gas_tx(
+    value: u64,
+    blind: &Blind,
+    asset: u64,
+    lock: &[u8; 32],
+    timeout: u64,
+    refund_pk: &PubKey,
+    gas_blind: &Blind,
+    gas_tx: &shield_tx::ShieldTx,
+    stx: &shield_tx::ShieldTx,
+    refund: &zcrypt_core::htlc_shield::CoinOpening,
+) -> Vec<u8> {
+    let mut t = vec![0x5Du8];
+    t.extend(burn_lock_body(value, blind, asset, lock, timeout, refund_pk, Some((gas_blind, gas_tx)), stx, refund));
     t
 }
 
@@ -990,9 +1042,43 @@ pub fn burn_lock_btc_tx(
     let mut t = vec![0x67u8];
     t.extend_from_slice(&btc_claim_pk.inner.serialize()); // 33 bytes, compressed secp256k1
     // The 0x5D burn-lock body (header + refund opening + shield tx), byte-identical.
-    let body = burn_lock_tx(value, blind, asset, lock, timeout, refund_pk, stx, refund);
-    t.extend_from_slice(&body[1..]);
+    t.extend(burn_lock_body(value, blind, asset, lock, timeout, refund_pk, None, stx, refund));
     t
+}
+
+/// The `0x67` redeem lock with the ZCRYPT gas note: `btc_claim_pk(33)` then the gassed
+/// `0x5D` body ([`burn_lock_gas_tx`]). This is the form a zBTC redeem must use: the zBTC
+/// spend has fee 0, so no zBTC is burned as a fee and the reserve BTC behind every zBTC
+/// stays redeemable.
+#[allow(clippy::too_many_arguments)]
+pub fn burn_lock_btc_gas_tx(
+    btc_claim_pk: &PublicKey,
+    value: u64,
+    blind: &Blind,
+    asset: u64,
+    lock: &[u8; 32],
+    timeout: u64,
+    refund_pk: &PubKey,
+    gas_blind: &Blind,
+    gas_tx: &shield_tx::ShieldTx,
+    stx: &shield_tx::ShieldTx,
+    refund: &zcrypt_core::htlc_shield::CoinOpening,
+) -> Vec<u8> {
+    let mut t = vec![0x67u8];
+    t.extend_from_slice(&btc_claim_pk.inner.serialize());
+    t.extend(burn_lock_body(value, blind, asset, lock, timeout, refund_pk, Some((gas_blind, gas_tx)), stx, refund));
+    t
+}
+
+/// A redeem burn as the user side sees it after broadcast: the escrow id, the zBTC change
+/// coin's opening and the ZCRYPT gas change coin's opening (both to `user.normal_address()`).
+#[derive(Clone, Debug)]
+pub struct RedeemBurn {
+    pub escrow_id: [u8; 32],
+    pub change_value: u64,
+    pub change_blind: Blind,
+    pub gas_change_value: u64,
+    pub gas_change_blind: Blind,
 }
 
 /// Parse a `0x67` burn-lock-with-btc-key tx body (bytes AFTER the tag) into the fields the redeem
@@ -2636,27 +2722,34 @@ pub fn resume_deposit(
 /// coin to the unspendable `BURN_PK`, output[1] = change back to the user). `hashlock` is
 /// `H(preimage)` for a preimage the USER holds. `btc_claim_pk` is the user's Bitcoin key, carried
 /// ON-CHAIN (tag 0x67) so the operator's redeem watcher pays out to a key the user themselves
-/// committed to — no off-chain trust. Returns `(escrow_id, change_value, change_blind)`.
+/// committed to — no off-chain trust. The zBTC spend has fee 0: gas is `gas_coin`, a ZCRYPT
+/// coin of `user` spent in a bundled gas note that burns 0.01 ZCRYPT (its change returns to
+/// `user.normal_address()`), so no zBTC is ever burned as a fee.
 #[allow(clippy::too_many_arguments)]
 pub fn redeem_user_burn(
     zc: &Zcrypt,
     user: &Account,
     coins: &[Coin],
+    gas_coin: &Coin,
     asset: u64,
     hashlock: &[u8; 32],
     zbtc_value: u64,
     btc_claim_pk: &PublicKey,
-) -> Result<([u8; 32], u64, Blind), String> {
+) -> Result<RedeemBurn, String> {
     if coins.is_empty() {
         return Err("no zBTC coins to redeem".to_string());
     }
+    let min_fee = zcrypt_core::emission::MIN_FEE;
+    if gas_coin.asset_id != zcrypt_shield::ASSET_ZCRYPT || gas_coin.value < min_fee {
+        return Err("the gas coin must be a ZCRYPT coin worth at least the 0.01 fee".to_string());
+    }
     let in_total: u64 = coins.iter().map(|c| c.value).sum();
-    if zbtc_value + zcrypt_core::emission::MIN_FEE > in_total {
-        return Err("lock value + fee exceeds the user's zBTC coins".to_string());
+    if zbtc_value > in_total {
+        return Err("lock value exceeds the user's zBTC coins".to_string());
     }
     let burn_blind = zcrypt_core::keys::random_blind();
     let change_blind = zcrypt_core::keys::random_blind();
-    let change_value = in_total - zbtc_value - zcrypt_core::emission::MIN_FEE;
+    let change_value = in_total - zbtc_value;
     let burn_out: OutCoin = (zbtc_value, burn_blind, zcrypt_core::htlc_shield::BURN_PK, asset);
     let change_out: OutCoin = (change_value, change_blind, user.pubkey(), asset);
     let change_note = zcrypt_core::kem::ciphertext_to_bytes(&zcrypt_core::keys::encrypt_note_asset(
@@ -2686,15 +2779,55 @@ pub fn redeem_user_burn(
         zc,
         coins,
         &[burn_out, change_out],
-        zcrypt_core::emission::MIN_FEE,
+        0,
         vec![zcrypt_core::keys::cover_note_bytes(), change_note],
         &envelope,
     )?;
-    let data = zc.broadcast(&burn_lock_btc_tx(
-        btc_claim_pk, zbtc_value, &burn_blind, asset, hashlock, zc_timeout, &user.pubkey(), &stx, &refund_open,
+    // The gas note is bound to the zBTC spend it pays for, exactly like a transfer's.
+    let gas_blind = zcrypt_core::keys::random_blind();
+    let gas_burn: OutCoin = (min_fee, gas_blind, zcrypt_core::htlc_shield::BURN_PK, zcrypt_shield::ASSET_ZCRYPT);
+    let gas_change_value = gas_coin.value - min_fee;
+    let gas_change_blind = zcrypt_core::keys::random_blind();
+    let gas_change = zcrypt_core::keys::out_coin(&user.normal_address(), gas_change_value, gas_change_blind);
+    let gas_note = zcrypt_core::kem::ciphertext_to_bytes(&zcrypt_core::keys::encrypt_note(
+        &user.normal_address(),
+        gas_change_value,
+        gas_change_blind,
+    ));
+    let gas_tx = build_shield_spend_bound(
+        zc,
+        std::slice::from_ref(gas_coin),
+        &[gas_burn, gas_change],
+        0,
+        vec![zcrypt_core::keys::cover_note_bytes(), gas_note],
+        &shield_tx::gas_pay_envelope(&shield_tx::txbind(chain_id(), &stx)),
+    )?;
+    let data = zc.broadcast(&burn_lock_btc_gas_tx(
+        btc_claim_pk, zbtc_value, &burn_blind, asset, hashlock, zc_timeout, &user.pubkey(), &gas_blind, &gas_tx, &stx,
+        &refund_open,
     ))?;
     let escrow_id = escrow_id_from(&data)?;
-    Ok((escrow_id, change_value, change_blind))
+    Ok(RedeemBurn { escrow_id, change_value, change_blind, gas_change_value, gas_change_blind })
+}
+
+/// Devnet helper for the e2e drivers: seed a ZCRYPT gas coin for `owner` through the `0x56`
+/// seed tx and return it (spendable once the seed is in a block).
+pub fn seed_gas_coin(zc: &Zcrypt, owner: &Account) -> Result<Coin, String> {
+    let c = owner.own_coin(zcrypt_core::emission::MIN_FEE * 2, zcrypt_core::keys::random_blind());
+    zc.broadcast(&seed_tx(&c.commitment()))?;
+    Ok(c)
+}
+
+/// Devnet helper for the e2e drivers: block until `c` is a committed leaf (a seed or change
+/// coin is spendable only once it is in the tree), giving up after about a minute.
+pub fn wait_for_leaf(zc: &Zcrypt, c: &Commitment) {
+    for _ in 0..120 {
+        if zc.leaves().map(|l| l.contains(c)).unwrap_or(false) {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+    eprintln!("wait_for_leaf: {c:?} never appeared in the commitment tree");
 }
 
 /// OPERATOR side, step 2 of a redeem: lock RESERVE BTC into an HTLC the user can claim with the

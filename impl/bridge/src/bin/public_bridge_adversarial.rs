@@ -113,7 +113,9 @@ fn main() {
     swap::wait_for_maturity(&zc, &user_btc, Some(&|n| user_btc.mine(n)), 6).unwrap();
     let redeem_zbtc = 5_000_000u64;
     let redeem_lock = htlc_hashlock(&swap::fresh_preimage());
-    let (escrow_id, _c, _b) = swap::redeem_user_burn(&zc, &user, &[coin], asset, &redeem_lock, redeem_zbtc, &user_btc_key.pk).expect("burn");
+    let gas_coin = swap::seed_gas_coin(&zc, &user).expect("seed gas");
+    swap::wait_for_leaf(&zc, &gas_coin.commitment());
+    let swap::RedeemBurn { escrow_id, .. } = swap::redeem_user_burn(&zc, &user, &[coin], &gas_coin, asset, &redeem_lock, redeem_zbtc, &user_btc_key.pk).expect("burn");
 
     // ========================================================================
     // ATTACK 3 — redeem VALUE mismatch. Ask the operator to release MORE BTC than the burn.
