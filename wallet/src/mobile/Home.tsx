@@ -128,7 +128,7 @@ export default function Home({ refreshTick, onSend, onReceive }: { refreshTick: 
         </div>
         <div className="m-hero-foot">
           <span className={`m-dot ${node?.connected ? "" : "off"}`} />
-          {node === null ? "Connecting…" : node.connected ? `Synced · block ${node.height.toLocaleString()}` : "Node unreachable"}
+          {node === null ? "Connecting…" : node.connected ? `Synced · block ${node.height.toLocaleString()}` : "Offline · last synced balance"}
           <span style={{ marginLeft: "auto" }}>{coins} coin{coins === 1 ? "" : "s"}</span>
         </div>
       </div>

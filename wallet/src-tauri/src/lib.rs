@@ -450,6 +450,9 @@ struct Wallet {
     /// Fresh random seeds for stealth sub-accounts — NOT derived from the mnemonic,
     /// so stealth funds are recoverable only from this store (or a separate backup).
     stealth_seeds: Vec<[u8; 32]>,
+    /// Ticker and decimals of every asset this wallet has held, as last read from the
+    /// chain registry, so an offline wallet still names its balances.
+    asset_meta: std::collections::BTreeMap<u64, (String, u8)>,
     clock: u64,
     scan_height: i64,
     /// The chain GENERATION this coin store belongs to (`chain::chain_tag`). When the
@@ -492,6 +495,7 @@ impl Wallet {
             next_stealth: 0,
             next_change: 0,
             stealth_seeds: vec![],
+            asset_meta: Default::default(),
             clock: 0,
             scan_height: 0,
             chain_tag: String::new(),
@@ -810,6 +814,8 @@ struct PersistState {
     next_change: u32,
     #[serde(default)]
     stealth_seeds: Vec<[u8; 32]>,
+    #[serde(default)]
+    asset_meta: std::collections::BTreeMap<u64, (String, u8)>,
     clock: u64,
     /// Chain generation this store belongs to (see [`Wallet::chain_tag`]).
     #[serde(default)]
@@ -868,6 +874,7 @@ fn save_state(w: &Wallet, dir: &str) -> Result<(), String> {
         next_stealth: w.next_stealth,
         next_change: w.next_change,
         stealth_seeds: w.stealth_seeds.clone(),
+        asset_meta: w.asset_meta.clone(),
         clock: w.clock,
         chain_tag: w.chain_tag.clone(),
         action_keys: w.action_keys.clone(),
@@ -939,6 +946,7 @@ fn load_state(w: &mut Wallet, dir: &str) {
     w.next_stealth = ps.next_stealth;
     w.next_change = ps.next_change;
     w.stealth_seeds = ps.stealth_seeds;
+    w.asset_meta = ps.asset_meta;
     w.clock = ps.clock;
     w.chain_tag = ps.chain_tag;
     w.action_keys = ps.action_keys;
@@ -5868,26 +5876,53 @@ struct HeldAsset {
 #[tauri::command]
 async fn held_assets(state: State<'_, AppState>) -> R<Vec<HeldAsset>> {
     let url = node_url(&state)?;
-    let leaves = chain::fetch_leaves(&url).unwrap_or_default();
+    // Offline (airplane mode, node down): the balance is the last CONFIRMED state, every
+    // unspent coin this wallet has already observed as a leaf. Only with the live tree in
+    // hand are coins that have not landed yet left out.
+    let leaves = chain::fetch_leaves(&url).ok();
     let mut bal: std::collections::BTreeMap<u64, u64> = std::collections::BTreeMap::new();
     bal.insert(zcrypt_shield::ASSET_ZCRYPT, 0);
     {
         let g = state.wallet.lock().unwrap();
         let w = g.as_ref().ok_or("locked")?;
         for c in w.coins.iter().filter(|c| !c.spent) {
-            if chain::find_index(&leaves, &c.coin.commitment()).is_some() {
+            let on_chain = match &leaves {
+                Some(l) => chain::find_index(l, &c.coin.commitment()).is_some(),
+                None => c.leaf_index.is_some(),
+            };
+            if on_chain {
                 *bal.entry(c.coin.asset_id).or_insert(0) += c.value;
             }
         }
     }
     let mut out = Vec::new();
+    let mut learned: Vec<(u64, (String, u8))> = Vec::new();
     for (asset_id, balance) in bal {
         let (ticker, decimals) = if asset_id == zcrypt_shield::ASSET_ZCRYPT {
             ("ZCRYPT".to_string(), 6)
         } else {
-            chain::asset_meta(&url, asset_id).unwrap_or_else(|| (format!("asset#{asset_id}"), 8))
+            let cached = state.wallet.lock().unwrap().as_ref().and_then(|w| w.asset_meta.get(&asset_id).cloned());
+            match cached {
+                Some(m) => m,
+                None => match chain::asset_meta(&url, asset_id) {
+                    Some(m) => {
+                        learned.push((asset_id, m.clone()));
+                        m
+                    }
+                    None => (format!("asset#{asset_id}"), 8),
+                },
+            }
         };
         out.push(HeldAsset { asset_id, ticker, decimals, balance });
+    }
+    if !learned.is_empty() {
+        // Remember the registry's answer so the next offline start still names the asset.
+        let _ = with_wallet(&state, |w| {
+            for (id, m) in learned {
+                w.asset_meta.insert(id, m);
+            }
+            Ok(())
+        });
     }
     ok(out)
 }
