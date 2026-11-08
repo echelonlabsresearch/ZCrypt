@@ -1,4 +1,4 @@
-# Local compose interpolation vars (e.g. ZCRYPT_FOUNDATION_ADDR for the validator).
-# Keep the machine-specific foundation address out of git; commit validator.env.example instead.
+# Local compose interpolation vars (foundation .env, and chain/validator/.env).
+# Keep secrets out of git. The validator example is validator/.env.example.
 .env
 .env.bak

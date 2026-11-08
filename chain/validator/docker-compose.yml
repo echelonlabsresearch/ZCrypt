@@ -1,0 +1,64 @@
+# Mainnet validator. From this directory:
+#
+#   cp .env.example .env
+#   # .env is one line, copied from the wallet before the first start:
+#   # VALIDATOR_KEY=...
+#   docker compose up -d
+#
+# The first start compiles the node from this checkout. Chain id, seed, and ports
+# below are the public mainnet. Nothing else is set in .env.
+
+services:
+  validator-abci:
+    image: zcrypt-abci:local
+    build:
+      context: ../..
+      dockerfile: chain/docker/Dockerfile
+      args:
+        # Empty is production. Do not set the devnet feature on mainnet.
+        ABCI_FEATURES: ""
+    container_name: zcrypt-validator-abci
+    restart: unless-stopped
+    environment:
+      ABCI_PORT: "26658"
+      ZCRYPT_STATE_DB: /data/zcrypt-state.db
+      ZCRYPT_STATE_FILE: /data/zcrypt-state.bin
+      ZCRYPT_BACKUP_EVERY: "1000"
+      ZCRYPT_VESTING_ACCEL: "1"
+      # Bitcoin SPV checkpoint and the zBTC reserve key come from the genesis
+      # this node downloads. A validator does not set them.
+    volumes:
+      - validator-abci-data:/data
+    networks: [vnet]
+
+  validator-cometbft:
+    image: cometbft/cometbft:v0.38.17
+    container_name: zcrypt-validator-cometbft
+    restart: unless-stopped
+    depends_on:
+      - validator-abci
+    environment:
+      CHAIN_ID: zcrypt-1
+      ABCI_ADDR: tcp://validator-abci:26658
+      SEED_RPC: https://rpc.zcrypt.network
+      SEED_P2P_HOST: rpc.zcrypt.network
+      SEED_P2P_PORT: "26656"
+      RPC_CORS_ORIGINS: "[]"
+      # Base64 of priv_validator_key.json, from the wallet. The only .env line.
+      VALIDATOR_KEY: ${VALIDATOR_KEY:-}
+    entrypoint: ["/bin/sh", "/entrypoint.sh"]
+    volumes:
+      - ../docker/validator-entrypoint.sh:/entrypoint.sh:ro
+      - validator-cometbft-data:/cometbft
+    ports:
+      - "127.0.0.1:56657:26657"
+      - "56656:26656"
+    networks: [vnet]
+
+volumes:
+  validator-abci-data:
+  validator-cometbft-data:
+
+networks:
+  vnet:
+    driver: bridge

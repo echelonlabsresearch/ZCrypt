@@ -348,9 +348,9 @@ export default function Rewards({
                     <b>Run a node with this identity</b>
                   </div>
                   <div style={{ fontSize: "0.78rem", opacity: 0.8, margin: "0.4rem 0" }}>
-                    On any machine with Docker: clone the repo, copy <code>chain/validator.env.example</code> to{" "}
-                    <code>.env</code>, paste the line below into it, then{" "}
-                    <code>docker compose -f docker-compose.validator.yml up -d</code>. The line is the node's signing key:
+                    On any machine with Docker: clone the repo, <code>cd chain/validator</code>, copy{" "}
+                    <code>.env.example</code> to <code>.env</code>, paste the line below into it, then{" "}
+                    <code>docker compose up -d</code>. The line is the node's signing key:
                     it goes in <b>before the first start</b>, and the file stays private. A node already running with its
                     own key must be stopped, its volume removed, and started again with the line in place.
                   </div>

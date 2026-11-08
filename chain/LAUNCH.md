@@ -255,13 +255,9 @@ To launch one later, with the chain running:
 A foundation-minted asset is a custodial peg: whoever runs it holds the ETH, SOL or gold
 behind it. Set the max supply to what is actually backed, and say so publicly.
 
-### Validator image provenance
+### Joining validators
 
-Validators run the image by DIGEST, signed with cosign by the "Publish ABCI image"
-workflow (`.github/workflows/image.yml`). After each release: take the digest from the
-workflow summary, verify its signature (`chain/README-validator.md`), and commit it into
-`chain/docker-compose.validator.yml`. Also publish the genesis fingerprint printed by the
-foundation entrypoint (`genesis.sha256`) so validators can set `GENESIS_SHA256`.
+A joining validator builds the node from its checkout. `chain/validator/docker-compose.yml` already has the mainnet chain id, seed, and ports. The operator puts `VALIDATOR_KEY` in `chain/validator/.env` and runs `docker compose up`. The image workflow still publishes a signed ABCI image; the validator compose file does not pull it.
 
 ### Fee model (unchanged decision)
 

@@ -1,13 +1,12 @@
-# Publish the validator/foundation ABCI image, by DIGEST, signed with cosign (keyless,
-# GitHub OIDC). Validators pin the digest in docker-compose.validator.yml and verify the
-# signature before trusting it (chain/README-validator.md "Verify the image").
+# Publish the ABCI image, signed with cosign (keyless, GitHub OIDC).
+# A joining validator does not pull it. chain/validator/docker-compose.yml builds
+# the checkout; its .env is only VALIDATOR_KEY.
 #
 # Runs on release tags (v*), on the testnet and mainnet branches when the node or
-# image definition changes, and on demand. Both images are the production ABCI
+# image definition changes, and on demand. The image is the production ABCI
 # binary (no devnet features). The testnet branch tags :testnet, which is mainnet
 # code that has not shipped yet. The mainnet branch tags :mainnet. A v* tag also
-# publishes an immutable digest; pin that in .env as ZCRYPT_ABCI_IMAGE after the
-# job summary prints it. The Dockerfile uses a date-pinned nightly and --locked.
+# publishes an immutable digest. The Dockerfile uses a date-pinned nightly and --locked.
 name: Publish ABCI image
 
 on:
@@ -17,7 +16,7 @@ on:
     paths:
       - "impl/**"
       - "chain/docker/**"
-      - "chain/docker-compose.validator.yml"
+      - "chain/validator/docker-compose.yml"
       - ".github/workflows/image.yml"
   workflow_dispatch:
     inputs:
@@ -27,8 +26,8 @@ on:
         default: ""
 
 env:
-  # Change the owner here (and in docker-compose.validator.yml) if the image lives under
-  # the zcryptnetwork org rather than the repository owner.
+  # Change the owner here if the image lives under the zcryptnetwork org
+  # rather than the repository owner.
   IMAGE: ghcr.io/${{ github.repository_owner }}/zcrypt-abci
 
 permissions:

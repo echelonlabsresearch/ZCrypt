@@ -112,11 +112,11 @@ validators are the bootstrap quorum; new validators join dynamically on top.
 
 On the public chain, the node's consensus identity comes from the wallet. In the wallet
 open **Rewards, Run a validator, Node setup** and click **Copy the .env line**; put that
-`VALIDATOR_KEY=...` line in a `.env` next to `chain/docker-compose.validator.yml`
-**before the node's first start**, then `docker compose -f docker-compose.validator.yml
-up -d`. The entrypoint installs the line as `priv_validator_key.json`, downloads the
-genesis from the foundation RPC, discovers a seed peer and syncs (details, genesis-hash
-pinning and image verification: [`chain/README-validator.md`](chain/README-validator.md)).
+`VALIDATOR_KEY=...` line in `chain/validator/.env`
+**before the node's first start**, then `docker compose up -d` from that directory.
+Mainnet chain id, seed, and ports are already in that file. `.env` is only the key. The entrypoint
+installs the key, downloads the genesis, and syncs
+([`chain/README-validator.md`](chain/README-validator.md)).
 
 On a local 3-node devnet you can instead add a 4th service to `docker-compose.3node.yml`
 (copy a `cometbftN`/`abciN` pair, give it a fresh volume + `NODE_INDEX` + published
@@ -276,7 +276,7 @@ impl/                     Rust workspace
   cli/                    reference CLI demo
 chain/                    Docker consensus stacks
   docker-compose.yml            foundation node (raw RPC 127.0.0.1:36657, Caddy edge)
-  docker-compose.validator.yml  plug-and-play validator (digest-pinned image)
+  validator/docker-compose.yml  joining validator (`docker compose up`; .env is the key)
   e2e/docker-compose.3node.yml  3-validator devnet (RPC 46657/46667/46677)
   docker/                       Dockerfile(s) + CometBFT entrypoints + Caddyfile
   e2e/run-all.sh                full live end-to-end
