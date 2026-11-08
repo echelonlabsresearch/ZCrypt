@@ -612,8 +612,8 @@ impl HeaderChain {
         // honest relayer produces). Consensus itself accepts any set of headers that link
         // to known ones, but there is no reason to admit branchy batches.
         let mut prev_hash: Option<[u8; 32]> = None;
-        for chunk in bytes.chunks_exact(80) {
-            let raw: [u8; 80] = chunk.try_into().unwrap();
+        for raw in bytes.as_chunks::<80>().0 {
+            let raw = *raw;
             let hdr: Header = deserialize(&raw).map_err(|e| format!("bad header: {e}"))?;
             if let Some(p) = prev_hash {
                 if hdr.prev_blockhash.to_byte_array() != p {
@@ -662,8 +662,8 @@ impl HeaderChain {
         }
         let mut overlay: BTreeMap<[u8; 32], Entry> = BTreeMap::new();
         let mut out = Vec::new();
-        for chunk in bytes.chunks_exact(80) {
-            let raw: [u8; 80] = chunk.try_into().unwrap();
+        for raw in bytes.as_chunks::<80>().0 {
+            let raw = *raw;
             let header: Header = deserialize(&raw).map_err(|e| format!("bad header: {e}"))?;
             let hash = header.block_hash().to_byte_array();
             if self.index.contains_key(&hash) || overlay.contains_key(&hash) {
