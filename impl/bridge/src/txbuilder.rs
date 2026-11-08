@@ -56,7 +56,7 @@ fn input_cost(fee_rate_sat_vb: f64) -> u64 {
 fn spendable(utxos: &[WalletUtxo], fee_rate_sat_vb: f64) -> Vec<&WalletUtxo> {
     let floor = input_cost(fee_rate_sat_vb);
     let mut avail: Vec<&WalletUtxo> = utxos.iter().filter(|u| u.utxo.confirmed && u.utxo.value > floor).collect();
-    avail.sort_by(|a, b| b.utxo.value.cmp(&a.utxo.value));
+    avail.sort_by_key(|a| std::cmp::Reverse(a.utxo.value));
     avail
 }
 
