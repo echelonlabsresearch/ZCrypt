@@ -126,12 +126,12 @@ block 0. At this point it is a **syncing full node** — it doesn't yet produce 
 
 ### 3. Bond → pledge stake → become a block producer
 
-A **BOND (`0x57`)** transaction must be signed by the node's ed25519 **consensus key**
-(the first 32 bytes of its `priv_validator_key.json`). With the wallet-owned key from
-step 2 the wallet holds that key, so bonding is a button: **Rewards, Run a validator,
-Bond**. Only when the node generated its own key does the wallet not have it; then the
-wallet prepares the bond and the validator host signs it with `bond_validator sign`
-(chain/README-validator.md, section 3). Bonding **genuinely pledges your
+A **BOND (`0x57`)** transaction must be signed by the node's ed25519 **consensus key**.
+With the wallet key from step 2, the wallet holds that key, so bonding is a button:
+**Rewards, Run a validator, Bond**. There is no host command and no signature to paste
+back. If the node was started without `VALIDATOR_KEY`, it has a different key; stop it
+with `docker compose down -v`, put the wallet line in `.env`, start again, and click
+Bond. Bonding **genuinely pledges your
 coins**: the tx carries a shield spend that burns ≥ 10,000 ZCRYPT into an unspendable
 burn coin, so the stake is real, locked value — not a self-declared number. It also
 names a reward address. On the next block the ABCI app emits the `ValidatorUpdate` and
