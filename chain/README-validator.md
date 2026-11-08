@@ -16,8 +16,11 @@ docker logs -f zcrypt-validator-cometbft                  # watch it fetch genes
 
 `validator-up.sh` is the out-of-the-box start. A fresh Ubuntu box has the old
 `docker-compose` v1 program, which rejects this file, and often has no `docker compose`
-plugin. The script installs Compose v2, pulls `ghcr.io/echelonlabsresearch/zcrypt-abci:testnet`,
-and builds from this checkout only if that pull fails. Do not run `docker-compose up` yourself.
+plugin. The script installs Compose v2, then pulls the ABCI image for the branch you
+have checked out. On `testnet` that tag is `:testnet`: the same mainnet program, built
+from the commit you are testing, not a different chain. On `mainnet` the tag is
+`:mainnet`. If the pull fails, the script builds this checkout. Do not run
+`docker-compose up` yourself.
 
 The node installs the identity from your `.env` (section 2) or generates one, **downloads
 the genesis** and **discovers the seed peer** automatically, and syncs. You never touch the genesis file. It is now a full node;
@@ -30,10 +33,11 @@ Two things worth doing before you trust it with a bond:
   `config/genesis.sha256`). Put it in a `.env` next to the compose file as
   `GENESIS_SHA256=<64 hex>`: the entrypoint then refuses to start on any genesis whose
   hash differs, so a poisoned download cannot put you on a fork.
-* **Verify the image.** The testnet image is the moving tag
-  `ghcr.io/echelonlabsresearch/zcrypt-abci:testnet`, signed by the image workflow on the
-  `testnet` branch. A release tag also publishes an immutable digest. Check the signature
-  once, from any machine with `cosign` installed:
+* **Verify the image.** Both tags are the production binary. `:testnet` is the build of
+  the `testnet` branch (mainnet code that has not shipped). `:mainnet` is the build of
+  the `mainnet` branch. A release tag also publishes an immutable digest. Check the
+  signature once. For the branch you are testing, use `testnet` in both places below;
+  for the shipped branch, use `mainnet`.
 
   ```sh
   cosign verify ghcr.io/echelonlabsresearch/zcrypt-abci:testnet \
@@ -54,10 +58,10 @@ RPC, and the genesis carries the foundation address in its `app_state`, so a dow
 genesis fully describes the chain.
 
 > Foundation operator, one-time: keep the HTTPS RPC edge (`rpc.zcrypt.network`, Caddy)
-> and P2P (26656) reachable, and publish `genesis.sha256`. A push to `testnet` that
-> changes the node publishes `ghcr.io/echelonlabsresearch/zcrypt-abci:testnet`. Those
-> defaults are what make a download "just work". Optionally host a static `genesis.json`
-> and set `GENESIS_URL`.
+> and P2P (26656) reachable, and publish `genesis.sha256`. A push to the `testnet`
+> branch that changes the node publishes `:testnet`. A push to the `mainnet` branch
+> publishes `:mainnet`. Both are the production binary. Optionally host a static
+> `genesis.json` and set `GENESIS_URL`.
 
 ## 2. The validator identity comes from your wallet
 

@@ -2,17 +2,18 @@
 # GitHub OIDC). Validators pin the digest in docker-compose.validator.yml and verify the
 # signature before trusting it (chain/README-validator.md "Verify the image").
 #
-# Runs on release tags (v*), on testnet and main when the node or image definition
-# changes, and on demand. testnet pushes tag the image :testnet, which
-# docker-compose.validator.yml pulls. A v* tag also publishes an immutable digest;
-# pin that in .env as ZCRYPT_ABCI_IMAGE after the job summary prints it. The
-# Dockerfile uses a date-pinned nightly and --locked.
+# Runs on release tags (v*), on the testnet and mainnet branches when the node or
+# image definition changes, and on demand. Both images are the production ABCI
+# binary (no devnet features). The testnet branch tags :testnet, which is mainnet
+# code that has not shipped yet. The mainnet branch tags :mainnet. A v* tag also
+# publishes an immutable digest; pin that in .env as ZCRYPT_ABCI_IMAGE after the
+# job summary prints it. The Dockerfile uses a date-pinned nightly and --locked.
 name: Publish ABCI image
 
 on:
   push:
     tags: ["v*"]
-    branches: ["testnet", "main"]
+    branches: ["testnet", "mainnet"]
     paths:
       - "impl/**"
       - "chain/docker/**"

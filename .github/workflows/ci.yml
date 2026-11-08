@@ -9,9 +9,10 @@
 #     lockfiles, npm audit on the wallet frontend;
 #   * the wallet frontend build + backend tests.
 # The live 3-node job is in this same workflow. It builds Docker images and real STARK
-# proofs, so it runs on testnet, on main, on a pull request into main, nightly at
-# 06:00 UTC, or when someone starts the workflow by hand. A pull request into main
-# must come from the testnet branch; the gate job fails any other head.
+# proofs, so it runs on the testnet branch, on the mainnet branch, on a pull
+# request into mainnet, nightly at 06:00 UTC, or when someone starts the workflow
+# by hand. The testnet branch is mainnet code that has not shipped yet. A pull
+# request into mainnet must come from that branch; the gate job fails any other head.
 # Every cargo invocation is --locked: Cargo.lock is authoritative. Actions are pinned by
 # commit SHA (the tag is in the comment) so a moved tag cannot change what runs.
 # Publishing the ABCI image is not a test; that stays in image.yml.
@@ -190,9 +191,9 @@ jobs:
         working-directory: wallet/src-tauri
         run: cargo test --locked
 
-  main-from-testnet:
-    name: Only testnet merges to main
-    if: github.event_name == 'pull_request' && github.base_ref == 'main'
+  mainnet-from-testnet:
+    name: Only testnet merges to mainnet
+    if: github.event_name == 'pull_request' && github.base_ref == 'mainnet'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -201,18 +202,19 @@ jobs:
           HEAD: ${{ github.head_ref }}
         run: |
           if [ "$HEAD" != "testnet" ]; then
-            echo "Pull requests into main must come from the testnet branch (this one is '$HEAD')."
+            echo "Pull requests into mainnet must come from the testnet branch (this one is '$HEAD')."
+            echo "That branch is mainnet code which has not shipped yet. It is not a separate chain."
             exit 1
           fi
 
   live-e2e:
     name: 3-node network + all live drivers
-    # testnet and main, a pull request into main, the nightly schedule, and a manual run.
+    # The testnet branch, the mainnet branch, a pull request into mainnet, the nightly, or a manual run.
     if: >-
       github.event_name == 'schedule' ||
       github.event_name == 'workflow_dispatch' ||
-      (github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/testnet')) ||
-      (github.event_name == 'pull_request' && github.base_ref == 'main')
+      (github.event_name == 'push' && (github.ref == 'refs/heads/mainnet' || github.ref == 'refs/heads/testnet')) ||
+      (github.event_name == 'pull_request' && github.base_ref == 'mainnet')
     runs-on: ubuntu-latest
     timeout-minutes: 120
     steps:

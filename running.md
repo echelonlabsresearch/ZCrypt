@@ -12,13 +12,13 @@ Everything runs in Docker — you only need:
 Building the **wallet** from source additionally needs Node.js 20+ and the Rust nightly
 pinned in `rust-toolchain.toml`.
 
-## How a change reaches main
+## How a change reaches the mainnet branch
 
-Work lands on the `testnet` branch. CI runs there, including the 3-node live test.
-Open a pull request from `testnet` into `main` only. GitHub will not merge it until
-that CI is green, and it rejects a pull request that comes from any other branch.
-Merging runs the same CI again on `main`. Main stays the branch you ship from; it is
-green only after that second run passes.
+`testnet` is a git branch, not a second network. The code on it is mainnet code that
+has not shipped yet. CI runs there, including the 3-node test, and you run that same
+code against the live chain. When it works, open a pull request from `testnet` into
+`mainnet`. GitHub merges it only when that CI is green, and only from `testnet`.
+The merge runs the same CI again on `mainnet`. `mainnet` is the branch you ship.
 
 ---
 

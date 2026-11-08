@@ -12,11 +12,12 @@
 # The defaults below point at the public foundation. To join a DIFFERENT chain (e.g. a
 # local test foundation), drop a `.env` next to this file overriding GENESIS_URL / SEED_*.
 #
-# Supply chain: testnet pulls ghcr.io/echelonlabsresearch/zcrypt-abci:testnet, published
-# by .github/workflows/image.yml. A release tag also publishes a digest; pin it with
-# ZCRYPT_ABCI_IMAGE in .env after you verify the cosign signature (README-validator.md).
-# If the repository moves to another GitHub org, change the owner here, in
-# README-validator.md and in image.yml.
+# Supply chain: this file pulls the shipped image, ghcr.io/echelonlabsresearch/zcrypt-abci:mainnet.
+# The testnet branch is the same mainnet program before it has shipped. validator-up.sh
+# selects the :testnet tag while you are on that branch. A release tag also publishes a
+# digest; pin it with ZCRYPT_ABCI_IMAGE in .env after you verify the cosign signature
+# (README-validator.md). If the repository moves to another GitHub org, change the owner
+# here, in README-validator.md and in image.yml.
 
 name: zcrypt-validator
 
@@ -24,11 +25,10 @@ services:
   # This validator's own ABCI state machine. The foundation address (and everything else)
   # comes from the downloaded genesis, so there is nothing to configure here.
   validator-abci:
-    # The testnet branch publishes ghcr.io/<owner>/zcrypt-abci:testnet. A release tag
-    # publishes a digest; pin that by setting ZCRYPT_ABCI_IMAGE in .env. There is no
-    # `build:` here: a digest cannot be a build tag, and `up` must pull. Source builds
-    # go through validator-up.sh, which adds docker-compose.validator.build.yml.
-    image: ${ZCRYPT_ABCI_IMAGE:-ghcr.io/echelonlabsresearch/zcrypt-abci:testnet}
+    # Shipped image. validator-up.sh overrides this with :testnet on the testnet branch
+    # (mainnet code that has not shipped). No `build:` here: a digest cannot be a build
+    # tag, and `up` must pull. Source builds go through validator-up.sh.
+    image: ${ZCRYPT_ABCI_IMAGE:-ghcr.io/echelonlabsresearch/zcrypt-abci:mainnet}
     pull_policy: always
     container_name: zcrypt-validator-abci
     restart: unless-stopped
