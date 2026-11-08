@@ -9,10 +9,11 @@
 #     lockfiles, npm audit on the wallet frontend;
 #   * the wallet frontend build + backend tests.
 # The live 3-node job is in this same workflow. It builds Docker images and real STARK
-# proofs, so it runs on the testnet branch, on the mainnet branch, on a pull
-# request into mainnet, nightly at 06:00 UTC, or when someone starts the workflow
-# by hand. The testnet branch is mainnet code that has not shipped yet. A pull
-# request into mainnet must come from that branch; the gate job fails any other head.
+# proofs, so it runs on a push to testnet or mainnet, on a pull request into either
+# branch, nightly at 06:00 UTC, or when someone starts the workflow by hand. A pull
+# request into testnet is where new code is tested. A pull request into mainnet must
+# come from that branch; the gate job fails any other head. Merging re-runs the same
+# tests on mainnet.
 # Every cargo invocation is --locked: Cargo.lock is authoritative. Actions are pinned by
 # commit SHA (the tag is in the comment) so a moved tag cannot change what runs.
 # Publishing the ABCI image is not a test; that stays in image.yml.
@@ -209,12 +210,12 @@ jobs:
 
   live-e2e:
     name: 3-node network + all live drivers
-    # The testnet branch, the mainnet branch, a pull request into mainnet, the nightly, or a manual run.
+    # Push to testnet or mainnet, a pull request into either, the nightly, or a manual run.
     if: >-
       github.event_name == 'schedule' ||
       github.event_name == 'workflow_dispatch' ||
       (github.event_name == 'push' && (github.ref == 'refs/heads/mainnet' || github.ref == 'refs/heads/testnet')) ||
-      (github.event_name == 'pull_request' && github.base_ref == 'mainnet')
+      (github.event_name == 'pull_request' && (github.base_ref == 'mainnet' || github.base_ref == 'testnet'))
     runs-on: ubuntu-latest
     timeout-minutes: 120
     steps:
