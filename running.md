@@ -9,8 +9,16 @@ Everything runs in Docker — you only need:
 - **Docker** + **Docker Compose v2** (`docker compose …`)
 - a few minutes on first build (the image compiles the Plonky3 prover from source)
 
-Building the **wallet** from source additionally needs Node.js 20+ and a Rust nightly
-toolchain (auto-selected via `rust-toolchain.toml`).
+Building the **wallet** from source additionally needs Node.js 20+ and the Rust nightly
+pinned in `rust-toolchain.toml`.
+
+## How a change reaches main
+
+Work lands on the `testnet` branch. CI runs there, including the 3-node live test.
+Open a pull request from `testnet` into `main` only. GitHub will not merge it until
+that CI is green, and it rejects a pull request that comes from any other branch.
+Merging runs the same CI again on `main`. Main stays the branch you ship from; it is
+green only after that second run passes.
 
 ---
 

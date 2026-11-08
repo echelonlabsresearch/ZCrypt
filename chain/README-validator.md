@@ -6,12 +6,18 @@ runs a **validator** that joins the chain. (Test stacks live in `e2e/`.) The who
 
 ## 1. Start the validator
 
-Download `docker-compose.validator.yml` and run:
+From a checkout of this repo, on the validator machine:
 
 ```sh
-docker compose -f docker-compose.validator.yml up -d      # joins + syncs, zero config
+cd chain
+./validator-up.sh
 docker logs -f zcrypt-validator-cometbft                  # watch it fetch genesis, dial the seed, sync
 ```
+
+`validator-up.sh` is the out-of-the-box start. A fresh Ubuntu box has the old
+`docker-compose` v1 program, which rejects this file, and often has no `docker compose`
+plugin. The script installs Compose v2, pulls `ghcr.io/echelonlabsresearch/zcrypt-abci:testnet`,
+and builds from this checkout only if that pull fails. Do not run `docker-compose up` yourself.
 
 The node installs the identity from your `.env` (section 2) or generates one, **downloads
 the genesis** and **discovers the seed peer** automatically, and syncs. You never touch the genesis file. It is now a full node;
@@ -24,21 +30,20 @@ Two things worth doing before you trust it with a bond:
   `config/genesis.sha256`). Put it in a `.env` next to the compose file as
   `GENESIS_SHA256=<64 hex>`: the entrypoint then refuses to start on any genesis whose
   hash differs, so a poisoned download cannot put you on a fork.
-* **Verify the image.** The compose file references the ABCI image by **digest**, and
-  every published digest is signed with cosign (keyless, GitHub OIDC). Check the
-  signature once, from any machine with `cosign` installed:
+* **Verify the image.** The testnet image is the moving tag
+  `ghcr.io/echelonlabsresearch/zcrypt-abci:testnet`, signed by the image workflow on the
+  `testnet` branch. A release tag also publishes an immutable digest. Check the signature
+  once, from any machine with `cosign` installed:
 
   ```sh
-  IMG=$(grep -o 'ghcr.io/[^ ]*@sha256:[0-9a-f]*' docker-compose.validator.yml | head -1)
-  cosign verify "$IMG" \
-    --certificate-identity-regexp '^https://github.com/echelonlabsresearch/ZCrypt/\.github/workflows/image\.yml@refs/tags/v' \
+  cosign verify ghcr.io/echelonlabsresearch/zcrypt-abci:testnet \
+    --certificate-identity-regexp '^https://github.com/echelonlabsresearch/zcrypt-v2/\.github/workflows/image\.yml@refs/heads/testnet' \
     --certificate-oidc-issuer https://token.actions.githubusercontent.com
   ```
 
-  A digest is immutable: a tag can be moved, a digest cannot. If verification fails, do
-  not run the image. To build from source instead, set `ZCRYPT_ABCI_IMAGE` to a local tag
-  (see `validator.env.example`); the Dockerfile uses the same date-pinned toolchain and
-  `--locked` build as the published image.
+  For a release digest, the identity regexp ends in `@refs/tags/v` instead. If
+  verification fails, do not run that image. Set `ZCRYPT_ABCI_IMAGE` to the digest only
+  after it verifies, or let `validator-up.sh` build from source.
 
 The validator's own RPC is published on `127.0.0.1:56657` only (set `VALIDATOR_RPC_BIND`
 to open it deliberately); P2P `56656` must be reachable by peers.
@@ -49,8 +54,8 @@ RPC, and the genesis carries the foundation address in its `app_state`, so a dow
 genesis fully describes the chain.
 
 > Foundation operator, one-time: keep the HTTPS RPC edge (`rpc.zcrypt.network`, Caddy)
-> and P2P (26656) reachable, publish the ABCI image digest from the "Publish ABCI image"
-> workflow (and commit it into this compose file), and publish `genesis.sha256`. Those
+> and P2P (26656) reachable, and publish `genesis.sha256`. A push to `testnet` that
+> changes the node publishes `ghcr.io/echelonlabsresearch/zcrypt-abci:testnet`. Those
 > defaults are what make a download "just work". Optionally host a static `genesis.json`
 > and set `GENESIS_URL`.
 

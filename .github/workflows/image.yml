@@ -2,14 +2,22 @@
 # GitHub OIDC). Validators pin the digest in docker-compose.validator.yml and verify the
 # signature before trusting it (chain/README-validator.md "Verify the image").
 #
-# Runs on release tags (v*) and on demand. The build is reproducible in the sense that the
-# Dockerfile uses a date-pinned nightly and --locked; the digest printed in the job summary
-# is the value to commit into the validator compose file.
+# Runs on release tags (v*), on testnet and main when the node or image definition
+# changes, and on demand. testnet pushes tag the image :testnet, which
+# docker-compose.validator.yml pulls. A v* tag also publishes an immutable digest;
+# pin that in .env as ZCRYPT_ABCI_IMAGE after the job summary prints it. The
+# Dockerfile uses a date-pinned nightly and --locked.
 name: Publish ABCI image
 
 on:
   push:
     tags: ["v*"]
+    branches: ["testnet", "main"]
+    paths:
+      - "impl/**"
+      - "chain/docker/**"
+      - "chain/docker-compose.validator.yml"
+      - ".github/workflows/image.yml"
   workflow_dispatch:
     inputs:
       abci_features:
@@ -49,6 +57,7 @@ jobs:
         with:
           images: ${{ env.IMAGE }}
           tags: |
+            type=ref,event=branch
             type=ref,event=tag
             type=sha,format=long
       - id: build
@@ -72,9 +81,29 @@ jobs:
         env:
           DIGEST: ${{ steps.build.outputs.digest }}
         run: |
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            id_re="^https://github.com/${{ github.repository }}/\\.github/workflows/image\\.yml@refs/tags/v"
+          else
+            id_re="^https://github.com/${{ github.repository }}/\\.github/workflows/image\\.yml@${{ github.ref }}$"
+          fi
           cosign verify "${IMAGE}@${DIGEST}" \
-            --certificate-identity-regexp "^https://github.com/${{ github.repository }}/\\.github/workflows/image\\.yml@refs/tags/v" \
+            --certificate-identity-regexp "$id_re" \
             --certificate-oidc-issuer https://token.actions.githubusercontent.com
+      - name: Make the package public
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # GHCR packages are private by default, so a fresh validator cannot pull
+          # them. A public repo's package should be public. Do not fail the publish
+          # if GitHub has not finished registering the package yet.
+          if gh api --method PATCH \
+            -H "Accept: application/vnd.github+json" \
+            "/orgs/${{ github.repository_owner }}/packages/container/zcrypt-abci" \
+            -f visibility=public; then
+            echo "package is public"
+          else
+            echo "could not mark ghcr.io/${{ github.repository_owner }}/zcrypt-abci public. Set the package to public in GitHub or pulls will return 403."
+          fi
       - name: Publish the digest
         env:
           DIGEST: ${{ steps.build.outputs.digest }}

@@ -9,8 +9,9 @@
 #     lockfiles, npm audit on the wallet frontend;
 #   * the wallet frontend build + backend tests.
 # The live 3-node job is in this same workflow. It builds Docker images and real STARK
-# proofs, so it runs only on main, nightly at 06:00 UTC, or when someone starts the
-# workflow by hand. Pull requests skip it.
+# proofs, so it runs on testnet, on main, on a pull request into main, nightly at
+# 06:00 UTC, or when someone starts the workflow by hand. A pull request into main
+# must come from the testnet branch; the gate job fails any other head.
 # Every cargo invocation is --locked: Cargo.lock is authoritative. Actions are pinned by
 # commit SHA (the tag is in the comment) so a moved tag cannot change what runs.
 # Publishing the ABCI image is not a test; that stays in image.yml.
@@ -189,10 +190,29 @@ jobs:
         working-directory: wallet/src-tauri
         run: cargo test --locked
 
+  main-from-testnet:
+    name: Only testnet merges to main
+    if: github.event_name == 'pull_request' && github.base_ref == 'main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Head branch is testnet
+        env:
+          HEAD: ${{ github.head_ref }}
+        run: |
+          if [ "$HEAD" != "testnet" ]; then
+            echo "Pull requests into main must come from the testnet branch (this one is '$HEAD')."
+            exit 1
+          fi
+
   live-e2e:
     name: 3-node network + all live drivers
-    # Main pushes, the nightly schedule, and a manual run. A pull request skips this job.
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    # testnet and main, a pull request into main, the nightly schedule, and a manual run.
+    if: >-
+      github.event_name == 'schedule' ||
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/testnet')) ||
+      (github.event_name == 'pull_request' && github.base_ref == 'main')
     runs-on: ubuntu-latest
     timeout-minutes: 120
     steps:

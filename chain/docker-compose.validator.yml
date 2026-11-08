@@ -1,6 +1,6 @@
 # Become a ZCrypt validator. Plug-and-play: download this file, run one command, then bond.
 #
-#   docker compose -f docker-compose.validator.yml up -d      # joins + syncs, zero config
+#   ./validator-up.sh                                         # installs Compose v2 if needed, pulls or builds, starts
 #   ./validator-bond.sh                                       # then bond to start producing
 #
 # It generates its own validator identity, downloads the chain's genesis, dials the public
@@ -12,16 +12,11 @@
 # The defaults below point at the public foundation. To join a DIFFERENT chain (e.g. a
 # local test foundation), drop a `.env` next to this file overriding GENESIS_URL / SEED_*.
 #
-# Supply chain: the ABCI image is referenced by DIGEST (immutable) and signed with cosign
-# by the repository's "Publish ABCI image" workflow (.github/workflows/image.yml), so the
-# signing identity is that repository. Verify before trusting it (README-validator.md):
-#   cosign verify ghcr.io/echelonlabsresearch/zcrypt-abci@sha256:<digest> \
-#     --certificate-identity-regexp '^https://github.com/echelonlabsresearch/zcrypt-v2/\.github/workflows/image\.yml@refs/tags/v' \
-#     --certificate-oidc-issuer https://token.actions.githubusercontent.com
-# To update: take the digest printed in the workflow run summary (or
-# `docker buildx imagetools inspect ghcr.io/echelonlabsresearch/zcrypt-abci:vX.Y.Z`), verify
-# its signature, then replace the sha256 below in one commit. If the repository moves to
-# another GitHub org, change the owner here, in README-validator.md and in image.yml.
+# Supply chain: testnet pulls ghcr.io/echelonlabsresearch/zcrypt-abci:testnet, published
+# by .github/workflows/image.yml. A release tag also publishes a digest; pin it with
+# ZCRYPT_ABCI_IMAGE in .env after you verify the cosign signature (README-validator.md).
+# If the repository moves to another GitHub org, change the owner here, in
+# README-validator.md and in image.yml.
 
 name: zcrypt-validator
 
@@ -29,19 +24,12 @@ services:
   # This validator's own ABCI state machine. The foundation address (and everything else)
   # comes from the downloaded genesis, so there is nothing to configure here.
   validator-abci:
-    # Digest-pinned published image so downloaders need no source and cannot be served a
-    # different binary under the same tag. `ZCRYPT_ABCI_IMAGE` overrides (e.g. a local build).
-    # PLACEHOLDER DIGEST: replace with the digest of the first signed release image.
-    image: ${ZCRYPT_ABCI_IMAGE:-ghcr.io/echelonlabsresearch/zcrypt-abci@sha256:724828d04516299929c13f5d0b777e8d6ffa6095c8155d3570aba80985cf311b}
-    build:
-      context: ..
-      dockerfile: chain/docker/Dockerfile
-      args:
-        # PRODUCTION build by default (no features): a mainnet validator MUST NOT run the
-        # devnet feature (SEED faucet / dev-seed). Mainnet-grade FRI parameters are compiled
-        # into every binary unconditionally, so validators and wallets always share one
-        # proof format. Override to `devnet` only for a local test chain.
-        ABCI_FEATURES: ${ABCI_FEATURES:-}
+    # The testnet branch publishes ghcr.io/<owner>/zcrypt-abci:testnet. A release tag
+    # publishes a digest; pin that by setting ZCRYPT_ABCI_IMAGE in .env. There is no
+    # `build:` here: a digest cannot be a build tag, and `up` must pull. Source builds
+    # go through validator-up.sh, which adds docker-compose.validator.build.yml.
+    image: ${ZCRYPT_ABCI_IMAGE:-ghcr.io/echelonlabsresearch/zcrypt-abci:testnet}
+    pull_policy: always
     container_name: zcrypt-validator-abci
     restart: unless-stopped
     environment:
