@@ -2,9 +2,10 @@
 resolver = "2"
 members = ["core", "cli", "abci-node", "shield", "bridge", "explorer"]
 
-# Plonky3's published p3-util (0.6.1) uses an unstable API without declaring the
-# feature gate; vendored copy adds `#![feature(maybe_uninit_slice)]`. Requires
-# the nightly toolchain pinned in rust-toolchain.toml.
+# Plonky3's published p3-util (0.6.1) called a then-unstable MaybeUninit slice API
+# and did not name the feature. That API is stable now; this vendored copy stays
+# so the workspace still builds. The compiler is the nightly pinned in
+# rust-toolchain.toml.
 [patch.crates-io]
 p3-util = { path = "vendor/p3-util" }
 

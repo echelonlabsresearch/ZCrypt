@@ -9,8 +9,16 @@ Everything runs in Docker — you only need:
 - **Docker** + **Docker Compose v2** (`docker compose …`)
 - a few minutes on first build (the image compiles the Plonky3 prover from source)
 
-Building the **wallet** from source additionally needs Node.js 20+ and a Rust nightly
-toolchain (auto-selected via `rust-toolchain.toml`).
+Building the **wallet** from source additionally needs Node.js 20+ and the Rust nightly
+pinned in `rust-toolchain.toml`.
+
+## How a change reaches the mainnet branch
+
+`testnet` is a git branch, not a second network. The code on it is mainnet code that
+has not shipped yet. CI runs there, including the 3-node test, and you run that same
+code against the live chain. When it works, open a pull request from `testnet` into
+`mainnet`. GitHub merges it only when that CI is green, and only from `testnet`.
+The merge runs the same CI again on `mainnet`. `mainnet` is the branch you ship.
 
 ---
 
@@ -104,11 +112,11 @@ validators are the bootstrap quorum; new validators join dynamically on top.
 
 On the public chain, the node's consensus identity comes from the wallet. In the wallet
 open **Rewards, Run a validator, Node setup** and click **Copy the .env line**; put that
-`VALIDATOR_KEY=...` line in a `.env` next to `chain/docker-compose.validator.yml`
-**before the node's first start**, then `docker compose -f docker-compose.validator.yml
-up -d`. The entrypoint installs the line as `priv_validator_key.json`, downloads the
-genesis from the foundation RPC, discovers a seed peer and syncs (details, genesis-hash
-pinning and image verification: [`chain/README-validator.md`](chain/README-validator.md)).
+`VALIDATOR_KEY=...` line in `chain/validator/.env`
+**before the node's first start**, then `docker compose up -d` from that directory.
+Mainnet chain id, seed, and ports are already in that file. `.env` is only the key. The entrypoint
+installs the key, downloads the genesis, and syncs
+([`chain/README-validator.md`](chain/README-validator.md)).
 
 On a local 3-node devnet you can instead add a 4th service to `docker-compose.3node.yml`
 (copy a `cometbftN`/`abciN` pair, give it a fresh volume + `NODE_INDEX` + published
@@ -118,12 +126,12 @@ block 0. At this point it is a **syncing full node** — it doesn't yet produce 
 
 ### 3. Bond → pledge stake → become a block producer
 
-A **BOND (`0x57`)** transaction must be signed by the node's ed25519 **consensus key**
-(the first 32 bytes of its `priv_validator_key.json`). With the wallet-owned key from
-step 2 the wallet holds that key, so bonding is a button: **Rewards, Run a validator,
-Bond**. Only when the node generated its own key does the wallet not have it; then the
-wallet prepares the bond and the validator host signs it with `bond_validator sign`
-(chain/README-validator.md, section 3). Bonding **genuinely pledges your
+A **BOND (`0x57`)** transaction must be signed by the node's ed25519 **consensus key**.
+With the wallet key from step 2, the wallet holds that key, so bonding is a button:
+**Rewards, Run a validator, Bond**. There is no host command and no signature to paste
+back. If the node was started without `VALIDATOR_KEY`, it has a different key; stop it
+with `docker compose down -v`, put the wallet line in `.env`, start again, and click
+Bond. Bonding **genuinely pledges your
 coins**: the tx carries a shield spend that burns ≥ 10,000 ZCRYPT into an unspendable
 burn coin, so the stake is real, locked value — not a self-declared number. It also
 names a reward address. On the next block the ABCI app emits the `ValidatorUpdate` and
@@ -268,7 +276,7 @@ impl/                     Rust workspace
   cli/                    reference CLI demo
 chain/                    Docker consensus stacks
   docker-compose.yml            foundation node (raw RPC 127.0.0.1:36657, Caddy edge)
-  docker-compose.validator.yml  plug-and-play validator (digest-pinned image)
+  validator/docker-compose.yml  joining validator (`docker compose up`; .env is the key)
   e2e/docker-compose.3node.yml  3-validator devnet (RPC 46657/46667/46677)
   docker/                       Dockerfile(s) + CometBFT entrypoints + Caddyfile
   e2e/run-all.sh                full live end-to-end

@@ -17,8 +17,8 @@
 //! compression: one width-16 permutation, then the feed-forward digest
 //! `Trunc_8(P(x) + x)`. Ownership is bound by `pk` inside the commitment, so
 //! membership + ownership together prove the prover knows the spend secret of a
-//! genuine tree coin — without revealing *which* leaf. Requires nightly (see
-//! rust-toolchain.toml).
+//! genuine tree coin — without revealing *which* leaf. Built with the pinned
+//! toolchain in rust-toolchain.toml.
 
 use core::borrow::Borrow;
 

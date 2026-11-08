@@ -160,7 +160,14 @@ impl Desk {
         }
         self.btc_usd.1 = now();
         let agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(10)).build();
-        match agent.get(&self.cfg.btc_usd_url).call().and_then(|r| Ok(r.into_json::<serde_json::Value>()?)) {
+        // String errors: ureq::Error is large enough that returning it from the closure
+        // trips the Clippy ratchet, and the only consumer is this log line.
+        let fetched = agent
+            .get(&self.cfg.btc_usd_url)
+            .call()
+            .map_err(|e| e.to_string())
+            .and_then(|r| r.into_json::<serde_json::Value>().map_err(|e| e.to_string()));
+        match fetched {
             Ok(v) => match v["USD"].as_f64() {
                 Some(p) if p.is_finite() && p > 0.0 => self.btc_usd.0 = p,
                 _ => eprintln!("[sale] price feed: no USD field"),

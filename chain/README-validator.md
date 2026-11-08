@@ -1,65 +1,33 @@
 # Become a ZCrypt validator
 
-Two files: `docker-compose.yml` runs the **foundation** node; `docker-compose.validator.yml`
-runs a **validator** that joins the chain. (Test stacks live in `e2e/`.) The whole flow is:
-**1) copy the identity line from your wallet, 2) start the validator, 3) click Bond.**
+`docker-compose.yml` in this directory runs the **foundation** node. A joining validator
+is `validator/docker-compose.yml`. (Test stacks live in `e2e/`.) The whole flow is:
+**1) put the identity line in `.env`, 2) `docker compose up`, 3) click Bond.**
 
 ## 1. Start the validator
 
-Download `docker-compose.validator.yml` and run:
-
 ```sh
-docker compose -f docker-compose.validator.yml up -d      # joins + syncs, zero config
-docker logs -f zcrypt-validator-cometbft                  # watch it fetch genesis, dial the seed, sync
+cd chain/validator
+cp .env.example .env
+# paste VALIDATOR_KEY=... into .env (section 2) before the first start
+docker compose up -d
+docker logs -f zcrypt-validator-cometbft
 ```
 
-The node installs the identity from your `.env` (section 2) or generates one, **downloads
-the genesis** and **discovers the seed peer** automatically, and syncs. You never touch the genesis file. It is now a full node;
-it does not produce blocks until you bond it (step 3).
+That is the whole start. Chain id `zcrypt-1`, the seed `https://rpc.zcrypt.network`, and the ports are already in the compose file. `.env` is only the key. The first start compiles the node from this checkout, then downloads the genesis and finds a peer. It is a full node. It does not produce blocks until you bond it (step 3).
 
-Two things worth doing before you trust it with a bond:
+If this machine has the older `docker-compose` command and not the `docker compose` plugin, start the same file with `docker-compose up -d`.
 
-* **Pin the genesis fingerprint.** The foundation publishes the SHA-256 of `genesis.json`
-  (it is printed by the foundation node at first start and written to
-  `config/genesis.sha256`). Put it in a `.env` next to the compose file as
-  `GENESIS_SHA256=<64 hex>`: the entrypoint then refuses to start on any genesis whose
-  hash differs, so a poisoned download cannot put you on a fork.
-* **Verify the image.** The compose file references the ABCI image by **digest**, and
-  every published digest is signed with cosign (keyless, GitHub OIDC). Check the
-  signature once, from any machine with `cosign` installed:
+RPC is on `127.0.0.1:56657`. P2P is on port `56656`, which peers must be able to reach.
 
-  ```sh
-  IMG=$(grep -o 'ghcr.io/[^ ]*@sha256:[0-9a-f]*' docker-compose.validator.yml | head -1)
-  cosign verify "$IMG" \
-    --certificate-identity-regexp '^https://github.com/echelonlabsresearch/ZCrypt/\.github/workflows/image\.yml@refs/tags/v' \
-    --certificate-oidc-issuer https://token.actions.githubusercontent.com
-  ```
-
-  A digest is immutable: a tag can be moved, a digest cannot. If verification fails, do
-  not run the image. To build from source instead, set `ZCRYPT_ABCI_IMAGE` to a local tag
-  (see `validator.env.example`); the Dockerfile uses the same date-pinned toolchain and
-  `--locked` build as the published image.
-
-The validator's own RPC is published on `127.0.0.1:56657` only (set `VALIDATOR_RPC_BIND`
-to open it deliberately); P2P `56656` must be reachable by peers.
-
-It is plug-and-play because the compose defaults point at the public foundation
-(`rpc.zcrypt.network`, which also serves P2P on 26656): it fetches the genesis and finds a peer from the seed node's
-RPC, and the genesis carries the foundation address in its `app_state`, so a downloaded
-genesis fully describes the chain.
-
-> Foundation operator, one-time: keep the HTTPS RPC edge (`rpc.zcrypt.network`, Caddy)
-> and P2P (26656) reachable, publish the ABCI image digest from the "Publish ABCI image"
-> workflow (and commit it into this compose file), and publish `genesis.sha256`. Those
-> defaults are what make a download "just work". Optionally host a static `genesis.json`
-> and set `GENESIS_URL`.
+> Foundation operator: keep the HTTPS RPC edge (`rpc.zcrypt.network`) and P2P port 26656 reachable. The genesis the validator downloads carries the foundation address and the Bitcoin anchor.
 
 ## 2. The validator identity comes from your wallet
 
 Open the **ZCrypt wallet**, **Rewards, Run a validator**. The wallet already holds a
 validator identity: an ed25519 consensus key derived from your recovery phrase (so it
 restores with the phrase). Under **Node setup**, click **Copy the .env line** and paste
-it into a `.env` next to `docker-compose.validator.yml` **before the node's first start**:
+it into `chain/validator/.env` **before the node's first start**:
 
 ```sh
 VALIDATOR_KEY=eyJhZGRyZXNzIjoi…      # one line, from the wallet; keep this file private
@@ -140,20 +108,15 @@ Rewards accrue automatically each epoch; claiming just materializes them into co
 spend. Your **⏳ Unbonding** schedule (from unbonding a validator or undelegating) shows here
 too, with how long until each stake is free.
 
-## Join a local test foundation instead of the public one
+## Join a local foundation instead of mainnet
 
-Point the validator at a local foundation with a `.env` next to the compose file (see
-`validator.env.example`): genesis and peer both come from the seed RPC, nothing to host:
-
-```sh
-SEED_RPC=http://host.docker.internal:36657
-SEED_P2P_HOST=host.docker.internal
-SEED_P2P_PORT=26656
-```
+Change `SEED_RPC`, `SEED_P2P_HOST`, and `CHAIN_ID` in `validator/docker-compose.yml`. `.env` stays the validator key only.
 
 ## Teardown
 
+From `chain/validator`:
+
 ```sh
-docker compose -f docker-compose.validator.yml down       # stop, keep identity + synced state
-docker compose -f docker-compose.validator.yml down -v     # stop and wipe this validator
+docker compose down       # stop, keep identity + synced state
+docker compose down -v    # stop and wipe this validator
 ```

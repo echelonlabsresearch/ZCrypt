@@ -171,13 +171,9 @@ Validators run the node image by digest, so after the relaunch:
 1. Tag a release (`git tag v0.1.2-alpha && git push origin v0.1.2-alpha`). The tag builds
    the wallet installers as a draft release and publishes the ABCI image to ghcr with a
    cosign signature.
-2. Take the image digest from the "Publish ABCI image" workflow summary and commit it
-   into `docker-compose.validator.yml`; publish the `genesis.sha256` from step 5 so joiners
-   can pin it with `GENESIS_SHA256=`.
-3. Publish the wallet draft once the installers are checked.
+2. Publish the wallet draft once the installers are checked.
 
-Until the digest is updated, a joiner can build locally with `ZCRYPT_ABCI_IMAGE` as in
-`validator.env.example`.
+A joining validator builds the ABCI node from its checkout. From `chain/validator`, `.env` is `VALIDATOR_KEY` only and `docker compose up -d` is the start. The compose file already contains the mainnet seed and chain id.
 
 ## 8. Backups, same day
 

@@ -200,7 +200,7 @@ fn api_blocks_nonempty(node: &str, count: i64) -> Value {
         scanned_to = lo;
         hi = lo - 1;
     }
-    kept.sort_by(|a, b| b.0.cmp(&a.0));
+    kept.sort_by_key(|a| std::cmp::Reverse(a.0));
     let out: Vec<Value> = kept.iter().map(|(h, _t)| block_row(node, &cid, *h)).collect();
     // reached_floor: we stopped because we hit the scan window, not because we filled `count`.
     let reached_floor = (out.len() as i64) < count && scanned_to <= floor;

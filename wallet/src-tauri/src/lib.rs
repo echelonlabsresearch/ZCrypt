@@ -5510,9 +5510,8 @@ async fn claim_rewards(state: State<'_, AppState>) -> R<ClaimResult> {
         let leaves = chain::fetch_leaves(&url)?;
         let n = with_wallet(&state, |w| {
             let acct = w.reward_account(rk);
-            let mut index = start;
             let mut n = 0u32;
-            for chunk in zcrypt_core::keys::claim_chunks(claimable, first_claim) {
+            for (index, chunk) in (start..).zip(zcrypt_core::keys::claim_chunks(claimable, first_claim)) {
                 let coin = acct.reward_coin(chunk, index);
                 let com = coin.commitment();
                 let already = w.coins.iter().any(|c| c.coin.commitment() == com);
@@ -5523,7 +5522,6 @@ async fn claim_rewards(state: State<'_, AppState>) -> R<ClaimResult> {
                     w.push_hist("reward", chunk as i64, "staking reward".into(), zcrypt_shield::ASSET_ZCRYPT);
                     n += 1;
                 }
-                index += 1;
             }
             Ok(n)
         })?;
@@ -5615,8 +5613,7 @@ async fn claim_fees(asset_id: String, state: State<'_, AppState>) -> R<u64> {
         let leaves = chain::fetch_leaves(&url)?;
         with_wallet(&state, |w| {
             let acct = w.reward_account(rk);
-            let mut index = start;
-            for chunk in zcrypt_core::keys::claim_chunks(claimable, false) {
+            for (index, chunk) in (start..).zip(zcrypt_core::keys::claim_chunks(claimable, false)) {
                 let coin = acct.fee_reward_coin(chunk, asset, index);
                 let com = coin.commitment();
                 let already = w.coins.iter().any(|c| c.coin.commitment() == com);
@@ -5626,7 +5623,6 @@ async fn claim_fees(asset_id: String, state: State<'_, AppState>) -> R<u64> {
                     w.coins.push(CoinRec::observed(coin, leaf, born));
                     w.push_hist("fee", chunk as i64, format!("{ticker} bridge fee"), asset);
                 }
-                index += 1;
             }
             Ok(())
         })?;

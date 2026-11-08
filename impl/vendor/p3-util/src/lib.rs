@@ -1,7 +1,6 @@
 //! Various simple utilities.
 
 #![no_std]
-#![feature(maybe_uninit_slice)]
 
 extern crate alloc;
 

@@ -9,7 +9,7 @@
 #
 # Native deps: librocksdb-sys builds RocksDB from source and generates bindings with
 # bindgen, which needs clang + libclang; cmake/pkg-config are needed by its C++ build.
-ARG RUST_NIGHTLY=nightly-2025-10-12
+ARG RUST_NIGHTLY=nightly-2026-11-07
 
 FROM rust:1.90-bookworm AS build
 ARG RUST_NIGHTLY

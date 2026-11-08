@@ -52,8 +52,8 @@ url = "2"             # strict node-URL policy (https or .onion for remote hosts
 #   (RUSTSEC-2024-0370, build-time only), paste 1.0.15 (RUSTSEC-2024-0436, build-time macro via p3-*).
 #   None is reachable from untrusted input in this wallet; re-check with `cargo audit` on each upgrade.
 
-# zcrypt-shield (pulled via zcrypt-core) needs the patched p3-util + nightly
-# (see ../rust-toolchain.toml).
+# zcrypt-shield (pulled via zcrypt-core) uses the vendored p3-util. The compiler
+# is the nightly pinned in ../rust-toolchain.toml.
 [patch.crates-io]
 p3-util = { path = "../../impl/vendor/p3-util" }
 

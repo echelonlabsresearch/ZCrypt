@@ -1,7 +1,6 @@
-# Must match impl/rust-toolchain.toml (the wallet links zcrypt-core / zcrypt-shield, which
-# need the same nightly for the vendored p3-util feature gate). Pinned by date for
-# reproducible builds; bump both files together.
+# Must match impl/rust-toolchain.toml. Pinned by date so the wallet and the node
+# compile with the same compiler; bump both files together.
 [toolchain]
-channel = "nightly-2025-10-12"
+channel = "nightly-2026-11-07"
 components = ["rustfmt", "clippy"]
 profile = "minimal"
