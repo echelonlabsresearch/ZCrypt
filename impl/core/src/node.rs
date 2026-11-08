@@ -1168,6 +1168,8 @@ impl Node {
         // The ZCRYPT gas note (`gas_tx`, its burn blind), the same bundle a transfer or swap
         // lock carries. Required for every non-ZCRYPT asset: the locked asset is never the
         // fee. A ZCRYPT lock may still pay gas as the spend's own fee (legacy form).
+        // zcrypt-1 blocks before [`Self::MAINNET_BURN_LOCK_ZCRYPT_GAS_HEIGHT`] predate that
+        // rule and are replayed under the fee check they were committed with.
         gas: Option<(&crate::shield_tx::ShieldTx, zcrypt_shield::Blind)>,
         value: u64,
         blind: zcrypt_shield::Blind,
@@ -1200,7 +1202,9 @@ impl Node {
         lock_value_ok(value)?;
         // Anti-bypass: every lock pays MIN_FEE of ZCRYPT gas, so an escrow lock cannot be
         // used to move value through output[1..] for free (see `bond_with_stake`).
-        Self::burn_lock_gas_ok(asset_id, shield_tx.fee, gas.is_some())?;
+        Self::burn_lock_gas_ok(
+            chain_id, self.current_height, asset_id, shield_tx.fee, gas.is_some(),
+        )?;
         if let Some((gas_tx, gas_blind)) = gas {
             if gas_tx.output_commitments.first() != Some(&Self::gas_burn_coin(&gas_blind)) {
                 return Err("burn-lock: gas note output[0] is not the 0.01 ZCRYPT burn coin".to_string());
@@ -1248,11 +1252,43 @@ impl Node {
         self.htlc.lock_burn(asset_id, value, hashlock, timeout_height, refund_pk, btc_claim_pk, refund.coin.clone())
     }
 
+    /// First zcrypt-1 height that requires the ZCRYPT gas note on a non-ZCRYPT burn-lock.
+    ///
+    /// Block 74946 (2026-10-28) is the one historical zBTC redeem (`0x67`) committed while
+    /// every burn-lock paid `MIN_FEE` in the locked asset. The foundation upgraded in place
+    /// on 2026-11-02 and kept that state, so it never re-executes the block. A joiner does.
+    /// Rejecting the redeem there yields a different app hash and the node halts. No later
+    /// block contains a burn-lock, so the strict rule from this height matches the chain
+    /// the foundation already runs. Other chain ids never take the exception.
+    pub const MAINNET_BURN_LOCK_ZCRYPT_GAS_HEIGHT: u64 = 74947;
+
     /// The gas rule of a burn-lock. Gas is always ZCRYPT. A lock of ZCRYPT itself may pay it
     /// as the spend's own in-tx fee (the legacy form) or with a gas note; a lock of any other
     /// asset must carry the gas note and burn nothing in-asset. An in-asset fee is value the
     /// asset's backing never gets back: a zBTC fee is reserve BTC nobody can redeem.
-    fn burn_lock_gas_ok(asset_id: u64, fee: u64, has_gas: bool) -> Result<(), String> {
+    ///
+    /// On `zcrypt-1`, below [`Self::MAINNET_BURN_LOCK_ZCRYPT_GAS_HEIGHT`], a burn-lock with no
+    /// gas note is accepted when its in-asset fee is at least `MIN_FEE`. That is the rule
+    /// those blocks were committed under.
+    fn burn_lock_gas_ok(
+        chain_id: &[u8],
+        height: u64,
+        asset_id: u64,
+        fee: u64,
+        has_gas: bool,
+    ) -> Result<(), String> {
+        if chain_id == b"zcrypt-1"
+            && height < Self::MAINNET_BURN_LOCK_ZCRYPT_GAS_HEIGHT
+            && !has_gas
+        {
+            if fee < crate::emission::MIN_FEE {
+                return Err(format!(
+                    "burn-lock: spend must burn ≥ MIN_FEE ({}) gas; got {fee}",
+                    crate::emission::MIN_FEE
+                ));
+            }
+            return Ok(());
+        }
         if has_gas {
             if fee != 0 {
                 return Err(format!("burn-lock: with a gas note the asset spend must have fee 0; got {fee}"));
@@ -2921,6 +2957,7 @@ impl Node {
     #[allow(clippy::too_many_arguments)]
     pub fn precheck_lock_params(
         &self,
+        chain_id: &[u8],
         kind: crate::htlc_shield::EscrowKind,
         asset_id: u64,
         value: u64,
@@ -2943,7 +2980,7 @@ impl Node {
         lock_value_ok(value)?;
         match kind {
             crate::htlc_shield::EscrowKind::Burn => {
-                Self::burn_lock_gas_ok(asset_id, fee, has_gas)?;
+                Self::burn_lock_gas_ok(chain_id, self.current_height, asset_id, fee, has_gas)?;
                 if !btc_claim_pk.is_empty() {
                     if btc_claim_pk.len() != 33 {
                         return Err("burn-lock: btc_claim_pk must be 33 bytes (compressed)".to_string());
@@ -3308,21 +3345,66 @@ mod tests {
         let asset = node.register_asset("GOLD", 8, None, 1_000_000).unwrap();
         let fee = crate::emission::MIN_FEE;
         let zc = zcrypt_shield::ASSET_ZCRYPT;
+        let chain = b"zcrypt-devnet".as_slice();
         // A non-ZCRYPT lock: gas note required, in-asset fee refused.
-        assert!(node.precheck_lock_params(EscrowKind::Burn, asset, 5, 100, 0, true, &[]).is_ok());
-        assert!(node.precheck_lock_params(EscrowKind::Burn, asset, 5, 100, fee, true, &[]).is_err(), "fee must be 0 with gas");
-        assert!(node.precheck_lock_params(EscrowKind::Burn, asset, 5, 100, fee, false, &[]).is_err(), "no in-asset gas");
-        assert!(node.precheck_lock_params(EscrowKind::Burn, asset, 5, 100, 0, false, &[]).is_err(), "gas note required");
+        assert!(node.precheck_lock_params(chain, EscrowKind::Burn, asset, 5, 100, 0, true, &[]).is_ok());
+        assert!(node.precheck_lock_params(chain, EscrowKind::Burn, asset, 5, 100, fee, true, &[]).is_err(), "fee must be 0 with gas");
+        assert!(node.precheck_lock_params(chain, EscrowKind::Burn, asset, 5, 100, fee, false, &[]).is_err(), "no in-asset gas");
+        assert!(node.precheck_lock_params(chain, EscrowKind::Burn, asset, 5, 100, 0, false, &[]).is_err(), "gas note required");
         // A ZCRYPT lock: either form.
-        assert!(node.precheck_lock_params(EscrowKind::Burn, zc, 5, 100, fee, false, &[]).is_ok());
-        assert!(node.precheck_lock_params(EscrowKind::Burn, zc, 5, 100, 0, true, &[]).is_ok());
-        assert!(node.precheck_lock_params(EscrowKind::Burn, zc, 5, 100, 0, false, &[]).is_err(), "fee below MIN_FEE");
-        assert!(node.precheck_lock_params(EscrowKind::Burn, asset, 5, 10, 0, true, &[]).is_err(), "timeout not after now");
-        assert!(node.precheck_lock_params(EscrowKind::Burn, asset, 0, 100, 0, true, &[]).is_err(), "zero value");
-        assert!(node.precheck_lock_params(EscrowKind::Burn, asset, 5, 100, 0, true, &[1u8; 33]).is_err(), "bad payout key");
-        assert!(node.precheck_lock_params(EscrowKind::Burn, asset + 1, 5, 100, 0, true, &[]).is_err(), "unregistered");
-        assert!(node.precheck_lock_params(EscrowKind::Swap, asset, 5, 100, 0, true, &[]).is_ok());
-        assert!(node.precheck_lock_params(EscrowKind::Swap, asset, 5, 100, fee, true, &[]).is_err(), "swap fee must be 0");
+        assert!(node.precheck_lock_params(chain, EscrowKind::Burn, zc, 5, 100, fee, false, &[]).is_ok());
+        assert!(node.precheck_lock_params(chain, EscrowKind::Burn, zc, 5, 100, 0, true, &[]).is_ok());
+        assert!(node.precheck_lock_params(chain, EscrowKind::Burn, zc, 5, 100, 0, false, &[]).is_err(), "fee below MIN_FEE");
+        assert!(node.precheck_lock_params(chain, EscrowKind::Burn, asset, 5, 10, 0, true, &[]).is_err(), "timeout not after now");
+        assert!(node.precheck_lock_params(chain, EscrowKind::Burn, asset, 0, 100, 0, true, &[]).is_err(), "zero value");
+        assert!(node.precheck_lock_params(chain, EscrowKind::Burn, asset, 5, 100, 0, true, &[1u8; 33]).is_err(), "bad payout key");
+        assert!(node.precheck_lock_params(chain, EscrowKind::Burn, asset + 1, 5, 100, 0, true, &[]).is_err(), "unregistered");
+        assert!(node.precheck_lock_params(chain, EscrowKind::Swap, asset, 5, 100, 0, true, &[]).is_ok());
+        assert!(node.precheck_lock_params(chain, EscrowKind::Swap, asset, 5, 100, fee, true, &[]).is_err(), "swap fee must be 0");
+    }
+
+    /// Block 74946 on zcrypt-1 paid its zBTC redeem fee in zBTC. That acceptance is replay-only:
+    /// it stops at the next height, and it does not apply to any other chain.
+    #[test]
+    fn precheck_lock_params_mainnet_historical_in_asset_fee() {
+        use crate::htlc_shield::EscrowKind;
+        let mut node = Node::new();
+        let asset = node.register_asset("GOLD", 8, None, 1_000_000).unwrap();
+        let fee = crate::emission::MIN_FEE;
+        let height = Node::MAINNET_BURN_LOCK_ZCRYPT_GAS_HEIGHT - 1;
+        node.set_height(height);
+        let timeout = height + 100;
+        assert!(
+            node.precheck_lock_params(b"zcrypt-1", EscrowKind::Burn, asset, 5, timeout, fee, false, &[])
+                .is_ok(),
+            "historical mainnet zBTC redeem paid the fee in-asset"
+        );
+        assert!(
+            node.precheck_lock_params(b"zcrypt-1", EscrowKind::Burn, asset, 5, timeout, fee - 1, false, &[])
+                .is_err(),
+            "the old rule still required MIN_FEE"
+        );
+        assert!(
+            node.precheck_lock_params(b"zcrypt-1", EscrowKind::Burn, asset, 5, timeout, 0, true, &[])
+                .is_ok(),
+            "a gas note was already valid"
+        );
+        assert!(
+            node.precheck_lock_params(b"zcrypt-1", EscrowKind::Burn, asset, 5, timeout, fee, true, &[])
+                .is_err(),
+            "a gas note still requires fee 0"
+        );
+        assert!(
+            node.precheck_lock_params(b"zcrypt-devnet", EscrowKind::Burn, asset, 5, timeout, fee, false, &[])
+                .is_err(),
+            "other chains never accept an in-asset fee"
+        );
+        node.set_height(Node::MAINNET_BURN_LOCK_ZCRYPT_GAS_HEIGHT);
+        let timeout = Node::MAINNET_BURN_LOCK_ZCRYPT_GAS_HEIGHT + 100;
+        let err = node
+            .precheck_lock_params(b"zcrypt-1", EscrowKind::Burn, asset, 5, timeout, fee, false, &[])
+            .unwrap_err();
+        assert!(err.contains("gas note"), "{err}");
     }
 
     #[test]

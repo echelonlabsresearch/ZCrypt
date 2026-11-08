@@ -1805,7 +1805,7 @@ impl ZcryptApp {
                             // Mirror the delivery-time admission rules that would otherwise
                             // only fail AFTER the pledge is applied: value bound and escrow id.
                             s.node
-                                .precheck_lock_params(zcrypt_core::htlc_shield::EscrowKind::Burn, asset, value, timeout, stx.fee, gas.is_some(), &[])
+                                .precheck_lock_params(chain_id, zcrypt_core::htlc_shield::EscrowKind::Burn, asset, value, timeout, stx.fee, gas.is_some(), &[])
                                 .and_then(|()| s.node.escrow_id_available(zcrypt_core::htlc_shield::EscrowKind::Burn, asset, value, &lock, timeout, &refund, &refund, &[opening.coin.commitment]))
                                 .and_then(|()| match &gas {
                                     Some((gas_blind, gas_tx)) => s.node.precheck_transfer(&stx, gas_tx, *gas_blind),
@@ -1849,7 +1849,7 @@ impl ZcryptApp {
                                     std::slice::from_ref(&opening.coin),
                                 );
                                 s.node
-                                    .precheck_lock_params(zcrypt_core::htlc_shield::EscrowKind::Burn, asset, value, timeout, stx.fee, gas.is_some(), btc_claim_pk)
+                                    .precheck_lock_params(chain_id, zcrypt_core::htlc_shield::EscrowKind::Burn, asset, value, timeout, stx.fee, gas.is_some(), btc_claim_pk)
                                     .and_then(|()| s.node.escrow_id_available(zcrypt_core::htlc_shield::EscrowKind::Burn, asset, value, &lock, timeout, &refund, &refund, &[opening.coin.commitment]))
                                     .and_then(|()| match &gas {
                                         Some((gas_blind, gas_tx)) => s.node.precheck_transfer(&stx, gas_tx, *gas_blind),
@@ -1901,7 +1901,7 @@ impl ZcryptApp {
                             // Both proofs are deferred so a bad lock is rejected before it
                             // can burn the gas.
                             s.node
-                                .precheck_lock_params(zcrypt_core::htlc_shield::EscrowKind::Swap, asset, value, timeout, stx.fee, true, &[])
+                                .precheck_lock_params(chain_id, zcrypt_core::htlc_shield::EscrowKind::Swap, asset, value, timeout, stx.fee, true, &[])
                                 .and_then(|()| s.node.escrow_id_available(zcrypt_core::htlc_shield::EscrowKind::Swap, asset, value, &lock, timeout, &cp, &refund, &[claim_open.coin.commitment, refund_open.coin.commitment]))
                                 .and_then(|()| s.node.precheck_transfer(&stx, &gas_tx, gas_blind))
                                 .map(|()| {
