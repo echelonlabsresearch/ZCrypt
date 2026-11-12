@@ -85,18 +85,28 @@ const DATA: Record<string, unknown> = {
   tor_status: { enabled: false, reachable: false, node_routed: false, bridge_routed: false, proxy: "127.0.0.1:9050", detail: "" },
   chain_pin: "zcrypt-1",
   my_assets: [],
-  list_validators: [{ pubkey: "f957727d5d1db6206f074f0149930f94bf2d4122cb9ed54f6456056d52a51e38", stake: "10000000000", commission_pct: 10 }],
+  list_validators: [
+    { pubkey: "407f6c8d5d1db6206f074f0149930f94bf2d4122cb9ed54f6456056d52a51e38", stake: "20001000000", commission_pct: 10 },
+    { pubkey: "90a958575d1db6206f074f0149930f94bf2d4122cb9ed54f6456056d52a51e38", stake: "10000000000", commission_pct: 5 },
+    { pubkey: "4b694a5d5d1db6206f074f0149930f94bf2d4122cb9ed54f6456056d52a51e38", stake: "10000000000", commission_pct: 8 },
+  ],
   my_unbonding: [],
+  my_delegations: [],
+  get_claimable: { ready: 0, accruing: 0, accruing_keys: 0 },
+  claimable_fees: [],
+  claim_rewards: { claimed: 0, coins: 0 },
   validator_identity: {
     pubkey_hex: "f957727d5d1db6206f074f0149930f94bf2d4122cb9ed54f6456056d52a51e38",
-    env_line: "VALIDATOR_KEY=eyJhZGRyZXNzIjoi…",
-    bonded: true,
-    stake: 10_000_000_000,
-    commission_pct: 10,
-    ever_bonded: true,
+    env_line: "VALIDATOR_KEY=eyJub3QtYS1yZWFsLWtleS1wcmV2aWV3LW9ubHk",
+    bonded: false,
+    stake: 0,
+    commission_pct: 0,
+    ever_bonded: false,
     signed_this_epoch: 0,
-    epoch_progress: 56,
+    epoch_progress: 0,
     epoch_blocks: 100,
+    delegated: "0",
+    delegation_count: 0,
   },
   address_kind: "normal",
   estimate_btc_send: { amount_sats: 500_000, fee_sats: 1_118, fee_rate_sat_vb: 7.3, inputs: 2 },
@@ -126,9 +136,79 @@ function saleView(id: string) {
   };
 }
 
+// Preview-only staking position. `?rewards=run|del|back|ready` opens that screen; Bond,
+// Delegate, Stop, and Unbond move it for the rest of the browser session. None of this
+// is chain state.
+const REWARDS_PK = "f957727d5d1db6206f074f0149930f94bf2d4122cb9ed54f6456056d52a51e38";
+type RewardsMode = "setup" | "run" | "del";
+let rewardsMode: RewardsMode = "setup";
+let rewardsClaimed = false;
+let rewardsUnbonding: { stake: string; release_time: string }[] = [];
+
+function rewardsQuery(): string | null {
+  return new URLSearchParams(window.location.search).get("rewards");
+}
+
+function seedRewardsPreview() {
+  const q = rewardsQuery();
+  rewardsMode = q === "run" || q === "del" ? q : "setup";
+  rewardsClaimed = false;
+  rewardsUnbonding = [];
+  const key = `zcrypt.unbonding.${REWARDS_PK}`;
+  if (q === "back") {
+    rewardsUnbonding = [{ stake: "10000000000", release_time: String(Math.floor(Date.now() / 1000) + 10 * 86400) }];
+    localStorage.removeItem(key);
+  } else if (q === "ready") {
+    localStorage.setItem(key, JSON.stringify([{ stake: "10000000000", release_time: String(Math.floor(Date.now() / 1000) - 3600) }]));
+  } else {
+    localStorage.removeItem(key);
+  }
+}
+
+function mockClaimable() {
+  if (rewardsClaimed) return { ready: 0, accruing: 0, accruing_keys: 0 };
+  if (rewardsQuery() === "ready") return { ready: 10_000_000_000, accruing: 0, accruing_keys: 0 };
+  if (rewardsMode === "run") return { ready: 1_715_032, accruing: 91_127, accruing_keys: 1 };
+  if (rewardsMode === "del") return { ready: 240_000, accruing: 91_127, accruing_keys: 1 };
+  return { ready: 0, accruing: 0, accruing_keys: 0 };
+}
+
+function mockIdentity() {
+  const base = DATA.validator_identity as Record<string, unknown>;
+  const run = rewardsMode === "run";
+  return {
+    ...base,
+    bonded: run,
+    stake: run ? 10_000_000_000 : 0,
+    commission_pct: run ? 10 : 0,
+    ever_bonded: run,
+    signed_this_epoch: run ? 42 : 0,
+    epoch_progress: run ? 48 : 0,
+    delegated: run ? "4200000000" : "0",
+    delegation_count: run ? 3 : 0,
+  };
+}
+
+function mockDelegations() {
+  if (rewardsMode !== "del") return [];
+  return [{
+    validator_pubkey: "407f6c8d5d1db6206f074f0149930f94bf2d4122cb9ed54f6456056d52a51e38",
+    index: 1,
+    legacy: false,
+    stake: "1000000000",
+    commission_pct: 10,
+  }];
+}
+
 export function installMock() {
-  const w = window as unknown as { __TAURI_INTERNALS__?: unknown };
+  const w = window as unknown as { __TAURI_INTERNALS__?: unknown; __mockSaved?: string[]; __mockOpened?: string[]; __mockBtcSends?: number };
   if (w.__TAURI_INTERNALS__) return;
+  seedRewardsPreview();
+  // Coins created during this preview. Oldest first, matching the wallet file.
+  let pendingSecrets: { id: number; kind: string; label: string; secret: string; created: number }[] = [];
+  let nextSecretId = 1;
+  w.__mockSaved = [];
+  w.__mockOpened = [];
   w.__TAURI_INTERNALS__ = {
     invoke: async (cmd: string, args?: Record<string, unknown>): Promise<unknown> => {
       await new Promise((r) => setTimeout(r, 80));
@@ -156,6 +236,91 @@ export function installMock() {
       if (cmd === "buy_forget") {
         delete saleOrders[String(args?.id ?? "")];
         return { success: true, data: true } satisfies Resp;
+      }
+      if (cmd === "validator_identity") return { success: true, data: mockIdentity() } satisfies Resp;
+      if (cmd === "my_delegations") return { success: true, data: mockDelegations() } satisfies Resp;
+      if (cmd === "my_unbonding") return { success: true, data: rewardsUnbonding } satisfies Resp;
+      if (cmd === "get_claimable") return { success: true, data: mockClaimable() } satisfies Resp;
+      if (cmd === "bond_validator") {
+        rewardsMode = "run";
+        rewardsClaimed = false;
+        return { success: true, data: "Bond broadcast." } satisfies Resp;
+      }
+      if (cmd === "unbond_validator") {
+        rewardsMode = "setup";
+        rewardsUnbonding = [{ stake: "10000000000", release_time: String(Math.floor(Date.now() / 1000) + 10 * 86400) }];
+        return { success: true, data: "Unbond broadcast. The stake returns after 10 days." } satisfies Resp;
+      }
+      if (cmd === "delegate_validator") {
+        rewardsMode = "del";
+        rewardsClaimed = false;
+        return { success: true, data: "Delegated." } satisfies Resp;
+      }
+      if (cmd === "undelegate_validator") {
+        rewardsMode = "setup";
+        rewardsUnbonding = [{ stake: "1000000000", release_time: String(Math.floor(Date.now() / 1000) + 10 * 86400) }];
+        return { success: true, data: "Undelegated. The stake returns after 10 days." } satisfies Resp;
+      }
+      if (cmd === "claim_rewards") {
+        const c = mockClaimable();
+        rewardsClaimed = true;
+        const now = Date.now() / 1000;
+        rewardsUnbonding = rewardsUnbonding.filter((u) => Number(u.release_time) > now);
+        return { success: true, data: { claimed: c.ready, coins: c.ready > 0 ? 1 : 0 } } satisfies Resp;
+      }
+      if (cmd === "wallet_health") {
+        return { success: true, data: { save_error: null, pending_secrets: pendingSecrets.length, pending_deposits: 0, pending_redeems: 0 } } satisfies Resp;
+      }
+      if (cmd === "list_pending_secrets") return { success: true, data: pendingSecrets } satisfies Resp;
+      if (cmd === "dismiss_pending_secret") {
+        const id = Number(args?.id);
+        pendingSecrets = pendingSecrets.filter((s) => s.id !== id);
+        return { success: true, data: true } satisfies Resp;
+      }
+      if (cmd === "address_kind") {
+        const a = String(args?.address ?? "");
+        const kind = a.toLowerCase().includes("stealth") ? "stealth" : a.startsWith("zc1") ? "normal" : "invalid";
+        return { success: true, data: kind } satisfies Resp;
+      }
+      if (cmd === "save_export") {
+        const filename = String(args?.filename ?? "coin.zcrypt");
+        w.__mockSaved?.push(filename);
+        return { success: true, data: `/Users/chris/Downloads/${filename}` } satisfies Resp;
+      }
+      if (cmd === "open_external") {
+        w.__mockOpened?.push(String(args?.target ?? ""));
+        return { success: true, data: true } satisfies Resp;
+      }
+      // The send spinner needs a moment on screen. These answers are still invented.
+      if (cmd === "create_bearer" || cmd === "send_stealth" || cmd === "send_onchain" || cmd === "withdraw_btc") {
+        await new Promise((r) => setTimeout(r, 700));
+      }
+      if (cmd === "create_bearer") {
+        const secret = String(DATA.create_bearer);
+        const amount = Number(args?.amount ?? 0);
+        pendingSecrets = [...pendingSecrets, { id: nextSecretId++, kind: "bearer", label: `bearer coin: ${amount} base units of asset 0`, secret, created: Math.floor(Date.now() / 1000) }];
+        return { success: true, data: secret } satisfies Resp;
+      }
+      if (cmd === "send_stealth") {
+        const file = String((DATA.send_stealth as { file: string }).file);
+        const amount = Number(args?.amount ?? 0);
+        pendingSecrets = [...pendingSecrets, { id: nextSecretId++, kind: "stealth_note", label: `stealth note for zc1… (${amount} base units of asset 0)`, secret: file, created: Math.floor(Date.now() / 1000) }];
+        return { success: true, data: { file } } satisfies Resp;
+      }
+      if (cmd === "send_onchain") {
+        if (String(args?.recipient ?? "").includes("fail")) return { success: false, error: "proof failed" } satisfies Resp;
+        return { success: true, data: null } satisfies Resp;
+      }
+      if (cmd === "withdraw_btc") {
+        w.__mockBtcSends = (w.__mockBtcSends ?? 0) + 1;
+        return { success: true, data: "mocktxid0123456789abcdef" } satisfies Resp;
+      }
+      // `?buy=hang` leaves the fee quote pending. `?buy=late` resolves it after the
+      // screen has had time to leave the check, so a late quote must not send.
+      if (cmd === "estimate_btc_send") {
+        const mode = new URLSearchParams(window.location.search).get("buy");
+        if (mode === "hang") await new Promise((r) => setTimeout(r, 120_000));
+        if (mode === "late") await new Promise((r) => setTimeout(r, 1500));
       }
       if (cmd in DATA) return { success: true, data: DATA[cmd] } satisfies Resp;
       return { success: false, error: `mock: no canned answer for ${cmd}` } satisfies Resp;

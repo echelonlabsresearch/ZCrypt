@@ -154,3 +154,72 @@ export async function saveFile(filename: string, content: string): Promise<strin
 export async function openExternal(target: string): Promise<void> {
   await call<boolean>("open_external", { target });
 }
+
+/** Random export name, e.g. `zcrypt-bearer-k3m9qx2a.zcrypt`. Eight letters or digits. */
+export function coinFileName(kind: "bearer" | "note"): string {
+  const alphabet = "abcdefghijklmnopqrstuvwxyz0123456789";
+  const bytes = new Uint8Array(8);
+  crypto.getRandomValues(bytes);
+  let id = "";
+  for (const b of bytes) id += alphabet[b % alphabet.length];
+  return kind === "note" ? `zcrypt-note-${id}.zcrypt` : `zcrypt-bearer-${id}.zcrypt`;
+}
+
+export type ShareChannel = "whatsapp" | "telegram" | "email";
+
+export const SHARE_CHANNELS: { id: ShareChannel; label: string }[] = [
+  { id: "whatsapp", label: "WhatsApp" },
+  { id: "telegram", label: "Telegram" },
+  { id: "email", label: "Email" },
+];
+
+/** https and mailto only. `open_external` refuses custom schemes such as whatsapp://. */
+export function shareLink(channel: ShareChannel, text: string, subject: string): string {
+  const body = encodeURIComponent(text);
+  if (channel === "whatsapp") return `https://api.whatsapp.com/send?text=${body}`;
+  if (channel === "telegram") return `https://t.me/share/url?text=${body}`;
+  return `mailto:?subject=${encodeURIComponent(subject)}&body=${body}`;
+}
+
+/** Save a coin file. If that name is already in Downloads, try one new random name. */
+export async function saveCoinFile(filename: string, content: string): Promise<string> {
+  try {
+    return await saveFile(filename, content);
+  } catch (e) {
+    if (!/already exists/i.test(String(e))) throw e;
+    const kind = filename.startsWith("zcrypt-note-") ? "note" : "bearer";
+    return await saveFile(coinFileName(kind), content);
+  }
+}
+
+/** Drop a saved coin from the wallet's unsaved list. The file on disk is the copy. */
+export async function dismissSavedSecret(content: string): Promise<void> {
+  const secrets = await call<{ id: number; secret: string }[]>("list_pending_secrets");
+  const hits = secrets.filter((s) => s.secret === content);
+  for (const s of hits) await call("dismiss_pending_secret", { id: s.id });
+}
+
+/**
+ * Hand a coin file to WhatsApp, Telegram, or email.
+ * A truncated link would be a dead coin, so a file that does not fit in the URL is
+ * saved first and the message only names that file.
+ */
+const SHARE_URL_MAX = 7500;
+
+export async function openCoinShare(
+  channel: ShareChannel,
+  content: string,
+  filename: string,
+  subject: string,
+): Promise<void> {
+  const direct = shareLink(channel, content, subject);
+  if (direct.length <= SHARE_URL_MAX) {
+    await openExternal(direct);
+    return;
+  }
+  const path = await saveCoinFile(filename, content);
+  const name = path.split(/[/\\]/).pop() || filename;
+  await openExternal(
+    shareLink(channel, `Attach ${name} from Downloads. That file is the ZCrypt payment.`, subject),
+  );
+}

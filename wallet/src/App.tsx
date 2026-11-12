@@ -1,5 +1,5 @@
 import { useEffect, useState, useCallback } from "react";
-import { call, fmt, fmtAsset, trunc, copySensitive, clearSensitiveClipboard } from "./lib/api";
+import { call, fmt, trunc, copySensitive, clearSensitiveClipboard } from "./lib/api";
 import { listen } from "@tauri-apps/api/event";
 import Balance from "./components/Balance";
 import Send from "./components/Send";
@@ -35,7 +35,7 @@ interface PendingSecret {
   created: number;
 }
 
-const VERSION = "0.2.0";
+const VERSION = "0.2.7";
 
 export default function App() {
   const [mode, setMode] = useState<Mode>("loading");
@@ -144,7 +144,12 @@ export default function App() {
     if (mode !== "ready") return;
     pollHealth();
     const t = setInterval(pollHealth, 15000);
-    return () => clearInterval(t);
+    const onSaved = () => void pollHealth();
+    window.addEventListener("zc-secrets", onSaved);
+    return () => {
+      clearInterval(t);
+      window.removeEventListener("zc-secrets", onSaved);
+    };
   }, [mode, pollHealth]);
 
   async function dismissSecret(id: number) {
@@ -365,7 +370,7 @@ export default function App() {
   }
 
   // ---------- main app ----------
-  const tabs: Tab[] = ["balance", "buy", "receive", "send", "history", "mint", "rewards", "bridge", "settings"];
+  const tabs: Tab[] = ["balance", "buy", "send", "receive", "mint", "rewards", "bridge", "history", "settings"];
   return (
     <div className="app">
       <header className="header">
@@ -437,11 +442,11 @@ export default function App() {
         <div style={{ display: tab === "buy" ? "block" : "none" }}>
           <Buy active={tab === "buy"} onBought={(a) => { refresh(); toast("ZCRYPT Bought", `+${fmt(a)} ZCRYPT arrived from the sale desk`); }} />
         </div>
-        <div style={{ display: tab === "receive" ? "block" : "none" }}>
+        <div className={tab === "receive" ? "receive-fill" : undefined} style={{ display: tab === "receive" ? "flex" : "none" }}>
           <Receive
             incoming={incoming[0] ?? ""}
             onConsumed={() => setIncoming((q) => q.slice(1))}
-            onReceived={(r) => { refresh(); toast("Coin Received!", `+${fmtAsset(r.amount, r.decimals)} ${r.ticker}`); }}
+            onReceived={() => { refresh(); }}
           />
         </div>
         <div style={{ display: tab === "send" ? "block" : "none" }}>

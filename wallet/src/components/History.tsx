@@ -1,5 +1,15 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
-import { call, copySensitive, fmtAsset, HeldAsset, saveFile } from "../lib/api";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  call,
+  coinFileName,
+  copySensitive,
+  fmtAsset,
+  HeldAsset,
+  openCoinShare,
+  saveFile,
+  SHARE_CHANNELS,
+  ShareChannel,
+} from "../lib/api";
 
 interface Tx {
   tx_id: string;
@@ -53,6 +63,110 @@ const RECEIPT_NOTE: Record<string, string> = {
     "This records the coin in the file. The nullifier line is how a sweep of that file is recognized. The receipt does not contain the spend secret.",
 };
 
+interface PendingSecret {
+  id: number;
+  kind: string;
+  label: string;
+  secret: string;
+  created: number;
+}
+
+/** The wallet stores "N base units of asset 0". Asset 0 is always ZCRYPT, 6 decimals. */
+function secretMeta(label: string): string {
+  const m = label.match(/(\d+) base units of asset (\d+)/);
+  if (m && m[2] === "0") return `${fmtAsset(Number(m[1]), 6)} ZCRYPT · still on this computer`;
+  return `${label} · still on this computer`;
+}
+
+/**
+ * A coin or note still in the wallet because it was never saved. Copy and share leave it
+ * here. Save writes one file, then the row goes away.
+ */
+function UnsentCoin({ sx, onSaved }: { sx: PendingSecret; onSaved: (id: number) => void }) {
+  const [note, setNote] = useState("");
+  const [busy, setBusy] = useState("");
+  const fileKind = sx.kind === "stealth_note" ? "note" : "bearer";
+  const title = fileKind === "note" ? "Stealth note" : "Bearer coin";
+  const subject = fileKind === "note" ? "ZCrypt note" : "ZCrypt coin";
+  const [filename] = useState(() => coinFileName(fileKind));
+  const lock = useRef(false);
+  const wrote = useRef(false);
+
+  async function copyCoin() {
+    try {
+      await copySensitive(sx.secret);
+      setNote("Copied. The clipboard clears in 60 seconds. Paste it to send the coin again.");
+    } catch (e) {
+      setNote(String(e instanceof Error ? e.message : e));
+    }
+  }
+
+  async function save() {
+    if (lock.current) return;
+    lock.current = true;
+    setBusy("save");
+    setNote("");
+    try {
+      if (!wrote.current) {
+        try {
+          await saveFile(filename, sx.secret);
+        } catch (e) {
+          // The first click already wrote this name. Do not mint another one.
+          if (!/already exists/i.test(String(e))) throw e;
+        }
+        wrote.current = true;
+      }
+      await call("dismiss_pending_secret", { id: sx.id });
+      window.dispatchEvent(new Event("zc-secrets"));
+      onSaved(sx.id);
+    } catch (e) {
+      setNote(String(e instanceof Error ? e.message : e));
+      lock.current = false;
+      setBusy("");
+    }
+  }
+
+  async function share(channel: ShareChannel) {
+    setBusy(channel);
+    setNote("");
+    try {
+      await openCoinShare(channel, sx.secret, coinFileName(fileKind), subject);
+      const label = SHARE_CHANNELS.find((c) => c.id === channel)?.label ?? channel;
+      setNote(`Opened ${label}. The coin is still here if it did not go through.`);
+    } catch (e) {
+      setNote(String(e instanceof Error ? e.message : e));
+    } finally {
+      setBusy("");
+    }
+  }
+
+  return (
+    <div className="tx-card secret">
+      <div className="secret-top">
+        <span className="tx-icon">{fileKind === "note" ? "🕶️" : "💠"}</span>
+        <div className="tx-body">
+          <div className="tx-type">{title}</div>
+          <div className="tx-meta">{secretMeta(sx.label)}</div>
+        </div>
+      </div>
+      <div className="secret-actions">
+        <button className="copy-btn" disabled={!!busy} onClick={copyCoin}>
+          ⧉ Copy
+        </button>
+        <button className="copy-btn" disabled={!!busy} onClick={save}>
+          {busy === "save" ? "Saving…" : "💾 Save"}
+        </button>
+        {SHARE_CHANNELS.map((c) => (
+          <button key={c.id} className="copy-btn" disabled={!!busy} onClick={() => share(c.id)}>
+            {busy === c.id ? "Opening…" : c.label}
+          </button>
+        ))}
+      </div>
+      {note && <div className="secret-note">{note}</div>}
+    </div>
+  );
+}
+
 const ICON: Record<string, string> = {
   receive: "📥",
   send: "📤",
@@ -81,10 +195,15 @@ export default function History({ active }: { active: boolean }) {
   const [saved, setSaved] = useState<Record<string, string>>({});
   const [checking, setChecking] = useState<string | null>(null);
   const [checked, setChecked] = useState<Record<string, Verdict>>({});
+  const [secrets, setSecrets] = useState<PendingSecret[]>([]);
+  const savedIds = useRef(new Set<number>());
 
   const load = useCallback(() => {
     call<Tx[]>("get_history").then(setItems).catch(() => {});
     call<Receipt[]>("list_receipts").then(setReceipts).catch(() => {});
+    call<PendingSecret[]>("list_pending_secrets")
+      .then((list) => setSecrets(list.filter((s) => !savedIds.current.has(s.id))))
+      .catch(() => {});
     call<HeldAsset[]>("held_assets")
       .then((assets) => {
         const m: Record<string, string> = {};
@@ -165,11 +284,29 @@ export default function History({ active }: { active: boolean }) {
     return "err";
   }
 
+  const unsent = [...secrets].reverse();
+
   return (
     <div>
       <h2 className="view-title">📋 History</h2>
+      {unsent.length > 0 && (
+        <div className="unsent">
+          <h3>Still on this computer</h3>
+          <p>These files are the payment. Copy one to send it again, or save it. Saving once removes it from this list.</p>
+          {unsent.map((sx) => (
+            <UnsentCoin
+              key={sx.id}
+              sx={sx}
+              onSaved={(id) => {
+                savedIds.current.add(id);
+                setSecrets((list) => list.filter((s) => s.id !== id));
+              }}
+            />
+          ))}
+        </div>
+      )}
       {items.length === 0 ? (
-        <div className="empty">📭 No transactions yet</div>
+        <div className="empty">{unsent.length ? "No other transactions yet" : "📭 No transactions yet"}</div>
       ) : (
         items.map((t) => {
           const r = receiptFor.get(t.tx_id);
