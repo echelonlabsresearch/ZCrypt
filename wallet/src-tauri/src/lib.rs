@@ -5586,9 +5586,9 @@ fn match_my_delegations(validators_json: &str, validators_csv: &str, keys: &[Del
         if !seen.insert(dedup) {
             continue;
         }
-        let commission_pct = commission.get(&pubkey.to_ascii_lowercase()).copied().unwrap_or_else(|| {
-            (zcrypt_core::staking::COMMISSION_NUM * 100 / zcrypt_core::staking::COMMISSION_DEN) as f64
-        });
+        let commission_pct = commission.get(&pubkey.to_ascii_lowercase()).copied().unwrap_or(
+            (zcrypt_core::staking::COMMISSION_NUM * 100 / zcrypt_core::staking::COMMISSION_DEN) as f64,
+        );
         out.push(MyDelegation {
             validator_pubkey: pubkey,
             index: k.index,
