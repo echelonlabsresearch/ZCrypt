@@ -127,6 +127,8 @@ if [ ! -f "$GENESIS" ]; then
   # Shield tx bundles are ~3 MB base64; cap the RPC body and mempool tx size accordingly.
   sed -i 's|^max_body_bytes =.*|max_body_bytes = 8000000|' "$CFG"
   sed -i 's|^max_tx_bytes =.*|max_tx_bytes = 5000000|' "$CFG"
+  # Same commit wait as the foundation node. The HTTP read deadline stays 10s.
+  sed -i 's|^timeout_broadcast_tx_commit =.*|timeout_broadcast_tx_commit = "30s"|' "$CFG"
   # Tolerate private/duplicate peer IPs (common behind NAT / on one host).
   sed -i 's|^addr_book_strict =.*|addr_book_strict = false|' "$CFG"
   sed -i 's|^allow_duplicate_ip =.*|allow_duplicate_ip = true|' "$CFG"
@@ -138,5 +140,9 @@ if [ ! -f "$GENESIS" ]; then
 fi
 
 export CMTHOME="$HOME_DIR"
+# Same as the foundation entrypoint: refresh the commit wait on every start.
+if [ -f "$CFG" ]; then
+  sed -i 's|^timeout_broadcast_tx_commit =.*|timeout_broadcast_tx_commit = "30s"|' "$CFG"
+fi
 echo "[validator] starting CometBFT (RPC :26657 inside the container)"
 exec cometbft start --home "$HOME_DIR"

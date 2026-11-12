@@ -106,6 +106,20 @@ export default function Bridge({
     }
   }
 
+  async function dismissDeposit(index: number) {
+    setErr("");
+    setFixMsg("");
+    setBusy("dismiss");
+    try {
+      setFixMsg(await call<string>("bridge_dismiss_unfunded_deposit", { index }));
+      await load();
+    } catch (e) {
+      setErr(String(e));
+    } finally {
+      setBusy("");
+    }
+  }
+
   async function refundDeposit(index: number) {
     setErr("");
     setFixMsg("");
@@ -339,21 +353,27 @@ export default function Bridge({
           <div className="card" style={{ marginTop: "0.75rem", background: "var(--bg-grid)", borderLeft: "3px solid var(--color-amber, #d99a00)" }}>
             <div style={{ fontWeight: "bold" }}>⏸ {pendingDeposits.length} BTC deposit(s) in flight</div>
             <div style={{ fontSize: "0.72rem", color: "var(--color-text-dim)", marginTop: 4 }}>
-              Each locks BTC in a Bitcoin HTLC until its zBTC is minted. "Diagnose &amp; fix" resumes the
-              mint while the lock holds; once the Bitcoin lock block has passed, Refund takes the BTC back.
+              A funded deposit locks BTC in a Bitcoin HTLC until its zBTC is minted. Diagnose resumes the
+              mint while the lock holds, and Refund takes the BTC back once the lock block has passed.
+              A deposit that never broadcast can be dismissed: no BTC left the wallet.
             </div>
             {pendingDeposits.map((d) => (
               <div key={d.index} style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 6, fontSize: "0.8rem" }}>
                 <span>#{d.index}: {zfmt(d.value_sats)} BTC</span>
                 <span style={{ color: "var(--color-text-dim)" }}>
-                  {d.funded ? "funded" : "funding not seen yet"}
-                  {d.btc_locktime > 0 ? ` · refundable from Bitcoin block ${d.btc_locktime}` : ""}
+                  {d.funded ? "funded" : "no Bitcoin lock broadcast"}
+                  {d.funded && d.btc_locktime > 0 ? ` · refundable from Bitcoin block ${d.btc_locktime}` : ""}
                   {d.refund_txid ? ` · refund sent ${d.refund_txid.slice(0, 12)}…` : ""}
                 </span>
                 <span className="spacer" />
-                {!d.refund_txid && (
+                {d.funded && !d.refund_txid && (
                   <button className="btn-secondary" disabled={busy !== ""} onClick={() => refundDeposit(d.index)}>
                     {busy === "refund" ? "Refunding…" : "Refund"}
+                  </button>
+                )}
+                {!d.funded && (
+                  <button className="btn-secondary" disabled={busy !== ""} onClick={() => dismissDeposit(d.index)}>
+                    {busy === "dismiss" ? "Dismissing…" : "Dismiss"}
                   </button>
                 )}
               </div>

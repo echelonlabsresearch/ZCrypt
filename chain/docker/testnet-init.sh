@@ -45,6 +45,7 @@ while [ "$i" -lt 3 ]; do
   # 1 MB RPC/mempool limits (and a tx bundles two proofs) — raise both.
   sed -i 's|^max_body_bytes =.*|max_body_bytes = 30000000|' "$CFG"
   sed -i 's|^max_tx_bytes =.*|max_tx_bytes = 12000000|' "$CFG"
+  sed -i 's|^timeout_broadcast_tx_commit =.*|timeout_broadcast_tx_commit = "30s"|' "$CFG"
 
   # Single-host devnet: peers share the docker bridge subnet.
   sed -i 's|^addr_book_strict =.*|addr_book_strict = false|' "$CFG"

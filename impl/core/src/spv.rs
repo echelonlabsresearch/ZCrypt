@@ -564,6 +564,11 @@ impl HeaderChain {
     pub fn tip_height(&self) -> u64 {
         self.index[&self.best].height
     }
+    /// Best-chain header hash at `height` (internal byte order). `None` when this chain
+    /// has no header there (below the checkpoint, or above the tip).
+    pub fn hash_at_height(&self, height: u64) -> Option<[u8; 32]> {
+        self.best_chain.get(&height).copied()
+    }
     /// The best tip header's `nTime` (Unix seconds): the freshness clock for the SPV view.
     pub fn tip_time(&self) -> u64 {
         let hdr: Header = deserialize(&self.index[&self.best].raw).expect("indexed header is valid");
@@ -1498,6 +1503,11 @@ mod tests {
             prev = raw;
         }
         assert_eq!(c.tip_height(), 5);
+        let genesis = deserialize::<Header>(&REGTEST_GENESIS).unwrap().block_hash().to_byte_array();
+        assert_eq!(c.hash_at_height(0), Some(genesis));
+        assert_eq!(c.hash_at_height(5), Some(hashes[4]));
+        assert_eq!(c.hash_at_height(1), Some(hashes[0]));
+        assert_eq!(c.hash_at_height(6), None);
         assert_eq!(c.confirmations(&hashes[4]), Some(1));
         assert_eq!(c.confirmations(&hashes[0]), Some(5));
         assert_eq!(c.confirmations(&[9u8; 32]), None);
@@ -1527,7 +1537,11 @@ mod tests {
         assert_eq!(c.tip_height(), 3);
         assert_eq!(c.confirmations(&a2_hash), None, "reorged block loses its confirmations");
         let b1_hash = deserialize::<Header>(&b1).unwrap().block_hash().to_byte_array();
+        let b2_hash = deserialize::<Header>(&b2).unwrap().block_hash().to_byte_array();
         assert_eq!(c.confirmations(&b1_hash), Some(3));
+        // The best-chain map follows the heavier fork, not the stale one.
+        assert_eq!(c.hash_at_height(2), Some(b2_hash));
+        assert_ne!(c.hash_at_height(2), Some(a2_hash));
     }
 
     // A regtest-bits parent header the chain does NOT contain (tweaked genesis) —

@@ -6,6 +6,10 @@ use zcrypt_shield::Commitment;
 
 const B64: base64::engine::general_purpose::GeneralPurpose = base64::engine::general_purpose::STANDARD;
 const TIMEOUT_S: u64 = 45;
+/// A broadcast uploads a multi-megabyte proof and then waits for the node to verify it
+/// and include it. The node waits 30s (`timeout_broadcast_tx_commit`); this has to cover
+/// that plus a slow upload.
+const BROADCAST_TIMEOUT_S: u64 = 90;
 
 /// App-wide Tor SOCKS proxy for node RPC. `None` = direct connection (default).
 /// `Some(url)` routes every node request through the local Tor proxy, hiding the
@@ -520,12 +524,28 @@ pub fn broadcast(url: &str, tx: &[u8]) -> Result<(), String> {
     });
     // Every broadcast rides a Tor circuit of its OWN (fresh credentials per call), separate
     // from the query traffic and from every other broadcast of this session.
-    let resp: Value = agent_fresh("broadcast", TIMEOUT_S)
-        .post(base(url))
-        .send_json(body)
-        .map_err(|e| e.to_string())?
-        .into_json()
-        .map_err(|e| e.to_string())?;
+    let resp: Value = match agent_fresh("broadcast", BROADCAST_TIMEOUT_S).post(base(url)).send_json(body) {
+        Ok(r) => r.into_json().map_err(|e| e.to_string())?,
+        // A non-2xx still carries the reason. CometBFT's body-read failure is HTTP 400
+        // with `error.data` set; dropping the body leaves only "status code 400".
+        Err(ureq::Error::Status(code, resp)) => {
+            let text = resp.into_string().unwrap_or_default();
+            let detail = serde_json::from_str::<Value>(&text).ok().and_then(|v| {
+                v["error"]["data"]
+                    .as_str()
+                    .or_else(|| v["error"]["message"].as_str())
+                    .map(|s| s.to_string())
+            });
+            let detail = detail.filter(|s| !s.is_empty()).unwrap_or(text);
+            let detail = detail.trim();
+            return Err(if detail.is_empty() {
+                format!("node returned HTTP {code}")
+            } else {
+                format!("node returned HTTP {code}: {detail}")
+            });
+        }
+        Err(e) => return Err(e.to_string()),
+    };
     if let Some(msg) = resp["error"]["data"].as_str().or_else(|| resp["error"]["message"].as_str()) {
         return Err(format!("node error: {msg}"));
     }

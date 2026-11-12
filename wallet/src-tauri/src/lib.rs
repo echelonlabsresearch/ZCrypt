@@ -4910,6 +4910,15 @@ struct ValidatorIdentity {
     /// `signed_this_epoch` the UI can say "signed 56 of 56" or "signed 0 of 56".
     epoch_progress: u64,
     epoch_blocks: u64,
+    /// Stake other wallets have delegated to this validator (base units). This is not
+    /// voting power: `stake` above is self-bond + delegated. Zero when the key is not
+    /// in the active set. There is no separate lifetime "commission earned" counter —
+    /// commission is credited onto the validator reward address together with the
+    /// operator's own share, and a claim withdraws that balance as one sum.
+    #[serde(with = "u64_str")]
+    delegated: u64,
+    /// Live delegations with a positive stake.
+    delegation_count: u32,
 }
 
 /// This wallet's validator identity and its current on-chain state.
@@ -4947,7 +4956,7 @@ async fn validator_identity(state: State<'_, AppState>) -> R<ValidatorIdentity> 
         .and_then(|s| s.trim().parse::<u64>().ok())
         .map(|n| n > 0)
         .unwrap_or(false);
-    let (signed_this_epoch, epoch_progress, epoch_blocks) = validator_participation(&url, &pubkey_hex);
+    let profile = validator_participation(&url, &pubkey_hex);
     ok(ValidatorIdentity {
         pubkey_hex,
         env_line,
@@ -4955,34 +4964,63 @@ async fn validator_identity(state: State<'_, AppState>) -> R<ValidatorIdentity> 
         stake,
         commission_pct,
         ever_bonded,
-        signed_this_epoch,
-        epoch_progress,
-        epoch_blocks,
+        signed_this_epoch: profile.signed_this_epoch,
+        epoch_progress: profile.epoch_progress,
+        epoch_blocks: profile.epoch_blocks,
+        delegated: profile.delegated,
+        delegation_count: profile.delegation_count,
     })
 }
 
-/// `(signed_this_epoch, epoch_progress, epoch_blocks)` for a consensus key, from the node's
+#[derive(Clone, Copy, Debug, Default)]
+struct ValidatorChainProfile {
+    signed_this_epoch: u64,
+    epoch_progress: u64,
+    epoch_blocks: u64,
+    delegated: u64,
+    delegation_count: u32,
+}
+
+fn json_u64(v: &serde_json::Value) -> u64 {
+    if let Some(n) = v.as_u64() {
+        return n;
+    }
+    v.as_str().and_then(|s| s.trim().parse().ok()).unwrap_or(0)
+}
+
+/// Participation, delegated stake, and delegator count for a consensus key, from the node's
 /// `/staking/validators_json` report. Zeros when the node cannot answer or the key is not
-/// bonded. This is the one number that says whether the validator is really running: the
-/// chain counts the signatures it sees, so a bonded key whose node is offline, or runs with a
-/// different `priv_validator_key.json`, shows zero.
-fn validator_participation(url: &str, pubkey_hex: &str) -> (u64, u64, u64) {
-    let Ok(raw) = chain::query_str(url, "/staking/validators_json") else {
-        return (0, 0, 0);
+/// bonded. The signature count is the one number that says whether the validator is really
+/// running: the chain counts the signatures it sees, so a bonded key whose node is offline,
+/// or runs with a different `priv_validator_key.json`, shows zero.
+fn validator_participation(url: &str, pubkey_hex: &str) -> ValidatorChainProfile {
+    match chain::query_str(url, "/staking/validators_json") {
+        Ok(raw) => profile_from_validators_json(&raw, pubkey_hex),
+        Err(_) => ValidatorChainProfile::default(),
+    }
+}
+
+fn profile_from_validators_json(raw: &str, pubkey_hex: &str) -> ValidatorChainProfile {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return ValidatorChainProfile::default();
     };
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) else {
-        return (0, 0, 0);
+    let mut profile = ValidatorChainProfile {
+        epoch_progress: json_u64(&v["epoch_progress"]),
+        epoch_blocks: json_u64(&v["epoch_blocks"]),
+        ..ValidatorChainProfile::default()
     };
-    let progress = v["epoch_progress"].as_u64().unwrap_or(0);
-    let epoch = v["epoch_blocks"].as_u64().unwrap_or(0);
-    let signed = v["validators"]
+    let Some(mine) = v["validators"].as_array().into_iter().flatten().find(|x| {
+        x["consensus_pubkey"].as_str().is_some_and(|k| k.eq_ignore_ascii_case(pubkey_hex))
+    }) else {
+        return profile;
+    };
+    profile.signed_this_epoch = json_u64(&mine["signed_this_epoch"]);
+    profile.delegated = json_u64(&mine["delegated"]);
+    profile.delegation_count = mine["delegations"]
         .as_array()
-        .into_iter()
-        .flatten()
-        .find(|x| x["consensus_pubkey"].as_str().is_some_and(|k| k.eq_ignore_ascii_case(pubkey_hex)))
-        .and_then(|x| x["signed_this_epoch"].as_u64())
+        .map(|ds| ds.iter().filter(|d| json_u64(&d["stake"]) > 0).count() as u32)
         .unwrap_or(0);
-    (signed, progress, epoch)
+    profile
 }
 
 /// Bond this wallet's validator: allocate a fresh reward key, sign the BOND with the
@@ -5080,6 +5118,45 @@ mod validator_identity_tests {
         // VALIDATOR_SEED_HEX recipe rely on.
         let seed: [u8; 32] = priv_[..32].try_into().unwrap();
         assert_eq!(ed25519_dalek::SigningKey::from_bytes(&seed).verifying_key().to_bytes(), sk.verifying_key().to_bytes());
+    }
+
+    #[test]
+    fn profile_and_delegations_come_from_the_public_validator_list() {
+        use sha2::{Digest, Sha256};
+        let pk = [0x11u8; 32];
+        let pk_hex = hex::encode(pk);
+        let id_hex = hex::encode(&Sha256::digest(pk)[..20]);
+        let mine = hex::encode([0x22u8; 20]);
+        let other = hex::encode([0x33u8; 20]);
+        let json = format!(
+            r#"{{"epoch_progress":12,"epoch_blocks":100,"validators":[{{"id":"{id_hex}","consensus_pubkey":"{pk_hex}","delegated":2000000000,"signed_this_epoch":9,"delegations":[{{"delegator":"{mine}","stake":2000000000}},{{"delegator":"{other}","stake":0}}]}}]}}"#
+        );
+        let csv = format!("{pk_hex}:12000000000:500");
+        let keys = vec![
+            DelegationLookup { target: pk_hex.clone(), delegator_id_hex: mine.clone(), index: 4, legacy: false },
+            // The same delegation recorded again by a chain scan, which stores the 20-byte id.
+            DelegationLookup { target: id_hex.clone(), delegator_id_hex: mine, index: 7, legacy: false },
+            DelegationLookup { target: id_hex, delegator_id_hex: other, index: 5, legacy: false },
+            DelegationLookup { target: pk_hex.clone(), delegator_id_hex: hex::encode([0x44u8; 20]), index: 6, legacy: false },
+        ];
+        let got = match_my_delegations(&json, &csv, &keys);
+        assert_eq!(got.len(), 1, "a closed or duplicate delegation is not a live position");
+        assert_eq!(got[0].validator_pubkey.to_ascii_lowercase(), pk_hex);
+        assert_eq!(got[0].index, 4);
+        assert!(!got[0].legacy);
+        assert_eq!(got[0].stake, 2_000_000_000);
+        assert_eq!(got[0].commission_pct, 5.0);
+        let profile = profile_from_validators_json(&json, &pk_hex);
+        assert_eq!(profile.signed_this_epoch, 9);
+        assert_eq!(profile.epoch_progress, 12);
+        assert_eq!(profile.epoch_blocks, 100);
+        assert_eq!(profile.delegated, 2_000_000_000);
+        assert_eq!(profile.delegation_count, 1);
+        let missing = profile_from_validators_json(&json, &hex::encode([0u8; 32]));
+        assert_eq!(missing.delegated, 0);
+        assert_eq!(missing.delegation_count, 0);
+        assert_eq!(missing.epoch_progress, 12);
+        assert!(match_my_delegations("not json", "", &keys).is_empty());
     }
 }
 
@@ -5350,23 +5427,44 @@ async fn delegate_validator(validator_pubkey_hex: String, stake_zcrypt: String, 
     .and_then(ok)
 }
 
+/// The ed25519 key that signed one recorded delegation. A legacy action used the single
+/// seed-level delegator key; every later delegation uses the key at its own HD index.
+fn delegation_signing_key(w: &Wallet, a: &ActionKey) -> ed25519_dalek::SigningKey {
+    if a.legacy {
+        delegator_signing_key(&w.account)
+    } else {
+        delegator_key_at(&w.account, a.index)
+    }
+}
+
 /// Undelegate from a validator (by its consensus pubkey hex). Removes your delegated stake
 /// from the validator immediately and starts the 10-day unbonding; the stake returns after.
 #[tauri::command]
-async fn undelegate_validator(validator_pubkey_hex: String, state: State<'_, AppState>) -> R<String> {
+async fn undelegate_validator(
+    validator_pubkey_hex: String,
+    index: Option<u32>,
+    legacy: Option<bool>,
+    state: State<'_, AppState>,
+) -> R<String> {
     let target = validator_target(&validator_pubkey_hex)?;
     let url = node_url(&state)?;
     with_wallet(&state, |w| {
         // The delegation was signed by a per-delegation key: find it by validator (pubkey
         // hex as recorded by the wallet, or the 20-byte id as recovered by a chain scan).
+        // `index` + `legacy` pick one when this wallet has several delegations to the same
+        // validator; omitting both keeps the previous "first match, else the legacy key".
         let target_hex = hex::encode(&target);
-        let del_sk = match w
-            .action_keys
-            .iter()
-            .find(|a| a.kind == "delegate" && (a.target.eq_ignore_ascii_case(validator_pubkey_hex.trim()) || a.target == target_hex))
-        {
-            Some(a) => delegator_key_at(&w.account, a.index),
-            None => delegator_signing_key(&w.account), // legacy single-key delegation
+        let want_specific = index.is_some() || legacy.is_some();
+        let chosen = w.action_keys.iter().find(|a| {
+            a.kind == "delegate"
+                && (a.target.eq_ignore_ascii_case(validator_pubkey_hex.trim()) || a.target.eq_ignore_ascii_case(&target_hex))
+                && index.map(|i| a.index == i).unwrap_or(true)
+                && legacy.map(|l| a.legacy == l).unwrap_or(true)
+        });
+        let del_sk = match chosen {
+            Some(a) => delegation_signing_key(w, a),
+            None if want_specific => return Err("no delegation under that key".into()),
+            None => delegator_signing_key(&w.account),
         };
         let cid = chain_id_for(&url)?;
         // Fetch the delegator key's current replay-protection nonce so the signature is single-use.
@@ -5388,6 +5486,151 @@ async fn undelegate_validator(validator_pubkey_hex: String, state: State<'_, App
         ))
     })
     .and_then(ok)
+}
+
+/// One live delegation this wallet still has stake in. Historical `action_keys` whose
+/// on-chain stake is already zero are omitted: an undelegate removes the stake immediately.
+#[derive(Serialize, Clone, Debug, PartialEq)]
+struct MyDelegation {
+    /// Consensus pubkey hex. Undelegate is addressed by this, not by the 20-byte id a
+    /// chain scan stores in `action_keys.target`.
+    validator_pubkey: String,
+    /// HD index of the delegator key. Together with `legacy`, this picks the signer when
+    /// several delegations point at the same validator.
+    index: u32,
+    legacy: bool,
+    /// Current delegated stake, base units.
+    #[serde(with = "u64_str")]
+    stake: u64,
+    commission_pct: f64,
+}
+
+struct DelegationLookup {
+    target: String,
+    delegator_id_hex: String,
+    index: u32,
+    legacy: bool,
+}
+
+fn commission_by_pubkey(csv: &str) -> std::collections::HashMap<String, f64> {
+    let mut out = std::collections::HashMap::new();
+    for tok in csv.split(',') {
+        let f: Vec<&str> = tok.split(':').collect();
+        if f.len() >= 2 && f[0].len() == 64 {
+            let commission_pct = if f.len() >= 3 {
+                f[2].trim().parse::<u16>().unwrap_or(0) as f64 / 100.0
+            } else {
+                (zcrypt_core::staking::COMMISSION_NUM * 100 / zcrypt_core::staking::COMMISSION_DEN) as f64
+            };
+            out.insert(f[0].to_ascii_lowercase(), commission_pct);
+        }
+    }
+    out
+}
+
+/// `(validator id hex, consensus pubkey hint)`. A 64-char target is the consensus key
+/// (what this wallet records when it delegates). A 40-char target is the 20-byte
+/// validator id a chain scan recovered. Anything else is ignored.
+fn validator_id_of(target: &str) -> Option<(String, String)> {
+    let raw = hex::decode(target.trim()).ok()?;
+    if raw.len() == 32 {
+        let id = validator_target(target).ok()?;
+        Some((hex::encode(id), target.trim().to_string()))
+    } else if raw.len() == 20 {
+        Some((hex::encode(raw), String::new()))
+    } else {
+        None
+    }
+}
+
+/// Join this wallet's delegate keys to the public validator list. The list is consensus
+/// state; nothing about the wallet is sent to find out whether a delegation is still live.
+fn match_my_delegations(validators_json: &str, validators_csv: &str, keys: &[DelegationLookup]) -> Vec<MyDelegation> {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(validators_json) else {
+        return Vec::new();
+    };
+    let vals = match v["validators"].as_array() {
+        Some(a) => a,
+        None => return Vec::new(),
+    };
+    let commission = commission_by_pubkey(validators_csv);
+    let mut out = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    for k in keys {
+        let Some((id_hex, pubkey_hint)) = validator_id_of(&k.target) else {
+            continue;
+        };
+        let Some(val) = vals.iter().find(|x| {
+            x["id"].as_str().is_some_and(|id| id.eq_ignore_ascii_case(&id_hex))
+                || (!pubkey_hint.is_empty()
+                    && x["consensus_pubkey"].as_str().is_some_and(|p| p.eq_ignore_ascii_case(&pubkey_hint)))
+        }) else {
+            continue;
+        };
+        let stake = val["delegations"]
+            .as_array()
+            .and_then(|ds| {
+                ds.iter()
+                    .find(|d| d["delegator"].as_str().is_some_and(|id| id.eq_ignore_ascii_case(&k.delegator_id_hex)))
+                    .map(|d| json_u64(&d["stake"]))
+            })
+            .unwrap_or(0);
+        if stake == 0 {
+            continue;
+        }
+        let pubkey = val["consensus_pubkey"].as_str().unwrap_or("").trim().to_string();
+        if pubkey.len() != 64 {
+            continue;
+        }
+        let dedup = format!("{}:{}", pubkey.to_ascii_lowercase(), k.delegator_id_hex.to_ascii_lowercase());
+        if !seen.insert(dedup) {
+            continue;
+        }
+        let commission_pct = commission.get(&pubkey.to_ascii_lowercase()).copied().unwrap_or_else(|| {
+            (zcrypt_core::staking::COMMISSION_NUM * 100 / zcrypt_core::staking::COMMISSION_DEN) as f64
+        });
+        out.push(MyDelegation {
+            validator_pubkey: pubkey,
+            index: k.index,
+            legacy: k.legacy,
+            stake,
+            commission_pct,
+        });
+    }
+    out
+}
+
+/// This wallet's live delegations: each delegate key whose stake is still on chain.
+/// The public validator list is matched locally, so the node is not told which
+/// delegator ids belong to this session.
+#[tauri::command]
+async fn my_delegations(state: State<'_, AppState>) -> R<Vec<MyDelegation>> {
+    let url = node_url(&state)?;
+    let keys: Vec<DelegationLookup> = {
+        let g = state.wallet.lock().unwrap();
+        let w = g.as_ref().ok_or("wallet is locked")?;
+        w.action_keys
+            .iter()
+            .filter(|a| a.kind == "delegate")
+            .map(|a| {
+                let sk = delegation_signing_key(w, a);
+                use sha2::{Digest, Sha256};
+                let id = hex::encode(&Sha256::digest(sk.verifying_key().to_bytes())[..20]);
+                DelegationLookup {
+                    target: a.target.clone(),
+                    delegator_id_hex: id,
+                    index: a.index,
+                    legacy: a.legacy,
+                }
+            })
+            .collect()
+    };
+    if keys.is_empty() {
+        return ok(Vec::new());
+    }
+    let json = chain::query_str(&url, "/staking/validators_json")?;
+    let csv = chain::query_str(&url, "/staking/validators").unwrap_or_default();
+    ok(match_my_delegations(&json, &csv, &keys))
 }
 
 /// One pending unbonding: `stake` returns to this wallet at `release_time` (unix seconds).
@@ -7812,6 +8055,73 @@ fn find_shield_funding(
     Ok(None)
 }
 
+/// The funding UTXO saved on the deposit, read from the transaction itself.
+///
+/// An address scan misses an output the backend has not indexed. The txid does not:
+/// the output is this deposit's HTLC when its script matches. A spent output is left
+/// for the sweep check. `Ok(None)` when the record has no outpoint, the backend does
+/// not have the tx, or the output is not this deposit's script.
+fn funding_from_record(
+    backend: &dyn zcrypt_bridge::BtcBackend,
+    p: &PendingDeposit,
+    net: bitcoin::Network,
+    lock: &[u8; 32],
+    reserve_pk: &bitcoin::PublicKey,
+    refund_pk: &bitcoin::PublicKey,
+) -> Result<Option<(zcrypt_bridge::HtlcUtxo, u32)>, String> {
+    use std::str::FromStr;
+    let Some((txid_s, vout)) = &p.funding else { return Ok(None) };
+    let txid = bitcoin::Txid::from_str(txid_s).map_err(|e| format!("deposit #{}: stored funding txid is malformed: {e}", p.index))?;
+    let raw = match backend.raw_tx(&txid) {
+        Ok(r) => r,
+        Err(_) => return Ok(None),
+    };
+    let tx: bitcoin::Transaction = bitcoin::consensus::deserialize(&raw)
+        .map_err(|e| format!("deposit #{}: stored funding tx does not decode: {e}", p.index))?;
+    let Some(out) = tx.output.get(*vout as usize) else { return Ok(None) };
+    for t in shield_locktime_candidates(p, net) {
+        let script = zcrypt_bridge::htlc_script(lock, reserve_pk, refund_pk, t as u32);
+        if out.script_pubkey != script.to_p2wsh() || out.value.to_sat() < p.value_sats {
+            continue;
+        }
+        let utxo = zcrypt_bridge::HtlcUtxo {
+            outpoint: bitcoin::OutPoint { txid, vout: *vout },
+            value: out.value,
+            script,
+        };
+        // A confirmed spend is not an open funding. `None` (unknown) still counts: a
+        // mempool spend can be replaced, and the resume path checks again.
+        if backend.utxo_unspent(&utxo).unwrap_or(None) == Some(false) {
+            return Ok(None);
+        }
+        return Ok(Some((utxo, t as u32)));
+    }
+    Ok(None)
+}
+
+/// `Some(true)` when this backend can see `script`'s address and nothing has ever
+/// paid it. `Some(false)` when any output exists. `None` when the backend cannot say,
+/// which must not be treated as proof that the deposit was never broadcast.
+fn htlc_address_unused(backend: &dyn zcrypt_bridge::BtcBackend, script: &bitcoin::ScriptBuf) -> Option<bool> {
+    let utxos = match backend.htlc_utxos(script) {
+        Ok(v) => v,
+        Err(_) => return None,
+    };
+    if !utxos.is_empty() {
+        return Some(false);
+    }
+    match backend.htlc_outputs_all(script) {
+        Ok(v) => Some(v.is_empty()),
+        Err(_) => None,
+    }
+}
+
+/// The exact HTLC script can be rebuilt only when the record stored both the CLTV
+/// and the reserve key it was built against.
+fn deposit_script_known(p: &PendingDeposit) -> bool {
+    p.btc_locktime > 0 && hex::decode(&p.reserve_pk_hex).is_ok_and(|b| b.len() == 33)
+}
+
 /// A shield deposit's HTLC output that the operator has already SWEPT via the claim branch
 /// with `preimage` (this deposit's own): `(funding outpoint, sweep txid)`. Looks at every
 /// output at the candidate HTLC addresses, spent ones included. `None` when the backend
@@ -7912,6 +8222,72 @@ async fn bridge_refund_deposit(index: u32, state: State<'_, AppState>) -> R<Stri
         Ok(())
     })?;
     ok(txid.to_string())
+}
+
+/// Close a deposit whose exact HTLC address has never been paid. Refuses while an
+/// unspent output exists, while the script cannot be rebuilt, or while the Bitcoin
+/// tip has not moved since the record was written (the funding tx may still be propagating).
+#[tauri::command]
+async fn bridge_dismiss_unfunded_deposit(index: u32, state: State<'_, AppState>) -> R<String> {
+    let p = {
+        let g = state.wallet.lock().unwrap();
+        g.as_ref()
+            .ok_or("wallet locked")?
+            .pending_deposits
+            .iter()
+            .find(|d| d.index == index && !d.archived)
+            .cloned()
+            .ok_or("no such pending deposit")?
+    };
+    let preimage = hex::decode(&p.preimage_hex).ok().filter(|v| v.len() == 32).ok_or("corrupt preimage record")?;
+    let lock = zcrypt_core::nullifier::htlc_hashlock(&preimage);
+    let _op = BridgeOpGuard::enter();
+    let (alice_bk, _dest) = swap_backend_lazy(&state, 0)?;
+    let zc = zc_client(&state)?;
+    let reserve_pk = reserve_pk_for(&zc, p.asset_id, &p.reserve_pk_hex)?;
+    let refund = {
+        let g = state.wallet.lock().unwrap();
+        alice_key_at(&g.as_ref().ok_or("wallet locked")?.account, p.index)
+    };
+    let dir = state.data_dir.lock().unwrap().clone();
+    let net = zcrypt_bridge::network_from_str(&bridge_settings(&dir)?.btc_network);
+    if find_shield_funding(alice_bk.as_ref(), &p, net, &lock, &reserve_pk, &refund.pk)?.is_some() {
+        return Err("this deposit has an unspent HTLC on Bitcoin. Use Diagnose & fix, or Refund once the lock has passed".into());
+    }
+    let horizon = shield_locktime_candidates(&p, net).into_iter().max().unwrap_or(0);
+    let script_known = deposit_script_known(&p);
+    let address_unused = if script_known {
+        let script = zcrypt_bridge::htlc_script(&lock, &reserve_pk, &refund.pk, p.btc_locktime);
+        htlc_address_unused(alice_bk.as_ref(), &script)
+    } else {
+        None
+    };
+    let tip = alice_bk.height()?;
+    match unfunded_deposit_action(
+        &UnfundedDeposit {
+            index: p.index,
+            value_sats: p.value_sats,
+            horizon,
+            btc_tip_at_start: p.btc_tip,
+            btc_tip_now: tip,
+            funding: p.funding.clone(),
+            script_known,
+            address_unused,
+        },
+        true,
+    ) {
+        UnfundedAction::Archive(note) => {
+            with_wallet(&state, |w| {
+                if let Some(d) = w.pending_deposits.iter_mut().find(|d| d.index == index) {
+                    d.archived = true;
+                    d.archive_note = note.clone();
+                }
+                Ok(())
+            })?;
+            ok(note)
+        }
+        UnfundedAction::Keep(note) => Err(note),
+    }
 }
 
 #[derive(Serialize)]
@@ -8051,10 +8427,21 @@ fn swap_shield_btc_impl(
     let utxo = match alice_bk.fund_htlc_unconfirmed(&script, btc_amt) {
         Ok(u) => u,
         Err(e) => {
+            // A broadcast POST can fail after the tx is already on the network. The
+            // backend names that tx; persist it before reporting the error.
+            if let Some((txid, vout)) = funding_outpoint_from_error(&e) {
+                let _ = with_wallet(state, |w| {
+                    if let Some(p) = w.pending_deposits.iter_mut().find(|p| p.index == idx) {
+                        p.funding = Some((txid, vout));
+                    }
+                    Ok(())
+                });
+            }
             return Err(format!(
-                "could not fund the Bitcoin HTLC: {e}. The deposit record is kept: if the funding did reach the \
+                "could not fund the Bitcoin HTLC: {}. The deposit record is kept: if the funding did reach the \
                  Bitcoin network, 'Diagnose & fix a stuck swap' picks it up from the HTLC; if it never did, the \
-                 record is closed once its lock is long past"
+                 record is closed once its lock is long past",
+                without_funding_marker(&e)
             ));
         }
     };
@@ -8372,6 +8759,199 @@ struct RecoverResult {
     message: String,
 }
 
+/// What Diagnose knows about a deposit whose unspent HTLC it could not find.
+struct UnfundedDeposit {
+    index: u32,
+    value_sats: u64,
+    /// Latest candidate CLTV. The mint is no longer safe once the Bitcoin tip passes it.
+    horizon: u64,
+    /// Bitcoin tip when the deposit record was written.
+    btc_tip_at_start: u64,
+    btc_tip_now: u64,
+    funding: Option<(String, u32)>,
+    /// Persisted locktime and reserve key, so the HTLC address is the one we would have paid.
+    script_known: bool,
+    /// `Some(true)`: that address has no Bitcoin history. `None`: the backend could not say.
+    address_unused: Option<bool>,
+}
+
+enum UnfundedAction {
+    Keep(String),
+    Archive(String),
+}
+
+/// Txid marker a backend appends when it signed a funding tx but the broadcast POST failed.
+fn funding_outpoint_from_error(err: &str) -> Option<(String, u32)> {
+    let line = err.lines().find(|l| l.starts_with("FUNDING_TX "))?;
+    let rest = line["FUNDING_TX ".len()..].trim();
+    let (txid, vout) = rest.split_once(':')?;
+    if txid.len() != 64 || !txid.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    Some((txid.to_string(), vout.trim().parse().ok()?))
+}
+
+fn without_funding_marker(err: &str) -> String {
+    err.lines().filter(|l| !l.starts_with("FUNDING_TX ")).collect::<Vec<_>>().join(" ")
+}
+
+/// Decide what to tell the user, and whether the record can be closed, when no unspent
+/// HTLC was found. An address with no history is proof nothing was locked only when the
+/// script is the exact one this record would have paid. `early_close` is the Dismiss
+/// button: the user may drop that record once a later Bitcoin block has arrived.
+/// Diagnose itself (`early_close == false`) waits until the lock has passed before
+/// closing, so a funding tx that is slow to show up is not hidden while it can still be minted.
+fn unfunded_deposit_action(d: &UnfundedDeposit, early_close: bool) -> UnfundedAction {
+    let never_paid = d.script_known && d.address_unused == Some(true);
+    let lock_passed = d.horizon > 0 && d.btc_tip_now >= d.horizon;
+    let propagated = d.btc_tip_now > d.btc_tip_at_start;
+    if never_paid && lock_passed {
+        return UnfundedAction::Archive(format!(
+            "deposit #{} ({} sats): its HTLC address has no Bitcoin history and no funding was broadcast. Nothing is locked. Record closed",
+            d.index, d.value_sats
+        ));
+    }
+    if early_close && never_paid && propagated {
+        return UnfundedAction::Archive(format!(
+            "deposit #{} ({} sats): dismissed. Its HTLC address has no Bitcoin history, so nothing was locked",
+            d.index, d.value_sats
+        ));
+    }
+    if early_close && never_paid {
+        return UnfundedAction::Keep(format!(
+            "deposit #{}: the funding transaction may still be propagating; wait for one more Bitcoin block before dismissing",
+            d.index
+        ));
+    }
+    if early_close {
+        return UnfundedAction::Keep(format!(
+            "deposit #{}: this deposit cannot be dismissed while its HTLC might still exist. Run Diagnose & fix",
+            d.index
+        ));
+    }
+    if never_paid {
+        return UnfundedAction::Keep(format!(
+            "deposit #{} ({} sats): Bitcoin has no transaction to this deposit's HTLC, confirmed or unconfirmed. Nothing is locked. If the shield stopped with an error, the BTC is still in your wallet and you can shield again. Dismiss the record, or it closes once Bitcoin block {} passes",
+            d.index, d.value_sats, d.horizon
+        ));
+    }
+    if d.funding.is_none() && lock_passed && d.btc_tip_now >= d.horizon.saturating_add(2016) {
+        return UnfundedAction::Archive(format!(
+            "deposit #{} ({} sats): no funding was ever found on Bitcoin and its lock passed two weeks ago; the record is archived (nothing was locked)",
+            d.index, d.value_sats
+        ));
+    }
+    if lock_passed {
+        let where_ = match &d.funding {
+            Some((txid, vout)) => format!("funding tx {txid}:{vout} is not an unspent HTLC on this backend"),
+            None => "no funding transaction was recorded".into(),
+        };
+        return UnfundedAction::Keep(format!(
+            "deposit #{} ({} sats): its Bitcoin lock (block {}) has passed but {where_}; the record is kept so a Refund is possible once your Bitcoin backend shows the HTLC",
+            d.index, d.value_sats, d.horizon
+        ));
+    }
+    if let Some((txid, vout)) = &d.funding {
+        return UnfundedAction::Keep(format!(
+            "deposit #{} ({} sats): saved funding tx {txid}:{vout} is not an unspent HTLC on this backend yet; try again later",
+            d.index, d.value_sats
+        ));
+    }
+    UnfundedAction::Keep(format!(
+        "deposit #{} ({} sats): no HTLC funding found on Bitcoin yet (it may still be unconfirmed); try again later",
+        d.index, d.value_sats
+    ))
+}
+
+#[cfg(test)]
+mod unfunded_deposit_tests {
+    use super::*;
+
+    fn sample() -> UnfundedDeposit {
+        UnfundedDeposit {
+            index: 28,
+            value_sats: 100_000,
+            horizon: 974_555,
+            btc_tip_at_start: 973_547,
+            btc_tip_now: 974_700,
+            funding: None,
+            script_known: true,
+            address_unused: Some(true),
+        }
+    }
+
+    #[test]
+    fn empty_address_past_the_lock_is_closed() {
+        match unfunded_deposit_action(&sample(), false) {
+            UnfundedAction::Archive(n) => assert!(n.contains("Nothing is locked"), "{n}"),
+            UnfundedAction::Keep(n) => panic!("kept a deposit that was never paid: {n}"),
+        }
+    }
+
+    #[test]
+    fn empty_address_inside_the_lock_stays_and_says_nothing_is_locked() {
+        let mut d = sample();
+        d.index = 79;
+        d.value_sats = 5_000_000;
+        d.btc_tip_now = 974_000;
+        d.horizon = 974_555;
+        match unfunded_deposit_action(&d, false) {
+            UnfundedAction::Keep(n) => {
+                assert!(n.contains("Nothing is locked"), "{n}");
+                assert!(n.contains("Dismiss"), "{n}");
+            }
+            UnfundedAction::Archive(n) => panic!("diagnose closed a deposit still inside its lock: {n}"),
+        }
+    }
+
+    #[test]
+    fn dismiss_waits_for_one_later_block() {
+        let mut d = sample();
+        d.btc_tip_at_start = 974_000;
+        d.btc_tip_now = 974_000;
+        d.horizon = 975_008;
+        assert!(matches!(unfunded_deposit_action(&d, true), UnfundedAction::Keep(_)));
+        d.btc_tip_now = 974_001;
+        assert!(matches!(unfunded_deposit_action(&d, true), UnfundedAction::Archive(_)));
+    }
+
+    #[test]
+    fn unknown_address_keeps_the_refund_note() {
+        let mut d = sample();
+        d.address_unused = None;
+        d.script_known = false;
+        match unfunded_deposit_action(&d, false) {
+            UnfundedAction::Keep(n) => assert!(n.contains("no funding transaction was recorded"), "{n}"),
+            UnfundedAction::Archive(n) => panic!("archived without proof the address is empty: {n}"),
+        }
+    }
+
+    #[test]
+    fn a_saved_txid_is_named_while_the_lock_holds() {
+        let mut d = sample();
+        d.address_unused = None;
+        d.script_known = false;
+        d.btc_tip_now = 974_000;
+        d.funding = Some(("ab".repeat(32), 0));
+        match unfunded_deposit_action(&d, false) {
+            UnfundedAction::Keep(n) => assert!(n.contains("saved funding tx"), "{n}"),
+            UnfundedAction::Archive(n) => panic!("{n}"),
+        }
+    }
+
+    #[test]
+    fn funding_marker_parses_and_is_hidden_from_the_user() {
+        let txid = "ab".repeat(32);
+        let err = format!("broadcast rejected (400): min relay fee\nFUNDING_TX {txid}:0");
+        assert_eq!(funding_outpoint_from_error(&err), Some((txid, 0)));
+        let shown = without_funding_marker(&err);
+        assert!(shown.contains("min relay fee"), "{shown}");
+        assert!(!shown.contains("FUNDING_TX"), "{shown}");
+        assert!(funding_outpoint_from_error("no marker").is_none());
+        assert!(funding_outpoint_from_error("FUNDING_TX zz:0").is_none());
+    }
+}
+
 /// **Diagnose & fix a stuck bridge.** Reconciles the wallet's zBTC against the live
 /// commitment tree: any zBTC coin no longer on-chain (typically after a devnet chain
 /// reset, which is what produces "input coin not on chain" on redeem) is cleared, so the
@@ -8433,7 +9013,19 @@ fn resume_pending_deposits(state: &State<AppState>, notes: &mut Vec<String>) -> 
             (alice_key_at(&w.account, p.index), w.key_at(p.index))
         };
         let horizon = shield_locktime_candidates(&p, net).into_iter().max().unwrap_or(0);
-        let Some((utxo, btc_locktime)) = find_shield_funding(alice_bk.as_ref(), &p, net, &lock, &reserve_pk, &refund.pk)? else {
+        let scanned = find_shield_funding(alice_bk.as_ref(), &p, net, &lock, &reserve_pk, &refund.pk)?;
+        let from_record = if scanned.is_some() {
+            None
+        } else {
+            match funding_from_record(alice_bk.as_ref(), &p, net, &lock, &reserve_pk, &refund.pk) {
+                Ok(v) => v,
+                Err(e) => {
+                    notes.push(e);
+                    continue;
+                }
+            }
+        };
+        let Some((utxo, btc_locktime)) = scanned.or(from_record) else {
             // No UNSPENT funding. The deposit may be finished: the operator sweeps the HTLC
             // with the preimage the mint revealed, so a claim-branch spend carrying OUR
             // preimage is proof the zBTC was minted (the record was lost after the fact, e.g.
@@ -8455,24 +9047,31 @@ fn resume_pending_deposits(state: &State<AppState>, notes: &mut Vec<String>) -> 
                 resumed += 1;
                 continue;
             }
-            if p.funding.is_none() && btc_tip_now >= horizon.saturating_add(2016) {
-                // Two weeks past the lock with no funding ever seen: the HTLC was never broadcast.
-                let note = format!(
-                    "deposit #{} ({} sats): no funding was ever found on Bitcoin and its lock passed two weeks ago; the record is archived (nothing was locked)",
-                    p.index, p.value_sats
-                );
-                notes.push(note.clone());
-                archive(state, p.index, note);
-            } else if btc_tip_now >= horizon {
-                notes.push(format!(
-                    "deposit #{} ({} sats): its Bitcoin lock (block {horizon}) has passed but no funding is visible; the record is kept so a Refund is possible once your Bitcoin backend shows the HTLC",
-                    p.index, p.value_sats
-                ));
+            let script_known = deposit_script_known(&p);
+            let address_unused = if script_known {
+                let script = zcrypt_bridge::htlc_script(&lock, &reserve_pk, &refund.pk, p.btc_locktime);
+                htlc_address_unused(alice_bk.as_ref(), &script)
             } else {
-                notes.push(format!(
-                    "deposit #{} ({} sats): no HTLC funding found on Bitcoin yet (it may still be unconfirmed); try again later",
-                    p.index, p.value_sats
-                ));
+                None
+            };
+            match unfunded_deposit_action(
+                &UnfundedDeposit {
+                    index: p.index,
+                    value_sats: p.value_sats,
+                    horizon,
+                    btc_tip_at_start: p.btc_tip,
+                    btc_tip_now,
+                    funding: p.funding.clone(),
+                    script_known,
+                    address_unused,
+                },
+                false,
+            ) {
+                UnfundedAction::Archive(note) => {
+                    notes.push(note.clone());
+                    archive(state, p.index, note);
+                }
+                UnfundedAction::Keep(note) => notes.push(note),
             }
             continue;
         };
@@ -9752,6 +10351,7 @@ pub fn run() {
             list_validators,
             delegate_validator,
             undelegate_validator,
+            my_delegations,
             my_unbonding,
             bridge_init,
             bridge_status,
@@ -9760,6 +10360,7 @@ pub fn run() {
             swap_redeem_btc,
             bridge_recover,
             bridge_refund_deposit,
+            bridge_dismiss_unfunded_deposit,
             list_pending_deposits,
             list_pending_secrets,
             dismiss_pending_secret,
@@ -10055,7 +10656,7 @@ mod live_3node {
         assert!(claimed.claimed >= claimable.ready && claimed.coins >= 1, "claimed {:?}", claimed.claimed);
         v(scan_onchain(alice.st())).expect("scan");
         println!("[wallet] rewards accrued ({}) and claimed ({} base units, {} coins)", claimable.ready, claimed.claimed, claimed.coins);
-        let u = v(undelegate_validator(vpk_hex.clone(), alice.st())).expect("undelegate");
+        let u = v(undelegate_validator(vpk_hex.clone(), None, None, alice.st())).expect("undelegate");
         println!("[wallet] {u}");
         let unb = v(my_unbonding(alice.st())).expect("unbonding");
         assert!(!unb.is_empty(), "the undelegated stake is in the unbonding queue");

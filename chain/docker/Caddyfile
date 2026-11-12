@@ -103,7 +103,15 @@
 		reverse_proxy cometbft:26657
 	}
 	handle @jsonrpc {
-		reverse_proxy cometbft:26657
+		# CometBFT 0.38 reads the whole request under a hard-coded 10s deadline and
+		# answers HTTP 400 ("i/o timeout") when a multi-megabyte shield broadcast is
+		# still arriving. There is no config key for that read timer. Buffer the body
+		# here, capped by the 8MB limit above, and hand CometBFT a finished request
+		# over the local network. The 30/min broadcast limit bounds how many of these
+		# sit in memory at once.
+		reverse_proxy cometbft:26657 {
+			request_buffers 8MB
+		}
 	}
 	handle {
 		respond "not found" 404

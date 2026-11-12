@@ -1195,6 +1195,13 @@ fn load_chain_id(db_path: &Path) -> Vec<u8> {
     }
 }
 
+/// Bitcoin display order (big-endian hex) of an internal header hash.
+fn spv_hash_display(hash: [u8; 32]) -> String {
+    let mut be = hash;
+    be.reverse();
+    hex::encode(be)
+}
+
 /// Header-relay txs must not exceed the per-block byte budget; tracked per block so the
 /// cap is a deterministic function of the block's contents.
 fn header_budget_ok(used: usize, len: usize) -> bool {
@@ -2759,9 +2766,33 @@ impl ZcryptApp {
             "/spv/tip" => {
                 let (h, hash) = s.node.btc_tip();
                 // Display hash big-endian like every Bitcoin explorer.
-                let mut be = hash;
-                be.reverse();
-                format!("{h}:{}", hex::encode(be)).into_bytes()
+                format!("{h}:{}", spv_hash_display(hash)).into_bytes()
+            }
+            // Best-chain header hash at one height, same display order as `/spv/tip`.
+            // A relayer uses this to find the fork point after a Bitcoin reorg: height
+            // alone would append the next canonical header onto a stale tip and fail
+            // with "unknown parent header".
+            p if p.starts_with("/spv/hash/") => {
+                let rest = &p["/spv/hash/".len()..];
+                match rest.parse::<u64>() {
+                    Ok(height) => match s.node.spv().hash_at_height(height) {
+                        Some(hash) => spv_hash_display(hash).into_bytes(),
+                        None => {
+                            return ResponseQuery {
+                                code: ERR,
+                                log: format!("no header at height {height}"),
+                                ..Default::default()
+                            }
+                        }
+                    },
+                    Err(_) => {
+                        return ResponseQuery {
+                            code: ERR,
+                            log: "bad /spv/hash/<height>".into(),
+                            ..Default::default()
+                        }
+                    }
+                }
             }
             "/spv/claimed" => s.node.spv().claimed_count().to_string().into_bytes(),
             // A staker's claimable bridge-fee yield: "/staking/fees/<pk_hex>/<asset_id>".

@@ -854,32 +854,308 @@ pub fn wait_for_maturity(
     Err("timed out waiting for SPV mints to mature".to_string())
 }
 
-/// Catch the consensus SPV chain up to `btc`'s current tip: query the chain's
-/// `/spv/height`, fetch every missing header from the (untrusted) backend, and
-/// relay them in batches. Idempotent and race-safe — duplicate headers are
-/// consensus no-ops. Returns the chain's new Bitcoin tip height.
+/// Catch the consensus SPV chain up to `btc`'s best chain.
+///
+/// Height alone is not enough. After a Bitcoin reorg the consensus tip can sit at the
+/// same height as a block this backend no longer serves. Relaying `tip + 1` then fails
+/// `check_tx` with `unknown parent header` — the canonical parent was never stored — and
+/// every later header, including a deposit's confirming block, stays stuck behind it.
+/// `/spv/tip` carries the tip hash. When it differs from the backend's header at that
+/// height, walk back to the common ancestor (`/spv/hash/<height>`) and relay the
+/// canonical branch from there. A node that does not answer `/spv/hash` falls back to
+/// doubling the lookback until a batch connects. A node that only answers `/spv/height`
+/// keeps the old height-only relay. Returns the Bitcoin height now covered.
 pub fn relay_btc_headers(zc: &dyn ZcNode, btc: &dyn crate::BtcBackend) -> Result<u64, String> {
-    let chain_tip: u64 = zc
-        .query("/spv/height")?
+    let btc_tip = btc.height()?;
+    let (chain_h, chain_hash) = match zc.query("/spv/tip") {
+        Ok(s) if s.contains(':') => parse_spv_tip(&s)?,
+        _ => {
+            // No tip hash (older node). Try height+1 first; on `unknown parent`
+            // walk back until a batch connects to a stored header.
+            let chain_h = query_spv_height(zc)?;
+            if btc_tip <= chain_h {
+                return Ok(chain_h);
+            }
+            return relay_by_lookback(zc, btc, chain_h, btc_tip, 0);
+        }
+    };
+    // The consensus tip is at least as tall as this backend. Nothing newer to relay.
+    // (A taller stale fork is left for a backend that has grown past it.)
+    if btc_tip <= chain_h {
+        return Ok(chain_h);
+    }
+    let at_tip = header_display_hash(&btc.block_header(chain_h)?)?;
+    if at_tip.eq_ignore_ascii_case(&chain_hash) {
+        relay_header_range(zc, btc, chain_h + 1, btc_tip)?;
+        return Ok(btc_tip);
+    }
+    // Stale tip: the next canonical header's parent is not the consensus tip.
+    match spv_common_ancestor(zc, btc, chain_h) {
+        Ok(fork) => {
+            relay_header_range(zc, btc, fork + 1, btc_tip)?;
+            Ok(btc_tip)
+        }
+        // The tip hash already disagreed, so height+1 cannot connect. Start one
+        // block further back.
+        Err(e) if spv_hash_unsupported(&e) => relay_by_lookback(zc, btc, chain_h, btc_tip, 1),
+        Err(e) => Err(e),
+    }
+}
+
+fn query_spv_height(zc: &dyn ZcNode) -> Result<u64, String> {
+    zc.query("/spv/height")?
         .trim()
         .parse()
-        .map_err(|e| format!("bad /spv/height: {e}"))?;
-    let btc_tip = btc.height()?;
-    if btc_tip <= chain_tip {
-        return Ok(chain_tip);
+        .map_err(|e| format!("bad /spv/height: {e}"))
+}
+
+/// `/spv/tip` is `"<height>:<display hash>"`.
+fn parse_spv_tip(s: &str) -> Result<(u64, String), String> {
+    let s = s.trim();
+    let (h, hash) = s.split_once(':').ok_or("bad /spv/tip: expected <height>:<hash>")?;
+    let height: u64 = h.parse().map_err(|_| format!("bad /spv/tip height {h:?}"))?;
+    let hash = hash.trim().to_ascii_lowercase();
+    if hash.len() != 64 || !hash.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(format!("bad /spv/tip hash {hash:?}"));
+    }
+    Ok((height, hash))
+}
+
+fn header_display_hash(raw: &[u8; 80]) -> Result<String, String> {
+    let hdr: bitcoin::block::Header =
+        bitcoin::consensus::deserialize(raw).map_err(|e| format!("block header: {e}"))?;
+    Ok(hdr.block_hash().to_string())
+}
+
+fn spv_hash_unsupported(err: &str) -> bool {
+    err.contains("unknown path") || err.contains("unknown query")
+}
+
+/// Highest height at or below `mismatch_at` whose best-chain hash equals the backend's
+/// header. `mismatch_at` itself does not match (the caller checked the tip).
+fn spv_common_ancestor(zc: &dyn ZcNode, btc: &dyn crate::BtcBackend, mismatch_at: u64) -> Result<u64, String> {
+    let btc_hash = |h: u64| header_display_hash(&btc.block_header(h)?);
+    let chain_hash = |h: u64| spv_hash_at(zc, h);
+    common_ancestor_height(mismatch_at, &btc_hash, &chain_hash)
+}
+
+/// Highest height `< mismatch_at` where `btc_hash` and `chain_hash` agree.
+/// `chain_hash` returns `Ok(None)` for a height the consensus chain does not have.
+fn common_ancestor_height(
+    mismatch_at: u64,
+    btc_hash: &dyn Fn(u64) -> Result<String, String>,
+    chain_hash: &dyn Fn(u64) -> Result<Option<String>, String>,
+) -> Result<u64, String> {
+    if mismatch_at == 0 {
+        return Err(
+            "consensus SPV tip and this Bitcoin backend disagree at the checkpoint; cannot relay".into(),
+        );
+    }
+    let mut hi = mismatch_at;
+    let mut step = 1u64;
+    let mut cursor = mismatch_at;
+    let mut matched: Option<u64> = None;
+    while cursor > 0 {
+        let h = cursor.saturating_sub(step);
+        if h == cursor {
+            break;
+        }
+        match headers_match(h, btc_hash, chain_hash)? {
+            Some(true) => {
+                matched = Some(h);
+                break;
+            }
+            Some(false) => {
+                cursor = h;
+                hi = h;
+                step = step.saturating_mul(2).min(8_192);
+            }
+            None => {
+                return Err(format!(
+                    "SPV chain and this Bitcoin backend share no header at or below height {cursor} \
+                     (height {h} is not on the consensus best chain)"
+                ));
+            }
+        }
+    }
+    let Some(mut lo) = matched else {
+        return Err("SPV chain and this Bitcoin backend share no common header".into());
+    };
+    while lo + 1 < hi {
+        let mid = lo + (hi - lo) / 2;
+        match headers_match(mid, btc_hash, chain_hash)? {
+            Some(true) => lo = mid,
+            Some(false) | None => hi = mid,
+        }
+    }
+    Ok(lo)
+}
+
+/// `Some(true/false)` when both sides have a header at `height`, `None` when the consensus
+/// chain does not. An unknown `/spv/hash` endpoint is an error so the caller can fall back.
+fn headers_match(
+    height: u64,
+    btc_hash: &dyn Fn(u64) -> Result<String, String>,
+    chain_hash: &dyn Fn(u64) -> Result<Option<String>, String>,
+) -> Result<Option<bool>, String> {
+    let chain = match chain_hash(height)? {
+        Some(s) => s.to_ascii_lowercase(),
+        None => return Ok(None),
+    };
+    Ok(Some(chain == btc_hash(height)?.to_ascii_lowercase()))
+}
+
+fn spv_hash_at(zc: &dyn ZcNode, height: u64) -> Result<Option<String>, String> {
+    match zc.query(&format!("/spv/hash/{height}")) {
+        Ok(s) => {
+            let s = s.trim().to_string();
+            if s.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(s))
+            }
+        }
+        Err(e) if e.contains("no header") => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// How far below `chain_h + 1` attempt `n` starts. 0, then 1, 2, 4, 8, ...
+fn lookback_distance(attempt: u32) -> u64 {
+    if attempt == 0 {
+        0
+    } else {
+        1u64 << (attempt - 1).min(20)
+    }
+}
+
+/// Relay without `/spv/hash`: double the number of older headers until the batch's first
+/// new header connects to a stored parent. `first_attempt` 0 starts at `chain_h + 1`
+/// (the aligned case). `first_attempt` 1 starts at `chain_h`, which is what a one-block
+/// reorg needs: the canonical header at the stale tip, whose parent is the fork point.
+fn relay_by_lookback(
+    zc: &dyn ZcNode,
+    btc: &dyn crate::BtcBackend,
+    chain_h: u64,
+    btc_tip: u64,
+    first_attempt: u32,
+) -> Result<u64, String> {
+    const MAX_ATTEMPT: u32 = 21; // 2^20 blocks of lookback
+    let mut last_err = String::new();
+    for attempt in first_attempt..MAX_ATTEMPT {
+        let dist = lookback_distance(attempt);
+        if dist > chain_h + 1 {
+            break;
+        }
+        let start = (chain_h + 1).saturating_sub(dist);
+        if start == 0 || start > btc_tip {
+            break;
+        }
+        match relay_header_range(zc, btc, start, btc_tip) {
+            Ok(()) => return Ok(btc_tip),
+            Err(e) if e.contains("unknown parent header") => last_err = e,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(format!(
+        "{last_err}. The consensus SPV tip (height {chain_h}) is not on this Bitcoin chain; \
+         relaying older headers did not find a common ancestor"
+    ))
+}
+
+/// Relay headers `start..=btc_tip` in batches. A batch the chain already has is skipped
+/// (a lookback includes the common ancestor's children, which are duplicates).
+fn relay_header_range(zc: &dyn ZcNode, btc: &dyn crate::BtcBackend, start: u64, btc_tip: u64) -> Result<(), String> {
+    if start > btc_tip {
+        return Ok(());
     }
     let mut batch = Vec::with_capacity(HEADER_BATCH * 80);
-    for h in (chain_tip + 1)..=btc_tip {
+    for h in start..=btc_tip {
         batch.extend_from_slice(&btc.block_header(h)?);
         if batch.len() >= HEADER_BATCH * 80 {
-            zc.broadcast(&headers_tx(&batch))?;
+            broadcast_headers(zc, &batch)?;
             batch.clear();
         }
     }
     if !batch.is_empty() {
-        zc.broadcast(&headers_tx(&batch))?;
+        broadcast_headers(zc, &batch)?;
     }
-    Ok(btc_tip)
+    Ok(())
+}
+
+fn broadcast_headers(zc: &dyn ZcNode, batch: &[u8]) -> Result<(), String> {
+    match zc.broadcast(&headers_tx(batch)) {
+        Ok(_) => Ok(()),
+        Err(e) if e.contains("no new headers") || e.contains("already known") => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+#[cfg(test)]
+mod header_relay_tests {
+    use super::{common_ancestor_height, lookback_distance, parse_spv_tip};
+
+    #[test]
+    fn parses_spv_tip() {
+        let (h, hash) = parse_spv_tip(
+            "974400:000000000000000000018B7C42B80B3EF0C336E351D069C8D524FED28880A823\n",
+        )
+        .unwrap();
+        assert_eq!(h, 974_400);
+        assert_eq!(hash, "000000000000000000018b7c42b80b3ef0c336e351d069c8d524fed28880a823");
+        assert!(parse_spv_tip("974400").is_err());
+        assert!(parse_spv_tip("nope:abcd").is_err());
+    }
+
+    #[test]
+    fn lookback_doubles_from_the_stale_tip() {
+        assert_eq!(lookback_distance(0), 0);
+        assert_eq!(lookback_distance(1), 1);
+        assert_eq!(lookback_distance(2), 2);
+        assert_eq!(lookback_distance(3), 4);
+        // A one-block reorg (the canonical parent of tip+1 is unknown) connects on attempt 1,
+        // which starts at the stale tip height itself.
+        let chain_h = 974_400u64;
+        assert_eq!((chain_h + 1).saturating_sub(lookback_distance(0)), chain_h + 1);
+        assert_eq!((chain_h + 1).saturating_sub(lookback_distance(1)), chain_h);
+    }
+
+    /// Bitcoin and the consensus chain agree at every height `<= same_through`.
+    fn ancestor(mismatch_at: u64, same_through: u64) -> Result<u64, String> {
+        let btc = |h: u64| Ok(format!("btc{h}"));
+        let chain = move |h: u64| -> Result<Option<String>, String> {
+            if h == 0 {
+                Ok(None) // checkpoint floor
+            } else if h <= same_through {
+                Ok(Some(format!("btc{h}")))
+            } else {
+                Ok(Some(format!("stale{h}")))
+            }
+        };
+        common_ancestor_height(mismatch_at, &btc, &chain)
+    }
+
+    #[test]
+    fn one_block_reorg_forks_at_the_parent() {
+        // Consensus tip height 974400 is a different block than Bitcoin's 974400
+        // (the parent named in `unknown parent header`). They still share 974399,
+        // so relay must start at 974400, not 974401.
+        assert_eq!(ancestor(974_400, 974_399).unwrap(), 974_399);
+    }
+
+    #[test]
+    fn deeper_reorg_binary_searches_the_fork() {
+        assert_eq!(ancestor(1_200, 1_000).unwrap(), 1_000);
+        assert_eq!(ancestor(100, 99).unwrap(), 99);
+        assert_eq!(ancestor(80_000, 40_000).unwrap(), 40_000);
+    }
+
+    #[test]
+    fn no_common_header_is_an_error() {
+        let btc = |h: u64| Ok(format!("btc{h}"));
+        let chain = |_h: u64| Ok(Some("stale".into()));
+        assert!(common_ancestor_height(10, &btc, &chain).is_err());
+    }
 }
 
 /// Build a mint-escrow open tx (0x5A). `auth` is the encoded M-of-N mint authorization
@@ -2518,7 +2794,9 @@ pub enum SweepOutcome {
 /// Sweep ONE deposit whose preimage is revealed: verify consensus accepted the claim,
 /// defer until the funding is buried past `safe_sweep_conf`, then spend the HTLC's claim
 /// branch to `dest`. Never blocks on confirmations on a real network (regtest self-mines);
-/// the caller tracks the sweep txid (bridge N7).
+/// the caller tracks the sweep txid (bridge N7). `extra_fee_sat` is added on top of the
+/// estimated fee so a re-sweep clears Bitcoin's incremental relay fee; pass 0 for a first sweep.
+#[allow(clippy::too_many_arguments)]
 pub fn sweep_deposit(
     zc: &dyn ZcNode,
     operator_btc: &dyn BtcBackend,
@@ -2528,6 +2806,7 @@ pub fn sweep_deposit(
     preimage: &[u8],
     fee_target: u32,
     btc_tip: u64,
+    extra_fee_sat: u64,
 ) -> SweepOutcome {
     use bitcoin::hashes::Hash as _;
     let net = spv_net(operator_btc.network());
@@ -2570,6 +2849,7 @@ pub fn sweep_deposit(
     let outcome = (|| -> Result<bitcoin::Txid, String> {
         let utxo = htlc_utxo_from_proof(&proof, &lock)?;
         let fee = htlc_spend_fee_for(operator_btc, effective_fee_target, utxo.value.to_sat())?;
+        let fee = Amount::from_sat(fee.to_sat().saturating_add(extra_fee_sat));
         let txid = operator_btc.claim(&utxo, preimage, reserve, &pay, fee)?;
         if operator_btc.network() == bitcoin::Network::Regtest {
             operator_btc.confirm(&txid)?; // instant self-mine; real networks are polled per tick
@@ -2614,7 +2894,7 @@ pub fn reserve_claim_revealed(
             continue;
         }
         let prox = refund_proximity(dep.btc_locktime, btc_tip);
-        match sweep_deposit(zc, operator_btc, &keys, dest, &dep, &preimage, fee_target, btc_tip) {
+        match sweep_deposit(zc, operator_btc, &keys, dest, &dep, &preimage, fee_target, btc_tip, 0) {
             SweepOutcome::Swept(txid) => {
                 already_swept.insert(eid);
                 report.swept.push((eid, txid));

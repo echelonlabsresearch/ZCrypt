@@ -49,12 +49,14 @@
 //! threshold/HSM custody and keep only a low hot float (see the launch runbook). The daemon
 //! never prints or logs the secret, only its pubkey.
 
+use std::cell::Cell;
+use std::io::Write;
 use std::path::PathBuf;
 use std::time::Duration;
 
 use zcrypt_bridge::watcher::{
     btc_rpc_url_policy, finalize_margin_policy, fresh_state_guard, previous_reserve_keys_from_env, reserve_key_from_env, seed_cursor,
-    watcher_tick_persisting, FeeBumper, InstanceLock, WatcherState,
+    watcher_tick_persisting, FeeBumper, InstanceLock, WatcherState, SCAN_BLOCKS_PER_TICK, SCAN_PERSIST_EVERY,
 };
 use zcrypt_bridge::zcrypt::Zcrypt;
 use zcrypt_bridge::{swap, Btc};
@@ -204,18 +206,36 @@ fn main() {
         eprintln!("[bridge-watcher] {e}");
         std::process::exit(2);
     }
-    let persist = |st: &WatcherState| st.save(&state_path);
+    // stderr is block-buffered under Docker. A catch-up used to scan for hours and
+    // print nothing until the tick returned, so the log looked frozen at an old cursor
+    // while the state file moved. Flush every line, and print the cursor every
+    // SCAN_PERSIST_EVERY blocks during the scan itself.
+    let last_logged = Cell::new(state.cursor);
+    let persist = |st: &WatcherState| {
+        let saved = st.save(&state_path);
+        if st.cursor >= last_logged.get().saturating_add(SCAN_PERSIST_EVERY) {
+            eprintln!("[bridge-watcher] scanning cursor={}", st.cursor);
+            let _ = std::io::stderr().flush();
+            last_logged.set(st.cursor);
+        }
+        saved
+    };
     let bumper: &dyn FeeBumper = &operator_btc;
     loop {
-        match watcher_tick_persisting(&mut state, &zc, &operator_btc, &keys, &shield_dest, asset, margin, fee_target, Some(bumper), &persist) {
+        let cursor_before = state.cursor;
+        match watcher_tick_persisting(
+            &mut state, &zc, &operator_btc, &keys, &shield_dest, asset, margin, fee_target, Some(bumper), Some(SCAN_BLOCKS_PER_TICK),
+            &persist,
+        ) {
             Ok(r) => {
                 if r.swept + r.locked + r.finalized + r.refunded + r.reanchored + r.resumed + r.deferred + r.at_risk + r.critical + r.rejected > 0
                     || r.pause_new_shields
                     || !r.errors.is_empty()
+                    || r.behind > 0
                 {
                     eprintln!(
-                        "[bridge-watcher] cursor={} retry_heights={} swept={} locked={} finalized={} refunded={} reanchored={} resumed={} deferred={} bumped={} promoted={} at_risk={} critical={} pause_shields={} rejected={} errors={}",
-                        state.cursor, state.retry_heights.len(), r.swept, r.locked, r.finalized, r.refunded, r.reanchored, r.resumed, r.deferred, r.bumped, r.promoted, r.at_risk, r.critical,
+                        "[bridge-watcher] cursor={} behind={} retry_heights={} swept={} locked={} finalized={} refunded={} reanchored={} resumed={} deferred={} bumped={} promoted={} at_risk={} critical={} pause_shields={} rejected={} errors={}",
+                        state.cursor, r.behind, state.retry_heights.len(), r.swept, r.locked, r.finalized, r.refunded, r.reanchored, r.resumed, r.deferred, r.bumped, r.promoted, r.at_risk, r.critical,
                         r.pause_new_shields, r.rejected, r.errors.len()
                     );
                 }
@@ -237,8 +257,19 @@ fn main() {
                 if let Err(e) = state.save(&state_path) {
                     eprintln!("[bridge-watcher] WARNING: failed to persist state: {e}");
                 }
+                let _ = std::io::stderr().flush();
+                // Still behind, and this tick moved the cursor: settle again immediately.
+                // Sleeping the poll interval here is how a catch-up used to fall further
+                // behind a 1-second chain. A tick that made no progress sleeps, so a
+                // stuck block RPC is not retried in a tight loop.
+                if r.behind > 0 && state.cursor > cursor_before {
+                    continue;
+                }
             }
-            Err(e) => eprintln!("[bridge-watcher] tick error (will retry): {e}"),
+            Err(e) => {
+                eprintln!("[bridge-watcher] tick error (will retry): {e}");
+                let _ = std::io::stderr().flush();
+            }
         }
         std::thread::sleep(poll);
     }

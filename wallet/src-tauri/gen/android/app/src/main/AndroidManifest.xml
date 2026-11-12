@@ -23,18 +23,6 @@
                 <!-- AndroidTV support -->
                 <category android:name="android.intent.category.LEANBACK_LAUNCHER" />
             </intent-filter>
-            <!-- tauri-file-associations. AUTO-GENERATED. DO NOT REMOVE. -->
-            <intent-filter>
-                <action android:name="android.intent.action.SEND" />
-                <action android:name="android.intent.action.SEND_MULTIPLE" />
-                <action android:name="android.intent.action.VIEW" />
-                <category android:name="android.intent.category.DEFAULT" />
-                <category android:name="android.intent.category.BROWSABLE" />
-                <data android:mimeType="application/x-zcrypt" />
-                <data android:pathPattern=".*\\.zcrypt" />
-            </intent-filter>
-            
-            <!-- tauri-file-associations. AUTO-GENERATED. DO NOT REMOVE. -->
             <!-- A .zcrypt document handed over by a chat or mail app arrives as a content URI,
                  usually typed as a generic binary. Offer ZCrypt for those too. -->
             <intent-filter>
@@ -56,6 +44,18 @@
                 <data android:pathPattern=".*\\.zcrypt" />
                 <data android:pathPattern=".*\\..*\\.zcrypt" />
             </intent-filter>
+            <!-- tauri-file-associations. AUTO-GENERATED. DO NOT REMOVE. -->
+            <intent-filter>
+                <action android:name="android.intent.action.SEND" />
+                <action android:name="android.intent.action.SEND_MULTIPLE" />
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:mimeType="application/x-zcrypt" />
+                <data android:pathPattern=".*\\.zcrypt" />
+            </intent-filter>
+            
+            <!-- tauri-file-associations. AUTO-GENERATED. DO NOT REMOVE. -->
         </activity>
 
         <provider

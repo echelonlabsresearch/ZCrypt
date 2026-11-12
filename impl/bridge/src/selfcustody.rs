@@ -188,7 +188,12 @@ impl SelfCustodyBtc {
         let utxos = self.esplora.wallet_utxos(&self.hd)?;
         let fee_rate = self.esplora.fee_rate_sat_vb(self.conf_target().max(3))?;
         let signed = txbuilder::build_and_sign(&self.hd, &utxos, dest, amount.to_sat(), change, fee_rate)?;
-        self.esplora.broadcast(&signed.hex)?;
+        // The txid is known before broadcast. A rejected or timed-out POST can still
+        // have propagated; the marker lets the wallet persist the outpoint so Diagnose
+        // can find the tx without the address index.
+        if let Err(e) = self.esplora.broadcast(&signed.hex) {
+            return Err(format!("{e}\nFUNDING_TX {}:{}", signed.txid, signed.vout0.vout));
+        }
         Ok(HtlcUtxo { outpoint: signed.vout0, value: amount, script: script.clone() })
     }
 

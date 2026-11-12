@@ -1,20 +1,21 @@
 //! The bridge operator's WATCHER: the always-on service that settles the public bridge
 //! autonomously. One [`watcher_tick`] does a full, NON-BLOCKING pass over new ZCrypt blocks:
 //!
-//!   1. relay any missing Bitcoin headers (keeps the SPV chain current),
-//!   2. SHIELD: index every deposit locked to the reserve, sweep each one whose preimage was
+//!   1. SHIELD: index every deposit locked to the reserve, sweep each one whose preimage was
 //!      revealed into the reserve (deferring, and REMEMBERING, the ones not yet buried past
 //!      maturity), and RE-ANCHOR any tracked deposit a Bitcoin reorg re-mined elsewhere,
-//!   3. REDEEM (lock): for each on-chain `0x67` redeem, lock reserve BTC 1:1 to the user's
+//!   2. REDEEM (lock): for each on-chain `0x67` redeem, lock reserve BTC 1:1 to the user's
 //!      on-chain key, persisting a funding INTENT before the broadcast and polling its
 //!      confirmations across ticks,
-//!   4. REDEEM (finalize): detect the user's BTC claim of a locked HTLC and burn the zBTC,
+//!   3. REDEEM (finalize): detect the user's BTC claim of a locked HTLC and burn the zBTC,
 //!      or REFUND a lock the user never claimed once its CLTV has passed (and keep watching
 //!      until the refund confirms, finalizing instead if the user's claim wins the race).
 //!
 //! Nothing in a tick waits for a Bitcoin confirmation (bridge N7): every wait is a persisted
-//! state machine advanced by later ticks, so header relay, re-anchoring, finalizing and
-//! refunding keep running while fundings and sweeps confirm.
+//! state machine advanced by later ticks, so re-anchoring, finalizing and refunding keep
+//! running while fundings and sweeps confirm. Bitcoin header relay runs AFTER settlement,
+//! and the daemon scans at most [`SCAN_BLOCKS_PER_TICK`] new blocks per call, so a catch-up
+//! cannot postpone a redeem lock until the whole gap has been walked.
 //!
 //! All of it is idempotent and resumable via [`WatcherState`], which persists a scan cursor,
 //! the swept/funded/rejected escrow sets, in-flight funding intents, tracked deposits,
@@ -185,6 +186,11 @@ pub struct SweepTx {
     pub preimage_hex: String,
     pub txid: String,
     pub broadcast_at_btc: u64,
+    /// Bitcoin height before which a fee-rejected re-sweep is not tried again.
+    /// A replacement that pays the same fee as the mempool tx is rejected every time;
+    /// hammering it once per poll does not confirm the claim.
+    #[serde(default)]
+    pub next_resweep_btc: u64,
 }
 
 /// The state-file schema this daemon writes. A file with a HIGHER schema was written by a
@@ -256,6 +262,18 @@ pub const FUNDING_BUMP_AFTER_BLOCKS: u64 = 3;
 /// Scanned blocks between two persisted cursor checkpoints during a long catch-up, so a
 /// crash mid-scan resumes near where it stopped instead of at the previous tick (audit M9).
 pub const SCAN_PERSIST_EVERY: i64 = 200;
+
+/// New ZCrypt blocks one daemon tick will scan. The rest of the gap waits for the next
+/// call, which the daemon makes immediately, after this tick has funded, swept, and
+/// refunded whatever it already knows about. [`watcher_tick`] passes no cap and still
+/// scans through the tip (one-shot callers and tests).
+pub const SCAN_BLOCKS_PER_TICK: i64 = 500;
+
+/// Extra satoshis added to a re-sweep each time the previous replacement was rejected.
+/// One HTLC-spend vsize at 1 sat/vB clears Bitcoin's incremental relay fee (a same-fee
+/// replacement is rejected with "not enough additional fees") and is added again on
+/// each later attempt.
+pub const RESWEEP_FEE_STEP_SATS: u64 = 200;
 
 /// A retry height older than this many ZC blocks is dropped with an error: the node will
 /// never serve it again (pruned history), and the operator must investigate by hand.
@@ -344,6 +362,9 @@ pub struct TickReport {
     pub promoted: usize,
     /// Non-fatal per-item errors (transient RPC, insufficient reserve, etc.): retried next tick.
     pub errors: Vec<String>,
+    /// ZCrypt blocks still unscanned after this tick (`tip - cursor`). The daemon calls
+    /// again immediately while this is non-zero.
+    pub behind: i64,
 }
 
 /// Fee-bumping of the operator wallet's own unconfirmed sends (`bumpfee`). Separate from
@@ -377,7 +398,9 @@ pub fn watcher_tick(
     min_finalize_margin: u64,
     fee_target: u32,
 ) -> Result<TickReport, String> {
-    watcher_tick_persisting(state, zc, operator_btc, reserve, shield_dest, zbtc_asset, min_finalize_margin, fee_target, None, &|_| Ok(()))
+    watcher_tick_persisting(
+        state, zc, operator_btc, reserve, shield_dest, zbtc_asset, min_finalize_margin, fee_target, None, None, &|_| Ok(()),
+    )
 }
 
 /// Confirmations a redeem funding needs before the operator treats it as locked, and a
@@ -478,7 +501,8 @@ pub fn intent_past_deadline(intent: &FundingIntent, network: bitcoin::Network, b
 /// crash must not lose information (after each funding intent is recorded, after each
 /// broadcast, after each sweep, every [`SCAN_PERSIST_EVERY`] scanned blocks). Mutates `state`
 /// in place; the caller persists it again after. `bumper` fee-bumps stale unconfirmed
-/// fundings when the backend offers it (audit M6).
+/// fundings when the backend offers it (audit M6). `max_new_blocks` caps how many new
+/// ZCrypt blocks this call scans (`None` scans through the tip).
 #[allow(clippy::too_many_arguments)]
 pub fn watcher_tick_persisting(
     state: &mut WatcherState,
@@ -490,11 +514,15 @@ pub fn watcher_tick_persisting(
     min_finalize_margin: u64,
     fee_target: u32,
     bumper: Option<&dyn FeeBumper>,
+    // `max_new_blocks`: new ZCrypt blocks to scan this call. `None` scans through the
+    // tip. The daemon passes `SCAN_BLOCKS_PER_TICK` so settlement is not stuck behind
+    // a multi-hour catch-up.
+    max_new_blocks: Option<i64>,
     persist: &dyn Fn(&WatcherState) -> Result<(), String>,
 ) -> Result<TickReport, String> {
-    // 1. Keep the consensus SPV chain current (non-fatal: a user's own shield relays too).
-    let _ = swap::relay_btc_headers(zc, operator_btc);
-
+    // Header relay used to run FIRST. A slow Bitcoin RPC then held the whole tick, the
+    // chain moved on, and the following scan walked the entire gap before any redeem was
+    // funded. Relay now runs after settlement, and only on a tick that reached the tip.
     let tip = zc.height()?;
     // Block heights are 1-indexed (height 0 is the CometBFT genesis, which has no queryable
     // block). The cursor is the highest block fully scanned; a fresh operator (cursor 0, or a
@@ -538,6 +566,8 @@ pub fn watcher_tick_persisting(
     }
     let retry: Vec<i64> = state.retry_heights.iter().copied().filter(|h| *h >= 1 && *h <= tip).collect();
     let mut since_persist = 0i64;
+    let mut scanned_new = 0i64;
+    let mut capped = false;
     for (is_retry, h) in retry.iter().map(|h| (true, *h)).chain((from..=tip).map(|h| (false, h))) {
         let txs = match zc.block_txs(h) {
             Ok(t) => t,
@@ -624,13 +654,19 @@ pub fn watcher_tick_persisting(
         }
         if !is_retry {
             state.cursor = h;
+            scanned_new += 1;
             since_persist += 1;
             if since_persist >= SCAN_PERSIST_EVERY {
                 persist(state)?;
                 since_persist = 0;
             }
+            if max_new_blocks.is_some_and(|n| scanned_new >= n.max(1) && h < tip) {
+                capped = true;
+                break;
+            }
         }
     }
+    report.behind = tip.saturating_sub(state.cursor);
     state.swept = swept.iter().map(hex::encode).collect();
     persist(state)?;
 
@@ -657,7 +693,7 @@ pub fn watcher_tick_persisting(
             RefundProximity::AtRisk => report.at_risk += 1,
             RefundProximity::Ok => {}
         }
-        match swap::sweep_deposit(zc, operator_btc, reserve, shield_dest, &dep, &preimage, fee_target, btc_tip) {
+        match swap::sweep_deposit(zc, operator_btc, reserve, shield_dest, &dep, &preimage, fee_target, btc_tip, 0) {
             SweepOutcome::Swept(txid) => {
                 swept.insert(eid);
                 state.deferred.retain(|x| x.deposit.escrow_id != dep.escrow_id);
@@ -671,6 +707,7 @@ pub fn watcher_tick_persisting(
                         preimage_hex: hex::encode(&preimage),
                         txid: txid.to_string(),
                         broadcast_at_btc: btc_tip,
+                        next_resweep_btc: 0,
                     });
                 }
                 state.swept = swept.iter().map(hex::encode).collect();
@@ -707,13 +744,16 @@ pub fn watcher_tick_persisting(
         if confs >= 1 {
             continue; // done
         }
-        if btc_tip.saturating_sub(s.broadcast_at_btc) < SWEEP_RESWEEP_AFTER_BLOCKS {
+        if btc_tip < s.next_resweep_btc || btc_tip.saturating_sub(s.broadcast_at_btc) < SWEEP_RESWEEP_AFTER_BLOCKS {
             still_sweeping.push(s);
             continue;
         }
         // Long enough: is the HTLC still unspent (our sweep vanished)? Re-sweep aggressively.
         // `Some(true)` = unspent on the confirmed chain; `Some(false)` = a CONFIRMED spend;
         // `None` = the backend cannot tell (or the funding is unconfirmed).
+        // `gettxout` without the mempool also reports Some(true) while OUR sweep sits
+        // unconfirmed, so a re-broadcast is an RBF replacement and must pay more than the
+        // tx already in the mempool.
         let unspent = s
             .deposit
             .proof()
@@ -722,14 +762,30 @@ pub fn watcher_tick_persisting(
             .and_then(|u| operator_btc.utxo_unspent(&u).ok().flatten());
         if unspent == Some(true) {
             let pre = hex::decode(&s.preimage_hex).unwrap_or_default();
-            match swap::sweep_deposit(zc, operator_btc, reserve, shield_dest, &s.deposit, &pre, 1, btc_tip) {
+            let attempts = (btc_tip.saturating_sub(s.broadcast_at_btc) / SWEEP_RESWEEP_AFTER_BLOCKS).max(1);
+            let extra = attempts.saturating_mul(RESWEEP_FEE_STEP_SATS);
+            match swap::sweep_deposit(zc, operator_btc, reserve, shield_dest, &s.deposit, &pre, 1, btc_tip, extra) {
                 SweepOutcome::Swept(txid) => {
                     report.errors.push(format!("shield {}: sweep {} was dropped, re-swept as {txid}", s.deposit.escrow_id, s.txid));
-                    still_sweeping.push(SweepTx { txid: txid.to_string(), broadcast_at_btc: btc_tip, ..s });
+                    still_sweeping.push(SweepTx { txid: txid.to_string(), broadcast_at_btc: btc_tip, next_resweep_btc: 0, ..s });
                 }
                 other => {
-                    report.errors.push(format!("shield {}: re-sweep: {other:?}", s.deposit.escrow_id));
-                    still_sweeping.push(s);
+                    let msg = format!("{other:?}");
+                    // Same-fee replacement: the original is still in the mempool. Wait, and
+                    // the next attempt pays RESWEEP_FEE_STEP_SATS more (attempts grows with age).
+                    if msg.contains("insufficient fee") || msg.contains("rejecting replacement") {
+                        report.errors.push(format!(
+                            "shield {}: re-sweep rejected for fee; backing off {} bitcoin blocks",
+                            s.deposit.escrow_id, SWEEP_RESWEEP_AFTER_BLOCKS
+                        ));
+                        still_sweeping.push(SweepTx {
+                            next_resweep_btc: btc_tip.saturating_add(SWEEP_RESWEEP_AFTER_BLOCKS),
+                            ..s
+                        });
+                    } else {
+                        report.errors.push(format!("shield {}: re-sweep: {msg}", s.deposit.escrow_id));
+                        still_sweeping.push(s);
+                    }
                 }
             }
         } else {
@@ -1046,7 +1102,75 @@ pub fn watcher_tick_persisting(
     // 6. The cursor advanced block by block above; deferred claims and intents are persisted,
     //    so advancing never forgets an unswept claim or an unfunded redeem (bridge N1).
     persist(state)?;
+
+    // Header relay AFTER settlement. A tick that stopped at the scan cap skips it: catching
+    // up on ZCrypt (so a redeem gets funded) beats walking Bitcoin headers. The next tick
+    // that reaches the tip relays at most one batch. Non-fatal; a user's own shield relays too.
+    if !capped {
+        relay_headers_bounded(zc, operator_btc);
+    }
     Ok(report)
+}
+
+/// Headers walked in one tick. One CometBFT tx carries 500, and stopping there means a
+/// slow Bitcoin RPC cannot spend hours inside a single tick the way an unbounded walk did.
+const HEADER_RELAY_PER_TICK: u64 = 500;
+
+/// Relay at most [`HEADER_RELAY_PER_TICK`] headers when the consensus SPV tip is on this
+/// Bitcoin chain. A tip hash that does not match falls through to [`swap::relay_btc_headers`],
+/// which walks back to the common ancestor. Any Bitcoin RPC error stops this tick's relay.
+fn relay_headers_bounded(zc: &dyn ZcNode, btc: &dyn BtcBackend) {
+    let Ok(btc_tip) = btc.height() else { return };
+    let Ok(tip_s) = zc.query("/spv/tip") else {
+        let _ = swap::relay_btc_headers(zc, btc);
+        return;
+    };
+    let Some((height_s, chain_hash)) = tip_s.trim().split_once(':') else {
+        let _ = swap::relay_btc_headers(zc, btc);
+        return;
+    };
+    let Ok(chain_h) = height_s.parse::<u64>() else {
+        let _ = swap::relay_btc_headers(zc, btc);
+        return;
+    };
+    if btc_tip <= chain_h {
+        return;
+    }
+    let on_our_chain = match btc.block_header(chain_h) {
+        Ok(raw) => bitcoin::consensus::deserialize::<bitcoin::block::Header>(&raw)
+            .ok()
+            .is_some_and(|h| h.block_hash().to_string().eq_ignore_ascii_case(chain_hash.trim())),
+        // Do not start the unbounded walk when Bitcoin RPC is already failing.
+        Err(_) => return,
+    };
+    if !on_our_chain {
+        let _ = swap::relay_btc_headers(zc, btc);
+        return;
+    }
+    let end = btc_tip.min(chain_h.saturating_add(HEADER_RELAY_PER_TICK));
+    let mut batch = Vec::with_capacity((end - chain_h) as usize * 80);
+    for h in (chain_h + 1)..=end {
+        match btc.block_header(h) {
+            Ok(raw) => batch.extend_from_slice(&raw),
+            Err(e) => {
+                eprintln!("[bridge-watcher] header relay stopped at {h}: {e}");
+                break;
+            }
+        }
+    }
+    if batch.is_empty() {
+        return;
+    }
+    if let Err(e) = zc.broadcast(&swap::headers_tx(&batch)) {
+        if !e.contains("no new headers") && !e.contains("already known") {
+            eprintln!("[bridge-watcher] header relay: {e}");
+        }
+    } else if end < btc_tip {
+        eprintln!(
+            "[bridge-watcher] bitcoin headers behind by {}; relayed through {end}",
+            btc_tip - chain_h
+        );
+    }
 }
 
 // ---- Daemon start-up guards (audit 2026-10 H5) ----
@@ -1518,6 +1642,8 @@ mod tests {
         refunds: Cell<u32>,
         /// The next fund_htlc_unconfirmed broadcasts, then errors (read-back failure).
         fail_readback_once: Cell<bool>,
+        /// claim() returns Bitcoin's same-fee replacement rejection instead of spending.
+        reject_claim: Cell<bool>,
         /// Block hashes reported by tx_block_hash, per txid (reorg simulation).
         block_of: RefCell<HashMap<Txid, [u8; 32]>>,
         proof_for: RefCell<HashMap<Txid, Vec<u8>>>,
@@ -1535,6 +1661,7 @@ mod tests {
                 claims: Cell::new(0),
                 refunds: Cell::new(0),
                 fail_readback_once: Cell::new(false),
+                reject_claim: Cell::new(false),
                 block_of: RefCell::new(HashMap::new()),
                 proof_for: RefCell::new(HashMap::new()),
                 raw_txs: RefCell::new(HashMap::new()),
@@ -1599,6 +1726,12 @@ mod tests {
         }
         fn claim(&self, utxo: &HtlcUtxo, preimage: &[u8], _: &Key, _: &Address, _: Amount) -> Result<Txid, String> {
             self.claims.set(self.claims.get() + 1);
+            if self.reject_claim.get() {
+                return Err(
+                    "JSON-RPC error: insufficient fee, rejecting replacement, not enough additional fees to relay; 0.00 < 0.00000014"
+                        .into(),
+                );
+            }
             for u in self.utxos.borrow_mut().iter_mut().filter(|u| u.outpoint == utxo.outpoint) {
                 u.spend = Some((None, Some(preimage.to_vec())));
             }
@@ -1762,6 +1895,69 @@ mod tests {
         let r4 = tick(&mut st, &zc, &btc, &d.reserve);
         assert_eq!(r4.swept, 0);
         assert_eq!(btc.claims.get(), 1);
+    }
+
+    #[test]
+    fn a_catch_up_tick_scans_only_its_budget_then_the_next_tick_continues() {
+        // A daemon tick must not walk an unbounded gap before it returns to fund, sweep,
+        // and refund. Five empty blocks, budget 2: cursor stops at 2 with 3 left, and
+        // two more capped ticks finish the range.
+        let zc = FakeZc::new();
+        let btc = SimBtc::new(1);
+        for _ in 0..5 {
+            zc.push_block(vec![]);
+        }
+        let reserve = Key::from_bytes(&[0xB1; 32]);
+        let mut st = WatcherState::default();
+        let tick_capped = |st: &mut WatcherState| {
+            watcher_tick_persisting(
+                st, &zc, &btc, &swap::ReserveKeys::single(&reserve), &dest(), ASSET,
+                swap::default_finalize_margin(Network::Signet), 3, None, Some(2), &|_| Ok(()),
+            )
+            .unwrap()
+        };
+        let r1 = tick_capped(&mut st);
+        assert_eq!(st.cursor, 2);
+        assert_eq!(r1.behind, 3);
+        let r2 = tick_capped(&mut st);
+        assert_eq!(st.cursor, 4);
+        assert_eq!(r2.behind, 1);
+        let r3 = tick_capped(&mut st);
+        assert_eq!(st.cursor, 5);
+        assert_eq!(r3.behind, 0);
+    }
+
+    #[test]
+    fn a_fee_rejected_resweep_backs_off_instead_of_retrying_every_tick() {
+        // The HTLC is still unspent on the confirmed chain while our sweep sits in the
+        // mempool. Re-broadcasting the same fee is rejected. The watcher must wait
+        // SWEEP_RESWEEP_AFTER_BLOCKS before trying again, not once per poll.
+        let d = deposit(11);
+        let zc = FakeZc::new();
+        let btc = SimBtc::new(1);
+        btc.add_confirmed(d.utxo.clone(), 1);
+        zc.set_escrow(d.eid, ASSET, VALUE, d.lock, 100_000, "open");
+        zc.push_block(vec![d.open_tx.clone()]);
+        zc.set_escrow(d.eid, ASSET, VALUE, d.lock, 100_000, "claimed");
+        zc.push_block(vec![d.claim_tx.clone()]);
+        let mut st = WatcherState::default();
+        let _ = tick(&mut st, &zc, &btc, &d.reserve);
+        btc.mine(3);
+        let r = tick(&mut st, &zc, &btc, &d.reserve);
+        assert_eq!(r.swept, 1);
+        assert_eq!(st.sweeps.len(), 1);
+        let claims_after_sweep = btc.claims.get();
+        // Advance the Bitcoin tip without confirming the sweep (mine() would).
+        btc.tip.set(btc.tip.get() + SWEEP_RESWEEP_AFTER_BLOCKS);
+        btc.reject_claim.set(true);
+        let r2 = tick(&mut st, &zc, &btc, &d.reserve);
+        assert_eq!(btc.claims.get(), claims_after_sweep + 1, "one replacement attempt");
+        assert!(r2.errors.iter().any(|e| e.contains("backing off")), "{:?}", r2.errors);
+        assert_eq!(st.sweeps.len(), 1);
+        assert!(st.sweeps[0].next_resweep_btc > btc.tip.get());
+        let r3 = tick(&mut st, &zc, &btc, &d.reserve);
+        assert_eq!(btc.claims.get(), claims_after_sweep + 1, "no retry inside the backoff");
+        assert!(!r3.errors.iter().any(|e| e.contains("re-sweep")));
     }
 
     #[test]
@@ -2064,7 +2260,7 @@ mod tests {
             snapshots.borrow_mut().push(ids);
             Ok(())
         };
-        watcher_tick_persisting(&mut st, &zc, &btc, &swap::ReserveKeys::single(&d1.reserve), &dest(), ASSET, swap::default_finalize_margin(Network::Signet), 3, None, &persist).unwrap();
+        watcher_tick_persisting(&mut st, &zc, &btc, &swap::ReserveKeys::single(&d1.reserve), &dest(), ASSET, swap::default_finalize_margin(Network::Signet), 3, None, None, &persist).unwrap();
         assert!(!snapshots.borrow().is_empty());
         for snap in snapshots.borrow().iter() {
             assert!(snap.contains(&hex::encode(d1.eid)) && snap.contains(&hex::encode(d2.eid)), "snapshot dropped an intent: {snap:?}");
@@ -2394,7 +2590,7 @@ mod tests {
         });
         st.funded.push(hex::encode(d.eid));
         btc.tip.set(101 + FUNDING_BUMP_AFTER_BLOCKS);
-        let r = watcher_tick_persisting(&mut st, &zc, &btc, &swap::ReserveKeys::single(&d.reserve), &dest(), ASSET, swap::default_finalize_margin(Network::Signet), 3, Some(&Bumper), &|_| Ok(())).unwrap();
+        let r = watcher_tick_persisting(&mut st, &zc, &btc, &swap::ReserveKeys::single(&d.reserve), &dest(), ASSET, swap::default_finalize_margin(Network::Signet), 3, Some(&Bumper), None, &|_| Ok(())).unwrap();
         assert_eq!(r.bumped, 1, "{:?}", r.errors);
         assert_eq!(st.funding[0].funding, Some((bumped.to_string(), 0)), "vout re-located in the replacement");
 
@@ -2468,7 +2664,7 @@ mod tests {
         st.funded.push(hex::encode(d.eid));
         let bumper = Bumper { calls: Cell::new(0) };
         let run = |st: &mut WatcherState| {
-            watcher_tick_persisting(st, &zc, &btc, &swap::ReserveKeys::single(&d.reserve), &dest(), ASSET, swap::default_finalize_margin(Network::Signet), 3, Some(&bumper), &|_| Ok(())).unwrap()
+            watcher_tick_persisting(st, &zc, &btc, &swap::ReserveKeys::single(&d.reserve), &dest(), ASSET, swap::default_finalize_margin(Network::Signet), 3, Some(&bumper), None, &|_| Ok(())).unwrap()
         };
         let _ = run(&mut st);
         assert_eq!(btc.broadcasts.get(), 1, "funded once");
