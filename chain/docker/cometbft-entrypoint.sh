@@ -149,6 +149,10 @@ if [ ! -f "$GENESIS" ]; then
   # base64 JSON. 8 MB body / 5 MB tx leaves headroom without accepting arbitrary blobs.
   sed -i 's|^max_body_bytes =.*|max_body_bytes = 8000000|' "$CFG"
   sed -i 's|^max_tx_bytes =.*|max_tx_bytes = 5000000|' "$CFG"
+  # How long /broadcast_tx_commit waits for the proof check and inclusion. Also raises
+  # the HTTP write deadline (CometBFT sets it to this plus one second). The read
+  # deadline stays 10s and is not configurable; the Caddy edge buffers the upload.
+  sed -i 's|^timeout_broadcast_tx_commit =.*|timeout_broadcast_tx_commit = "30s"|' "$CFG"
 
   # Publish the genesis fingerprint for joining validators (GENESIS_SHA256).
   # Canonical form (sorted keys, compact) so the published hash matches whatever
@@ -166,6 +170,12 @@ if [ ! -f "$GENESIS" ]; then
   rm -f "$GENESIS.canon"
   printf '%s\n' "$SUM" > "$HOME_DIR/config/genesis.sha256"
   echo "[genesis] chain_id=$CHAIN_ID sha256=$SUM (publish this with genesis.json)"
+fi
+
+# Applied on every start, including a node whose genesis already exists. CometBFT reads
+# this at process start, so a container restart picks it up without touching the chain.
+if [ -f "$CFG" ]; then
+  sed -i 's|^timeout_broadcast_tx_commit =.*|timeout_broadcast_tx_commit = "30s"|' "$CFG"
 fi
 
 exec cometbft start --home "$HOME_DIR"

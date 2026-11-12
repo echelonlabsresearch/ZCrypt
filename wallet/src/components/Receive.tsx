@@ -1,7 +1,8 @@
-import React, { useCallback, useEffect, useState, DragEvent } from "react";
+import { useCallback, useEffect, useState, type DragEvent } from "react";
 import QRCode from "qrcode";
-import { call, fmtAsset } from "../lib/api";
+import { call, copySensitive, fmtAsset } from "../lib/api";
 import { CopyButton } from "./Share";
+import Success from "../mobile/Success";
 
 export interface ReceivedInfo {
   amount: number;
@@ -14,46 +15,15 @@ interface Stealth {
   address: string;
 }
 
-/** Plain-language guide to every address / key type. */
-const TYPES = [
-  {
-    icon: "🏷️",
-    name: "Normal address",
-    color: "--color-cyan",
-    tag: "zc1… · recoverable from your phrase",
-    body: "Your everyday address. Share it to get paid: payments land on-chain and auto-credit when you Refresh. Your 24-word phrase restores it, and your view key can see what arrives here.",
-  },
-  {
-    icon: "🕶️",
-    name: "Stealth address",
-    color: "--color-purple",
-    tag: "zc1… (stealth) · NOT in your phrase",
-    body: "Maximum privacy. A payment arrives as an encrypted FILE (nothing readable is left on-chain) and is invisible even to your own view key. Each stealth address has its own key that your phrase will NOT restore, so back up the key.",
-  },
-  {
-    icon: "💵",
-    name: "Bearer coin",
-    color: "--color-yellow",
-    tag: "file · coin + gas",
-    body: "Not an address: a file from the Send tab. Send it over any chat. Opening it in a wallet credits the full amount, and the file includes 0.01 ZCRYPT gas so a brand-new wallet can claim it. Until that claim is in a block, anyone with the file can take it.",
-  },
-  {
-    icon: "🔎",
-    name: "View key",
-    color: "--color-green",
-    tag: "read-only · for auditors",
-    body: "A key you can GIVE someone so they can see the amounts of payments to your NORMAL address, and nothing else. It can never spend, and cannot see stealth or bearer coins. Find it under Settings.",
-  },
-  {
-    icon: "₿",
-    name: "Bitcoin deposit address",
-    color: "--color-cyan",
-    tag: "bc1… · derived from the same phrase",
-    body: "Real Bitcoin, on the Bitcoin chain. Deposit here, then shield it into private zBTC under Bridge, or send it out again under Send.",
-  },
-];
-
 const QR_COLOR = { dark: "#0b0f19", light: "#ffffff" };
+
+type TileId = "zcrypt" | "shield" | "btc";
+
+function shortAddr(address: string): string {
+  if (!address) return "…";
+  if (address.length <= 16) return address;
+  return `${address.slice(0, 4)}…${address.slice(-4)}`;
+}
 
 /**
  * QR-friendly form of an address. A `zc1…` address is 2,008 characters (it carries a
@@ -69,23 +39,6 @@ function qrText(text: string): string {
 function fitScale(text: string, px: number): number {
   const n = QRCode.create(qrText(text), { errorCorrectionLevel: "L" }).modules.size + 8;
   return Math.max(1, Math.floor(px / n));
-}
-
-/**
- * The text as a QR image (data URL), or "" while it renders or when there is no text.
- * Rendered at an integer number of pixels per module and shown at its natural size, so
- * every module is a crisp square on screen (a fixed CSS width resamples the grid, and a
- * phone camera then fails to lock on). `scale` is CSS pixels per module.
- */
-function useQr(text: string, scale: number): string {
-  const [qr, setQr] = useState("");
-  useEffect(() => {
-    if (!text) return setQr("");
-    QRCode.toDataURL(qrText(text), { margin: 4, scale, errorCorrectionLevel: "L", color: QR_COLOR })
-      .then(setQr)
-      .catch(() => setQr(""));
-  }, [text, scale]);
-  return qr;
 }
 
 /**
@@ -113,61 +66,28 @@ function QrOverlay({ text, title, onClose }: { text: string; title: string; onCl
   );
 }
 
-/** One address with its QR code, the address text and a copy button. */
-function AddressTile({
-  icon, title, tag, color, address, qr, note, empty, extra, onShowQr,
-}: {
-  icon: string;
-  title: string;
-  tag: string;
-  color: string;
-  address: string;
-  qr: string;
-  note: string;
-  /** Shown in place of the QR and address when there is no address yet. */
-  empty?: React.ReactNode;
-  /** Controls specific to this address, rendered under the address line. */
-  extra?: React.ReactNode;
-  onShowQr: (text: string, title: string) => void;
-}) {
-  const [expanded, setExpanded] = useState(false);
-  const short = address.length > 24 ? `${address.slice(0, 12)}…${address.slice(-8)}` : address;
+/** Copy a spend secret, then clear the clipboard. */
+function KeyCopy({ text }: { text: string }) {
+  const [done, setDone] = useState(false);
   return (
-    <div className="card addr-tile">
-      <div className="addr-tile-title" style={{ color }}>
-        {icon} {title}
-      </div>
-      <div className="addr-tile-tag">{tag}</div>
-      {address ? (
-        <>
-          <button className="qr-tile qr-tile-btn" onClick={() => onShowQr(address, title)} title="Show a large QR code for scanning">
-            {qr ? <img src={qr} alt={`QR code: ${title}`} /> : null}
-          </button>
-          <button className="btn-link" onClick={() => onShowQr(address, title)}>⛶ Show large QR to scan</button>
-          <div className="addr-line">
-            <code title={address} style={{ color }} className={expanded ? "full" : ""}>
-              {expanded ? address : short}
-            </code>
-            <span className="addr-actions">
-              <button className="copy-btn" onClick={() => setExpanded((e) => !e)}>
-                {expanded ? "Collapse" : "Expand"}
-              </button>
-              <CopyButton text={address} label="⧉ Copy" />
-            </span>
-          </div>
-          {extra}
-        </>
-      ) : (
-        <div className="addr-tile-empty">{empty ?? <span style={{ opacity: 0.5 }}>…</span>}</div>
-      )}
-      <div className="addr-tile-note">{note}</div>
-    </div>
+    <button
+      className="copy-btn"
+      type="button"
+      onClick={async () => {
+        await copySensitive(text);
+        setDone(true);
+        setTimeout(() => setDone(false), 1500);
+      }}
+    >
+      {done ? "Copied (clears in 60 s)" : "Copy private key"}
+    </button>
   );
 }
 
 /**
- * Receive: everything about getting paid in one place. Your addresses (normal, stealth,
- * Bitcoin), the drop zone that claims a coin file or an encrypted note, and the view key.
+ * Receive: the whole screen accepts a coin file. The three receive addresses sit in a
+ * dock on the right. A shielded address is not in the recovery phrase; its key is shown
+ * only after the wallet password.
  */
 export default function Receive({
   onReceived,
@@ -198,18 +118,19 @@ export default function Receive({
   const [bigQr, setBigQr] = useState<{ text: string; title: string } | null>(null);
   const showQr = useCallback((text: string, title: string) => setBigQr({ text, title }), []);
   const hideQr = useCallback(() => setBigQr(null), []);
-  // Tile previews: a 2,008-character address needs about 150 modules a side, so the
-  // preview is 1 px per module and only the overlay (QrOverlay) is meant to be scanned.
-  const normalQr = useQr(normal, 1);
-  const stealthQr = useQr(latestStealth, 1);
-  const btcQr = useQr(btcAddr, 4);
+  const [open, setOpen] = useState<TileId | null>(null);
 
   // Drop zone
   const [blob, setBlob] = useState("");
   const [busy, setBusy] = useState(false);
   const [dragging, setDragging] = useState(false);
-  const [state, setState] = useState<"idle" | "ok" | "err" | "warn">("idle");
-  const [msg, setMsg] = useState("");
+  const [phase, setPhase] = useState<
+    | { kind: "form" }
+    | { kind: "busy"; what: "coin" | "receipt" }
+    | { kind: "credited"; pretty: string }
+    | { kind: "failed"; msg: string }
+    | { kind: "receipt"; ok: boolean; msg: string }
+  >({ kind: "form" });
 
   const load = useCallback(() => {
     call<string>("get_address").then(setNormal).catch(() => {});
@@ -233,7 +154,10 @@ export default function Receive({
     setErr("");
     setStealthBusy(true);
     try {
-      await call("new_stealth_address");
+      const info = await call<Stealth>("new_stealth_address");
+      setStealth((list) => (list.some((x) => x.index === info.index) ? list : [...list, info]));
+      setStealthIdx(info.index);
+      setOpen("shield");
       load();
     } catch (e) {
       setErr(String(e));
@@ -260,16 +184,26 @@ export default function Receive({
     setRevealErr("");
   }
 
+  function hideKey(index: number) {
+    setRevealed((r) => {
+      const next = { ...r };
+      delete next[index];
+      return next;
+    });
+    cancelReveal();
+  }
+
   async function receive(text: string) {
     const s = text.trim();
     if (!s) return;
     setBusy(true);
-    setState("idle");
+    setDragging(false);
+    const receipt = s.startsWith("zcrypt-receipt/1");
+    setPhase({ kind: "busy", what: receipt ? "receipt" : "coin" });
     try {
-      if (s.startsWith("zcrypt-receipt/1")) {
+      if (receipt) {
         const r = await call<{ on_chain: boolean; names_recipient: boolean; summary: string }>("verify_receipt", { text: s });
-        setState(r.on_chain && r.names_recipient ? "ok" : r.on_chain ? "warn" : "err");
-        setMsg(r.summary);
+        setPhase({ kind: "receipt", ok: r.on_chain && r.names_recipient, msg: r.summary });
         return;
       }
       if (s.startsWith("zcb1")) {
@@ -279,13 +213,13 @@ export default function Receive({
       const cmd = isBearer ? "claim_bearer" : "receive_coin";
       const args = isBearer ? { token: s } : { note: s };
       const r = await call<{ amount: number; coin_id: string; ticker: string; decimals: number }>(cmd, args);
-      setState("ok");
-      setMsg(`Received ${fmtAsset(r.amount, r.decimals)} ${r.ticker}`);
       setBlob("");
+      setPhase({ kind: "credited", pretty: `${fmtAsset(r.amount, r.decimals)} ${r.ticker}` });
       onReceived({ amount: r.amount, ticker: r.ticker, decimals: r.decimals });
     } catch (e) {
-      setState("err");
-      setMsg(String(e));
+      const msg = String(e instanceof Error ? e.message : e);
+      if (receipt) setPhase({ kind: "receipt", ok: false, msg });
+      else setPhase({ kind: "failed", msg });
     } finally {
       setBusy(false);
     }
@@ -296,8 +230,8 @@ export default function Receive({
     if (!dragging) setDragging(true);
   }
   function onDragLeave(e: DragEvent) {
-    // only clear when leaving the dropzone itself, not a child
-    if (e.currentTarget === e.target) setDragging(false);
+    if (e.currentTarget.contains(e.relatedTarget as Node)) return;
+    setDragging(false);
   }
   async function onDrop(e: DragEvent) {
     e.preventDefault();
@@ -316,141 +250,230 @@ export default function Receive({
     }
   }
 
-  const cls = dragging ? "dragging" : state === "ok" ? "success" : state === "err" ? "error" : "";
+  function toggle(id: TileId) {
+    setOpen((cur) => (cur === id ? null : id));
+  }
+
+  const key = shown ? revealed[shown.index] : undefined;
+
+  if (phase.kind === "busy") {
+    return (
+      <Success
+        tone="busy"
+        title={phase.what === "receipt" ? "Checking receipt" : "Receiving payment"}
+        subtitle={
+          phase.what === "receipt"
+            ? "Looking the payment up on the chain."
+            : "Checking the chain and building the claim proof on this computer. This takes a few seconds."
+        }
+        onDone={() => {}}
+      />
+    );
+  }
+  if (phase.kind === "credited") {
+    return (
+      <Success
+        title={`${phase.pretty} received!`}
+        subtitle="The coin is yours now and already counts in your portfolio."
+        onDone={() => setPhase({ kind: "form" })}
+      />
+    );
+  }
+  if (phase.kind === "failed") {
+    const claimed = /already|spent|claimed|nullifier/i.test(phase.msg);
+    return (
+      <Success
+        tone="bad"
+        title={claimed ? "Already claimed" : "Could not receive"}
+        subtitle={
+          claimed
+            ? "This coin was claimed before, by this wallet or by someone else who had the file. It cannot be received twice."
+            : "The payment could not be credited. Nothing was taken from the sender."
+        }
+        onDone={() => { setPhase({ kind: "form" }); setBlob(""); }}
+      >
+        {!claimed && <div className="m-done-detail">{phase.msg}</div>}
+      </Success>
+    );
+  }
+  if (phase.kind === "receipt") {
+    return (
+      <Success
+        tone={phase.ok ? "ok" : "bad"}
+        title={phase.ok ? "Receipt checked" : "Receipt not confirmed"}
+        subtitle={phase.msg}
+        onDone={() => setPhase({ kind: "form" })}
+      />
+    );
+  }
 
   return (
-    <div>
-      <h2 className="view-title">📥 Receive</h2>
-
-      {/* Your addresses: one tile per address, each with its QR code and the address text.
-          Whitelisted assets with a native chain get a tile here as they are added. */}
-      <div className="addr-tiles">
-        <AddressTile
-          icon="🏷️"
-          title="Your ZCRYPT recoverable address"
-          tag="zc1… · restored by your recovery phrase"
-          color="var(--color-cyan)"
-          address={normal}
-          qr={normalQr}
-          onShowQr={showQr}
-          note="Share this to get paid in ZCRYPT or any shielded asset. Your view key can see what arrives here; nobody else can."
-        />
-        <AddressTile
-          icon="🕶️"
-          title="Your ZCRYPT shielded address"
-          tag="zc1… (stealth) · NOT recoverable from your phrase"
-          color="var(--color-purple)"
-          address={latestStealth}
-          qr={stealthQr}
-          onShowQr={showQr}
-          note="Maximum privacy: paid with an encrypted file, invisible even to your own view key. Your recovery phrase will NOT restore it: back up its private key."
-          empty={
-            <button className="btn-secondary" disabled={stealthBusy} onClick={newStealth}>
-              {stealthBusy ? "Creating…" : "Create a shielded address"}
+    <div className="rx">
+      <div
+        className={`rx-stage${dragging ? " dragging" : ""}${open ? " has-sheet" : ""}`}
+        onDragOver={onDragOver}
+        onDragEnter={onDragOver}
+        onDragLeave={onDragLeave}
+        onDrop={onDrop}
+      >
+        <div className="rx-copy">
+          <div className="rx-kicker">Receive</div>
+          <div className="rx-mark" aria-hidden="true">
+            <svg width="32" height="32" viewBox="0 0 32 32" fill="none">
+              <path d="M8 6.5h10.2L24 12.2V25.5H8V6.5z" stroke="#35e0ff" strokeWidth="1.6" strokeLinejoin="round" />
+              <path d="M18 6.8V12h5" stroke="#35e0ff" strokeWidth="1.6" strokeLinejoin="round" />
+              <path d="M16 22.2V15.2M16 22.2l-2.6-2.6M16 22.2l2.6-2.6" stroke="#35e0ff" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" />
+            </svg>
+          </div>
+          <h2>{dragging ? "Drop the coin to receive it" : "Drop a coin file anywhere"}</h2>
+          <p className="rx-lead">
+            {dragging
+              ? "Release to claim it into this wallet."
+              : "The whole screen takes the file. Bearer coins, shielded notes, and payment receipts all land here."}
+          </p>
+          <div className="rx-paste">
+            <textarea
+              value={blob}
+              onChange={(e) => setBlob(e.target.value)}
+              placeholder="or paste a coin file, a shielded note, or a receipt"
+            />
+            <button className="btn-primary btn-block" style={{ marginTop: 10 }} disabled={busy} onClick={() => receive(blob)}>
+              {busy ? "Verifying…" : "Receive"}
             </button>
-          }
-          extra={shown && (
-            <div className="stealth-tools">
-              {stealth.length > 1 && (
-                <select value={shown.index} onChange={(e) => setStealthIdx(Number(e.target.value))}>
-                  {stealth.map((x) => (
-                    <option key={x.index} value={x.index}>
-                      Shielded #{x.index} · {x.address.slice(0, 10)}…{x.address.slice(-6)}
-                    </option>
-                  ))}
-                </select>
-              )}
-              {revealed[shown.index] ? (
-                <>
-                  <div className="mono-box" style={{ color: "var(--color-yellow)", wordBreak: "break-all", fontSize: "0.74rem", textAlign: "left" }}>
-                    {revealed[shown.index]}
-                  </div>
-                  <CopyButton text={revealed[shown.index]} label="⧉ Copy private key" />
-                </>
-              ) : pwFor === shown.index ? (
-                <div className="stealth-reveal">
-                  <input
-                    type="password"
-                    placeholder="Password to reveal"
-                    value={pw}
-                    autoFocus
-                    onChange={(e) => setPw(e.target.value)}
-                    onKeyDown={(e) => e.key === "Enter" && revealBackup(shown.index)}
-                  />
-                  <span className="addr-actions">
-                    <button className="copy-btn" onClick={() => revealBackup(shown.index)}>Reveal</button>
-                    <button className="btn-link" onClick={cancelReveal}>Cancel</button>
-                  </span>
-                  {revealErr && <span style={{ color: "var(--color-red, #e66)", fontSize: "0.78rem" }}>{revealErr}</span>}
-                </div>
-              ) : (
-                <span className="addr-actions">
-                  <button className="btn-link" onClick={() => { setPwFor(shown.index); setPw(""); setRevealErr(""); }}>
-                    🔑 Reveal private key
-                  </button>
-                  <button className="btn-link" disabled={stealthBusy} onClick={newStealth}>
-                    {stealthBusy ? "…" : "+ New shielded address"}
-                  </button>
-                </span>
-              )}
-            </div>
-          )}
-        />
-        <AddressTile
-          icon="₿"
-          title="Your Bitcoin address"
-          tag="bc1… · restored by your recovery phrase"
-          color="var(--color-yellow)"
-          address={btcAddr}
-          qr={btcQr}
-          onShowQr={showQr}
-          note="Real BTC on the Bitcoin chain. Deposit here, then shield it into zBTC under Bridge."
-        />
-      </div>
-
-      {/* The drop zone: a coin file, an encrypted note, or a receipt to check. */}
-      <div className={`dropzone compact ${cls}`} style={{ marginTop: "1.2rem" }} onDragOver={onDragOver} onDragEnter={onDragOver} onDragLeave={onDragLeave} onDrop={onDrop}>
-        <div className="drop-icon">{dragging ? "⬇️" : state === "ok" ? "✓" : state === "err" ? "✗" : "💎"}</div>
-        <div style={{ fontWeight: "bold", color: dragging ? "var(--color-cyan)" : undefined }}>
-          {dragging ? "Drop the coin to receive it" : "Got a coin file or a note? Drop it here"}
+            <div className="rx-fine">A receipt is only checked. It does not move funds.</div>
+          </div>
         </div>
-        <div style={{ width: "100%", padding: "0 1.2rem", boxSizing: "border-box" }}>
-          <textarea
-            className="mnemonic-input"
-            value={blob}
-            onChange={(e) => setBlob(e.target.value)}
-            placeholder="or paste a bearer coin file, an encrypted stealth note, or a payment receipt"
-            style={{ minHeight: 90 }}
-          />
-          <button className="btn-primary btn-block" style={{ marginTop: "0.6rem" }} disabled={busy} onClick={() => receive(blob)}>
-            {busy ? "Verifying…" : "Receive"}
+
+        <aside className="rx-dock" aria-label="Addresses to receive into">
+          <button className={`rx-tile${open === "zcrypt" ? " open" : ""}`} type="button" aria-pressed={open === "zcrypt"} onClick={() => toggle("zcrypt")}>
+            <span className="rx-glyph z">Z</span>
+            <span className="rx-tile-name">ZCRYPT</span>
+            <span className="rx-tile-sub">{shortAddr(normal)}</span>
           </button>
-          {state !== "idle" && !dragging && (
-            <div className={`msg ${state === "ok" ? "ok" : state === "warn" ? "warn" : "err"}`}>{msg}</div>
-          )}
-          <div style={{ fontSize: "0.74rem", opacity: 0.6, marginTop: "0.5rem" }}>
-            A receipt pasted here is checked against the chain; it moves nothing. Never drop a coin into anything but your own wallet.
-          </div>
-        </div>
-      </div>
+          <button className={`rx-tile${open === "shield" ? " open" : ""}`} type="button" aria-pressed={open === "shield"} onClick={() => toggle("shield")}>
+            <span className="rx-glyph s" aria-hidden="true">
+              <svg width="20" height="20" viewBox="0 0 20 20" fill="none">
+                <path d="M10 2.2l6 2.2v5.1c0 3.6-2.4 6.2-6 7.5-3.6-1.3-6-3.9-6-7.5V4.4l6-2.2z" stroke="currentColor" strokeWidth="1.5" strokeLinejoin="round" />
+              </svg>
+            </span>
+            <span className="rx-tile-name">Shielded</span>
+            <span className="rx-tile-sub">{latestStealth ? shortAddr(latestStealth) : "Create"}</span>
+          </button>
+          <button className={`rx-tile${open === "btc" ? " open" : ""}`} type="button" aria-pressed={open === "btc"} onClick={() => toggle("btc")}>
+            <span className="rx-glyph b" aria-hidden="true">
+              <svg width="18" height="18" viewBox="0 0 18 18" fill="none">
+                <path d="M9 1.4v2.1M9 14.5v2.1M6.2 4.2h4.1a2.35 2.35 0 0 1 0 4.7H6.2h4.5a2.55 2.55 0 0 1 0 5.1H6.2M6.2 4.2v9.8" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
+              </svg>
+            </span>
+            <span className="rx-tile-name">Bitcoin</span>
+            <span className="rx-tile-sub">{shortAddr(btcAddr)}</span>
+          </button>
+        </aside>
 
-      {/* Plain-language guide, folded away */}
-      <details className="card guide" style={{ marginTop: "1.2rem" }}>
-        <summary>Which one should I use?</summary>
-        {TYPES.map((t) => (
-          <div className="card-row" key={t.name} style={{ alignItems: "flex-start" }}>
-            <div style={{ flex: 1 }}>
-              <div style={{ color: `var(${t.color})`, fontWeight: "bold" }}>
-                {t.icon} {t.name}
-              </div>
-              <div style={{ fontSize: "0.72rem", opacity: 0.55, margin: "0.15rem 0 0.35rem" }}>{t.tag}</div>
-              <div style={{ fontSize: "0.85rem", opacity: 0.85, lineHeight: 1.5 }}>{t.body}</div>
+        {open === "zcrypt" && (
+          <div className="rx-sheet">
+            <div className="eyebrow">Recoverable · zc1</div>
+            <h3>ZCRYPT address</h3>
+            <p>Share this to get paid in ZCRYPT or any shielded asset. Your recovery phrase restores it.</p>
+            <div className="rx-addr" title={normal}>{normal || "Loading…"}</div>
+            <div className="rx-row">
+              {normal && <CopyButton text={normal} label="Copy address" />}
+              <button className="ghost" type="button" disabled={!normal} onClick={() => showQr(normal, "ZCRYPT address")}>Large QR</button>
             </div>
+            {normal && <div className="rx-fine">{normal.length.toLocaleString()} characters</div>}
           </div>
-        ))}
-      </details>
+        )}
 
-      {err && <div className="msg err">{err}</div>}
+        {open === "shield" && (
+          <div className="rx-sheet">
+            <div className="eyebrow">Not in your phrase · zc1</div>
+            <h3>Shielded address</h3>
+            <p>A payment arrives as an encrypted file. Nothing readable is left on-chain.</p>
+            {shown ? (
+              <>
+                {stealth.length > 1 && (
+                  <select value={shown.index} onChange={(e) => { setStealthIdx(Number(e.target.value)); cancelReveal(); }}>
+                    {stealth.map((x) => (
+                      <option key={x.index} value={x.index}>
+                        Shielded #{x.index} · {shortAddr(x.address)}
+                      </option>
+                    ))}
+                  </select>
+                )}
+                <div className="rx-addr" title={shown.address}>{shown.address}</div>
+                <div className="rx-row">
+                  <CopyButton text={shown.address} label="Copy address" />
+                  <button className="ghost" type="button" onClick={() => showQr(shown.address, "Shielded address")}>Large QR</button>
+                </div>
+                <div className="rx-fine">Share the address. Keep the key.</div>
+                <div className="rx-rule" />
+                <div className="rx-key-label">Private key</div>
+                {key ? (
+                  <>
+                    <div className="rx-key">{key}</div>
+                    <div className="rx-row">
+                      <KeyCopy text={key} />
+                      <button className="ghost" type="button" onClick={() => hideKey(shown.index)}>Hide</button>
+                    </div>
+                    <div className="rx-fine">Write this down. Your 24-word phrase will not restore it. Losing the key and this wallet loses anything sent here.</div>
+                  </>
+                ) : pwFor === shown.index ? (
+                  <>
+                    <p>Enter your wallet password. The key for this address is shown once you confirm it.</p>
+                    <input
+                      type="password"
+                      placeholder="Wallet password"
+                      value={pw}
+                      autoFocus
+                      onChange={(e) => setPw(e.target.value)}
+                      onKeyDown={(e) => e.key === "Enter" && revealBackup(shown.index)}
+                    />
+                    {revealErr && <div className="msg err">{revealErr}</div>}
+                    <div className="rx-row">
+                      <button className="rx-recover" type="button" style={{ width: "auto" }} onClick={() => revealBackup(shown.index)}>Recover</button>
+                      <button className="ghost" type="button" onClick={cancelReveal}>Cancel</button>
+                    </div>
+                  </>
+                ) : (
+                  <>
+                    <p>Your recovery phrase does not restore this address. Recover its private key with your wallet password, then store the key yourself.</p>
+                    <button className="rx-recover" type="button" onClick={() => { setPwFor(shown.index); setPw(""); setRevealErr(""); }}>
+                      Recover private key
+                    </button>
+                  </>
+                )}
+                <div className="rx-row">
+                  <button className="btn-link" type="button" disabled={stealthBusy} onClick={newStealth}>
+                    {stealthBusy ? "Creating…" : "+ New shielded address"}
+                  </button>
+                </div>
+              </>
+            ) : (
+              <>
+                <p>You do not have a shielded address yet. Creating one makes a key your recovery phrase cannot restore.</p>
+                <button className="rx-recover" type="button" disabled={stealthBusy} onClick={newStealth}>
+                  {stealthBusy ? "Creating…" : "Create a shielded address"}
+                </button>
+              </>
+            )}
+            {err && <div className="msg err">{err}</div>}
+          </div>
+        )}
+
+        {open === "btc" && (
+          <div className="rx-sheet">
+            <div className="eyebrow">Bitcoin chain · bc1</div>
+            <h3>Bitcoin address</h3>
+            <p>Real bitcoin. Deposit here, then shield it into zBTC under Bridge, or send it out under Send.</p>
+            <div className="rx-addr" title={btcAddr}>{btcAddr || "Loading…"}</div>
+            <div className="rx-row">
+              {btcAddr && <CopyButton text={btcAddr} label="Copy address" />}
+              <button className="ghost" type="button" disabled={!btcAddr} onClick={() => showQr(btcAddr, "Bitcoin address")}>Large QR</button>
+            </div>
+            <div className="rx-fine">Restored by the same phrase.</div>
+          </div>
+        )}
+      </div>
       {bigQr && <QrOverlay text={bigQr.text} title={bigQr.title} onClose={hideQr} />}
     </div>
   );

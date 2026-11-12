@@ -47,3 +47,7 @@ zcryptlaunchholdingpage/
 
 # operator secrets mounted into containers (reserve key etc.)
 chain/secrets/
+impl/reserve.key
+
+# local iOS packaging output
+wallet/build/

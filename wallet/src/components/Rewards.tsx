@@ -1,7 +1,103 @@
 import { useCallback, useEffect, useState } from "react";
 import { call, copySensitive, fmt } from "../lib/api";
 
-/** Claim accrued staking block rewards into spendable shield coins. */
+/**
+ * Staking home.
+ *
+ * Not validating and not delegating: two equal cards (run a validator, delegate).
+ * Validating: one dashboard. An existing delegation stays reachable so its stake
+ * can be unbonded, but the delegate setup is not shown.
+ * Delegating and not validating: one dashboard. Several live delegations are all listed.
+ * After unbond or undelegate the setup returns, and each returning stake keeps its line
+ * until it is withdrawn into the wallet. Matured stake is credited as claimable and
+ * comes back through the same claim the reward button uses.
+ */
+
+type FeeYield = { asset_id: string; ticker: string; decimals: number; amount: string };
+type Unbonding = { stake: string; release_time: string };
+type ValidatorIdentity = {
+  pubkey_hex: string;
+  env_line: string;
+  bonded: boolean;
+  stake: number;
+  commission_pct: number;
+  ever_bonded: boolean;
+  signed_this_epoch: number;
+  epoch_progress: number;
+  epoch_blocks: number;
+  /** Base units, as a string (u64). */
+  delegated: string;
+  delegation_count: number;
+};
+type ValInfo = { pubkey: string; stake: string; commission_pct: number };
+type MyDelegation = {
+  validator_pubkey: string;
+  index: number;
+  legacy: boolean;
+  stake: string;
+  commission_pct: number;
+};
+type Claimable = { ready: number; accruing: number; accruing_keys: number };
+
+const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+
+function releaseLabel(unix: string): string {
+  const d = new Date(Number(unix) * 1000);
+  return `${d.getDate()} ${MONTHS[d.getMonth()]} ${d.getFullYear()}`;
+}
+
+function noticeId(u: Unbonding): string {
+  return `${u.stake}:${u.release_time}`;
+}
+
+function noticeStore(pubkey: string): string {
+  return `zcrypt.unbonding.${pubkey}`;
+}
+
+function saneNotice(u: unknown): u is Unbonding {
+  if (!u || typeof u !== "object") return false;
+  const x = u as Unbonding;
+  return /^\d+$/.test(x.stake) && /^\d+$/.test(x.release_time);
+}
+
+function readNotices(pubkey: string): Unbonding[] {
+  try {
+    const raw = localStorage.getItem(noticeStore(pubkey));
+    const parsed = raw ? JSON.parse(raw) : [];
+    return Array.isArray(parsed) ? parsed.filter(saneNotice) : [];
+  } catch {
+    return [];
+  }
+}
+
+function writeNotices(pubkey: string, items: Unbonding[]) {
+  localStorage.setItem(noticeStore(pubkey), JSON.stringify(items));
+}
+
+function mergeNotices(local: Unbonding[], chain: Unbonding[]): Unbonding[] {
+  const map = new Map<string, Unbonding>();
+  for (const u of local) map.set(noticeId(u), u);
+  for (const u of chain) map.set(noticeId(u), u);
+  return [...map.values()].sort((a, b) => Number(a.release_time) - Number(b.release_time));
+}
+
+function shortPk(pk: string): string {
+  const s = pk.trim();
+  return s.length <= 8 ? s : `${s.slice(0, 8)}…`;
+}
+
+function zcrypt(base: number | string): string {
+  return `${fmt(Number(base))} ZCRYPT`;
+}
+
+function delegatedLine(count: number, delegated: string): string {
+  const amount = Number(delegated);
+  if (!count && !amount) return "None";
+  if (!count) return zcrypt(delegated);
+  const wallets = count === 1 ? "1 wallet" : `${count} wallets`;
+  return `${wallets} · ${zcrypt(delegated)}`;
+}
+
 export default function Rewards({
   active,
   onClaimed,
@@ -9,61 +105,37 @@ export default function Rewards({
   active: boolean;
   onClaimed: (amount: number) => void;
 }) {
-  // `ready` is what a claim will actually withdraw. `accruing` is on reward keys still
-  // under the 1 ZCRYPT consensus floor; those stay on the ledger and are not part of the button.
   const [ready, setReady] = useState(0);
   const [accruing, setAccruing] = useState(0);
   const [accruingKeys, setAccruingKeys] = useState(0);
+  const [balancesOk, setBalancesOk] = useState(false);
   const [busy, setBusy] = useState(false);
-  const [loading, setLoading] = useState(false);
   const [err, setErr] = useState("");
-  // Bridge-fee yield (asset-denominated, e.g. zBTC) — earned by validators AND delegators.
-  type FeeYield = { asset_id: string; ticker: string; decimals: number; amount: string };
   const [fees, setFees] = useState<FeeYield[]>([]);
   const [feeBusy, setFeeBusy] = useState("");
-  // Last successful fee claim, shown in place of the empty-state text (the list empties
-  // right after a claim, which used to read as if nothing had happened).
   const [feeMsg, setFeeMsg] = useState("");
-  // Pending unbonding (validator unbond or undelegate): persists until the 10-day timer ends.
-  type Unbonding = { stake: string; release_time: string };
   const [unbonding, setUnbonding] = useState<Unbonding[]>([]);
-  // Run a validator. The wallet derives the validator's consensus key from the
-  // recovery phrase; the node imports it once at install (one line in its .env). After
-  // that, bonding and unbonding are plain wallet actions: nothing to sign elsewhere.
-  type ValidatorIdentity = {
-    pubkey_hex: string;
-    env_line: string;
-    bonded: boolean;
-    stake: number;
-    commission_pct: number;
-    ever_bonded: boolean;
-    signed_this_epoch: number;
-    epoch_progress: number;
-    epoch_blocks: number;
-  };
+  const [unbondLoaded, setUnbondLoaded] = useState(false);
+  const [unbondErr, setUnbondErr] = useState("");
+  const [notices, setNotices] = useState<Unbonding[]>([]);
   const [ident, setIdent] = useState<ValidatorIdentity | null>(null);
   const [identErr, setIdentErr] = useState("");
-  // The user confirms a node is running with this identity before Bond is enabled: bonding
-  // alone registers the key and pledges the stake; only that node can sign blocks.
+  const [identLoaded, setIdentLoaded] = useState(false);
   const [nodeReady, setNodeReady] = useState(false);
   const [copiedKey, setCopiedKey] = useState(false);
   const [stake, setStake] = useState("10000");
   const [commissionPct, setCommissionPct] = useState("10");
   const [bonding, setBonding] = useState(false);
-  const [bondMsg, setBondMsg] = useState("");
   const [bondErr, setBondErr] = useState("");
-  // Reward balances are fetched only on an explicit click (see the note in the UI).
-  const [checked, setChecked] = useState(false);
-  // Delegate: stake to an existing validator without running a node.
-  type ValInfo = { pubkey: string; stake: string; commission_pct: number };
   const [vals, setVals] = useState<ValInfo[]>([]);
   const [selVal, setSelVal] = useState("");
   const [delAmt, setDelAmt] = useState("1000");
   const [delBusy, setDelBusy] = useState(false);
-  const [delMsg, setDelMsg] = useState("");
   const [delErr, setDelErr] = useState("");
+  const [dels, setDels] = useState<MyDelegation[]>([]);
+  const [delLoadErr, setDelLoadErr] = useState("");
+  const [delsLoaded, setDelsLoaded] = useState(false);
 
-  // Validators list sends nothing about this wallet to the node: safe to auto-load.
   const loadValidators = useCallback(async () => {
     try {
       const vs = await call<ValInfo[]>("list_validators");
@@ -74,39 +146,84 @@ export default function Rewards({
     }
   }, []);
 
-  // Balance lookups send this wallet's REWARD keys to the node (fresh keys created per bond
-  // and delegation, never the payment address). They run only when the user asks.
-  const load = useCallback(async () => {
-    setLoading(true);
-    setChecked(true);
+  const loadBalances = useCallback(async () => {
     try {
-      const c = await call<{ ready: number; accruing: number; accruing_keys: number }>("get_claimable");
+      const c = await call<Claimable>("get_claimable");
       setReady(c.ready);
       setAccruing(c.accruing);
       setAccruingKeys(c.accruing_keys);
-    } catch {
-      setReady(0);
-      setAccruing(0);
-      setAccruingKeys(0);
+      setBalancesOk(true);
+    } catch (e) {
+      setBalancesOk(false);
+      setErr(String(e));
     }
+  }, []);
+
+  const refreshPositions = useCallback(async () => {
     await loadValidators();
-    try {
-      setFees(await call<FeeYield[]>("claimable_fees"));
-    } catch {
-      setFees([]);
+    const [idRes, delRes, unRes] = await Promise.allSettled([
+      call<ValidatorIdentity>("validator_identity"),
+      call<MyDelegation[]>("my_delegations"),
+      call<Unbonding[]>("my_unbonding"),
+    ]);
+    if (idRes.status === "fulfilled") {
+      setIdent(idRes.value);
+      setIdentErr("");
+    } else {
+      setIdentErr(String(idRes.reason));
     }
-    try {
-      setUnbonding(await call<Unbonding[]>("my_unbonding"));
-    } catch {
-      setUnbonding([]);
-    } finally {
-      setLoading(false);
+    setIdentLoaded(true);
+    if (delRes.status === "fulfilled") {
+      setDels(delRes.value);
+      setDelLoadErr("");
+    } else {
+      setDelLoadErr(String(delRes.reason));
     }
+    setDelsLoaded(true);
+    if (unRes.status === "fulfilled") {
+      setUnbonding(unRes.value.filter(saneNotice));
+      setUnbondErr("");
+      setUnbondLoaded(true);
+    } else {
+      setUnbondErr(String(unRes.reason));
+      setUnbondLoaded(false);
+    }
+    // Bridge-fee yield is claimed on this tab. An empty result draws nothing, so the
+    // idle cards stay the only thing in the middle.
+    call<FeeYield[]>("claimable_fees").then(setFees).catch(() => {});
   }, [loadValidators]);
 
   useEffect(() => {
-    if (active) loadValidators();
-  }, [active, loadValidators]);
+    if (!active) return;
+    void refreshPositions();
+    const t = setInterval(() => void refreshPositions(), 60_000);
+    return () => clearInterval(t);
+  }, [active, refreshPositions]);
+
+  // Remember every unbonding the chain reports. Once the queue drops the entry, the
+  // line has to survive until a claim actually moves the stake — the chain no longer
+  // lists it. Do not drop a line before that fetch has succeeded, or a slow answer
+  // looks like the stake was already released.
+  useEffect(() => {
+    const pk = ident?.pubkey_hex;
+    if (!pk) return;
+    const now = Date.now() / 1000;
+    const queued = new Set(unbonding.map(noticeId));
+    let merged = mergeNotices(readNotices(pk), unbonding);
+    if (unbondLoaded && balancesOk && ready === 0) {
+      merged = merged.filter((u) => !(Number(u.release_time) <= now && !queued.has(noticeId(u))));
+    }
+    writeNotices(pk, merged);
+    setNotices(merged);
+  }, [ident?.pubkey_hex, unbonding, unbondLoaded, balancesOk, ready]);
+
+  const dueNotice = notices.some((u) => Number(u.release_time) <= Date.now() / 1000);
+  const needsBalances = Boolean(ident?.bonded) || dels.length > 0 || dueNotice;
+
+  useEffect(() => {
+    if (!active || !needsBalances) return;
+    void loadBalances();
+  }, [active, needsBalances, loadBalances, ident?.bonded, dels.length, unbonding]);
 
   async function claim() {
     setErr("");
@@ -114,7 +231,8 @@ export default function Rewards({
     try {
       const r = await call<{ claimed: number; coins: number }>("claim_rewards");
       onClaimed(r.claimed);
-      await load();
+      await loadBalances();
+      await refreshPositions();
     } catch (e) {
       setErr(String(e));
     } finally {
@@ -132,26 +250,13 @@ export default function Rewards({
       const dec = f?.decimals ?? 0;
       const amount = (Number(claimed) / 10 ** dec).toFixed(Math.min(dec, 8));
       setFeeMsg(`Claimed ${amount} ${f?.ticker ?? ""}: the coins are in your wallet and spendable. New yield accrues with bridge volume.`);
-      await load();
+      await refreshPositions();
     } catch (e) {
       setErr(String(e));
     } finally {
       setFeeBusy("");
     }
   }
-
-  const loadIdentity = useCallback(async () => {
-    setIdentErr("");
-    try {
-      setIdent(await call<ValidatorIdentity>("validator_identity"));
-    } catch (e) {
-      setIdentErr(String(e));
-    }
-  }, []);
-
-  useEffect(() => {
-    if (active) loadIdentity();
-  }, [active, loadIdentity]);
 
   async function copyNodeKey() {
     if (!ident) return;
@@ -160,23 +265,21 @@ export default function Rewards({
       setCopiedKey(true);
       setTimeout(() => setCopiedKey(false), 2500);
     } catch {
-      setBondErr("Could not reach the clipboard; select the line and copy it by hand.");
+      setBondErr("Could not reach the clipboard. Select the line and copy it by hand.");
     }
   }
 
   async function bond() {
     setBondErr("");
-    setBondMsg("");
     setBonding(true);
     try {
-      const msg = await call<string>("bond_validator", {
+      await call<string>("bond_validator", {
         stakeZcrypt: stake.trim(),
         commissionPct: commissionPct.trim(),
       });
-      setBondMsg(msg);
-      await load();
-      await loadIdentity();
-      await loadValidators();
+      setNodeReady(false);
+      await refreshPositions();
+      await loadBalances();
     } catch (e) {
       setBondErr(String(e));
     } finally {
@@ -186,14 +289,11 @@ export default function Rewards({
 
   async function unbond() {
     setBondErr("");
-    setBondMsg("");
     setBonding(true);
     try {
-      const msg = await call<string>("unbond_validator");
-      setBondMsg(msg);
-      await load();
-      await loadIdentity();
-      await loadValidators();
+      await call<string>("unbond_validator");
+      setNodeReady(false);
+      await refreshPositions();
     } catch (e) {
       setBondErr(String(e));
     } finally {
@@ -203,15 +303,14 @@ export default function Rewards({
 
   async function delegate() {
     setDelErr("");
-    setDelMsg("");
     setDelBusy(true);
     try {
-      const msg = await call<string>("delegate_validator", {
+      await call<string>("delegate_validator", {
         validatorPubkeyHex: selVal,
-        stakeZcrypt: delAmt,
+        stakeZcrypt: delAmt.trim(),
       });
-      setDelMsg(msg);
-      await load();
+      await refreshPositions();
+      await loadBalances();
     } catch (e) {
       setDelErr(String(e));
     } finally {
@@ -219,276 +318,373 @@ export default function Rewards({
     }
   }
 
-  async function undelegate() {
+  async function undelegate(d: MyDelegation) {
     setDelErr("");
-    setDelMsg("");
     setDelBusy(true);
     try {
-      const msg = await call<string>("undelegate_validator", { validatorPubkeyHex: selVal });
-      setDelMsg(msg);
-      await load();
+      await call<string>("undelegate_validator", {
+        validatorPubkeyHex: d.validator_pubkey,
+        index: d.index,
+        legacy: d.legacy,
+      });
+      await refreshPositions();
     } catch (e) {
       setDelErr(String(e));
     } finally {
       setDelBusy(false);
     }
   }
+
+  const queued = new Set(unbonding.map(noticeId));
+  const nowSec = Date.now() / 1000;
+
+  function stakeIsReady(u: Unbonding): boolean {
+    if (!unbondLoaded || !balancesOk || ready <= 0) return false;
+    if (Number(u.release_time) > nowSec) return false;
+    return !queued.has(noticeId(u));
+  }
+
+  function pendingPanel() {
+    if (notices.length === 0 && !unbondErr) return null;
+    return (
+      <section className="rewards-pending">
+        {unbondErr && <div className="msg err">Could not refresh unbonding: {unbondErr}</div>}
+        {notices.map((u) => {
+          const due = Number(u.release_time) <= nowSec;
+          const stillQueued = queued.has(noticeId(u));
+          const open = stakeIsReady(u);
+          const msg = !due || stillQueued
+            ? `${zcrypt(u.stake)} is returning to this wallet on ${releaseLabel(u.release_time)}.${due && stillQueued ? " The chain credits it on the next block." : ""}`
+            : `${zcrypt(u.stake)} is ready to withdraw into this wallet.`;
+          return (
+            <div className="rewards-prow" key={noticeId(u)}>
+              <p className="rewards-back">{msg}</p>
+              <button
+                className={open ? "btn-primary" : "btn-primary btn-later"}
+                disabled={!open || busy}
+                onClick={claim}
+              >
+                {busy ? "Withdrawing…" : "Withdraw to wallet"}
+              </button>
+            </div>
+          );
+        })}
+      </section>
+    );
+  }
+
+  function claimRows() {
+    const avail = balancesOk ? zcrypt(ready) : "…";
+    const held = balancesOk ? zcrypt(accruing) : "…";
+    return (
+      <>
+        <div className="rewards-stat">
+          <span className="lab">Available to withdraw</span>
+          <span className={`val${balancesOk && ready > 0 ? " ok" : ""}`}>{avail}</span>
+        </div>
+        <div className="rewards-stat">
+          <span className="lab">Not available to withdraw</span>
+          <span className={`val${balancesOk && accruing > 0 ? " warn" : ""}`}>{held}</span>
+        </div>
+      </>
+    );
+  }
+
+  function withdrawButton() {
+    const label = !balancesOk
+      ? "Checking…"
+      : ready > 0
+        ? `Withdraw ${zcrypt(ready)}`
+        : "Nothing to withdraw";
+    return (
+      <button className="btn-primary btn-block" disabled={busy || !balancesOk || ready <= 0} onClick={claim}>
+        {busy ? "Withdrawing…" : label}
+      </button>
+    );
+  }
+
+  function validatorDash(id: ValidatorIdentity) {
+    const silent = id.epoch_progress >= 5 && id.signed_this_epoch === 0;
+    const lead = silent
+      ? `Your node is not signing. The chain has seen 0 signatures in the ${id.epoch_progress} blocks of this epoch, so no rewards accrue. The node has to be running with the key from this wallet.`
+      : id.signed_this_epoch > 0
+        ? `Your node is signing ${id.signed_this_epoch} of ${id.epoch_progress} blocks this epoch.`
+        : "The epoch just started. The signing check needs a few more blocks.";
+    const floor = balancesOk && accruing > 0
+      ? ` ${zcrypt(accruing)} stays on the ledger until that reward key reaches 1 ZCRYPT${accruingKeys > 1 ? ` (${accruingKeys} keys)` : ""}.`
+      : "";
+    return (
+      <>
+        <section className="rewards-dash">
+          <h2>Your validator</h2>
+          <p className={silent ? "msg err" : "rewards-lead"}>{lead}</p>
+          {claimRows()}
+          <div className="rewards-stat">
+            <span className="lab">Delegated to you</span>
+            <span className="val">{delegatedLine(id.delegation_count, id.delegated || "0")}</span>
+          </div>
+          <p className="rewards-foot">
+            Commission you keep from people who delegate to you is already inside Available to withdraw.
+            The chain adds it to rewards on your own stake, so it is not a second balance.{floor}
+          </p>
+          {bondErr && <div className="msg err">{bondErr}</div>}
+          <div className="rewards-actions">
+            {withdrawButton()}
+            <button className="btn-secondary btn-block" disabled={bonding} onClick={unbond}>
+              {bonding ? "Stopping…" : "Stop validating"}
+            </button>
+          </div>
+        </section>
+        {dels.length > 0 && (
+          <section className="rewards-dash">
+            <h2>Also delegated</h2>
+            <p className="rewards-lead">This stake is with another validator. Unbonding it takes 10 days and does not stop your own validator.</p>
+            {dels.map((d) => (
+              <div className="rewards-stat" key={`${d.validator_pubkey}:${d.index}:${d.legacy}`}>
+                <span className="lab">{shortPk(d.validator_pubkey)} · {d.commission_pct}%</span>
+                <span className="val">{zcrypt(d.stake)}</span>
+              </div>
+            ))}
+            {delErr && <div className="msg err">{delErr}</div>}
+            <div className="rewards-actions">
+              {dels.map((d) => (
+                <button
+                  key={`${d.validator_pubkey}:${d.index}:unbond`}
+                  className="btn-secondary btn-block"
+                  disabled={delBusy}
+                  onClick={() => undelegate(d)}
+                >
+                  {delBusy ? "Working on-chain…" : `Unbond from ${shortPk(d.validator_pubkey)}`}
+                </button>
+              ))}
+            </div>
+          </section>
+        )}
+      </>
+    );
+  }
+
+  function delegateDash() {
+    const one = dels.length === 1 ? dels[0] : null;
+    const floor = balancesOk && accruing > 0
+      ? ` ${zcrypt(accruing)} stays on the ledger until that reward key reaches 1 ZCRYPT.`
+      : "";
+    return (
+      <section className="rewards-dash">
+        <h2>{one ? "Your delegation" : "Your delegations"}</h2>
+        <p className="rewards-lead">
+          {one
+            ? `Staked with ${shortPk(one.validator_pubkey)}. You earn a share of that validator's rewards, minus its ${one.commission_pct}% commission.`
+            : "You have stake with more than one validator. Each unbond takes 10 days."}
+        </p>
+        {claimRows()}
+        <div className="rewards-stat">
+          <span className="lab">Earned from delegating</span>
+          <span className="val">{balancesOk ? zcrypt(ready + accruing) : "…"}</span>
+        </div>
+        {one ? (
+          <div className="rewards-stat">
+            <span className="lab">Delegated</span>
+            <span className="val">{zcrypt(one.stake)}</span>
+          </div>
+        ) : (
+          dels.map((d) => (
+            <div className="rewards-stat" key={`${d.validator_pubkey}:${d.index}:${d.legacy}`}>
+              <span className="lab">{shortPk(d.validator_pubkey)} · {d.commission_pct}%</span>
+              <span className="val">{zcrypt(d.stake)}</span>
+            </div>
+          ))
+        )}
+        <p className="rewards-foot">
+          Earned from delegating is what is still on the ledger: the amount available now, plus what is still under the 1 ZCRYPT minimum.
+          Unbonding returns the stake after 10 days.{floor}
+        </p>
+        {delErr && <div className="msg err">{delErr}</div>}
+        <div className="rewards-actions">
+          {withdrawButton()}
+          {dels.map((d) => (
+            <button
+              key={`${d.validator_pubkey}:${d.index}:unbond`}
+              className="btn-secondary btn-block"
+              disabled={delBusy}
+              onClick={() => undelegate(d)}
+            >
+              {delBusy ? "Working on-chain…" : one ? "Unbond" : `Unbond from ${shortPk(d.validator_pubkey)}`}
+            </button>
+          ))}
+        </div>
+      </section>
+    );
+  }
+
+  function setupBoard() {
+    const keyPreview = ident ? `${ident.env_line.slice(0, 28)}…` : "";
+    return (
+      <div className="rewards-setup">
+        <div className="bg l" />
+        <div className="bg r" />
+
+        <h2 className="c l r1 pad-top">Run a validator</h2>
+        <h2 className="c r r1 pad-top">Delegate</h2>
+
+        <div className="c l r2"><div className="rewards-k">Step 1</div></div>
+        <div className="c r r2"><div className="rewards-k">Validator</div></div>
+
+        <div className="c l r3"><p className="rewards-t">Start the node</p></div>
+        <div className="c r r3"><p className="rewards-t">Choose who to stake with</p></div>
+
+        <div className="c l r4">
+          <p className="rewards-d">
+            Clone the repo, <code>cd chain/validator</code>, copy <code>.env.example</code> to <code>.env</code>, paste the line, then <code>docker compose up -d</code>. The line has to be in place before the first start.
+          </p>
+        </div>
+        <div className="c r r4">
+          <p className="rewards-d">Stake, commission, and signing record are public. You earn a share of that validator's rewards, minus its commission.</p>
+        </div>
+
+        <div className="c l r5">
+          <div className="rewards-keyline">
+            <span>{keyPreview}</span>
+            <button className="copy-btn" type="button" onClick={copyNodeKey}>{copiedKey ? "Copied" : "Copy"}</button>
+          </div>
+        </div>
+        <div className="c r r5">
+          {vals.length === 0 ? (
+            <div className="warn">No bonded validators to delegate to yet.</div>
+          ) : (
+            <select value={selVal} onChange={(e) => setSelVal(e.target.value)} aria-label="Validator">
+              {vals.map((v) => (
+                <option key={v.pubkey} value={v.pubkey}>
+                  {shortPk(v.pubkey)} · {fmt(Number(v.stake))} staked · {v.commission_pct}%
+                </option>
+              ))}
+            </select>
+          )}
+        </div>
+
+        <div className="c l r6" />
+        <div className="c r r6" />
+
+        <div className="c l r7"><div className="rewards-k">Step 2</div></div>
+        <div className="c r r7"><div className="rewards-k">Amount</div></div>
+
+        <div className="c l r8"><p className="rewards-t">Sync to the tip</p></div>
+        <div className="c r r8"><p className="rewards-t">ZCRYPT to delegate</p></div>
+
+        <div className="c l r9">
+          <p className="rewards-d">Wait until the node is caught up. Bonding earlier means it misses blocks from the moment it joins.</p>
+        </div>
+        <div className="c r r9">
+          <p className="rewards-d">This leaves your spendable balance and stays delegated until you undelegate. Undelegate takes 10 days to return.</p>
+        </div>
+
+        <div className="c l r10">
+          <label className="rewards-check">
+            <input type="checkbox" checked={nodeReady} onChange={(e) => setNodeReady(e.target.checked)} />
+            Node is synced
+          </label>
+        </div>
+        <div className="c r r10">
+          <input value={delAmt} onChange={(e) => setDelAmt(e.target.value)} inputMode="numeric" aria-label="Amount to delegate" />
+        </div>
+
+        <div className="c l r11" />
+        <div className="c r r11" />
+
+        <div className="c l r12"><div className="rewards-k">Step 3</div></div>
+        <div className="c r r12" />
+
+        <div className="c l r13"><p className="rewards-t">Bond the stake</p></div>
+        <div className="c r r13" />
+
+        <div className="c l r14">
+          <div className="rewards-pair">
+            <div className="field">
+              <span className="rewards-k">Stake</span>
+              <input value={stake} onChange={(e) => setStake(e.target.value)} inputMode="numeric" aria-label="Stake, minimum 10,000 ZCRYPT" />
+            </div>
+            <div className="field">
+              <span className="rewards-k">Commission</span>
+              <input value={commissionPct} onChange={(e) => setCommissionPct(e.target.value)} inputMode="decimal" aria-label="Commission percent" />
+            </div>
+          </div>
+        </div>
+        <div className="c r r14" />
+
+        <div className="c l r15">
+          <p className="rewards-d">Commission is the share you keep of rewards earned by people who delegate to you. A lower percent draws more of their stake. 0–100%. Minimum stake is 10,000 ZCRYPT.</p>
+        </div>
+        <div className="c r r15" />
+
+        <div className="c l r16">
+          <button className="btn-primary btn-block" disabled={bonding || !nodeReady} onClick={bond}>
+            {bonding ? "Bonding…" : "Bond"}
+          </button>
+        </div>
+        <div className="c r r16">
+          <button className="btn-primary btn-block" disabled={delBusy || !selVal || vals.length === 0} onClick={delegate}>
+            {delBusy ? "Delegating…" : "Delegate"}
+          </button>
+        </div>
+
+        <div className="c l r17 pad-bot">
+          {bondErr && <div className="msg err">{bondErr}</div>}
+        </div>
+        <div className="c r r17 pad-bot">
+          {delErr && <div className="msg err">{delErr}</div>}
+        </div>
+      </div>
+    );
+  }
+
+  function feeCard() {
+    if (fees.length === 0 && !feeMsg) return null;
+    return (
+      <div className="card rewards-fees">
+        <h3 style={{ marginTop: 0 }}>Bridge-fee yield</h3>
+        <p className="rewards-d">Asset-denominated yield from bridge volume, earned by validators and delegators. Separate from ZCRYPT block rewards.</p>
+        {feeMsg && <div className="msg ok">{feeMsg}</div>}
+        {fees.map((f) => (
+          <div className="rewards-stat" key={f.asset_id}>
+            <span className="val">
+              {(Number(f.amount) / 10 ** f.decimals).toFixed(Math.min(f.decimals, 8))} {f.ticker}
+            </span>
+            <button className="btn-primary" disabled={feeBusy === f.asset_id} onClick={() => claimFee(f.asset_id)}>
+              {feeBusy === f.asset_id ? "Claiming…" : `Claim ${f.ticker}`}
+            </button>
+          </div>
+        ))}
+      </div>
+    );
+  }
+
+  const blocked = identLoaded && delsLoaded && (!ident || (!ident.bonded && dels.length === 0 && !!delLoadErr));
+  const mode = ident?.bonded ? "run" : dels.length > 0 ? "del" : "setup";
 
   return (
     <div>
       <h2 className="view-title">🏆 Staking Rewards</h2>
-      <div className="card" style={{ maxWidth: 560, margin: "0 auto" }}>
-        <div className="field">
-          <label>Ready to claim</label>
-          <div className="reward-amount">
-            {!checked ? "not checked" : loading ? "…" : `${fmt(ready)} ZCRYPT`}
-          </div>
+      {!identLoaded || !delsLoaded ? (
+        <div className="rewards-stage single">
+          <section className="rewards-dash">
+            <p className="rewards-lead" style={{ margin: 0 }}>Loading staking…</p>
+          </section>
         </div>
-        {checked && !loading && accruing > 0 && (
-          <div className="warn" style={{ marginTop: "0.7rem" }}>
-            {fmt(accruing)} ZCRYPT is still accruing on {accruingKeys === 1 ? "one reward key" : `${accruingKeys} reward keys`}.
-            Each key is withdrawn on its own, once it reaches 1 ZCRYPT. That amount stays on the ledger until then.
-          </div>
-        )}
-        {err && <div className="msg err">{err}</div>}
-        <button
-          className="btn-primary btn-block"
-          disabled={busy || loading || ready === 0}
-          onClick={claim}
-        >
-          {busy
-            ? "Claiming on-chain…"
-            : ready === 0
-              ? accruing > 0
-                ? "Below the 1 ZCRYPT minimum"
-                : "Nothing to claim"
-              : `Claim ${fmt(ready)} ZCRYPT`}
-        </button>
-        <button
-          className="btn-secondary btn-block"
-          style={{ marginTop: "0.6rem" }}
-          disabled={loading || busy}
-          onClick={load}
-        >
-          {checked ? "↻ Check again" : "🔎 Check rewards"}
-        </button>
-        <div className="warn" style={{ marginTop: "1rem" }}>
-          Checking asks the node for the balances of this wallet's <b>reward keys</b>: a fresh key is created
-          for every bond and delegation, so your payment address is never sent. The node still learns that this
-          session owns those keys, which is why the check only runs when you click. Claiming mints coinbase
-          coins <b>bound to your key</b>; only you can spend them. The amount is fixed by the emission schedule,
-          so a validator can never mint itself extra.
+      ) : blocked ? (
+        <div className="rewards-stage single">
+          <section className="rewards-dash">
+            <div className="msg err">{identErr || delLoadErr || "Could not read this wallet's staking position."}</div>
+            <button className="btn-secondary" onClick={() => void refreshPositions()}>Try again</button>
+          </section>
         </div>
-      </div>
-
-      <div className="card" style={{ maxWidth: 560, margin: "1.25rem auto 0" }}>
-        <h3 style={{ marginTop: 0 }}>🌉 Bridge-fee yield</h3>
-        <div style={{ fontSize: "0.82rem", opacity: 0.75, marginBottom: "0.7rem" }}>
-          Real asset-denominated yield (e.g. zBTC) from bridge volume, earned by validators{" "}
-          <b>and delegators</b> by stake × participation, net of commission. Separate from
-          ZCRYPT block rewards above.
-        </div>
-        {feeMsg && <div className="msg ok" style={{ marginBottom: "0.6rem" }}>{feeMsg}</div>}
-        {fees.length === 0 ? (
-          <div className="warn">
-            {feeMsg ? "Nothing further to claim right now." : "No bridge-fee yield to claim yet."}
-          </div>
-        ) : (
-          fees.map((f) => (
-            <div
-              key={f.asset_id}
-              style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: "0.6rem", marginBottom: "0.5rem" }}
-            >
-              <div className="reward-amount" style={{ fontSize: "1.1rem" }}>
-                {(Number(f.amount) / 10 ** f.decimals).toFixed(Math.min(f.decimals, 8))} {f.ticker}
-              </div>
-              <button
-                className="btn-primary"
-                disabled={feeBusy === f.asset_id}
-                onClick={() => claimFee(f.asset_id)}
-              >
-                {feeBusy === f.asset_id ? "Claiming…" : `Claim ${f.ticker}`}
-              </button>
-            </div>
-          ))
-        )}
-      </div>
-
-      <div className="card" style={{ maxWidth: 560, margin: "1.25rem auto 0" }}>
-        <h3 style={{ marginTop: 0 }}>🛡️ Run a validator</h3>
-        {identErr && <div className="msg err">{identErr}</div>}
-        {!ident ? (
-          <div style={{ fontSize: "0.82rem", opacity: 0.7 }}>Loading your validator identity…</div>
-        ) : (
-          <>
-            <div style={{ fontSize: "0.82rem", opacity: 0.8, marginBottom: "0.7rem" }}>
-              Two parts, both required. A <b>node</b> you run signs blocks with this identity; this <b>wallet</b> bonds
-              the stake behind it. Bonding without the node registers a validator that never signs and earns nothing.
-            </div>
-            <div className="field">
-              <label>Your validator (consensus public key)</label>
-              <div className="mono-box" style={{ fontSize: "0.72rem", wordBreak: "break-all" }}>{ident.pubkey_hex}</div>
-            </div>
-
-            {ident.bonded ? (
-              <>
-                <div className="msg ok" style={{ fontSize: "0.8rem" }}>
-                  Bonded: {fmt(ident.stake)} ZCRYPT staked at {ident.commission_pct}% commission. Rewards accrue to this
-                  wallet every {ident.epoch_blocks || 100} blocks; claim them above.
-                </div>
-                {ident.epoch_progress >= 5 && ident.signed_this_epoch === 0 ? (
-                  <div className="msg err" style={{ fontSize: "0.8rem" }}>
-                    <b>Your node is not signing.</b> The chain has seen 0 signatures from this key in the {ident.epoch_progress}{" "}
-                    blocks of the current epoch, so no rewards accrue. Bonding is done from this wallet, but blocks are signed by
-                    a node running with this identity. Either no node is running, or it runs with its own key instead of the{" "}
-                    <code>.env</code> line under <b>Node setup</b>: install that line before the node's first start (an existing
-                    node must be stopped, its data volume removed, and started again).
-                  </div>
-                ) : ident.signed_this_epoch > 0 ? (
-                  <div className="msg ok" style={{ fontSize: "0.8rem" }}>
-                    ✓ Your node is signing: {ident.signed_this_epoch} of {ident.epoch_progress} blocks so far this epoch.
-                  </div>
-                ) : (
-                  <div style={{ fontSize: "0.78rem", opacity: 0.65 }}>
-                    Epoch just started; the signing check needs a few more blocks.
-                  </div>
-                )}
-                <button className="btn-secondary btn-block" style={{ marginTop: "0.6rem" }} disabled={bonding} onClick={unbond}>
-                  {bonding ? "Working on-chain…" : "Unbond (stake returns after 10 days)"}
-                </button>
-              </>
-            ) : (
-              <>
-                <div className="step">
-                  <div className="step-head">
-                    <span className="step-num">1</span>
-                    <b>Run a node with this identity</b>
-                  </div>
-                  <div style={{ fontSize: "0.78rem", opacity: 0.8, margin: "0.4rem 0" }}>
-                    On any machine with Docker: clone the repo, <code>cd chain/validator</code>, copy{" "}
-                    <code>.env.example</code> to <code>.env</code>, paste the line below into it, then{" "}
-                    <code>docker compose up -d</code>. The line is the node's signing key:
-                    it goes in <b>before the first start</b>, and the file stays private. A node already running with its
-                    own key must be stopped, its volume removed, and started again with the line in place.
-                  </div>
-                  <div className="mono-box" style={{ fontSize: "0.66rem", wordBreak: "break-all", maxHeight: 60, overflow: "auto" }}>
-                    {ident.env_line.slice(0, 24)}…
-                  </div>
-                  <button className="copy-btn" style={{ marginTop: "0.4rem" }} onClick={copyNodeKey}>
-                    {copiedKey ? "✓ Copied (clears in 60 s)" : "📋 Copy the .env line"}
-                  </button>
-                  <div style={{ fontSize: "0.72rem", opacity: 0.6, marginTop: "0.5rem" }}>
-                    Let it sync to the chain tip before step 2, or it misses blocks from the moment it is bonded.
-                  </div>
-                </div>
-
-                <div className="step" style={{ marginTop: "0.9rem" }}>
-                  <div className="step-head">
-                    <span className="step-num">2</span>
-                    <b>Bond the stake from this wallet</b>
-                  </div>
-                  <label style={{ display: "flex", gap: "0.5rem", alignItems: "flex-start", fontWeight: "normal", fontSize: "0.8rem", margin: "0.5rem 0 0.8rem", cursor: "pointer" }}>
-                    <input type="checkbox" style={{ width: "auto", marginTop: 2 }} checked={nodeReady} onChange={(e) => setNodeReady(e.target.checked)} />
-                    <span>My node is running with this identity and is synced.</span>
-                  </label>
-                <div className="field">
-                  <label>Stake (ZCRYPT, min 10,000)</label>
-                  <input value={stake} onChange={(e) => setStake(e.target.value)} inputMode="numeric" />
-                </div>
-                <div className="field">
-                  <label>Commission % (your cut of delegators' rewards)</label>
-                  <input value={commissionPct} onChange={(e) => setCommissionPct(e.target.value)} inputMode="decimal" />
-                  <div style={{ fontSize: "0.72rem", opacity: 0.6, marginTop: 4 }}>
-                    Lower commission attracts more delegators; you keep this % of what they earn. 0-100%.
-                  </div>
-                </div>
-                <button className="btn-primary btn-block" disabled={bonding || !nodeReady} onClick={bond} title={nodeReady ? "" : "Confirm step 1 first"}>
-                  {bonding ? "Bonding on-chain…" : `Bond ${stake || "?"} ZCRYPT`}
-                </button>
-                <div style={{ fontSize: "0.72rem", opacity: 0.6, marginTop: "0.5rem" }}>
-                  The stake is pledged from this wallet and comes back after a 10-day unbond. Your key joins the active set on
-                  the next block, and from then on this card shows whether your node is signing.
-                </div>
-                </div>
-              </>
-            )}
-          </>
-        )}
-        {bondErr && <div className="msg err">{bondErr}</div>}
-        {bondMsg && <div className="msg ok">{bondMsg}</div>}
-      </div>
-
-      <div className="card" style={{ maxWidth: 560, margin: "1.25rem auto 0" }}>
-        <h3 style={{ marginTop: 0 }}>🤝 Delegate to a validator</h3>
-        <div style={{ fontSize: "0.82rem", opacity: 0.75, marginBottom: "0.7rem" }}>
-          Stake to an existing validator without running a node. You earn a share of its
-          rewards (minus its commission); your stake returns after a 10-day undelegate.
-        </div>
-        {vals.length === 0 ? (
-          <div className="warn">No bonded validators to delegate to yet.</div>
-        ) : (
-          <>
-            <div className="field">
-              <label>Validator</label>
-              <select value={selVal} onChange={(e) => setSelVal(e.target.value)}>
-                {vals.map((v) => (
-                  <option key={v.pubkey} value={v.pubkey}>
-                    {v.pubkey.slice(0, 16)}… · {fmt(Number(v.stake))} staked · {v.commission_pct}% commission
-                  </option>
-                ))}
-              </select>
-            </div>
-            <div className="field">
-              <label>Amount (ZCRYPT)</label>
-              <input value={delAmt} onChange={(e) => setDelAmt(e.target.value)} inputMode="numeric" />
-            </div>
-            {delErr && <div className="msg err">{delErr}</div>}
-            {delMsg && <div className="msg ok">{delMsg}</div>}
-            <button
-              className="btn-primary btn-block"
-              disabled={delBusy || !selVal}
-              onClick={delegate}
-            >
-              {delBusy ? "Working on-chain…" : `Delegate ${delAmt || "?"} ZCRYPT`}
-            </button>
-            <button
-              className="btn-secondary btn-block"
-              style={{ marginTop: "0.6rem" }}
-              disabled={delBusy || !selVal}
-              onClick={undelegate}
-            >
-              Undelegate from this validator
-            </button>
-          </>
-        )}
-      </div>
-
-      {unbonding.length > 0 && (
-        <div className="card" style={{ maxWidth: 560, margin: "1.25rem auto 0" }}>
-          <h3 style={{ marginTop: 0 }}>⏳ Unbonding</h3>
-          <div style={{ fontSize: "0.82rem", opacity: 0.75, marginBottom: "0.7rem" }}>
-            Stake you unbonded or undelegated, locked for the 10-day unbonding period. It
-            returns to this wallet as claimable balance when the timer ends.
-          </div>
-          {unbonding.map((u, i) => {
-            const releaseMs = Number(u.release_time) * 1000;
-            const days = Math.max(0, Math.ceil((releaseMs - Date.now()) / 86_400_000));
-            return (
-              <div
-                key={i}
-                style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: "0.6rem", marginBottom: "0.5rem" }}
-              >
-                <div className="reward-amount" style={{ fontSize: "1.1rem" }}>
-                  {fmt(Number(u.stake))} ZCRYPT
-                </div>
-                <div style={{ fontSize: "0.8rem", opacity: 0.8, textAlign: "right" }}>
-                  {days > 0 ? `free in ~${days} day${days === 1 ? "" : "s"}` : "releasing…"}
-                  <br />
-                  <span style={{ opacity: 0.6 }}>{new Date(releaseMs).toLocaleDateString()}</span>
-                </div>
-              </div>
-            );
-          })}
+      ) : (
+        <div className={mode === "setup" ? "rewards-stage wide" : "rewards-stage single"}>
+          {err && <div className="msg err">{err}</div>}
+          {identErr && <div className="msg err">{identErr}</div>}
+          {delLoadErr && mode === "run" && <div className="msg err">{delLoadErr}</div>}
+          {pendingPanel()}
+          {mode === "run" && ident ? validatorDash(ident) : mode === "del" ? delegateDash() : setupBoard()}
+          {feeCard()}
         </div>
       )}
     </div>

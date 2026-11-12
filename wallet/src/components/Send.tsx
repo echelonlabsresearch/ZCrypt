@@ -1,6 +1,18 @@
-import { useCallback, useEffect, useState } from "react";
-import { call, fmtAsset, toBaseAsset, HeldAsset } from "../lib/api";
-import { ShareBar } from "./Share";
+import { useCallback, useEffect, useRef, useState } from "react";
+import {
+  call,
+  coinFileName,
+  dismissSavedSecret,
+  fmtAsset,
+  HeldAsset,
+  openCoinShare,
+  saveCoinFile,
+  SHARE_CHANNELS,
+  ShareChannel,
+  toBaseAsset,
+} from "../lib/api";
+import Success from "../mobile/Success";
+import { Btn } from "../mobile/ui";
 
 type Deliver = "normal" | "stealth" | "bearer";
 
@@ -44,13 +56,41 @@ interface BtcQuote {
   inputs: number;
 }
 
+type SendWhat = "bearer" | "note" | "payment" | "btc";
+
+type Phase =
+  | { kind: "form" }
+  | { kind: "busy"; what: SendWhat }
+  | { kind: "handoff"; what: "bearer" | "note"; pretty: string; file: string; filename: string }
+  | { kind: "sent"; what: "payment" | "btc"; pretty: string; detail?: string }
+  | { kind: "failed"; msg: string };
+
+const BUSY_COPY: Record<SendWhat, { title: string; subtitle: string }> = {
+  bearer: {
+    title: "Creating the coin",
+    subtitle: "Building the coin file on this computer. This takes a few seconds.",
+  },
+  note: {
+    title: "Creating the note",
+    subtitle: "Encrypting the payment on this computer. This takes a few seconds.",
+  },
+  payment: {
+    title: "Sending payment",
+    subtitle: "Checking the chain and building the proof on this computer. This takes a few seconds.",
+  },
+  btc: {
+    title: "Sending bitcoin",
+    subtitle: "Signing the transaction and broadcasting it.",
+  },
+};
+
 export default function Send({
   active,
   onSent,
-  toast,
 }: {
   active: boolean;
   onSent: () => void;
+  /** Kept so a result screen is not paired with a second toast. */
   toast: (t: string, b: string) => void;
 }) {
   const [assets, setAssets] = useState<HeldAsset[]>([]);
@@ -59,11 +99,13 @@ export default function Send({
   const [deliver, setDeliver] = useState<Deliver>("normal");
   const [recipient, setRecipient] = useState("");
   const [amount, setAmount] = useState("");
-  const [busy, setBusy] = useState(false);
+  const [checking, setChecking] = useState(false);
   const [err, setErr] = useState("");
-  const [okMsg, setOkMsg] = useState("");
-  const [onchainOk, setOnchainOk] = useState(false);
-  const [file, setFile] = useState("");
+  const [phase, setPhase] = useState<Phase>({ kind: "form" });
+  const [acting, setActing] = useState<"" | "save" | ShareChannel>("");
+  const [handErr, setHandErr] = useState("");
+  const handLock = useRef(false);
+  const wroteFile = useRef(false);
   // Bitcoin: fee speed, a live quote from the same builder that signs, and "Max".
   const [speed, setSpeed] = useState<Speed>("normal");
   const [quote, setQuote] = useState<BtcQuote | null>(null);
@@ -132,78 +174,206 @@ export default function Send({
     }
   }
 
-  function resetOutputs() {
-    setErr("");
-    setOkMsg("");
-    setOnchainOk(false);
-    setFile("");
+  function errText(e: unknown): string {
+    return e instanceof Error ? e.message : String(e);
   }
 
   async function submit() {
-    resetOutputs();
-    setBusy(true);
+    setErr("");
+    // A typo stays on the form. The spinner starts only once the payment itself is in flight,
+    // so a bad address does not flash the full-screen result.
+    let started = false;
     try {
-      // --- Bitcoin (L1): a real on-chain BTC withdrawal ---
       if (isBtc) {
         const sats = toBaseAsset(amount, 8);
         if (!sats || sats <= 0) throw new Error("Enter a valid BTC amount.");
-        const btcAmt = sats / 1e8;
         if (!recipient.trim()) throw new Error("Enter a Bitcoin address.");
+        const pretty = `${satsToBtc(sats)} BTC`;
+        started = true;
+        setPhase({ kind: "busy", what: "btc" });
         const txid = await call<string>("withdraw_btc", { address: recipient.trim(), btc: amount.trim(), speed });
-        const feeNote = quote ? ` (fee ${quote.fee_sats.toLocaleString()} sat)` : "";
-        setOkMsg(`✓ Sent ${btcFmt(btcAmt)} BTC${feeNote} — txid ${txid}`);
-        toast("BTC sent", `${btcFmt(btcAmt)} BTC broadcast on the Bitcoin network`);
+        const feeNote = quote ? `Fee ${quote.fee_sats.toLocaleString()} sat. ` : "";
         setAmount("");
         setRecipient("");
         setQuote(null);
         onSent();
         loadAssets();
+        setPhase({ kind: "sent", what: "btc", pretty, detail: `${feeNote}Transaction ${txid}` });
         return;
       }
 
-      // --- Shielded asset (ZCRYPT / zBTC / …) ---
       const base = toBaseAsset(amount, asset.decimals);
       if (!base || base <= 0) throw new Error("Enter a valid amount.");
       if (base > asset.balance) throw new Error(`Amount exceeds your ${asset.ticker} balance.`);
       const pretty = `${fmtAsset(base, asset.decimals)} ${asset.ticker}`;
-      if (deliver === "bearer") {
-        const token = await call<string>("create_bearer", { amount: base, assetId: asset.asset_id });
-        setFile(token);
-        toast("Bearer coin created", `${pretty} — send the file. The receipt is in History`);
-      } else {
-        // Validate the recipient address kind against the delivery mode BEFORE
-        // proving (avoids wasting a proof; the backend enforces this too).
+
+      if (deliver !== "bearer") {
         if (!recipient.startsWith("zc1")) throw new Error("Recipient must be a zc1… address.");
+        setChecking(true);
         const kind = await call<string>("address_kind", { address: recipient.trim() });
+        setChecking(false);
         if (kind === "invalid") throw new Error("That doesn't look like a valid zc1… address.");
         if (deliver === "stealth" && kind !== "stealth")
           throw new Error("Stealth send requires a STEALTH address — you entered a normal address.");
         if (deliver === "normal" && kind !== "normal")
           throw new Error("That's a stealth address — switch delivery to Stealth to send to it.");
-
-        if (deliver === "stealth") {
-          const r = await call<{ file: string }>("send_stealth", { recipient: recipient.trim(), amount: base, assetId: asset.asset_id });
-          setFile(r.file);
-          toast("Stealth send", `${pretty} — share the note. The receipt is in History`);
-        } else {
-          await call("send_onchain", { recipient: recipient.trim(), amount: base, assetId: asset.asset_id });
-          setOnchainOk(true);
-          toast("Sent on-chain", `${pretty} — receipt saved in History`);
-        }
       }
-      setAmount("");
-      onSent();
-      loadAssets();
+
+      if (deliver === "bearer") {
+        started = true;
+        setPhase({ kind: "busy", what: "bearer" });
+        const token = await call<string>("create_bearer", { amount: base, assetId: asset.asset_id });
+        setAmount("");
+        onSent();
+        loadAssets();
+        setPhase({ kind: "handoff", what: "bearer", pretty, file: token, filename: coinFileName("bearer") });
+      } else if (deliver === "stealth") {
+        started = true;
+        setPhase({ kind: "busy", what: "note" });
+        const r = await call<{ file: string }>("send_stealth", {
+          recipient: recipient.trim(),
+          amount: base,
+          assetId: asset.asset_id,
+        });
+        setAmount("");
+        setRecipient("");
+        onSent();
+        loadAssets();
+        setPhase({ kind: "handoff", what: "note", pretty, file: r.file, filename: coinFileName("note") });
+      } else {
+        started = true;
+        setPhase({ kind: "busy", what: "payment" });
+        await call("send_onchain", { recipient: recipient.trim(), amount: base, assetId: asset.asset_id });
+        setAmount("");
+        setRecipient("");
+        onSent();
+        loadAssets();
+        setPhase({ kind: "sent", what: "payment", pretty });
+      }
     } catch (e) {
-      setErr(String(e));
-    } finally {
-      setBusy(false);
+      setChecking(false);
+      if (started) setPhase({ kind: "failed", msg: errText(e) });
+      else setErr(errText(e));
+    }
+  }
+
+  function leaveHandoff() {
+    setActing("");
+    setHandErr("");
+    handLock.current = false;
+    wroteFile.current = false;
+    setPhase({ kind: "form" });
+  }
+
+  async function saveCoin(file: string, filename: string) {
+    if (handLock.current) return;
+    handLock.current = true;
+    setActing("save");
+    setHandErr("");
+    try {
+      // A second click must not mint another filename. The first write is the file.
+      if (!wroteFile.current) {
+        await saveCoinFile(filename, file);
+        wroteFile.current = true;
+      }
+      await dismissSavedSecret(file);
+      window.dispatchEvent(new Event("zc-secrets"));
+      leaveHandoff();
+    } catch (e) {
+      setHandErr(errText(e));
+      handLock.current = false;
+      setActing("");
+    }
+  }
+
+  async function shareCoin(channel: ShareChannel, file: string, filename: string, subject: string) {
+    if (handLock.current) return;
+    handLock.current = true;
+    setActing(channel);
+    setHandErr("");
+    try {
+      await openCoinShare(channel, file, filename, subject);
+      leaveHandoff();
+    } catch (e) {
+      setHandErr(errText(e));
+      handLock.current = false;
+      setActing("");
     }
   }
 
   const availLabel = isBtc
     ? `Amount (BTC) — ${btcFmt(btc?.balance ?? 0)} on your deposit address`
     : `Amount (${asset.ticker}) — available ${fmtAsset(asset.balance, asset.decimals)}`;
+
+  if (phase.kind === "busy") {
+    const copy = BUSY_COPY[phase.what];
+    return <Success tone="busy" title={copy.title} subtitle={copy.subtitle} onDone={() => {}} />;
+  }
+  if (phase.kind === "failed") {
+    return (
+      <Success
+        tone="bad"
+        title="Could not send"
+        subtitle="The payment did not go out."
+        doneLabel="Back to send"
+        onDone={() => setPhase({ kind: "form" })}
+      >
+        <div className="m-done-detail">{phase.msg}</div>
+      </Success>
+    );
+  }
+  if (phase.kind === "sent") {
+    return (
+      <Success
+        title={`${phase.pretty} sent!`}
+        subtitle={
+          phase.what === "btc"
+            ? "Broadcast on the Bitcoin network."
+            : "Settled on the chain. The recipient's wallet credits it on the next refresh."
+        }
+        onDone={() => setPhase({ kind: "form" })}
+      >
+        {phase.detail && <div className="m-done-detail">{phase.detail}</div>}
+      </Success>
+    );
+  }
+  if (phase.kind === "handoff") {
+    const subject = phase.what === "note" ? `${phase.pretty} ZCrypt note` : `${phase.pretty} ZCrypt coin`;
+    const noun = phase.what === "note" ? "note" : "coin";
+    return (
+      <Success
+        title={`${phase.pretty} ready`}
+        subtitle={
+          phase.what === "note"
+            ? "Save the note, or send it on WhatsApp, Telegram, or email. Only their stealth key can open it."
+            : "Save the coin, or send it on WhatsApp, Telegram, or email. Whoever opens the file first gets the full amount."
+        }
+        doneKind="secondary"
+        doneLabel="Back to send"
+        onDone={() => {
+          if (!acting) leaveHandoff();
+        }}
+      >
+        <div className="send-hand">
+          <div className="send-hand-name">{phase.filename}</div>
+          <Btn kind="primary" full disabled={!!acting} onClick={() => saveCoin(phase.file, phase.filename)}>
+            {acting === "save" ? "Saving…" : phase.what === "note" ? "Save note file" : "Save coin file"}
+          </Btn>
+          <div className="send-share">
+            {SHARE_CHANNELS.map((c) => (
+              <Btn key={c.id} kind="secondary" disabled={!!acting} onClick={() => shareCoin(c.id, phase.file, phase.filename, subject)}>
+                {acting === c.id ? "Opening…" : c.label}
+              </Btn>
+            ))}
+          </div>
+          {handErr && <div className="m-done-detail">{handErr}</div>}
+          <p className="send-hand-note">
+            Until it is claimed, anyone with the file can take it. Leave without saving and this {noun} stays under History, ready to copy.
+          </p>
+        </div>
+      </Success>
+    );
+  }
 
   return (
     <div>
@@ -216,7 +386,7 @@ export default function Send({
             onChange={(e) => {
               setSel(e.target.value);
               setRecipient("");
-              resetOutputs();
+              setErr("");
             }}
           >
             {(assets.length ? assets : [FALLBACK]).map((a) => (
@@ -311,41 +481,15 @@ export default function Send({
 
         {err && <div className="msg err">{err}</div>}
 
-        <button className="btn-primary btn-block" disabled={busy} onClick={submit}>
-          {busy
-            ? isBtc
-              ? "Signing & broadcasting…"
-              : "Proving…"
+        <button className="btn-primary btn-block" disabled={checking} onClick={submit}>
+          {checking
+            ? "Checking…"
             : isBtc
             ? "₿ Send BTC"
             : deliver === "bearer"
             ? "💠 Create Bearer Coin"
             : "📤 Send"}
         </button>
-
-        {okMsg && <div className="msg ok" style={{ marginTop: "1.2rem" }}>{okMsg}</div>}
-
-        {onchainOk && (
-          <div className="msg ok" style={{ marginTop: "1.2rem" }}>
-            ✓ Settled on-chain — hidden amount, anonymous among the whole shielded pool. The receipt is in <b>History</b>. <b>No file for an address payment</b> — the
-            recipient's wallet finds it on its next <b>Refresh</b> (paid yourself? Refresh and it returns as change).
-          </div>
-        )}
-
-        {file && (
-          <div style={{ marginTop: "1.2rem" }}>
-            <div className="msg ok">
-              {deliver === "stealth"
-                ? "Stealth note — share it with the recipient (any channel). Only their stealth key can open it, and nothing on-chain reveals the payment. The receipt is in History."
-                : "Bearer coin — send the .zcrypt file like a photo. Opening it in the ZCrypt app credits their wallet the full amount. Until that claim is in a block, anyone who has the file can claim it first. The receipt is in History."}
-            </div>
-            <div className="mono-box">{file}</div>
-            <ShareBar
-              text={file}
-              filename={deliver === "stealth" ? "zcrypt-stealth-note.zcrypt" : "zcrypt-bearer.zcrypt"}
-            />
-          </div>
-        )}
       </div>
     </div>
   );

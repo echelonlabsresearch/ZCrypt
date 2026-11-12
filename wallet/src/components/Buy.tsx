@@ -134,6 +134,8 @@ export default function Buy({ active, onBought }: { active: boolean; onBought: (
   const onBoughtRef = useRef(onBought);
   onBoughtRef.current = onBought;
   const announced = useRef<Set<string>>(new Set());
+  // Bumped when the user leaves the balance check. A late quote must not spend Bitcoin.
+  const payGen = useRef(0);
 
   const loadQuote = useCallback(() => {
     setQErr("");
@@ -208,28 +210,60 @@ export default function Buy({ active, onBought }: { active: boolean; onBought: (
   /**
    * Pay an open order out of this wallet's own Bitcoin when it covers the amount plus the
    * network fee; otherwise leave the order on the address + QR for another wallet to pay.
-   * A send that was attempted and refused is reported; a plain shortfall is silent, the
-   * balance line already says what the wallet holds.
+   * The fee quote talks to the configured Esplora server and can sit there if that server
+   * never answers. Give up on screen after a minute, and ignore a quote that arrives after
+   * the user has already left this attempt — acting on it would broadcast a real send.
    */
+  const CHECK_MS = 60_000;
+  function leaveWalletPay(msg: string) {
+    payGen.current += 1;
+    setPaying(false);
+    setPayStep(null);
+    setPayErr(msg);
+  }
   async function payFromWallet(o: Order) {
     if (walletSats === 0) return;
+    const gen = ++payGen.current;
     setPayErr("");
     setPaying(true);
     setPayStep("checking");
+    const amt = btc(o.sats);
+    let timer = 0;
+    const quote = call<BtcQuote>("estimate_btc_send", { address: o.btc_address, btc: amt, speed: "normal" });
+    // The screen stops waiting on its own. A late failure must not surface as an unhandled rejection,
+    // and a late success is ignored below so it cannot start a send.
+    void quote.catch(() => {});
+    const timeout = new Promise<never>((_, reject) => {
+      timer = window.setTimeout(() => reject(new Error("timeout")), CHECK_MS);
+    });
     try {
-      const amt = btc(o.sats);
-      const q = await call<BtcQuote>("estimate_btc_send", { address: o.btc_address, btc: amt, speed: "normal" });
-      if (q.amount_sats + q.fee_sats > walletSats) return;
+      const q = await Promise.race([quote, timeout]);
+      if (gen !== payGen.current) return;
+      if (q.amount_sats + q.fee_sats > walletSats) {
+        setPayErr(
+          `This wallet holds ${btc(walletSats)} BTC. This payment plus the network fee needs ${btc(q.amount_sats + q.fee_sats)} BTC. Pay the address below from another wallet.`,
+        );
+        return;
+      }
       setPayStep("sending");
       const txid = await call<string>("withdraw_btc", { address: o.btc_address, btc: amt, speed: "normal" });
       rememberPaid(o.id, txid);
       setPaid(loadPaid());
       loadBtc();
     } catch (e) {
-      setPayErr(`Could not pay from this wallet (${String((e as Error)?.message ?? e)}). Pay the address below from another wallet.`);
+      if (gen !== payGen.current) return;
+      const timedOut = (e as Error)?.message === "timeout";
+      setPayErr(
+        timedOut
+          ? "The Bitcoin check did not finish. Nothing was sent from this wallet. Pay the address below, or try again."
+          : `Could not pay from this wallet (${String((e as Error)?.message ?? e)}). Pay the address below from another wallet.`,
+      );
     } finally {
-      setPaying(false);
-      setPayStep(null);
+      window.clearTimeout(timer);
+      if (gen === payGen.current) {
+        setPaying(false);
+        setPayStep(null);
+      }
     }
   }
 
@@ -238,7 +272,7 @@ export default function Buy({ active, onBought }: { active: boolean; onBought: (
    * sent (txid), seen by the desk (confirmations), ZCRYPT received. Replaces the address
    * and QR, which only matter when another wallet has to pay.
    */
-  function WalletPayProgress({ o, txid }: { o: Order; txid: string | null }) {
+  function WalletPayProgress({ o, txid, onUseAddress }: { o: Order; txid: string | null; onUseAddress?: () => void }) {
     const sent = !!txid;
     const seen = o.status === "seen" || o.status === "paid";
     const done = o.status === "paid";
@@ -283,6 +317,14 @@ export default function Buy({ active, onBought }: { active: boolean; onBought: (
             </li>
           ))}
         </ul>
+        {!done && payStep === "checking" && (
+          <div className="buy-hint" style={{ marginTop: "0.6rem" }}>Nothing has been sent. This is only checking the fee.</div>
+        )}
+        {!done && !sent && payStep !== "sending" && onUseAddress && (
+          <div className="addr-actions" style={{ marginTop: "0.8rem", flexWrap: "wrap" }}>
+            <button className="btn-secondary" onClick={onUseAddress}>Pay the address instead</button>
+          </div>
+        )}
         {!done && <div className="buy-hint" style={{ marginTop: "0.6rem" }}>Open until {new Date(o.expires * 1000).toLocaleString()}</div>}
       </div>
     );
@@ -417,7 +459,15 @@ export default function Buy({ active, onBought }: { active: boolean; onBought: (
           <h3 style={{ marginTop: 0 }}>Order {order.id.slice(0, 8)}</h3>
           {!(paying || paid[order.id]) && <div className={`buy-status ${st.tone}`}>{st.text}</div>}
           {payErr && <div className="msg err">{payErr}</div>}
-          {(paying || paid[order.id]) && <WalletPayProgress o={order} txid={paid[order.id] ?? null} />}
+          {(paying || paid[order.id]) && (
+            <WalletPayProgress
+              o={order}
+              txid={paid[order.id] ?? null}
+              onUseAddress={() =>
+                leaveWalletPay("Stopped. Nothing was sent from this wallet. Pay the address below from any Bitcoin wallet, or try again from this wallet.")
+              }
+            />
+          )}
           {order.status !== "paid" && !paying && !paid[order.id] && (
             <div className="buy-pay">
               {qr && (
@@ -434,7 +484,12 @@ export default function Buy({ active, onBought }: { active: boolean; onBought: (
                   {order.price_sats.toLocaleString()} sats per ZCRYPT.
                 </div>
                 <code className="buy-addr">{order.btc_address}</code>
-                <div className="addr-actions">
+                <div className="addr-actions" style={{ flexWrap: "wrap" }}>
+                  {walletSats >= order.sats && (
+                    <button className="btn-primary" onClick={() => void payFromWallet(order)}>
+                      Pay from this wallet
+                    </button>
+                  )}
                   <button className="btn-secondary" onClick={doCopy}>
                     {copied ? "Copied" : "Copy address"}
                   </button>

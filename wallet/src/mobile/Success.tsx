@@ -11,6 +11,7 @@ export default function Success({
   children,
   onDone,
   doneLabel = "Done",
+  doneKind,
   tone = "ok",
 }: {
   title: string;
@@ -18,6 +19,8 @@ export default function Success({
   children?: ReactNode;
   onDone: () => void;
   doneLabel?: string;
+  /** Override the foot button. The coin handoff uses a quiet "Back to send" under the real actions. */
+  doneKind?: "primary" | "secondary";
   /** "bad" is the red twin of this screen: no confetti, a cross instead of the check.
    *  "busy" is the waiting form: a spinner in the circle and no button. */
   tone?: "ok" | "bad" | "busy";
@@ -94,7 +97,7 @@ export default function Success({
       </div>
       {tone !== "busy" && (
         <div className="m-done-foot">
-          <Btn full kind={tone === "ok" ? "primary" : "secondary"} onClick={onDone}>{doneLabel}</Btn>
+          <Btn full kind={doneKind ?? (tone === "ok" ? "primary" : "secondary")} onClick={onDone}>{doneLabel}</Btn>
         </div>
       )}
     </div>
