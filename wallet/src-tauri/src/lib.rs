@@ -5434,15 +5434,62 @@ fn reward_pk_hexes(state: &State<AppState>) -> Result<Vec<(RewardKey, String)>, 
     Ok(w.reward_keys().into_iter().map(|k| (k, pk_hex(&w.reward_account(k).pubkey()))).collect())
 }
 
-/// Unclaimed staking rewards (base units) across every reward key of this wallet.
-#[tauri::command]
-async fn get_claimable(state: State<'_, AppState>) -> R<u64> {
-    let url = node_url(&state)?;
-    let mut total = 0u64;
-    for (_, pk_h) in reward_pk_hexes(&state)? {
-        total = total.saturating_add(chain::staking_u64(&url, &format!("/staking/claimable/{pk_h}")).unwrap_or(0));
+/// Unclaimed staking rewards, split the way consensus will actually pay them.
+///
+/// Each bond and delegation has its own reward key, and a claim (`0x58`) must take that
+/// key's full balance and only when it is at least [`zcrypt_core::emission::MIN_CLAIM`]
+/// (1 ZCRYPT). Summing the keys into one number makes a withdraw look possible when the
+/// click then dies on the first key still under the floor.
+#[derive(Serialize)]
+struct RewardClaimable {
+    ready: u64,         // base units on keys a claim will accept
+    accruing: u64,      // base units still under the 1 ZCRYPT floor; they stay on the ledger
+    accruing_keys: u32, // how many reward keys hold that accruing balance
+}
+
+fn split_claimable(amounts: impl IntoIterator<Item = u64>) -> RewardClaimable {
+    let mut ready = 0u64;
+    let mut accruing = 0u64;
+    let mut accruing_keys = 0u32;
+    for amount in amounts {
+        if amount >= zcrypt_core::emission::MIN_CLAIM {
+            ready = ready.saturating_add(amount);
+        } else if amount > 0 {
+            accruing = accruing.saturating_add(amount);
+            accruing_keys = accruing_keys.saturating_add(1);
+        }
     }
-    ok(total)
+    RewardClaimable { ready, accruing, accruing_keys }
+}
+
+#[cfg(test)]
+mod claimable_split_tests {
+    use super::split_claimable;
+    use zcrypt_core::emission::MIN_CLAIM;
+
+    #[test]
+    fn a_dust_key_is_accruing_and_a_key_at_the_floor_is_ready() {
+        // 1.715032 plus the 0.091127 key that consensus rejects, plus an empty key.
+        let s = split_claimable([1_715_032, 91_127, 0]);
+        assert_eq!(s.ready, 1_715_032);
+        assert_eq!(s.accruing, 91_127);
+        assert_eq!(s.accruing_keys, 1);
+        let floor = split_claimable([MIN_CLAIM, MIN_CLAIM - 1]);
+        assert_eq!(floor.ready, MIN_CLAIM);
+        assert_eq!(floor.accruing, MIN_CLAIM - 1);
+        assert_eq!(floor.accruing_keys, 1);
+    }
+}
+
+/// Unclaimed staking rewards across every reward key of this wallet.
+#[tauri::command]
+async fn get_claimable(state: State<'_, AppState>) -> R<RewardClaimable> {
+    let url = node_url(&state)?;
+    let mut amounts = Vec::new();
+    for (_, pk_h) in reward_pk_hexes(&state)? {
+        amounts.push(chain::staking_u64(&url, &format!("/staking/claimable/{pk_h}")).unwrap_or(0));
+    }
+    ok(split_claimable(amounts))
 }
 
 #[derive(Serialize)]
@@ -5451,18 +5498,22 @@ struct ClaimResult {
     coins: u32,   // number of spendable coinbase coins created
 }
 
-/// Claim all accrued staking rewards: broadcast a `0x58` CLAIM tx (which mints
-/// coinbase coins bound to our shield key), then reconstruct those coins locally
-/// so they become spendable. Trustless — the node only mints against the real,
-/// consensus-agreed reward balance.
+/// Claim every reward key that has reached 1 ZCRYPT: broadcast a `0x58` CLAIM tx (which
+/// mints coinbase coins bound to our shield key), then reconstruct those coins locally
+/// so they become spendable. Keys still under the floor are left on the ledger. Trustless —
+/// the node only mints against the real, consensus-agreed reward balance.
 #[tauri::command]
 async fn claim_rewards(state: State<'_, AppState>) -> R<ClaimResult> {
     let url = node_url(&state)?;
     let mut claimed_total = 0u64;
     let mut coins_total = 0u32;
+    let mut accruing = 0u64;
     for (rk, pk_h) in reward_pk_hexes(&state)? {
         let claimable = chain::staking_u64(&url, &format!("/staking/claimable/{pk_h}")).unwrap_or(0);
-        if claimable == 0 {
+        // Consensus rejects the whole tx when this key is under 1 ZCRYPT. Skip it and keep
+        // going: another key may already be withdrawable, and this balance keeps accruing.
+        if claimable < zcrypt_core::emission::MIN_CLAIM {
+            accruing = accruing.saturating_add(claimable);
             continue;
         }
         let start = chain::staking_u64(&url, &format!("/staking/claim_index/{pk_h}"))?;
@@ -5529,6 +5580,12 @@ async fn claim_rewards(state: State<'_, AppState>) -> R<ClaimResult> {
         coins_total += n;
     }
     if claimed_total == 0 {
+        if accruing > 0 {
+            return Err(format!(
+                "{:.6} ZCRYPT is still accruing. Each reward key is claimed on its own, and a key can be withdrawn once it reaches 1 ZCRYPT.",
+                accruing as f64 / 1e6
+            ));
+        }
         return Err("no staking rewards to claim on any of this wallet's reward keys".into());
     }
     ok(ClaimResult { claimed: claimed_total, coins: coins_total })
@@ -9992,12 +10049,12 @@ mod live_3node {
         println!("[wallet] {d}");
         let claimable = wait_until("rewards to accrue", 240, || {
             let c = v(get_claimable(alice.st())).ok()?;
-            (c > 0).then_some(c)
+            (c.ready > 0).then_some(c)
         });
         let claimed = v(claim_rewards(alice.st())).expect("claim");
-        assert!(claimed.claimed >= claimable && claimed.coins >= 1, "claimed {:?}", claimed.claimed);
+        assert!(claimed.claimed >= claimable.ready && claimed.coins >= 1, "claimed {:?}", claimed.claimed);
         v(scan_onchain(alice.st())).expect("scan");
-        println!("[wallet] rewards accrued ({claimable}) and claimed ({} base units, {} coins)", claimed.claimed, claimed.coins);
+        println!("[wallet] rewards accrued ({}) and claimed ({} base units, {} coins)", claimable.ready, claimed.claimed, claimed.coins);
         let u = v(undelegate_validator(vpk_hex.clone(), alice.st())).expect("undelegate");
         println!("[wallet] {u}");
         let unb = v(my_unbonding(alice.st())).expect("unbonding");
