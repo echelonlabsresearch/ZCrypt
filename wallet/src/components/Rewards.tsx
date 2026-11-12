@@ -9,7 +9,11 @@ export default function Rewards({
   active: boolean;
   onClaimed: (amount: number) => void;
 }) {
-  const [claimable, setClaimable] = useState(0);
+  // `ready` is what a claim will actually withdraw. `accruing` is on reward keys still
+  // under the 1 ZCRYPT consensus floor; those stay on the ledger and are not part of the button.
+  const [ready, setReady] = useState(0);
+  const [accruing, setAccruing] = useState(0);
+  const [accruingKeys, setAccruingKeys] = useState(0);
   const [busy, setBusy] = useState(false);
   const [loading, setLoading] = useState(false);
   const [err, setErr] = useState("");
@@ -76,9 +80,14 @@ export default function Rewards({
     setLoading(true);
     setChecked(true);
     try {
-      setClaimable(await call<number>("get_claimable"));
+      const c = await call<{ ready: number; accruing: number; accruing_keys: number }>("get_claimable");
+      setReady(c.ready);
+      setAccruing(c.accruing);
+      setAccruingKeys(c.accruing_keys);
     } catch {
-      setClaimable(0);
+      setReady(0);
+      setAccruing(0);
+      setAccruingKeys(0);
     }
     await loadValidators();
     try {
@@ -230,22 +239,30 @@ export default function Rewards({
       <h2 className="view-title">🏆 Staking Rewards</h2>
       <div className="card" style={{ maxWidth: 560, margin: "0 auto" }}>
         <div className="field">
-          <label>Claimable</label>
+          <label>Ready to claim</label>
           <div className="reward-amount">
-            {!checked ? "not checked" : loading ? "…" : `${fmt(claimable)} ZCRYPT`}
+            {!checked ? "not checked" : loading ? "…" : `${fmt(ready)} ZCRYPT`}
           </div>
         </div>
+        {checked && !loading && accruing > 0 && (
+          <div className="warn" style={{ marginTop: "0.7rem" }}>
+            {fmt(accruing)} ZCRYPT is still accruing on {accruingKeys === 1 ? "one reward key" : `${accruingKeys} reward keys`}.
+            Each key is withdrawn on its own, once it reaches 1 ZCRYPT. That amount stays on the ledger until then.
+          </div>
+        )}
         {err && <div className="msg err">{err}</div>}
         <button
           className="btn-primary btn-block"
-          disabled={busy || loading || claimable === 0}
+          disabled={busy || loading || ready === 0}
           onClick={claim}
         >
           {busy
             ? "Claiming on-chain…"
-            : claimable === 0
-              ? "Nothing to claim"
-              : `Claim ${fmt(claimable)} ZCRYPT`}
+            : ready === 0
+              ? accruing > 0
+                ? "Below the 1 ZCRYPT minimum"
+                : "Nothing to claim"
+              : `Claim ${fmt(ready)} ZCRYPT`}
         </button>
         <button
           className="btn-secondary btn-block"
