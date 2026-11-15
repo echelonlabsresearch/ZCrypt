@@ -91,6 +91,15 @@ pub struct PendingRedeem {
     /// without rescanning blocks.
     #[serde(default)]
     pub claim_preimage_hex: Option<String>,
+    /// Every funding outpoint this redeem was EVER recorded under (`txid:vout`), oldest
+    /// first: the tx each fee bump replaced. A replacement and the tx it replaced conflict,
+    /// so exactly one of them can confirm, and it is not always the newest. The watcher
+    /// follows whichever one is mined (see [`confirmed_other_funding`]).
+    #[serde(default)]
+    pub prior_fundings: Vec<(String, u32)>,
+    /// How many times the CLTV refund was re-broadcast at a higher fee.
+    #[serde(default)]
+    pub refund_bumps: u32,
 }
 
 impl PendingRedeem {
@@ -146,6 +155,10 @@ pub struct FundingIntent {
     /// How many times the funding was fee-bumped.
     #[serde(default)]
     pub bumps: u32,
+    /// The funding outpoints earlier fee bumps REPLACED (`txid:vout`), oldest first. Any
+    /// of them can still be the one a miner includes; see [`confirmed_other_funding`].
+    #[serde(default)]
+    pub prior_fundings: Vec<(String, u32)>,
 }
 
 impl FundingIntent {
@@ -173,6 +186,8 @@ impl FundingIntent {
             refund_seen_height: None,
             rescanned_from_funding: false,
             claim_preimage_hex: None,
+            prior_fundings: self.prior_fundings,
+            refund_bumps: 0,
         })
     }
 }
@@ -254,6 +269,9 @@ pub const RETRY_BACKOFF_BLOCKS: i64 = 900;
 /// Bitcoin blocks a broadcast sweep may sit unconfirmed before the watcher checks whether
 /// it was dropped (HTLC still unspent) and re-sweeps with an aggressive fee.
 pub const SWEEP_RESWEEP_AFTER_BLOCKS: u64 = 3;
+/// Bitcoin blocks an unconfirmed CLTV refund of a redeem HTLC may sit before the watcher
+/// re-broadcasts it at a higher fee.
+pub const REFUND_REBROADCAST_AFTER_BLOCKS: u64 = 3;
 
 /// Bitcoin blocks an unconfirmed redeem funding may sit (since broadcast or the last bump)
 /// before the watcher asks the wallet to fee-bump it (audit 2026-10 M6).
@@ -440,6 +458,45 @@ fn record_funding(intent: &mut FundingIntent, operator_btc: &dyn BtcBackend, utx
     } else {
         btc_tip.saturating_add(1)
     });
+}
+
+/// The funding that actually CONFIRMED, when it is not the one on record.
+///
+/// A fee bump replaces the funding tx, and the record follows the replacement. The
+/// replaced tx stays valid until one of the two is mined, and a miner may include the
+/// older one; the recorded txid then never confirms. The redeem has to be tracked on
+/// the tx that was mined.
+///
+/// Returns `(txid, vout, value_sat)` of an earlier funding of this redeem that has at
+/// least one confirmation while the recorded one has none. Conflicting txs cannot both
+/// confirm, so a confirmed earlier funding is the real one. Only outpoints the watcher
+/// itself recorded are considered.
+fn confirmed_other_funding(
+    btc: &dyn BtcBackend,
+    script: &ScriptBuf,
+    current: &str,
+    prior: &[(String, u32)],
+) -> Option<(String, u32, Option<u64>)> {
+    if prior.is_empty() {
+        return None;
+    }
+    if Txid::from_str(current).ok().is_some_and(|c| btc.tx_confirmations(&c).unwrap_or(0) > 0) {
+        return None;
+    }
+    for (t, v) in prior.iter().rev() {
+        if t == current {
+            continue;
+        }
+        let Ok(txid) = Txid::from_str(t) else { continue };
+        if btc.tx_confirmations(&txid).unwrap_or(0) == 0 {
+            continue;
+        }
+        return Some(match btc.htlc_output_in_tx(&txid, script) {
+            Ok(Some((vout, value))) => (t.clone(), vout, Some(value.to_sat())),
+            _ => (t.clone(), *v, None),
+        });
+    }
+    None
 }
 
 /// Advance one funding intent WITHOUT blocking: fund (or reuse an existing funding) if no
@@ -639,6 +696,7 @@ pub fn watcher_tick_persisting(
                 zc_timeout: plan.zc_timeout,
                 last_bump_btc: 0,
                 bumps: 0,
+                prior_fundings: Vec::new(),
             });
             if !state.funded.contains(&hx) {
                 state.funded.push(hx);
@@ -741,8 +799,14 @@ pub fn watcher_tick_persisting(
     let mut still_sweeping = Vec::new();
     for s in std::mem::take(&mut state.sweeps) {
         let confs = Txid::from_str(&s.txid).ok().and_then(|t| operator_btc.tx_confirmations(&t).ok()).unwrap_or(0);
+        // Done only once the sweep is buried past the network's confirmation floor, so a
+        // reorg that un-mines it is still noticed and the sweep is sent again.
+        if confs >= funding_confs_needed(operator_btc).max(1) {
+            continue;
+        }
         if confs >= 1 {
-            continue; // done
+            still_sweeping.push(s); // mined, not yet buried: keep the record, nothing to redo
+            continue;
         }
         if btc_tip < s.next_resweep_btc || btc_tip.saturating_sub(s.broadcast_at_btc) < SWEEP_RESWEEP_AFTER_BLOCKS {
             still_sweeping.push(s);
@@ -813,6 +877,23 @@ pub fn watcher_tick_persisting(
     for i in 0..state.funding.len() {
         let eid = state.funding[i].escrow_id.clone();
         let mut intent = state.funding[i].clone();
+        // A fee bump was recorded, but an EARLIER funding is the one that got mined: follow it.
+        if let Some((cur, cur_vout)) = intent.funding.clone() {
+            let other = intent.script().ok().and_then(|s| confirmed_other_funding(operator_btc, &s, &cur, &intent.prior_fundings));
+            if let Some((txid, vout, value)) = other {
+                report.errors.push(format!(
+                    "redeem-fund {eid}: funding {txid}:{vout} confirmed instead of its fee-bump replacement {cur}; following it"
+                ));
+                intent.prior_fundings.retain(|(t, _)| *t != txid);
+                intent.prior_fundings.push((cur, cur_vout));
+                intent.funding = Some((txid, vout));
+                if value.is_some() {
+                    intent.funding_value_sat = value;
+                }
+                state.funding[i] = intent.clone();
+                persist(state)?;
+            }
+        }
         if intent_past_deadline(&intent, net, btc_tip, tip.max(0) as u64) {
             if intent.funding.is_none() {
                 // Nothing recorded. Look ONCE for a funding that went out unrecorded; never
@@ -870,6 +951,7 @@ pub fn watcher_tick_persisting(
                 // FUNDING_BUMP_AFTER_BLOCKS Bitcoin blocks). The HTLC output keeps its vout.
                 let since = intent.funding_height.unwrap_or(btc_tip).max(intent.last_bump_btc);
                 if let (Some(b), Some((txid_s, vout))) = (bumper, intent.funding.clone()) {
+                    let old_vout = vout;
                     if btc_tip >= since.saturating_add(FUNDING_BUMP_AFTER_BLOCKS) {
                         match Txid::from_str(&txid_s).map_err(|e| e.to_string()).and_then(|t| b.bump_fee(&t)) {
                             Ok(new_txid) => {
@@ -888,6 +970,10 @@ pub fn watcher_tick_persisting(
                                 };
                                 report.errors.push(format!("redeem-fund {eid}: funding {txid_s} stale, fee-bumped as {new_txid}:{vout}"));
                                 report.bumped += 1;
+                                // The replaced tx can still be the one that confirms: keep it.
+                                if !intent.prior_fundings.iter().any(|(t, _)| *t == txid_s) {
+                                    intent.prior_fundings.push((txid_s.clone(), old_vout));
+                                }
                                 intent.funding = Some((new_txid.to_string(), vout));
                                 intent.last_bump_btc = btc_tip;
                                 intent.bumps += 1;
@@ -934,6 +1020,30 @@ pub fn watcher_tick_persisting(
                 continue;
             }
         };
+        // The funding on record was a fee-bump replacement, but an earlier funding is the
+        // one that confirmed (this entry may have been promoted at its deadline with the
+        // dead txid). Follow the mined one, and scan for its spend from the funding height.
+        if let Some((txid, vout, value)) = confirmed_other_funding(operator_btc, &utxo.script, &p.funding_txid, &p.prior_fundings) {
+            if let Ok(t) = Txid::from_str(&txid) {
+                report.errors.push(format!(
+                    "finalize {}: funding {txid}:{vout} confirmed instead of its fee-bump replacement {}; following it",
+                    p.escrow_id, p.funding_txid
+                ));
+                p.prior_fundings.retain(|(x, _)| *x != txid);
+                p.prior_fundings.push((p.funding_txid.clone(), p.vout));
+                p.funding_txid = txid;
+                p.vout = vout;
+                utxo.outpoint = bitcoin::OutPoint { txid: t, vout };
+                if let Some(v) = value {
+                    p.value_sat = v;
+                    utxo.value = Amount::from_sat(v);
+                }
+                p.scanned_to = p.scan_floor().saturating_sub(1);
+                // A refund built on the dead outpoint can never confirm: build it again.
+                p.refund_txid = None;
+                p.refund_bumps = 0;
+            }
+        }
         // The recorded vout must be the HTLC output of the recorded tx. A fee bump written by
         // an older daemon carried the pre-bump vout over, and bumpfee reorders outputs: the
         // watcher then polls the operator's own change (forever unspent), never sees the
@@ -1015,15 +1125,18 @@ pub fn watcher_tick_persisting(
             // Real backends report Refunded at 1 confirmation. Drop the redeem only once the
             // refund is buried past the network floor, so a reorg can still surface the
             // user's claim and be finalized (audit M7).
-            let buried = if p.refund_txid.is_some() {
-                // Count the recorded refund tx. An unreadable txid is 0 confs: keep the redeem.
-                let confs = p
-                    .refund_txid
-                    .as_deref()
-                    .and_then(|t| Txid::from_str(t).ok())
-                    .map(|rt| operator_btc.tx_confirmations(&rt).unwrap_or(0))
-                    .unwrap_or(0);
-                confs >= refund_confs
+            // Count the recorded refund tx first.
+            let recorded_confs = p
+                .refund_txid
+                .as_deref()
+                .and_then(|t| Txid::from_str(t).ok())
+                .map(|rt| operator_btc.tx_confirmations(&rt).unwrap_or(0))
+                .unwrap_or(0);
+            // A refund that was re-broadcast at a higher fee has more than one txid, and
+            // the one that confirmed may be an earlier one: then the recorded txid stays at
+            // 0 confirmations forever, so count depth from where the spend was first seen.
+            let buried = if p.refund_txid.is_some() && (recorded_confs >= refund_confs || p.refund_bumps == 0) {
+                recorded_confs >= refund_confs
             } else {
                 let seen = match p.refund_seen_height {
                     Some(h) => h,
@@ -1067,10 +1180,27 @@ pub fn watcher_tick_persisting(
             }
             continue;
         }
-        // Unclaimed. Past the CLTV, take the BTC back (bridge M5), once; then keep watching.
-        if p.refund_txid.is_none() && p.locktime > 0 && btc_tip >= p.locktime as u64 {
+        // Unclaimed. Past the CLTV, take the BTC back (bridge M5), then keep watching. A
+        // refund that is still unconfirmed REFUND_REBROADCAST_AFTER_BLOCKS later was evicted
+        // or is stuck below the going fee rate, so it is re-broadcast at the aggressive fee
+        // target plus a growing step (an RBF replacement must outbid the tx it replaces),
+        // still capped against the value.
+        let refund_stale = !regtest
+            && btc_tip.saturating_sub(p.refund_at_btc) >= REFUND_REBROADCAST_AFTER_BLOCKS
+            && p.refund_txid
+                .as_deref()
+                .and_then(|t| Txid::from_str(t).ok())
+                .is_some_and(|rt| operator_btc.tx_confirmations(&rt).unwrap_or(0) == 0);
+        if (p.refund_txid.is_none() || refund_stale) && p.locktime > 0 && btc_tip >= p.locktime as u64 {
+            let rebroadcast = p.refund_txid.is_some();
             let outcome = (|| -> Result<Txid, String> {
-                let fee = swap::htlc_spend_fee_for(operator_btc, fee_target, utxo.value.to_sat())?;
+                let fee = if rebroadcast {
+                    let base = swap::htlc_spend_fee_for(operator_btc, 1, utxo.value.to_sat())?.to_sat();
+                    let extra = u64::from(p.refund_bumps.saturating_add(1)).saturating_mul(RESWEEP_FEE_STEP_SATS);
+                    Amount::from_sat(crate::cap_fee_for_value(base.saturating_add(extra), utxo.value.to_sat(), 500)?)
+                } else {
+                    swap::htlc_spend_fee_for(operator_btc, fee_target, utxo.value.to_sat())?
+                };
                 // A redeem funded before a reserve rotation names the retired key as its
                 // refund key: sign with whichever held key the script commits to.
                 let key = reserve.key_in_script(utxo.script.as_bytes()).unwrap_or(reserve.current);
@@ -1085,6 +1215,14 @@ pub fn watcher_tick_persisting(
             })();
             match outcome {
                 Ok(txid) => {
+                    if rebroadcast {
+                        report.errors.push(format!(
+                            "refund {}: {} still unconfirmed after {REFUND_REBROADCAST_AFTER_BLOCKS} bitcoin blocks, re-broadcast as {txid}",
+                            p.escrow_id,
+                            p.refund_txid.as_deref().unwrap_or("?")
+                        ));
+                        p.refund_bumps = p.refund_bumps.saturating_add(1);
+                    }
                     p.refund_txid = Some(txid.to_string());
                     p.refund_at_btc = btc_tip;
                     if regtest {
@@ -1092,7 +1230,15 @@ pub fn watcher_tick_persisting(
                         let _ = operator_btc.confirm(&txid);
                     }
                 }
-                Err(e) => report.errors.push(format!("refund {}: {e}", p.escrow_id)),
+                Err(e) => {
+                    if rebroadcast {
+                        // Rejected (usually: does not outbid the tx still in the mempool).
+                        // Wait another window; the next attempt pays one more fee step.
+                        p.refund_bumps = p.refund_bumps.saturating_add(1);
+                        p.refund_at_btc = btc_tip;
+                    }
+                    report.errors.push(format!("refund {}: {e}", p.escrow_id));
+                }
             }
         }
         still_pending.push(p);
@@ -1403,15 +1549,49 @@ pub fn finalize_margin_policy(network: bitcoin::Network, requested: Option<u64>,
 /// RPC password and every wallet call across the internet in the clear, so it is refused
 /// unless `allow_public` (env `ZCRYPT_BTC_RPC_ALLOW_PUBLIC=1`) is set. Regtest is exempt.
 pub fn btc_rpc_url_policy(network: bitcoin::Network, url: &str, allow_public: bool) -> Result<(), String> {
-    if network == bitcoin::Network::Regtest || allow_public {
+    if private_rpc_url("BTC_URL", network, url, allow_public)? {
         return Ok(());
     }
-    let parsed = url::Url::parse(url).map_err(|e| format!("BTC_URL {url:?}: {e}"))?;
-    if parsed.scheme() == "https" {
+    Err(format!(
+        "BTC_URL {url:?} is plain http to a public host on {network:?}. The bitcoind RPC carries the RPC \
+         password and wallet calls unencrypted, so reach the node over a private link instead (WireGuard, \
+         VPC peering, an SSH tunnel to 127.0.0.1) or front it with TLS and use https://. Set \
+         ZCRYPT_BTC_RPC_ALLOW_PUBLIC=1 only if you accept the exposure."
+    ))
+}
+
+/// Transport policy for the ZCrypt node RPC the watcher reads (`ZC_URL`), the same rule as
+/// [`btc_rpc_url_policy`]. The watcher acts on this node's answers (which escrows exist,
+/// their value, the payout key, whether a mint was claimed), so on a
+/// real network the URL must be the operator's own node over a private path (loopback, a
+/// private address, a compose service name) or an authenticated `https://` endpoint;
+/// plain `http://` to a public host is refused unless `allow_public`
+/// (env `ZCRYPT_ZC_RPC_ALLOW_PUBLIC=1`) is set. Regtest is exempt.
+pub fn zc_rpc_url_policy(network: bitcoin::Network, url: &str, allow_public: bool) -> Result<(), String> {
+    if private_rpc_url("ZC_URL", network, url, allow_public)? {
         return Ok(());
+    }
+    Err(format!(
+        "ZC_URL {url:?} is plain http to a public host on {network:?}. The watcher acts on this node's \
+         answers, so point it at your own node over a private link (loopback, WireGuard, a compose \
+         service) or an https:// endpoint you control. Set ZCRYPT_ZC_RPC_ALLOW_PUBLIC=1 only if you \
+         accept the exposure."
+    ))
+}
+
+/// Whether `url` is acceptable for a plaintext operator RPC on `network`: `Ok(true)` for
+/// regtest, an explicit override, `https://`, or `http://` to a private host; `Ok(false)`
+/// for plain http to a public host; `Err` for an unparseable URL or another scheme.
+fn private_rpc_url(var: &str, network: bitcoin::Network, url: &str, allow_public: bool) -> Result<bool, String> {
+    if network == bitcoin::Network::Regtest || allow_public {
+        return Ok(true);
+    }
+    let parsed = url::Url::parse(url).map_err(|e| format!("{var} {url:?}: {e}"))?;
+    if parsed.scheme() == "https" {
+        return Ok(true);
     }
     if parsed.scheme() != "http" {
-        return Err(format!("BTC_URL {url:?}: expected http:// or https://"));
+        return Err(format!("{var} {url:?}: expected http:// or https://"));
     }
     let private = match parsed.host() {
         Some(url::Host::Ipv4(ip)) => {
@@ -1426,15 +1606,7 @@ pub fn btc_rpc_url_policy(network: bitcoin::Network, url: &str, allow_public: bo
         Some(url::Host::Domain(d)) => d == "localhost" || !d.contains('.'),
         None => false,
     };
-    if private {
-        return Ok(());
-    }
-    Err(format!(
-        "BTC_URL {url:?} is plain http to a public host on {network:?}. The bitcoind RPC carries the RPC \
-         password and wallet calls unencrypted, so reach the node over a private link instead (WireGuard, \
-         VPC peering, an SSH tunnel to 127.0.0.1) or front it with TLS and use https://. Set \
-         ZCRYPT_BTC_RPC_ALLOW_PUBLIC=1 only if you accept the exposure."
-    ))
+    Ok(private)
 }
 
 /// Load the operator's RESERVE key the way the daemon expects it (bridge L4). Sources, in
@@ -1516,6 +1688,20 @@ mod tests {
         }
         assert!(btc_rpc_url_policy(Bitcoin, "http://203.0.113.5:8332", true).is_ok());
         assert!(btc_rpc_url_policy(Regtest, "http://203.0.113.5:18443", false).is_ok());
+    }
+
+    #[test]
+    fn zc_rpc_url_policy_keeps_the_payout_oracle_on_a_private_path() {
+        use bitcoin::Network::{Bitcoin, Regtest};
+        for ok in ["http://localhost:36657", "http://cometbft:26657", "http://10.8.0.2:26657", "https://rpc.example.com"] {
+            assert!(zc_rpc_url_policy(Bitcoin, ok, false).is_ok(), "{ok}");
+        }
+        for bad in ["http://203.0.113.5:26657", "http://rpc.example.com:26657", "ws://localhost:26657"] {
+            let e = zc_rpc_url_policy(Bitcoin, bad, false).unwrap_err();
+            assert!(e.contains("ZC_URL"), "{e}");
+        }
+        assert!(zc_rpc_url_policy(Bitcoin, "http://203.0.113.5:26657", true).is_ok());
+        assert!(zc_rpc_url_policy(Regtest, "http://203.0.113.5:26657", false).is_ok());
     }
     use bitcoin::Network;
     use std::cell::{Cell, RefCell};
@@ -2000,6 +2186,8 @@ mod tests {
             refund_seen_height: None,
             rescanned_from_funding: false,
             claim_preimage_hex: None,
+            prior_fundings: Vec::new(),
+            refund_bumps: 0,
         }
     }
 
@@ -2194,6 +2382,7 @@ mod tests {
             zc_timeout: 0,
             last_bump_btc: 0,
             bumps: 0,
+            prior_fundings: Vec::new(),
         });
         st.funded.push(hex::encode(d.eid));
         let r1 = tick(&mut st, &zc, &btc, &d.reserve);
@@ -2248,6 +2437,7 @@ mod tests {
             zc_timeout: 0,
             last_bump_btc: 0,
             bumps: 0,
+            prior_fundings: Vec::new(),
         };
         let mut st = WatcherState::default();
         st.funding.push(mk(&d1, None));
@@ -2290,6 +2480,7 @@ mod tests {
             zc_timeout: 0,
             last_bump_btc: 0,
             bumps: 0,
+            prior_fundings: Vec::new(),
         });
         st.funded.push(hex::encode(d.eid));
         let r = tick(&mut st, &zc, &btc, &d.reserve);
@@ -2587,6 +2778,7 @@ mod tests {
             zc_timeout: 100_000,
             last_bump_btc: 0,
             bumps: 0,
+            prior_fundings: Vec::new(),
         });
         st.funded.push(hex::encode(d.eid));
         btc.tip.set(101 + FUNDING_BUMP_AFTER_BLOCKS);
@@ -2619,12 +2811,166 @@ mod tests {
             refund_seen_height: None,
             rescanned_from_funding: false,
             claim_preimage_hex: None,
+            prior_fundings: Vec::new(),
+            refund_bumps: 0,
         });
         st.funded.push(hex::encode(d.eid));
         let r = tick(&mut st, &zc, &btc, &d.reserve);
         assert!(r.errors.iter().any(|e| e.contains("corrected")), "{:?}", r.errors);
         assert_eq!(r.finalized, 1, "{:?}", r.errors);
         assert!(st.pending.is_empty());
+    }
+
+    #[test]
+    fn the_replaced_funding_confirming_instead_of_its_fee_bump_is_followed() {
+        // A fee bump replaces the funding tx, but a miner may include the ORIGINAL. The
+        // replacement is then a conflicted tx that never confirms. The watcher follows the
+        // tx that was mined, sees the user's claim of it and finalizes the redeem.
+        struct Bumper;
+        impl FeeBumper for Bumper {
+            fn bump_fee(&self, _txid: &Txid) -> Result<Txid, String> {
+                Ok(Txid::from_byte_array([0xBD; 32]))
+            }
+        }
+        let d = deposit(21);
+        let zc = FakeZc::new();
+        let btc = SimBtc::new(100);
+        zc.set_escrow(d.eid, ASSET, VALUE, d.lock, 100_000, "open");
+        zc.push_block(vec![]);
+        let locktime = 100 + swap::min_user_claim_blocks(Network::Signet) as u32 + 10;
+        let mut st = WatcherState::default();
+        st.funding.push(FundingIntent {
+            escrow_id: hex::encode(d.eid),
+            hashlock: hex::encode(d.lock),
+            script_hex: hex::encode(d.utxo.script.as_bytes()),
+            value_sat: VALUE,
+            locktime,
+            funding: None,
+            funding_value_sat: None,
+            funding_height: None,
+            zc_timeout: 100_000,
+            last_bump_btc: 0,
+            bumps: 0,
+            prior_fundings: Vec::new(),
+        });
+        st.funded.push(hex::encode(d.eid));
+        let run = |st: &mut WatcherState| {
+            watcher_tick_persisting(st, &zc, &btc, &swap::ReserveKeys::single(&d.reserve), &dest(), ASSET, swap::default_finalize_margin(Network::Signet), 3, Some(&Bumper), None, &|_| Ok(())).unwrap()
+        };
+        let _ = run(&mut st);
+        let (orig_txid, orig_vout) = st.funding[0].funding.clone().unwrap();
+        btc.tip.set(st.funding[0].funding_height.unwrap() + FUNDING_BUMP_AFTER_BLOCKS);
+        let r = run(&mut st);
+        assert_eq!(r.bumped, 1, "{:?}", r.errors);
+        assert_ne!(st.funding[0].funding.clone().unwrap().0, orig_txid, "the record follows the replacement");
+        assert_eq!(st.funding[0].prior_fundings, vec![(orig_txid.clone(), orig_vout)], "the replaced tx is remembered");
+
+        // A miner includes the ORIGINAL (the sim mines every tx it knows; the replacement
+        // txid is not one of them, exactly like a conflicted tx).
+        btc.mine(1);
+        let r = run(&mut st);
+        assert!(r.errors.iter().any(|e| e.contains("confirmed instead of its fee-bump replacement")), "{:?}", r.errors);
+        assert!(st.funding.is_empty(), "the intent confirmed on the original");
+        assert_eq!(st.pending.len(), 1);
+        assert_eq!(st.pending[0].funding_txid, orig_txid, "pending tracks the tx that was mined");
+        assert_eq!(st.pending[0].vout, orig_vout);
+        assert_eq!(btc.broadcasts.get(), 1, "never funded twice");
+
+        // The user claims the real HTLC: the watcher sees it and burns the zBTC.
+        let op = OutPoint { txid: Txid::from_str(&orig_txid).unwrap(), vout: orig_vout };
+        let h = btc.tip.get() + 1;
+        for u in btc.utxos.borrow_mut().iter_mut().filter(|u| u.outpoint == op) {
+            u.spend = Some((Some(h), Some(d.preimage.to_vec())));
+        }
+        btc.tip.set(h);
+        let r = run(&mut st);
+        assert_eq!(r.finalized, 1, "{:?}", r.errors);
+        assert!(st.pending.is_empty());
+        assert_eq!(zc.escrow_state(&d.eid), "claimed");
+    }
+
+    #[test]
+    fn a_pending_redeem_promoted_on_a_dead_replacement_follows_the_mined_funding() {
+        // Same race, found late: the entry is already pending under the replacement txid
+        // (promoted at its deadline, or written before the original was mined).
+        let d = deposit(22);
+        let zc = FakeZc::new();
+        let btc = SimBtc::new(15);
+        btc.add_confirmed(d.utxo.clone(), 10);
+        zc.set_escrow(d.eid, ASSET, VALUE, d.lock, 100_000, "open");
+        zc.push_block(vec![]);
+        let mut st = WatcherState::default();
+        let mut p = pending_redeem(&d, 10);
+        p.locktime = 1_000; // well before the CLTV: only claim detection runs
+        p.prior_fundings = vec![(p.funding_txid.clone(), p.vout)];
+        p.funding_txid = Txid::from_byte_array([0xDE; 32]).to_string();
+        st.pending.push(p);
+        for u in btc.utxos.borrow_mut().iter_mut().filter(|u| u.outpoint == d.utxo.outpoint) {
+            u.spend = Some((Some(12), Some(d.preimage.to_vec())));
+        }
+        let r = tick(&mut st, &zc, &btc, &d.reserve);
+        assert!(r.errors.iter().any(|e| e.contains("following it")), "{:?}", r.errors);
+        assert_eq!(r.finalized, 1, "{:?}", r.errors);
+        assert!(st.pending.is_empty());
+    }
+
+    #[test]
+    fn only_fundings_the_watcher_recorded_are_candidates() {
+        // Only outpoints the watcher itself recorded are candidates.
+        let d = deposit(23);
+        let btc = SimBtc::new(15);
+        btc.add_confirmed(d.utxo.clone(), 10);
+        let dead = Txid::from_byte_array([0xDE; 32]).to_string();
+        assert!(confirmed_other_funding(&btc, &d.utxo.script, &dead, &[]).is_none(), "no history, no switch");
+        // The recorded funding is confirmed: an earlier outpoint is never preferred.
+        let cur = d.utxo.outpoint.txid.to_string();
+        let prior = vec![(dead, 0)];
+        assert!(confirmed_other_funding(&btc, &d.utxo.script, &cur, &prior).is_none());
+    }
+
+    #[test]
+    fn a_stuck_refund_is_rebroadcast_at_a_higher_fee() {
+        // A CLTV refund that stays unconfirmed is sent again at a higher fee.
+        let d = deposit(24);
+        let zc = FakeZc::new();
+        let btc = SimBtc::new(15);
+        btc.add_confirmed(d.utxo.clone(), 10);
+        zc.set_escrow(d.eid, ASSET, VALUE, d.lock, 100_000, "open");
+        zc.push_block(vec![]);
+        let mut st = WatcherState::default();
+        st.pending.push(pending_redeem(&d, 10));
+        let _ = tick(&mut st, &zc, &btc, &d.reserve);
+        assert_eq!(btc.refunds.get(), 1);
+        let first = st.pending[0].refund_txid.clone().unwrap();
+        // Not yet stale: nothing is re-sent.
+        btc.tip.set(15 + REFUND_REBROADCAST_AFTER_BLOCKS - 1);
+        let _ = tick(&mut st, &zc, &btc, &d.reserve);
+        assert_eq!(btc.refunds.get(), 1, "no rebroadcast inside the window");
+        // Still unconfirmed a full window later: replaced.
+        btc.tip.set(15 + REFUND_REBROADCAST_AFTER_BLOCKS);
+        let r = tick(&mut st, &zc, &btc, &d.reserve);
+        assert_eq!(btc.refunds.get(), 2, "{:?}", r.errors);
+        assert_eq!(st.pending[0].refund_bumps, 1);
+        assert_ne!(st.pending[0].refund_txid.clone().unwrap(), first);
+        assert!(r.errors.iter().any(|e| e.contains("re-broadcast as")), "{:?}", r.errors);
+
+        // The EARLIER refund is the one a miner takes. The recorded (newer) txid never
+        // confirms; the redeem is still released once the spend is buried.
+        let first_txid = Txid::from_str(&first).unwrap();
+        let h = btc.tip.get() + 1;
+        for u in btc.utxos.borrow_mut().iter_mut() {
+            if u.outpoint.txid == first_txid {
+                u.mined_at = Some(h);
+            }
+            if u.outpoint == d.utxo.outpoint {
+                u.spend = Some((Some(h), None));
+            }
+        }
+        btc.tip.set(h);
+        let r = tick(&mut st, &zc, &btc, &d.reserve);
+        assert_eq!(r.refunded, 1, "{:?}", r.errors);
+        assert!(st.pending.is_empty());
+        assert_eq!(btc.refunds.get(), 2, "nothing re-sent once the output is spent");
     }
 
     #[test]
@@ -2660,6 +3006,7 @@ mod tests {
             zc_timeout: 100_000,
             last_bump_btc: 0,
             bumps: 0,
+            prior_fundings: Vec::new(),
         });
         st.funded.push(hex::encode(d.eid));
         let bumper = Bumper { calls: Cell::new(0) };
@@ -2710,6 +3057,7 @@ mod tests {
             zc_timeout: 0,
             last_bump_btc: 0,
             bumps: 0,
+            prior_fundings: Vec::new(),
         });
         st2.funded.push(hex::encode(d2.eid));
         let _ = tick(&mut st2, &zc2, &btc2, &d2.reserve);
@@ -2738,6 +3086,7 @@ mod tests {
                 zc_timeout: 0,
                 last_bump_btc: 0,
                 bumps: 0,
+                prior_fundings: Vec::new(),
             }
         }
     }

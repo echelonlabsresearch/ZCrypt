@@ -80,6 +80,19 @@ pub const NETWORK: Network = Network::Regtest;
 
 /// Resolve a config string to a Bitcoin network. `testnet4` maps to the testnet
 /// address format (same `tb1…` prefix) for crate compatibility. Unknown → regtest.
+/// [`network_from_str`] for operator daemons: an unrecognised name is an ERROR, not regtest.
+/// A typo in `BTC_NETWORK` must stop a daemon that holds real funds, never quietly select
+/// the network with every safety margin switched off.
+pub fn network_from_str_strict(s: &str) -> Result<Network, String> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "bitcoin" | "mainnet" | "main" => Ok(Network::Bitcoin),
+        "testnet" | "testnet3" | "testnet4" => Ok(Network::Testnet),
+        "signet" => Ok(Network::Signet),
+        "regtest" => Ok(Network::Regtest),
+        other => Err(format!("unknown Bitcoin network {other:?} (expected bitcoin, testnet, signet or regtest)")),
+    }
+}
+
 pub fn network_from_str(s: &str) -> Network {
     match s.trim().to_ascii_lowercase().as_str() {
         "bitcoin" | "mainnet" | "main" => Network::Bitcoin,

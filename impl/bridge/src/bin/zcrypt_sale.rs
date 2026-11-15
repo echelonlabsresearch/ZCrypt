@@ -507,7 +507,11 @@ fn main() {
         price_file: std::env::var("SALE_PRICE_FILE").ok().filter(|s| !s.is_empty()).map(PathBuf::from),
         min_sats: env("SALE_MIN_SATS", "20000").parse().unwrap_or(20_000),
         max_sats: env("SALE_MAX_SATS", "100000000").parse().unwrap_or(100_000_000),
-        min_conf: env("SALE_MIN_CONF", "1").parse().unwrap_or(1),
+        // Off regtest a payment needs at least one confirmation before the payout.
+        min_conf: {
+            let c: u32 = env("SALE_MIN_CONF", "1").parse().unwrap_or(1);
+            if network == bitcoin::Network::Regtest { c } else { c.max(1) }
+        },
         ttl_secs: env("SALE_TTL_SECS", "86400").parse().unwrap_or(86_400),
         state_path: PathBuf::from(env("SALE_STATE", "./zcrypt-sale-state.json")),
         network,
@@ -517,7 +521,20 @@ fn main() {
             eprintln!("state file {} is corrupt: {e}", cfg.state_path.display());
             std::process::exit(2)
         }),
-        Err(_) => State::default(),
+        // Only a file that does not exist yet is a first run. Any other read failure
+        // (permissions, a moved volume, an I/O error) stops the desk, so it never restarts
+        // its address index over existing orders.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!(
+                "[sale] no state file at {}: starting a NEW desk at address index 0. If this desk has sold before, stop now and restore the file.",
+                cfg.state_path.display()
+            );
+            State::default()
+        }
+        Err(e) => {
+            eprintln!("state file {} cannot be read: {e}", cfg.state_path.display());
+            std::process::exit(2)
+        }
     };
     let listen = env("SALE_LISTEN", "0.0.0.0:8787");
     let poll = Duration::from_secs(env("SALE_POLL_SECS", "20").parse().unwrap_or(20));
