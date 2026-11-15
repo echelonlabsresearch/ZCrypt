@@ -414,6 +414,14 @@ label {
   background: linear-gradient(90deg, var(--color-cyan), var(--color-green));
   transition: width 0.4s ease;
 }
+.progress-fill.waiting {
+  width: 28%;
+  animation: index-wait 1.1s ease-in-out infinite;
+}
+@keyframes index-wait {
+  0% { transform: translateX(-110%); }
+  100% { transform: translateX(320%); }
+}
 
 /* ---------- receive dropzone ---------- */
 .dropzone {

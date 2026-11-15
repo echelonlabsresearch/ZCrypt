@@ -201,8 +201,12 @@ export async function dismissSavedSecret(content: string): Promise<void> {
 
 /**
  * Hand a coin file to WhatsApp, Telegram, or email.
- * A truncated link would be a dead coin, so a file that does not fit in the URL is
- * saved first and the message only names that file.
+ *
+ * For WhatsApp and Telegram the coin is sent as a file: it is saved first and the
+ * message only names it, so the user attaches the file inside the chat app and the coin
+ * text stays out of the share link. Email opens the local mail client (mailto), so it may carry the
+ * text when it fits; a truncated link would be a dead coin, so a longer file is saved
+ * and named the same way.
  */
 const SHARE_URL_MAX = 7500;
 
@@ -212,10 +216,12 @@ export async function openCoinShare(
   filename: string,
   subject: string,
 ): Promise<void> {
-  const direct = shareLink(channel, content, subject);
-  if (direct.length <= SHARE_URL_MAX) {
-    await openExternal(direct);
-    return;
+  if (channel === "email") {
+    const direct = shareLink(channel, content, subject);
+    if (direct.length <= SHARE_URL_MAX) {
+      await openExternal(direct);
+      return;
+    }
   }
   const path = await saveCoinFile(filename, content);
   const name = path.split(/[/\\]/).pop() || filename;

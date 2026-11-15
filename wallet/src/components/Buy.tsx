@@ -221,8 +221,15 @@ export default function Buy({ active, onBought }: { active: boolean; onBought: (
     setPayStep(null);
     setPayErr(msg);
   }
-  async function payFromWallet(o: Order) {
+  async function payFromWallet(o: Order, agreedSats?: number) {
     if (walletSats === 0) return;
+    // The wallet pays what the user agreed to, never just what a reply says. The backend
+    // already refuses a reply whose amount differs from the request; this is the same
+    // rule at the point where money moves.
+    if (agreedSats !== undefined && o.sats !== agreedSats) {
+      setPayErr("The sale desk returned a different amount than you entered. Nothing was sent from this wallet.");
+      return;
+    }
     const gen = ++payGen.current;
     setPayErr("");
     setPaying(true);
@@ -349,7 +356,7 @@ export default function Buy({ active, onBought }: { active: boolean; onBought: (
       return;
     }
     setBusy(false);
-    await payFromWallet(o);
+    await payFromWallet(o, sats);
   }
 
   async function doCopy() {

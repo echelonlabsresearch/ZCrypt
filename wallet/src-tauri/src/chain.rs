@@ -73,6 +73,33 @@ pub fn set_tor(proxy: Option<String>) {
     *TOR_PROXY.write().unwrap() = proxy;
 }
 
+/// The Tor proxy for hosts that are NOT the node (the sale desk): `Some` whenever the Tor
+/// setting is on, even when the node itself is local and therefore reached directly.
+static TOR_PROXY_REMOTE: std::sync::RwLock<Option<String>> = std::sync::RwLock::new(None);
+
+pub fn set_tor_remote(proxy: Option<String>) {
+    *TOR_PROXY_REMOTE.write().unwrap() = proxy;
+}
+
+/// An agent for a third-party host at `url`, in its own isolation `class`. [`agent_for`]
+/// follows the NODE's routing, which is direct when the node is on loopback. This one
+/// decides by the TARGET: Tor whenever the setting is on and `url` is not loopback, and
+/// fail-closed on a bad proxy string.
+pub fn agent_for_remote(class: &str, secs: u64, url: &str) -> ureq::Agent {
+    let mut b = ureq::builder().timeout(std::time::Duration::from_secs(secs));
+    if !is_loopback_url(url) {
+        if let Some(proxy) = TOR_PROXY_REMOTE.read().unwrap().clone() {
+            match ureq::Proxy::new(&socks_isolated(&proxy, class)) {
+                Ok(p) => b = b.proxy(p),
+                Err(_) => {
+                    b = b.proxy(ureq::Proxy::new("socks5://127.0.0.1:1").expect("static proxy"));
+                }
+            }
+        }
+    }
+    b.build()
+}
+
 /// Whether node RPC is currently routed over Tor.
 pub fn tor_active() -> bool {
     TOR_PROXY.read().unwrap().is_some()
@@ -292,6 +319,161 @@ pub fn pinned_id() -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+// ---------------------------------------------------------------------------
+// Bridge RESERVE-KEY pinning.
+//
+// A BTC deposit is locked on Bitcoin to the chain's reserve key. The wallet reads that
+// key from the node and checks it against a key it already trusts before using it.
+//
+//   * A release build can carry the trusted keys (`ZCRYPT_RESERVE_PK_PINS` at compile
+//     time, `chain-id=hex[,hex...]` entries separated by `;`). For a chain listed there,
+//     only those keys are accepted and nothing the node says can add one.
+//   * Otherwise the first key seen for a (chain, asset) is pinned in the data dir, and a
+//     different key later is refused until the user accepts it explicitly (a reserve
+//     rotation is rare and announced).
+// ---------------------------------------------------------------------------
+
+/// Marker at the start of the error a changed reserve key produces; the Bridge screen keys
+/// its "accept the new key" prompt on it.
+pub const RESERVE_KEY_CHANGED: &str = "RESERVE-KEY-CHANGED";
+
+const BUILTIN_RESERVE_PINS: Option<&str> = option_env!("ZCRYPT_RESERVE_PK_PINS");
+
+/// The keys compiled into this build for `chain_id`, if the build pins that chain.
+fn builtin_reserve_pins(pins: Option<&str>, chain_id: &str) -> Option<Vec<String>> {
+    for entry in pins?.split(';') {
+        let Some((id, keys)) = entry.split_once('=') else { continue };
+        if id.trim() == chain_id {
+            let v: Vec<String> = keys.split(',').map(|k| k.trim().to_ascii_lowercase()).filter(|k| !k.is_empty()).collect();
+            if !v.is_empty() {
+                return Some(v);
+            }
+        }
+    }
+    None
+}
+
+fn reserve_pin_path() -> Option<std::path::PathBuf> {
+    PIN_DIR.read().unwrap().clone().map(|d| std::path::Path::new(&d).join("reserve_keys.json"))
+}
+
+fn load_reserve_pins(path: &std::path::Path) -> std::collections::BTreeMap<String, Vec<String>> {
+    std::fs::read_to_string(path).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default()
+}
+
+fn reserve_pin_slot(asset: u64) -> String {
+    format!("{}:{asset}", pinned_id().unwrap_or_default())
+}
+
+/// The decision for a reserve key the node reported, given what this wallet trusts.
+/// `builtin` = keys compiled in for this chain; `pinned` = keys pinned or accepted locally.
+fn reserve_key_verdict(builtin: Option<&[String]>, pinned: &[String], pk_hex: &str) -> Result<bool, String> {
+    if let Some(keys) = builtin {
+        return if keys.iter().any(|k| k == pk_hex) {
+            Ok(false)
+        } else {
+            Err(format!(
+                "the node reports a zBTC reserve key ({pk_hex}) that this wallet build does not recognise. \
+                 Nothing was sent. Update the wallet if a reserve rotation was announced; otherwise do not \
+                 use this node for the bridge."
+            ))
+        };
+    }
+    if pinned.is_empty() {
+        return Ok(true); // first sight: pin it
+    }
+    if pinned.iter().any(|k| k == pk_hex) {
+        return Ok(false);
+    }
+    Err(format!(
+        "{RESERVE_KEY_CHANGED}: the node now reports a different zBTC reserve key ({pk_hex}) than the one this \
+         wallet has used before ({}). Nothing was sent. A reserve rotation is rare and announced: accept the \
+         new key only if you have confirmed it from the project's own channels.",
+        pinned.last().map(String::as_str).unwrap_or("")
+    ))
+}
+
+/// Check a node-reported reserve key for `asset` against the trusted set, pinning it on
+/// first sight. `Err` means the key is NOT trusted and nothing may be funded to it.
+pub fn check_reserve_pk(asset: u64, pk: &[u8; 33]) -> Result<(), String> {
+    let pk_hex = hex::encode(pk);
+    let chain_id = pinned_id().unwrap_or_default();
+    let builtin = builtin_reserve_pins(BUILTIN_RESERVE_PINS, &chain_id);
+    let Some(path) = reserve_pin_path() else {
+        // No data dir (tests / pre-setup): only the compiled-in pins can apply.
+        return reserve_key_verdict(builtin.as_deref(), &[pk_hex.clone()], &pk_hex).map(|_| ());
+    };
+    let mut pins = load_reserve_pins(&path);
+    let slot = reserve_pin_slot(asset);
+    let have = pins.get(&slot).cloned().unwrap_or_default();
+    if reserve_key_verdict(builtin.as_deref(), &have, &pk_hex)? {
+        pins.entry(slot).or_default().push(pk_hex);
+        let json = serde_json::to_string(&pins).map_err(|e| e.to_string())?;
+        crate::privfs::write_private(&path, json.as_bytes()).map_err(|e| format!("could not pin the reserve key: {e}"))?;
+    }
+    Ok(())
+}
+
+/// Trust `pk_hex` as a reserve key for `asset` from now on (the user confirmed a rotation).
+/// Refused on a chain this build pins: there the trusted keys ship with the wallet.
+pub fn accept_reserve_pk(asset: u64, pk_hex: &str) -> Result<(), String> {
+    let pk_hex = pk_hex.trim().to_ascii_lowercase();
+    if hex::decode(&pk_hex).map(|b| b.len()).unwrap_or(0) != 33 {
+        return Err("not a 33-byte compressed public key".to_string());
+    }
+    if builtin_reserve_pins(BUILTIN_RESERVE_PINS, &pinned_id().unwrap_or_default()).is_some() {
+        return Err("this wallet build pins the reserve key for this chain; update the wallet instead".to_string());
+    }
+    let path = reserve_pin_path().ok_or("no wallet data directory")?;
+    let mut pins = load_reserve_pins(&path);
+    let keys = pins.entry(reserve_pin_slot(asset)).or_default();
+    if !keys.contains(&pk_hex) {
+        keys.push(pk_hex);
+    }
+    let json = serde_json::to_string(&pins).map_err(|e| e.to_string())?;
+    crate::privfs::write_private(&path, json.as_bytes()).map_err(|e| format!("could not save the reserve key: {e}"))
+}
+
+#[cfg(test)]
+mod reserve_pin_tests {
+    use super::*;
+
+    const A: &str = "02aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const B: &str = "03bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    #[test]
+    fn first_sight_pins_and_a_different_key_is_refused_until_accepted() {
+        assert_eq!(reserve_key_verdict(None, &[], A), Ok(true), "first key is pinned");
+        assert_eq!(reserve_key_verdict(None, &[A.to_string()], A), Ok(false), "the pinned key passes");
+        let e = reserve_key_verdict(None, &[A.to_string()], B).unwrap_err();
+        assert!(e.starts_with(RESERVE_KEY_CHANGED), "{e}");
+        // Once accepted (a rotation), both the old and the new key pass.
+        let both = [A.to_string(), B.to_string()];
+        assert_eq!(reserve_key_verdict(None, &both, B), Ok(false));
+        assert_eq!(reserve_key_verdict(None, &both, A), Ok(false));
+    }
+
+    #[test]
+    fn a_build_pin_overrides_everything_the_node_or_the_data_dir_says() {
+        let built = [A.to_string()];
+        assert_eq!(reserve_key_verdict(Some(&built), &[], A), Ok(false));
+        // A key outside the build's list is refused even on first sight and whatever the
+        // local pin file says; the error is not the "accept it" kind.
+        let e = reserve_key_verdict(Some(&built), &[B.to_string()], B).unwrap_err();
+        assert!(!e.starts_with(RESERVE_KEY_CHANGED), "{e}");
+    }
+
+    #[test]
+    fn build_pins_parse_per_chain() {
+        let pins = Some("zcrypt-1=02AA, 03bb ;zcrypt-test=02cc;junk");
+        assert_eq!(builtin_reserve_pins(pins, "zcrypt-1"), Some(vec!["02aa".to_string(), "03bb".to_string()]));
+        assert_eq!(builtin_reserve_pins(pins, "zcrypt-test"), Some(vec!["02cc".to_string()]));
+        assert_eq!(builtin_reserve_pins(pins, "other"), None);
+        assert_eq!(builtin_reserve_pins(None, "zcrypt-1"), None);
+        assert_eq!(builtin_reserve_pins(Some("zcrypt-1="), "zcrypt-1"), None);
+    }
+}
+
 /// A tag that uniquely identifies the chain GENERATION the node is serving:
 /// `"{chain_id}:{earliest_block_hash}"`. The chain id alone is not enough — a devnet
 /// re-genesis (`docker compose down -v`) reuses the same chain id but produces a fresh
@@ -449,7 +631,9 @@ pub fn fetch_leaves_from(url: &str, from: usize) -> Result<Vec<Commitment>, Stri
         let n = got.len();
         out.extend(got);
         cursor += n;
-        if n < page {
+        // An empty page always ends the walk: a node reporting a page size of 0 (or a
+        // page that never comes back short) must not spin this loop forever.
+        if n == 0 || n < page {
             break;
         }
     }
@@ -621,14 +805,20 @@ impl ScanFetch {
 /// paging through every block header 20 at a time. A node without an index (`indexer =
 /// "null"`) falls back to the header walk.
 pub fn scan_blocks(url: &str, from: i64, to: i64) -> ScanFetch {
+    scan_blocks_reporting(url, from, to, &|_, _| {})
+}
+
+/// Like [`scan_blocks`], calling `progress(height_reached, tip)` as the fetch moves.
+/// `height_reached` is the highest block this fetch has covered, not a count of requests.
+pub fn scan_blocks_reporting(url: &str, from: i64, to: i64, progress: &dyn Fn(i64, i64)) -> ScanFetch {
     if from > to {
         return ScanFetch::empty(to);
     }
-    match scan_blocks_indexed(url, from, to) {
+    match scan_blocks_indexed(url, from, to, progress) {
         Ok(f) => f,
         Err(e) => {
             eprintln!("[scan] tx index unavailable ({e}); walking block headers instead");
-            scan_blocks_walk(url, from, to)
+            scan_blocks_walk(url, from, to, progress)
         }
     }
 }
@@ -645,9 +835,11 @@ type IndexedTx = (i64, u32, Vec<u8>);
 /// Ask the node's transaction index for every transaction in `[from, to]`. `Err` means the
 /// index could not answer at all (so the caller should walk headers instead); a failure
 /// after the first page returns `Ok` with a partial, contiguous prefix and `error` set.
-fn scan_blocks_indexed(url: &str, from: i64, to: i64) -> Result<ScanFetch, String> {
+fn scan_blocks_indexed(url: &str, from: i64, to: i64, progress: &dyn Fn(i64, i64)) -> Result<ScanFetch, String> {
+    let tip = to;
     let to = to - INDEX_LAG_BLOCKS;
     if from > to {
+        progress(tip, tip);
         return Ok(ScanFetch::empty(from - 1));
     }
     // Shielded transactions are ~4 MB each on the wire (two proofs), so a page is kept
@@ -691,6 +883,8 @@ fn scan_blocks_indexed(url: &str, from: i64, to: i64) -> Result<ScanFetch, Strin
                 rows.push((h, t["index"].as_u64().unwrap_or(0) as u32, raw));
             }
         }
+        let at = rows.iter().map(|(h, _, _)| *h).max().unwrap_or(0);
+        progress(at, tip);
         if got == 0 || page * PER_PAGE >= total {
             break;
         }
@@ -731,7 +925,7 @@ fn indexed_prefix(rows: Vec<IndexedTx>, from: i64, error: Option<String>) -> Sca
 
 /// The pre-index scan: page through block headers 20 at a time and fetch each block that
 /// has transactions.
-fn scan_blocks_walk(url: &str, from: i64, to: i64) -> ScanFetch {
+fn scan_blocks_walk(url: &str, from: i64, to: i64, progress: &dyn Fn(i64, i64)) -> ScanFetch {
     let mut out = ScanFetch::empty(from - 1);
     if from > to {
         out.covered_to = to;
@@ -781,6 +975,7 @@ fn scan_blocks_walk(url: &str, from: i64, to: i64) -> ScanFetch {
             }
         }
         out.covered_to = hi;
+        progress(hi, to);
         lo = hi + 1;
     }
     out

@@ -110,6 +110,10 @@ export default function Receive({
   const [pw, setPw] = useState("");
   const [revealErr, setRevealErr] = useState("");
   const [stealthBusy, setStealthBusy] = useState(false);
+  // Restoring a stealth address from the private key the user stored for it.
+  const [importOpen, setImportOpen] = useState(false);
+  const [importKey, setImportKey] = useState("");
+  const [importErr, setImportErr] = useState("");
   const [err, setErr] = useState("");
   // The shielded tile shows one stealth address at a time: the newest, or the one picked.
   const [stealthIdx, setStealthIdx] = useState<number | null>(null);
@@ -175,6 +179,18 @@ export default function Receive({
       setPw("");
     } catch {
       setRevealErr("Wrong password.");
+    }
+  }
+
+  async function importBackup() {
+    setImportErr("");
+    try {
+      await call<Stealth>("import_stealth_backup", { seedHex: importKey.trim() });
+      setImportKey("");
+      setImportOpen(false);
+      load();
+    } catch (e) {
+      setImportErr(String(e));
     }
   }
 
@@ -455,6 +471,28 @@ export default function Receive({
                   {stealthBusy ? "Creating…" : "Create a shielded address"}
                 </button>
               </>
+            )}
+            {importOpen ? (
+              <>
+                <p>Paste the private key you stored for a shielded address. The address comes back with anything sent to it.</p>
+                <input
+                  type="password"
+                  placeholder="Private key (64 characters)"
+                  value={importKey}
+                  autoFocus
+                  onChange={(e) => setImportKey(e.target.value)}
+                  onKeyDown={(e) => e.key === "Enter" && void importBackup()}
+                />
+                {importErr && <div className="msg err">{importErr}</div>}
+                <div className="rx-row">
+                  <button className="rx-recover" type="button" style={{ width: "auto" }} onClick={() => void importBackup()}>Restore</button>
+                  <button className="ghost" type="button" onClick={() => { setImportOpen(false); setImportKey(""); setImportErr(""); }}>Cancel</button>
+                </div>
+              </>
+            ) : (
+              <div className="rx-row">
+                <button className="btn-link" type="button" onClick={() => setImportOpen(true)}>Restore a shielded address from its private key</button>
+              </div>
             )}
             {err && <div className="msg err">{err}</div>}
           </div>

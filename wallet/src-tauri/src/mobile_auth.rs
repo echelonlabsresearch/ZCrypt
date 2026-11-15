@@ -93,7 +93,12 @@ fn seal_secret(pin: &str, secret: &str) -> PinFile {
 }
 
 /// Check the PIN against `pin.json`, applying and recording the lockout policy.
+/// One PIN attempt at a time: the failure counter is read, bumped and written back, so
+/// attempts are serialized to keep the count exact.
+static PIN_ATTEMPT: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn open_with_pin(dir: &str, pin: &str) -> Result<Zeroizing<String>, String> {
+    let _one_at_a_time = PIN_ATTEMPT.lock().unwrap_or_else(|e| e.into_inner());
     let mut f = read_pin_file(dir)?;
     let t = now();
     if f.locked_until > t {
@@ -162,7 +167,7 @@ mod keychain {
     //! offered, so the file is never written.
     use std::path::{Path, PathBuf};
     fn path() -> PathBuf {
-        Path::new(&super::DIR.with(|d| d.borrow().clone())).join(super::BIO_FILE)
+        Path::new(&super::DIR.read().unwrap().clone()).join(super::BIO_FILE)
     }
     pub fn store(secret: &str) -> Result<(), String> {
         super::super::privfs::write_private(&path(), secret.as_bytes()).map_err(|e| e.to_string())
@@ -186,13 +191,15 @@ mod keychain {
     }
 }
 
+// Process-wide, not thread-local: the commands that set it `.await` before the file is
+// touched, and an async task can resume on a different worker thread. A thread-local
+// would then read as empty there, and `bio.key` would be written relative to the working
+// directory (or not at all, leaving biometrics silently off).
 #[cfg(not(target_os = "ios"))]
-thread_local! {
-    static DIR: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
-}
+static DIR: std::sync::RwLock<String> = std::sync::RwLock::new(String::new());
 #[cfg(not(target_os = "ios"))]
 fn set_dir(dir: &str) {
-    DIR.with(|d| *d.borrow_mut() = dir.to_string());
+    *DIR.write().unwrap() = dir.to_string();
 }
 #[cfg(target_os = "ios")]
 fn set_dir(_dir: &str) {}
@@ -358,17 +365,27 @@ pub async fn mobile_create(
     let dir = state.data_dir.lock().unwrap().clone();
     set_dir(&dir);
     let secret = new_device_secret();
+    // An existing wallet is never replaced (`refuse_if_wallet_exists`), so from here on
+    // the keystore on disk is the one this call wrote.
     let created = match mnemonic {
         Some(m) => super::restore_wallet(secret.to_string(), m, state).await?,
         None => super::create_wallet(secret.to_string(), state).await?,
     };
-    let pin_file = tauri::async_runtime::spawn_blocking({
+    // The keystore is sealed under a device secret only the PIN file can give back. If
+    // the PIN file cannot be written, that keystore can never be opened and would block
+    // every later attempt, so the half-made wallet is removed again. Nothing is lost: a
+    // new wallet's phrase has not been shown yet, and a restored one came from the user.
+    let sealed = tauri::async_runtime::spawn_blocking({
         let secret = secret.clone();
         move || seal_secret(&pin, &secret)
     })
     .await
-    .map_err(|e| e.to_string())?;
-    write_pin_file(&dir, &pin_file)?;
+    .map_err(|e| e.to_string())
+    .and_then(|pin_file| write_pin_file(&dir, &pin_file));
+    if let Err(e) = sealed {
+        let _ = std::fs::remove_file(super::keystore_path(&dir));
+        return Err(format!("could not finish setting up the wallet: {e}"));
+    }
     // A cancelled or failed prompt here must not cost the user the wallet just made:
     // biometrics simply stay off and can be switched on from Settings.
     if !biometric || store_bio(app, &secret).await.is_err() {
