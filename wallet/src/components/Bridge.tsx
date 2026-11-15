@@ -67,6 +67,17 @@ export default function Bridge({
   const [busy, setBusy] = useState("");
   const [err, setErr] = useState("");
   const [progress, setProgress] = useState<Progress | null>(null);
+  // A changed reserve key is refused by the backend. The new key is offered for explicit
+  // acceptance only when the error is of that kind (it names the key in parentheses).
+  const reserveKeyOffer = err.includes("RESERVE-KEY-CHANGED") ? (err.match(/reserve key \(([0-9a-f]{66})\)/)?.[1] ?? "") : "";
+  async function acceptReserveKey(pk: string) {
+    try {
+      await call<boolean>("bridge_accept_reserve_key", { pkHex: pk });
+      setErr("");
+    } catch (e) {
+      setErr(String(e));
+    }
+  }
   const [fixMsg, setFixMsg] = useState("");
   const [pendingDeposits, setPendingDeposits] = useState<PendingDeposit[]>([]);
   const [pendingRedeems, setPendingRedeems] = useState<PendingRedeem[]>([]);
@@ -449,7 +460,12 @@ export default function Bridge({
                 Locks this much BTC in an on-chain HTLC and mints the same amount of hidden zBTC (1:1).
               </div>
             </div>
-            {err && <div className="msg err">{err}</div>}
+            {err && <div className="msg err">{err.replace("RESERVE-KEY-CHANGED: ", "")}</div>}
+            {reserveKeyOffer && (
+              <button className="btn-link" onClick={() => void acceptReserveKey(reserveKeyOffer)}>
+                I have confirmed the rotation: trust the new reserve key
+              </button>
+            )}
             {renderProgress(progress)}
             <button className="btn-primary btn-block" disabled={busy !== ""} onClick={shield}>
               {busy === "shield" ? "Swapping BTC → zBTC…" : "Shield BTC → zBTC"}
@@ -480,7 +496,12 @@ export default function Bridge({
                 in your wallet as change. You have <b>{zfmt(status?.zbtc_balance ?? 0)} zBTC</b> spendable.
               </div>
             </div>
-            {err && <div className="msg err">{err}</div>}
+            {err && <div className="msg err">{err.replace("RESERVE-KEY-CHANGED: ", "")}</div>}
+            {reserveKeyOffer && (
+              <button className="btn-link" onClick={() => void acceptReserveKey(reserveKeyOffer)}>
+                I have confirmed the rotation: trust the new reserve key
+              </button>
+            )}
             {renderProgress(progress)}
             <button
               className="btn-primary btn-block"

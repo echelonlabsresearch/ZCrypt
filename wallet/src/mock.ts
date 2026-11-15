@@ -165,6 +165,42 @@ function seedRewardsPreview() {
   }
 }
 
+type IndexJob = { running: boolean; phase: string; at: number; total: number; percent: number; coins: number; detail: string };
+let indexJob: IndexJob = { running: false, phase: "idle", at: 0, total: 0, percent: 0, coins: 0, detail: "" };
+
+function advanceIndex() {
+  if (!indexJob.running) return;
+  const tip = 1_389_000;
+  if (indexJob.phase === "fetching") {
+    indexJob.at = Math.min(tip, indexJob.at + 180_000);
+    indexJob.total = tip;
+    indexJob.percent = Math.floor((indexJob.at * 90) / tip);
+    indexJob.detail = indexJob.at === 0
+      ? "Reading the chain from genesis."
+      : `Reading the chain, height ${indexJob.at.toLocaleString()} of ${tip.toLocaleString()}.`;
+    if (indexJob.at >= tip) {
+      indexJob.phase = "indexing";
+      indexJob.at = 0;
+      indexJob.total = 2_400;
+      indexJob.percent = 90;
+      indexJob.detail = "Indexing notes, 0 of 2,400 blocks.";
+    }
+    return;
+  }
+  if (indexJob.phase === "indexing") {
+    indexJob.at = Math.min(2_400, indexJob.at + 600);
+    indexJob.percent = 90 + Math.floor((indexJob.at * 9) / 2_400);
+    indexJob.coins = 3;
+    indexJob.detail = `Indexing notes, ${indexJob.at.toLocaleString()} of 2,400 blocks. 3 coin(s) found so far.`;
+    if (indexJob.at >= 2_400) {
+      indexJob.running = false;
+      indexJob.phase = "done";
+      indexJob.percent = 100;
+      indexJob.detail = "Index rebuilt: 3 coin(s) indexed.";
+    }
+  }
+}
+
 function mockClaimable() {
   if (rewardsClaimed) return { ready: 0, accruing: 0, accruing_keys: 0 };
   if (rewardsQuery() === "ready") return { ready: 10_000_000_000, accruing: 0, accruing_keys: 0 };
@@ -267,6 +303,16 @@ export function installMock() {
         const now = Date.now() / 1000;
         rewardsUnbonding = rewardsUnbonding.filter((u) => Number(u.release_time) > now);
         return { success: true, data: { claimed: c.ready, coins: c.ready > 0 ? 1 : 0 } } satisfies Resp;
+      }
+      if (cmd === "index_job") {
+        advanceIndex();
+        return { success: true, data: { ...indexJob } } satisfies Resp;
+      }
+      if (cmd === "rescan_from_genesis") {
+        if (!indexJob.running) {
+          indexJob = { running: true, phase: "fetching", at: 0, total: 1_389_000, percent: 0, coins: 0, detail: "Reading the chain from genesis." };
+        }
+        return { success: true, data: { ...indexJob } } satisfies Resp;
       }
       if (cmd === "wallet_health") {
         return { success: true, data: { save_error: null, pending_secrets: pendingSecrets.length, pending_deposits: 0, pending_redeems: 0 } } satisfies Resp;

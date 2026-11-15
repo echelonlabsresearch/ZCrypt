@@ -72,6 +72,10 @@ env:
   CARGO_PROFILE_RELEASE_DEBUG: "0"
   # nightly-2025-10-12 rejects 0/1 for this boolean. 0 is what failed the macOS build.
   CARGO_PROFILE_RELEASE_INCREMENTAL: "false"
+  # The zBTC reserve PUBLIC keys this wallet build trusts, per chain id (compiled in by
+  # wallet/src-tauri/src/chain.rs). Format: chain-id=hex[,hex];...
+  # Before a reserve rotation, ship a release that lists BOTH the old and the new key.
+  ZCRYPT_RESERVE_PK_PINS: "zcrypt-1=03fa3abbc2b4c15e11723e909c8a01ef130ecc88c62776b0f87bf828c367661e32"
 
 jobs:
   # A browser-downloaded disk image is checked on its own. A notarized app
@@ -368,7 +372,7 @@ jobs:
             exit 0
           fi
           case "$ARTIFACT_SIGNING_ENDPOINT" in https://*.codesigning.azure.net) ;; *) echo "ARTIFACT_SIGNING_ENDPOINT must be an https://<region>.codesigning.azure.net URL" >&2; exit 1 ;; esac
-          cargo install artifact-signing-cli --version 0.12.0
+          cargo install --locked artifact-signing-cli --version 0.12.0
           # Tauri runs signCommand for every PE it bundles (the exe, then the MSI); %1 is the file.
           printf '{"bundle":{"windows":{"signCommand":"artifact-signing-cli -e %s -a %s -c %s -d ZCrypt-Wallet %%1"}}}\n' \
             "$ARTIFACT_SIGNING_ENDPOINT" "$ARTIFACT_SIGNING_ACCOUNT" "$ARTIFACT_SIGNING_PROFILE" > windows-sign.json

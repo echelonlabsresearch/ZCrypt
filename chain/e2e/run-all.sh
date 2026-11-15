@@ -112,8 +112,17 @@ say "8d2/9 Node RESTART: abci1 reloads the incremental state DB (schema 3) and r
 $COMPOSE restart abci1 cometbft1 >/dev/null
 echo -n "  waiting for $N1 "
 for _ in $(seq 1 90); do curl -sf "$N1/status" >/dev/null 2>&1 && { echo "up"; break; }; echo -n .; sleep 2; done
-docker logs zcrypt-abci1 2>&1 | grep -q "\[state-db\] resumed from" || { echo "FAIL: abci1 did not resume from its RocksDB state"; docker logs --tail 40 zcrypt-abci1; exit 1; }
-echo "  abci1 resumed from RocksDB: $(docker logs zcrypt-abci1 2>&1 | grep -o '\[state-db\] resumed from.*' | tail -1)"
+# The RPC can answer before abci1 has logged its resume line, so poll for it. The log is
+# captured first: under pipefail, `docker logs | grep -q` fails when grep exits early.
+resumed=""
+for _ in $(seq 1 60); do
+  abci1_log="$(docker logs zcrypt-abci1 2>&1 || true)"
+  resumed="$(printf '%s\n' "$abci1_log" | grep -o '\[state-db\] resumed from.*' | tail -1 || true)"
+  [ -n "$resumed" ] && break
+  sleep 2
+done
+[ -n "$resumed" ] || { echo "FAIL: abci1 did not resume from its RocksDB state"; docker logs --tail 40 zcrypt-abci1; exit 1; }
+echo "  abci1 resumed from RocksDB: $resumed"
 rh1=$(curl -s "$N1/status" | grep -o '"latest_block_height":"[0-9]*"' | grep -o '[0-9]*'); sleep 8
 rh2=$(curl -s "$N1/status" | grep -o '"latest_block_height":"[0-9]*"' | grep -o '[0-9]*')
 [ "$rh2" -gt "$rh1" ] || { echo "FAIL: node1 not advancing after restart ($rh1 -> $rh2)"; exit 1; }

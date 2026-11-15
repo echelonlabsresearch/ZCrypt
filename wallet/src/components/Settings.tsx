@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { call, copySensitive } from "../lib/api";
 import ViewKeyCard from "./ViewKey";
 
@@ -87,19 +87,83 @@ export default function Settings() {
   const [esploraUrl, setEsploraUrl] = useState("");
   // The foundation's sale desk the Buy tab talks to ("send Bitcoin, get ZCRYPT").
   const [saleUrl, setSaleUrl] = useState("");
-  const [rescanBusy, setRescanBusy] = useState(false);
-  const [rescanMsg, setRescanMsg] = useState("");
-  async function rescan() {
-    setRescanBusy(true);
-    setRescanMsg("");
-    try {
-      const n = await call<number>("rescan_from_genesis");
-      setRescanMsg(`Index rebuilt: ${n} coin(s) indexed.`);
+  interface IndexJob {
+    running: boolean;
+    phase: string;
+    at: number;
+    total: number;
+    percent: number;
+    coins: number;
+    detail: string;
+  }
+  const [indexJob, setIndexJob] = useState<IndexJob | null>(null);
+  const [indexKick, setIndexKick] = useState(0);
+  const indexWasRunning = useRef(false);
+  // Bumped when a rebuild starts, so a poll that was already in flight cannot
+  // paint "idle" over the bar the click just showed.
+  const indexEpoch = useRef(0);
+  // The rebuild thread keeps going if this screen is hidden. Polling is how a
+  // return to Settings still shows the bar where it is.
+  useEffect(() => {
+    const epoch = indexEpoch.current;
+    let cancel = false;
+    let timer = 0;
+    const pull = async () => {
+      try {
+        const job = await call<IndexJob>("index_job");
+        if (cancel || epoch !== indexEpoch.current) return;
+        setIndexJob(job);
+        if (job.running) timer = window.setTimeout(pull, 400);
+      } catch {
+        if (!cancel && epoch === indexEpoch.current) timer = window.setTimeout(pull, 1000);
+      }
+    };
+    void pull();
+    return () => {
+      cancel = true;
+      window.clearTimeout(timer);
+    };
+  }, [indexKick]);
+  useEffect(() => {
+    if (indexJob?.running) {
+      indexWasRunning.current = true;
+      return;
+    }
+    if (indexWasRunning.current && indexJob?.phase === "done") {
+      indexWasRunning.current = false;
       window.dispatchEvent(new Event("zc-refresh"));
+    }
+    if (indexWasRunning.current && indexJob?.phase === "error") {
+      indexWasRunning.current = false;
+    }
+  }, [indexJob]);
+  async function rescan() {
+    if (indexJob?.running) return;
+    indexEpoch.current += 1;
+    // Gray the button and show the bar before the command returns. The job itself
+    // lives in the backend, so leaving this tab does not stop the rebuild.
+    setIndexJob({
+      running: true,
+      phase: "fetching",
+      at: 0,
+      total: 0,
+      percent: 0,
+      coins: 0,
+      detail: "Reading the chain from genesis.",
+    });
+    try {
+      setIndexJob(await call<IndexJob>("rescan_from_genesis"));
+      setIndexKick((k) => k + 1);
     } catch (e) {
-      setRescanMsg(`Rebuild failed: ${String((e as Error)?.message ?? e)}`);
-    } finally {
-      setRescanBusy(false);
+      setIndexJob({
+        running: false,
+        phase: "error",
+        at: 0,
+        total: 0,
+        percent: 0,
+        coins: 0,
+        detail: `Rebuild failed: ${String((e as Error)?.message ?? e)}`,
+      });
     }
   }
   const [btcSaved, setBtcSaved] = useState(false);
@@ -400,11 +464,29 @@ export default function Settings() {
           on a new device or if the balance shown here ever disagrees with the chain.
         </div>
         <div style={{ display: "flex", gap: "0.6rem", alignItems: "center", flexWrap: "wrap" }}>
-          <button className="btn-secondary" disabled={rescanBusy} onClick={rescan}>
-            {rescanBusy ? "Rebuilding…" : "Rebuild index from genesis"}
+          <button className="btn-secondary" disabled={!!indexJob?.running} onClick={rescan}>
+            {indexJob?.running ? "Rebuilding…" : "Rebuild index from genesis"}
           </button>
-          {rescanMsg && <span style={{ fontSize: "0.82rem" }}>{rescanMsg}</span>}
         </div>
+        {indexJob && indexJob.phase !== "idle" && (
+          <div style={{ marginTop: "0.85rem" }}>
+            <div
+              className="progress-bar"
+              role="progressbar"
+              aria-valuenow={indexJob.percent}
+              aria-valuemin={0}
+              aria-valuemax={100}
+              aria-valuetext={indexJob.detail}
+              aria-label="Index rebuild progress"
+            >
+              <div
+                className={indexJob.running && indexJob.percent === 0 ? "progress-fill waiting" : "progress-fill"}
+                style={indexJob.running && indexJob.percent === 0 ? undefined : { width: `${indexJob.percent}%` }}
+              />
+            </div>
+            <div style={{ fontSize: "0.82rem" }}>{indexJob.detail}</div>
+          </div>
+        )}
       </div>
 
       <ViewKeyCard />
@@ -479,7 +561,7 @@ export default function Settings() {
         </div>
         <div className="card-row">
           <span>Recovery</span>
-          <span style={{ color: "var(--color-cyan)" }}>BIP-39 · one phrase covers normal + stealth</span>
+          <span style={{ color: "var(--color-cyan)" }}>BIP-39 phrase · each shielded address has its own key to back up</span>
         </div>
       </div>
     </div>

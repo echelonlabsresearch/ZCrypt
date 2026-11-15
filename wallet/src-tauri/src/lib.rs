@@ -717,6 +717,12 @@ struct AppState {
     /// Resolved once in setup: the path plugin runs through Java and must not be called from
     /// a command's worker thread.
     inbox_dir: Mutex<Option<std::path::PathBuf>>,
+    /// One chain scan at a time. A genesis rebuild and a Refresh must not merge the
+    /// same blocks together.
+    scan_gate: Mutex<()>,
+    /// Progress of the Settings "rebuild index from genesis" job. Survives leaving
+    /// the tab; the screen polls it.
+    index_job: Mutex<IndexJob>,
 }
 
 // ---------------------------------------------------------------------------
@@ -904,6 +910,22 @@ fn save_state(w: &Wallet, dir: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// A coin store that exists but cannot be opened (corrupt, written by another seed, or by
+/// a build whose format this one cannot read) is moved aside, never left in place. The
+/// wallet then starts empty, and its next save would otherwise overwrite the only copy of
+/// things the recovery phrase does NOT restore: stealth-address seeds, unsent bearer coins,
+/// receipts and in-flight swap records. The copy stays next to the store as
+/// `coins.enc.unreadable-<unix time>` so it can be opened again with the right seed/build.
+fn preserve_unreadable_state(dir: &str) {
+    let from = coins_path(dir);
+    let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let mut to = from.clone().into_os_string();
+    to.push(format!(".unreadable-{ts}"));
+    if let Err(e) = std::fs::rename(&from, &to) {
+        eprintln!("[wallet] could not set aside the unreadable coin store: {e}");
+    }
+}
+
 fn load_state(w: &mut Wallet, dir: &str) {
     use chacha20poly1305::aead::{Aead, KeyInit};
     use chacha20poly1305::{ChaCha20Poly1305, Nonce};
@@ -913,24 +935,24 @@ fn load_state(w: &mut Wallet, dir: &str) {
     };
     let blob: serde_json::Value = match serde_json::from_str(&raw) {
         Ok(b) => b,
-        Err(_) => return,
+        Err(_) => return preserve_unreadable_state(dir),
     };
     let nonce = match blob["nonce"].as_str().and_then(|s| hex::decode(s).ok()) {
         Some(n) => n,
-        None => return,
+        None => return preserve_unreadable_state(dir),
     };
     let ct = match blob["ct"].as_str().and_then(|s| hex::decode(s).ok()) {
         Some(c) => c,
-        None => return,
+        None => return preserve_unreadable_state(dir),
     };
     let cipher = ChaCha20Poly1305::new_from_slice(state_key(&w.account).as_ref()).unwrap();
     let pt = match cipher.decrypt(Nonce::from_slice(&nonce), ct.as_ref()) {
         Ok(p) => Zeroizing::new(p),
-        Err(_) => return,
+        Err(_) => return preserve_unreadable_state(dir),
     };
     let ps: PersistState = match serde_json::from_slice(&pt) {
         Ok(p) => p,
-        Err(_) => return,
+        Err(_) => return preserve_unreadable_state(dir),
     };
     w.coins = ps
         .coins
@@ -986,11 +1008,21 @@ async fn wallet_exists(state: State<'_, AppState>) -> R<bool> {
     ok(keystore_path(&dir).exists())
 }
 
+/// Creating or restoring a wallet writes a new keystore. If one already exists it holds
+/// the only encrypted copy of a recovery phrase, so it is never replaced.
+fn refuse_if_wallet_exists(dir: &str) -> Result<(), String> {
+    if keystore_path(dir).exists() {
+        return Err("a wallet already exists on this device. Unlock it, or remove it first; it will not be overwritten.".to_string());
+    }
+    Ok(())
+}
+
 #[tauri::command]
 async fn create_wallet(password: String, state: State<'_, AppState>) -> R<CreateResult> {
     if password.len() < 8 {
         return Err("password must be at least 8 characters".into());
     }
+    refuse_if_wallet_exists(&state.data_dir.lock().unwrap().clone())?;
     let (account, phrase) = keys::new_account();
     let phrase = Zeroizing::new(phrase);
     let dir = state.data_dir.lock().unwrap().clone();
@@ -1018,6 +1050,7 @@ async fn restore_wallet(password: String, mnemonic: String, state: State<'_, App
     let account = Account::from_mnemonic(&mnemonic, "")
         .ok_or("invalid recovery phrase (check the words and order)")?;
     let dir = state.data_dir.lock().unwrap().clone();
+    refuse_if_wallet_exists(&dir)?;
     privfs::ensure_private_dir(std::path::Path::new(&dir)).map_err(|e| e.to_string())?;
     let ks = seal(&password, &mnemonic);
     write_keystore(&dir, &ks)?;
@@ -1193,6 +1226,33 @@ async fn new_stealth_address(state: State<'_, AppState>) -> R<StealthInfo> {
             index,
             address: acct.stealth_address().to_bech32(),
         })
+    })
+    .and_then(ok)
+}
+
+/// Put a stealth address back from its backup key (the 64-hex seed `reveal_stealth_backup`
+/// shows). Stealth seeds are random, not derived from the recovery phrase, so this is the
+/// only way a restored or reinstalled wallet can spend what was sent to one. The key is
+/// stored before the address is returned; an address already in the wallet is returned
+/// as it is, not added twice. The next scan picks up its coins.
+#[tauri::command]
+async fn import_stealth_backup(seed_hex: String, state: State<'_, AppState>) -> R<StealthInfo> {
+    let seed_hex = Zeroizing::new(seed_hex);
+    let bytes = Zeroizing::new(hex::decode(seed_hex.trim()).map_err(|_| "that is not a stealth backup key (64 hex characters)")?);
+    let seed: [u8; 32] = bytes.as_slice().try_into().map_err(|_| "that is not a stealth backup key (64 hex characters)")?;
+    with_wallet(&state, |w| {
+        let index = match w.stealth_seeds.iter().position(|s| *s == seed) {
+            Some(i) => i,
+            None => {
+                w.stealth_seeds.push(seed);
+                if let Err(e) = save_now(&state, w, "restore a stealth address") {
+                    w.stealth_seeds.pop();
+                    return Err(e);
+                }
+                w.stealth_seeds.len() - 1
+            }
+        };
+        Ok(StealthInfo { index: index as u32, address: Account::from_seed(seed).stealth_address().to_bech32() })
     })
     .and_then(ok)
 }
@@ -2293,16 +2353,16 @@ mod scan_tests {
         let key = hex::encode(pk64(&pk));
         let known = HashSet::new();
         let own_nf = HashMap::new();
-        let p1 = scan_pass(&blocks, &keys, &leaves, &known, &own_nf, &[], &seed, &seed);
+        let p1 = scan_pass(&blocks, &keys, &leaves, &known, &own_nf, &[], &seed, &seed, &|_| {});
         assert_eq!(p1.coins.len(), chunks.len());
         assert_eq!(p1.claim_counters.get(&key).copied(), Some(chunks.len() as u64));
         // Pass 2 seeded from the SNAPSHOT (fixed behaviour): identical counters.
-        let p2 = scan_pass(&blocks, &keys, &leaves, &known, &own_nf, &[], &seed, &seed);
+        let p2 = scan_pass(&blocks, &keys, &leaves, &known, &own_nf, &[], &seed, &seed, &|_| {});
         assert_eq!(p2.claim_counters, p1.claim_counters);
         // Pass 2 seeded from pass 1's OUTPUT (the old behaviour): the counter runs AHEAD of
         // the chain (the same claim is counted again), which is exactly what made a restored
         // wallet reconstruct later claims at the wrong indices.
-        let p2_bug = scan_pass(&blocks, &keys, &leaves, &known, &own_nf, &[], &p1.claim_counters, &p1.fee_claim_counters);
+        let p2_bug = scan_pass(&blocks, &keys, &leaves, &known, &own_nf, &[], &p1.claim_counters, &p1.fee_claim_counters, &|_| {});
         assert!(p2_bug.claim_counters.get(&key).copied().unwrap() > chunks.len() as u64);
     }
 }
@@ -2488,11 +2548,43 @@ fn settings_path(dir: &str) -> std::path::PathBuf {
     std::path::Path::new(dir).join("settings.json")
 }
 fn load_settings(dir: &str) -> Settings {
-    let s: Settings = std::fs::read_to_string(settings_path(dir))
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default();
+    let s = match std::fs::read_to_string(settings_path(dir)) {
+        Ok(raw) => settings_from_str(&raw),
+        Err(_) => Settings::default(),
+    };
     apply_transport(&s);
+    s
+}
+
+/// Parse a settings file. A file that does not parse falls back to the defaults, with one
+/// exception: the defaults have Tor OFF, so a user who had Tor ON would silently start
+/// talking to the public node from their own IP. Whatever of the transport choice can
+/// still be read from the damaged file is kept, and Tor stays on if the file said so.
+fn settings_from_str(raw: &str) -> Settings {
+    if let Ok(s) = serde_json::from_str::<Settings>(raw) {
+        return s;
+    }
+    let mut s = Settings::default();
+    match serde_json::from_str::<serde_json::Value>(raw) {
+        Ok(v) => {
+            if v["tor_enabled"].as_bool() == Some(true) {
+                s.tor_enabled = true;
+            }
+            if let Some(p) = v["tor_proxy"].as_str().filter(|p| !p.trim().is_empty()) {
+                s.tor_proxy = p.to_string();
+            }
+            if let Some(u) = v["node_url"].as_str().filter(|u| chain::check_node_url(u).is_ok()) {
+                s.node_url = u.to_string();
+            }
+        }
+        Err(_) => {
+            // Not JSON at all (truncated write): look for the flag in the raw text.
+            let squeezed: String = raw.chars().filter(|c| !c.is_whitespace()).collect();
+            if squeezed.contains("\"tor_enabled\":true") {
+                s.tor_enabled = true;
+            }
+        }
+    }
     s
 }
 
@@ -2529,6 +2621,7 @@ fn bridge_settings(dir: &str) -> Result<Settings, String> {
 /// per target), and the broadcast jitter switch.
 fn apply_transport(s: &Settings) {
     chain::set_tor(tor_proxy_url(s));
+    chain::set_tor_remote(tor_raw_proxy(s));
     // A bridge operation in flight owns the bridge circuit it rotated onto: a settings read
     // from the UI must not reset it mid-operation (wallet M13).
     if BRIDGE_OPS_IN_FLIGHT.load(std::sync::atomic::Ordering::SeqCst) == 0 {
@@ -2574,6 +2667,35 @@ struct SavedOrder {
     id: String,
     sale_url: String,
     created: u64,
+    /// The amount the user asked to pay and the address the desk quoted when the order was
+    /// opened. Every later reply for this order must repeat them (see `check_order_terms`).
+    /// 0 / empty on orders saved by older builds.
+    #[serde(default)]
+    sats: u64,
+    #[serde(default)]
+    btc_address: String,
+}
+
+/// The desk's reply for an order must carry the terms the user agreed to: the amount they
+/// typed and, once quoted, the same payment address. The Buy screen pays `sats` to
+/// `btc_address` from the wallet's own Bitcoin, so both are checked here first.
+fn check_order_terms(v: &serde_json::Value, want_sats: u64, want_address: Option<&str>) -> Result<(), String> {
+    let sats = v["sats"].as_u64().ok_or("sale desk: the order has no amount")?;
+    if sats != want_sats {
+        return Err(format!(
+            "sale desk returned an order for {sats} sats, but {want_sats} sats were requested. Nothing was paid."
+        ));
+    }
+    let addr = v["btc_address"].as_str().unwrap_or("");
+    if addr.is_empty() {
+        return Err("sale desk: the order has no payment address".to_string());
+    }
+    if let Some(want) = want_address {
+        if addr != want {
+            return Err("sale desk changed this order's payment address. Nothing was paid; do not pay it.".to_string());
+        }
+    }
+    Ok(())
 }
 
 fn buy_orders_path(dir: &str) -> std::path::PathBuf {
@@ -2605,7 +2727,8 @@ fn sale_url(state: &State<'_, AppState>) -> Result<String, String> {
 /// GET/POST JSON against the desk. Errors from the desk arrive as `{"error": "..."}` with a
 /// 4xx status; surface that message rather than the HTTP code.
 fn sale_call(url: &str, body: Option<serde_json::Value>) -> Result<serde_json::Value, String> {
-    let agent = chain::agent_with_timeout(25);
+    // Routed by the DESK's address, not the node's (a local node is reached directly).
+    let agent = chain::agent_for_remote("sale", 25, url);
     let resp = match body {
         Some(b) => agent.post(url).send_json(b),
         None => agent.get(url).call(),
@@ -2638,6 +2761,8 @@ async fn buy_order(sats: u64, state: State<'_, AppState>) -> R<serde_json::Value
     let url = sale_url(&state)?;
     let address = with_wallet(&state, |w| Ok(w.account.normal_address().to_bech32()))?;
     let v = sale_call(&format!("{url}/order"), Some(serde_json::json!({ "address": address, "sats": sats })))?;
+    check_order_terms(&v, sats, None)?;
+    let btc_address = v["btc_address"].as_str().unwrap_or("").to_string();
     if let Some(id) = v["id"].as_str() {
         let dir = state.data_dir.lock().unwrap().clone();
         let mut list = load_buy_orders(&dir);
@@ -2645,7 +2770,7 @@ async fn buy_order(sats: u64, state: State<'_, AppState>) -> R<serde_json::Value
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        list.push(SavedOrder { id: id.to_string(), sale_url: url.clone(), created });
+        list.push(SavedOrder { id: id.to_string(), sale_url: url.clone(), created, sats, btc_address });
         save_buy_orders(&dir, &list)?;
     }
     ok(v)
@@ -2655,16 +2780,17 @@ async fn buy_order(sats: u64, state: State<'_, AppState>) -> R<serde_json::Value
 #[tauri::command]
 async fn buy_status(id: String, state: State<'_, AppState>) -> R<serde_json::Value> {
     let dir = state.data_dir.lock().unwrap().clone();
-    let url = load_buy_orders(&dir)
-        .into_iter()
-        .find(|o| o.id == id)
-        .map(|o| o.sale_url)
-        .map(Ok)
-        .unwrap_or_else(|| sale_url(&state))?;
+    let saved = load_buy_orders(&dir).into_iter().find(|o| o.id == id);
+    let url = saved.as_ref().map(|o| o.sale_url.clone()).map(Ok).unwrap_or_else(|| sale_url(&state))?;
     if !id.chars().all(|c| c.is_ascii_hexdigit()) || id.len() != 32 {
         return Err("bad order id".to_string());
     }
-    sale_call(&format!("{url}/order/{id}"), None).and_then(ok)
+    let v = sale_call(&format!("{url}/order/{id}"), None)?;
+    // The terms recorded when the order was opened are the ones that stand.
+    if let Some(o) = saved.filter(|o| o.sats > 0 && !o.btc_address.is_empty()) {
+        check_order_terms(&v, o.sats, Some(&o.btc_address))?;
+    }
+    ok(v)
 }
 
 /// Orders this wallet opened, newest first (ids only; the desk holds the state).
@@ -3306,6 +3432,10 @@ fn ensure_spendable(asset_id: u64, amount: u64, state: &State<AppState>) -> Resu
             ReshapePlan::SelfSend(s) => {
                 do_shield_send_raw(&self_addr, s, asset_id, state, false, true)?;
                 // Pick up the self-sent coin (its note is on-chain, addressed to us).
+                if state.index_job.lock().unwrap_or_else(|e| e.into_inner()).running {
+                    return Err("the wallet index is rebuilding from genesis; try the send again when it finishes".into());
+                }
+                let _gate = state.scan_gate.lock().unwrap_or_else(|e| e.into_inner());
                 let _ = scan_onchain_inner(state.clone());
             }
         }
@@ -3916,6 +4046,7 @@ fn scan_pass(
     escrows_seed: &[EscrowRec],
     claim_counters: &std::collections::BTreeMap<String, u64>,
     fee_claim_counters: &std::collections::BTreeMap<String, u64>,
+    on_block: &dyn Fn(i64),
 ) -> ScanOut {
     use std::collections::{HashMap, HashSet};
     let leaf_set: HashSet<zcrypt_shield::Commitment> = leaves.iter().copied().collect();
@@ -3952,7 +4083,8 @@ fn scan_pass(
         o.coins.push((coin, kind));
     };
     let pk_at = |i: usize| keys.accounts[i].0;
-    for (_h, txs) in blocks {
+    for (h, txs) in blocks {
+        on_block(*h);
         for tx in txs {
             let tag = match tx.first() {
                 Some(t) => *t,
@@ -4361,27 +4493,247 @@ fn next_scan_height(widen_pending: bool, prev: i64, covered_to: i64) -> i64 {
     }
 }
 
-/// Scan new blocks for incoming coins (trial-decrypt on-chain notes), reconstruct the
-/// coins our public actions minted (claims, escrows), and mark our coins spent when their
-/// nullifiers appear on-chain. Fully local: the node only ever serves blocks and leaves.
-/// Rescan the chain for this wallet's coins. Async like every other command so the
-/// webview stays responsive; the work itself is synchronous inside.
-/// Forget the scan cursor and read the whole chain again. The result is authoritative: coins
-/// that are leaves and were never spent on this chain come back, whatever the store said.
+// Set only on the genesis-rebuild thread. Ordinary refreshes share the scan and must
+// not move the Settings progress bar.
+thread_local! {
+    static INDEX_REPORT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The Settings rebuild. `percent` moves only forward: fetching the chain is the first
+/// 90, indexing the notes that were fetched is the next 9, and saving is the last point.
+#[derive(Clone, Serialize)]
+struct IndexJob {
+    running: bool,
+    phase: String,
+    at: i64,
+    total: i64,
+    percent: u16,
+    coins: u64,
+    detail: String,
+}
+
+impl Default for IndexJob {
+    fn default() -> Self {
+        Self {
+            running: false,
+            phase: "idle".into(),
+            at: 0,
+            total: 0,
+            percent: 0,
+            coins: 0,
+            detail: String::new(),
+        }
+    }
+}
+
+fn index_commas(n: i64) -> String {
+    let neg = n < 0;
+    let digits = n.unsigned_abs().to_string();
+    let mut out = String::new();
+    for (i, c) in digits.chars().rev().enumerate() {
+        if i > 0 && i % 3 == 0 {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    let mut out: String = out.chars().rev().collect();
+    if neg {
+        out.insert(0, '-');
+    }
+    out
+}
+
+/// `span` points of a 0–100 bar, starting at `base`, for `at` out of `total`.
+fn index_slice(at: i64, total: i64, base: u16, span: u16) -> u16 {
+    if total <= 0 {
+        return base;
+    }
+    let at = at.clamp(0, total) as u128;
+    base + ((at * u128::from(span)) / total as u128) as u16
+}
+
+fn index_detail(phase: &str, at: i64, total: i64, coins: u64) -> String {
+    let body = match phase {
+        "fetching" if total > 0 && at > 0 => {
+            format!("Reading the chain, height {} of {}.", index_commas(at), index_commas(total))
+        }
+        "fetching" => "Reading the chain from genesis.".into(),
+        "indexing" if total > 0 => format!("Indexing notes, {} of {} blocks.", index_commas(at), index_commas(total)),
+        "saving" => "Saving the index.".into(),
+        "done" => format!("Index rebuilt: {coins} coin(s) indexed."),
+        _ => String::new(),
+    };
+    if coins > 0 && phase != "done" && phase != "error" {
+        format!("{body} {coins} coin(s) found so far.")
+    } else {
+        body
+    }
+}
+
+fn report_index(state: &AppState, phase: &str, at: i64, total: i64) {
+    if !INDEX_REPORT.with(|c| c.get()) {
+        return;
+    }
+    let mut job = state.index_job.lock().unwrap_or_else(|e| e.into_inner());
+    if !job.running {
+        return;
+    }
+    let pct = match phase {
+        "fetching" => index_slice(at, total, 0, 90),
+        "indexing" => index_slice(at, total, 90, 9),
+        "saving" => 99,
+        _ => job.percent,
+    };
+    job.percent = job.percent.max(pct);
+    job.phase = phase.to_string();
+    job.at = at.max(0);
+    job.total = total.max(0);
+    job.detail = index_detail(phase, job.at, job.total, job.coins);
+}
+
+fn note_index_coins(state: &AppState, found: usize) {
+    if !INDEX_REPORT.with(|c| c.get()) {
+        return;
+    }
+    let mut job = state.index_job.lock().unwrap_or_else(|e| e.into_inner());
+    if !job.running {
+        return;
+    }
+    job.coins = found as u64;
+    job.detail = index_detail(&job.phase, job.at, job.total, job.coins);
+}
+
+fn finish_index(state: &AppState, result: Result<usize, String>) {
+    let mut job = state.index_job.lock().unwrap_or_else(|e| e.into_inner());
+    job.running = false;
+    match result {
+        Ok(n) => {
+            job.phase = "done".into();
+            job.percent = 100;
+            job.coins = n as u64;
+            job.detail = index_detail("done", job.at, job.total, job.coins);
+        }
+        Err(e) => {
+            job.phase = "error".into();
+            job.detail = format!("Rebuild failed: {e}");
+        }
+    }
+}
+
+/// Clears the report flag and records the outcome, including when the scan panics,
+/// so the Settings button cannot stay on "Rebuilding…" after the thread is gone.
+struct IndexGuard<'a> {
+    state: &'a AppState,
+    result: Option<Result<usize, String>>,
+}
+
+impl Drop for IndexGuard<'_> {
+    fn drop(&mut self) {
+        INDEX_REPORT.with(|c| c.set(false));
+        let result = self.result.take().unwrap_or_else(|| Err("the rebuild stopped unexpectedly".into()));
+        finish_index(self.state, result);
+    }
+}
+
+/// Fetching fills 0–90, indexing 90–99, saving is 99, done is 100.
+#[cfg(test)]
+fn index_bar(phase: &str, at: i64, total: i64) -> u16 {
+    match phase {
+        "fetching" => index_slice(at, total, 0, 90),
+        "indexing" => index_slice(at, total, 90, 9),
+        "saving" => 99,
+        "done" => 100,
+        _ => 0,
+    }
+}
+
+#[test]
+fn index_bar_fills_forward() {
+    assert_eq!(index_bar("fetching", 0, 1_000), 0);
+    assert_eq!(index_bar("fetching", 500, 1_000), 45);
+    assert_eq!(index_bar("fetching", 1_000, 1_000), 90);
+    assert_eq!(index_bar("indexing", 0, 10), 90);
+    assert_eq!(index_bar("indexing", 10, 10), 99);
+    assert!(index_bar("indexing", 1, 10) >= index_bar("fetching", 1_000, 1_000));
+    assert_eq!(index_bar("saving", 1, 1), 99);
+    assert_eq!(index_bar("done", 1, 1), 100);
+    assert_eq!(index_detail("done", 1, 1, 3), "Index rebuilt: 3 coin(s) indexed.");
+    assert_eq!(index_commas(1_389_629), "1,389,629");
+}
+
+/// Forget the scan cursor and read the whole chain again, on a background thread.
+/// Returns at once. Poll [`index_job`] for the bar; leaving Settings does not stop it.
 #[tauri::command]
-async fn rescan_from_genesis(state: State<'_, AppState>) -> R<usize> {
-    with_wallet(&state, |w| {
-        w.scan_height = 0;
-        w.claim_counters.clear();
-        w.fee_claim_counters.clear();
-        Ok(())
-    })?;
-    scan_onchain(state).await
+async fn rescan_from_genesis(app: tauri::AppHandle, state: State<'_, AppState>) -> R<IndexJob> {
+    // Check and mark under one lock. Two clicks before the button disables must
+    // not start two scans; the second call just returns the job already running.
+    {
+        let mut job = state.index_job.lock().unwrap_or_else(|e| e.into_inner());
+        if job.running {
+            return ok(job.clone());
+        }
+        *job = IndexJob {
+            running: true,
+            phase: "fetching".into(),
+            at: 0,
+            total: 0,
+            percent: 0,
+            coins: 0,
+            detail: "Reading the chain from genesis.".into(),
+        };
+    }
+    let handle = app.clone();
+    let spawned = std::thread::Builder::new().name("index-rebuild".into()).spawn(move || {
+        let state = handle.state::<AppState>();
+        // Declared before the gate so a panic drops the gate first, then records the failure.
+        let mut guard = IndexGuard { state: state.inner(), result: None };
+        {
+            let _gate = state.scan_gate.lock().unwrap_or_else(|e| e.into_inner());
+            match with_wallet(&state, |w| {
+                w.scan_height = 0;
+                w.claim_counters.clear();
+                w.fee_claim_counters.clear();
+                Ok(())
+            }) {
+                Err(e) => guard.result = Some(Err(e)),
+                Ok(()) => {
+                    INDEX_REPORT.with(|c| c.set(true));
+                    guard.result = Some(match scan_onchain_inner(state.clone()) {
+                        Ok(api) => Ok(api.data.unwrap_or(0)),
+                        Err(e) => Err(e),
+                    });
+                }
+            }
+        }
+    });
+    if let Err(e) = spawned {
+        let msg = format!("could not start the rebuild: {e}");
+        finish_index(&state, Err(msg.clone()));
+        return Err(msg);
+    }
+    let job = state.index_job.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    ok(job)
+}
+
+#[tauri::command]
+async fn index_job(state: State<'_, AppState>) -> R<IndexJob> {
+    ok(state.index_job.lock().unwrap_or_else(|e| e.into_inner()).clone())
 }
 
 #[tauri::command]
 async fn scan_onchain(state: State<'_, AppState>) -> R<usize> {
-    scan_onchain_inner(state)
+    // A genesis rebuild already holds the gate. Refresh must not sit behind it:
+    // the rebuild finishes by asking the screen to refresh, and that scan is short.
+    // Clone before locking: the guard borrows `state`, and the scan takes its own handle.
+    let scan = state.clone();
+    let gate = match state.scan_gate.try_lock() {
+        Ok(g) => g,
+        Err(std::sync::TryLockError::WouldBlock) => return ok(0),
+        Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+    };
+    let n = scan_onchain_inner(scan);
+    drop(gate);
+    n
 }
 
 fn scan_onchain_inner(state: State<AppState>) -> R<usize> {
@@ -4438,7 +4790,15 @@ fn scan_onchain_inner(state: State<AppState>) -> R<usize> {
     // Transient node errors (429 rate limits, timeouts) are retried with backoff; if they
     // persist, the scan keeps what it fetched, records how far it got, and resumes from
     // there next time instead of starting over.
-    let fetched = if scan_notes { chain::scan_blocks(&url, from + 1, tip) } else { chain::ScanFetch::empty(tip) };
+    let progress = |at: i64, total: i64| report_index(state.inner(), "fetching", at, total);
+    if scan_notes {
+        progress(from.max(0), tip.max(0));
+    }
+    let fetched = if scan_notes {
+        chain::scan_blocks_reporting(&url, from + 1, tip, &progress)
+    } else {
+        chain::ScanFetch::empty(tip)
+    };
     let covered_to = fetched.covered_to;
     let blocks = fetched.blocks;
 
@@ -4492,7 +4852,14 @@ fn scan_onchain_inner(state: State<AppState>) -> R<usize> {
         by_reward.entry(master.reward_address()).or_insert(LEGACY_IDX);
         by_delegator.entry(delegator_signing_key(&master).verifying_key().to_bytes()).or_insert(LEGACY_IDX);
         let keys = ScanKeys { accounts, by_pk, by_reward, by_delegator };
-        let res = scan_pass(&blocks, &keys, &leaves, &known, &own_nf, &escrow_seed, &claim_seed, &fee_seed);
+        let seen = std::cell::Cell::new(0i64);
+        let block_count = blocks.len() as i64;
+        let on_block = |_: i64| {
+            let i = seen.get() + 1;
+            seen.set(i);
+            report_index(state.inner(), "indexing", i, block_count.max(1));
+        };
+        let res = scan_pass(&blocks, &keys, &leaves, &known, &own_nf, &escrow_seed, &claim_seed, &fee_seed, &on_block);
         let widen = gap_needs_widening(res.max_index_seen, change_hi);
         spent_seen.extend(res.spent.iter().copied());
         // Merge under a BRIEF lock.
@@ -4550,6 +4917,7 @@ fn scan_onchain_inner(state: State<AppState>) -> R<usize> {
                 }
             }
         }
+        note_index_coins(state.inner(), found);
         widen_pending = widen && !blocks.is_empty();
         if !widen_pending {
             break;
@@ -4567,6 +4935,7 @@ fn scan_onchain_inner(state: State<AppState>) -> R<usize> {
 
     // Reconcile against reality under a BRIEF lock, then persist.
     let mut paused: Option<String> = fetched.error.clone();
+    report_index(state.inner(), "saving", tip, tip.max(1));
     {
         let mut g = state.wallet.lock().unwrap();
         let w = g.as_mut().ok_or("locked")?;
@@ -6481,7 +6850,7 @@ mod swap_ticket_tests {
         let accounts: Vec<(Option<u32>, Account)> = (0..5).map(|i| (Some(i), w.key_at(i))).collect();
         let by_pk = accounts.iter().enumerate().map(|(p, (_, a))| (pk64(&a.pubkey()), p)).collect();
         let keys = ScanKeys { accounts, by_pk, by_reward: Default::default(), by_delegator: Default::default() };
-        let out = scan_pass(&[(1, vec![swap, burn])], &keys, &[], &Default::default(), &Default::default(), &[], &Default::default(), &Default::default());
+        let out = scan_pass(&[(1, vec![swap, burn])], &keys, &[], &Default::default(), &Default::default(), &[], &Default::default(), &Default::default(), &|_| {});
         assert_eq!(out.escrows.len(), 2);
         let s = out.escrows.iter().find(|e| e.kind == "swap").expect("swap escrow recorded");
         assert_eq!((s.role.as_str(), s.index, s.value, s.asset_id, s.timeout), ("refund", 3, 70, 11, 900));
@@ -8014,12 +8383,33 @@ fn parse_hex32(h: &str) -> Option<[u8; 32]> {
     hex::decode(h).ok()?.try_into().ok()
 }
 
+/// The chain's zBTC reserve key as the node reports it, accepted only if it is one this
+/// wallet trusts (`chain::check_reserve_pk`). Every bridge flow reads the key through here.
+fn trusted_reserve_pk(zc: &Zcrypt, asset: u64) -> Result<Option<[u8; 33]>, String> {
+    match bswap::chain_reserve_pk(zc, asset)? {
+        Some(pk) => {
+            chain::check_reserve_pk(asset, &pk)?;
+            Ok(Some(pk))
+        }
+        None => Ok(None),
+    }
+}
+
+/// Accept a rotated zBTC reserve key after the user confirmed it out of band.
+#[tauri::command]
+async fn bridge_accept_reserve_key(pk_hex: String, state: State<'_, AppState>) -> R<bool> {
+    let zc = zc_client(&state)?;
+    let asset = zbtc_asset(&zc)?;
+    chain::accept_reserve_pk(asset, &pk_hex)?;
+    ok(true)
+}
+
 /// The reserve key a pending bridge record was created against: the persisted one, else (for
 /// records written before the field existed) the chain's current key.
 fn reserve_pk_for(zc: &Zcrypt, asset: u64, persisted_hex: &str) -> Result<bitcoin::PublicKey, String> {
     let bytes: Vec<u8> = match hex::decode(persisted_hex) {
         Ok(b) if b.len() == 33 => b,
-        _ => bswap::chain_reserve_pk(zc, asset)?
+        _ => trusted_reserve_pk(zc, asset)?
             .ok_or("the chain has no zBTC reserve key pinned")?
             .to_vec(),
     };
@@ -8380,7 +8770,7 @@ fn swap_shield_btc_impl(
     // H1: everything consensus will check is checked BEFORE any BTC moves. The HTLC must pay
     // the chain's pinned reserve key: a wallet's own key is refused at the SPV open, which
     // used to strand the BTC in an HTLC this wallet could neither claim nor refund.
-    let reserve_bytes = bswap::chain_reserve_pk(&zc, asset)?
+    let reserve_bytes = trusted_reserve_pk(&zc, asset)?
         .ok_or("the chain has no zBTC reserve key pinned; shielding is not available on this network")?;
     let reserve_pk = bitcoin::PublicKey::from_slice(&reserve_bytes)
         .map_err(|e| format!("chain reserve key is malformed: {e}"))?;
@@ -8543,7 +8933,7 @@ fn swap_redeem_btc_impl(btc: &str, progress: &dyn Fn(u8, &str), state: &State<Ap
     // M11: everything that could leave zBTC burned with nobody to pay BTC is checked BEFORE
     // the burn: an operator reserve key must exist on-chain, the amount must be one the
     // operator serves, and the inputs must be committed leaves.
-    let reserve_bytes = bswap::chain_reserve_pk(&zc, asset)?.ok_or(
+    let reserve_bytes = trusted_reserve_pk(&zc, asset)?.ok_or(
         "the chain has no zBTC reserve key pinned, so no operator can pay out BTC; redeem is not available on this network",
     )?;
     let reserve_pk = bitcoin::PublicKey::from_slice(&reserve_bytes)
@@ -10307,6 +10697,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             rescan_from_genesis,
+            index_job,
             buy_quote,
             buy_order,
             buy_status,
@@ -10357,6 +10748,8 @@ pub fn run() {
             bridge_status,
             bridge_mature,
             swap_shield_btc,
+            bridge_accept_reserve_key,
+            import_stealth_backup,
             swap_redeem_btc,
             bridge_recover,
             bridge_refund_deposit,
@@ -11080,5 +11473,64 @@ mod live_3node {
         println!("[wallet] Bob restored from his phrase: {} of {} ZCRYPT recovered (stealth receipt is by design not derivable)", b2.total / ZC, b1.total / ZC);
 
         println!("\nWALLET BACKEND against the live 3-node chain: GREEN");
+    }
+}
+
+#[cfg(test)]
+mod remote_trust_tests {
+    use super::*;
+
+    #[test]
+    fn an_order_reply_must_repeat_the_amount_and_address_agreed() {
+        let good = serde_json::json!({ "id": "ab", "sats": 100_000, "btc_address": "bc1qexample" });
+        assert!(check_order_terms(&good, 100_000, None).is_ok());
+        assert!(check_order_terms(&good, 100_000, Some("bc1qexample")).is_ok());
+        // A reply for a different amount than the one requested.
+        let inflated = serde_json::json!({ "id": "ab", "sats": 250_000_000u64, "btc_address": "bc1qexample" });
+        let e = check_order_terms(&inflated, 100_000, None).unwrap_err();
+        assert!(e.contains("Nothing was paid"), "{e}");
+        // The address may not change after the order was opened.
+        let swapped = serde_json::json!({ "id": "ab", "sats": 100_000, "btc_address": "bc1qother" });
+        assert!(check_order_terms(&swapped, 100_000, Some("bc1qexample")).is_err());
+        // Missing or mistyped fields are refused, never read as "matches".
+        assert!(check_order_terms(&serde_json::json!({ "btc_address": "bc1qexample" }), 100_000, None).is_err());
+        assert!(check_order_terms(&serde_json::json!({ "sats": "100000", "btc_address": "bc1qexample" }), 100_000, None).is_err());
+        assert!(check_order_terms(&serde_json::json!({ "sats": 100_000 }), 100_000, None).is_err());
+    }
+
+    #[test]
+    fn a_damaged_settings_file_never_turns_tor_off() {
+        // Parses: used as written.
+        let full = serde_json::to_string(&Settings { tor_enabled: true, ..Settings::default() }).unwrap();
+        assert!(settings_from_str(&full).tor_enabled);
+        // Valid JSON that is not a Settings (a field of the wrong type): Tor stays on.
+        let s = settings_from_str(r#"{"node_url": 7, "tor_enabled": true, "tor_proxy": "socks5://127.0.0.1:9150"}"#);
+        assert!(s.tor_enabled);
+        assert_eq!(s.tor_proxy, "socks5://127.0.0.1:9150");
+        // A truncated write that is not JSON at all: the flag is still honoured.
+        assert!(settings_from_str(r#"{"node_url":"https://rpc.example", "tor_enabled" : true, "tor_pro"#).tor_enabled);
+        // Nothing says Tor was on: the defaults apply.
+        assert_eq!(settings_from_str("garbage").tor_enabled, Settings::default().tor_enabled);
+        assert!(!settings_from_str(r#"{"node_url": 7, "tor_enabled": false}"#).tor_enabled);
+    }
+
+    #[test]
+    fn an_unreadable_coin_store_is_set_aside_not_overwritten() {
+        let dir = std::env::temp_dir().join(format!("zc-preserve-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let d = dir.to_str().unwrap();
+        std::fs::write(coins_path(d), b"not a coin store").unwrap();
+        let (account, phrase) = keys::new_account();
+        let mut w = Wallet::fresh(account, Zeroizing::new(phrase));
+        load_state(&mut w, d);
+        assert!(!coins_path(d).exists(), "the unreadable store is no longer where a save would overwrite it");
+        let kept: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".unreadable-"))
+            .collect();
+        assert_eq!(kept.len(), 1, "one copy kept beside it");
+        assert_eq!(std::fs::read(kept[0].path()).unwrap(), b"not a coin store");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

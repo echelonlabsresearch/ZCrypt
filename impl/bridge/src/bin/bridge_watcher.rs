@@ -55,7 +55,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use zcrypt_bridge::watcher::{
-    btc_rpc_url_policy, finalize_margin_policy, fresh_state_guard, previous_reserve_keys_from_env, reserve_key_from_env, seed_cursor,
+    btc_rpc_url_policy, zc_rpc_url_policy, finalize_margin_policy, fresh_state_guard, previous_reserve_keys_from_env, reserve_key_from_env, seed_cursor,
     watcher_tick_persisting, FeeBumper, InstanceLock, WatcherState, SCAN_BLOCKS_PER_TICK, SCAN_PERSIST_EVERY,
 };
 use zcrypt_bridge::zcrypt::Zcrypt;
@@ -112,9 +112,17 @@ fn main() {
     };
     let keys = swap::ReserveKeys { current: &reserve, previous: &previous };
 
-    let zc = Zcrypt::new(&env("ZC_URL", "http://localhost:36657"));
+    let zc_url = env("ZC_URL", "http://localhost:36657");
+    let zc = Zcrypt::new(&zc_url);
     let btc_url = env("BTC_URL", "http://localhost:18443");
-    let net = zcrypt_bridge::network_from_str(&env("BTC_NETWORK", "regtest"));
+    // A typo here must not fall back to regtest (every safety margin off): refuse it.
+    let net = match zcrypt_bridge::network_from_str_strict(&env("BTC_NETWORK", "regtest")) {
+        Ok(n) => n,
+        Err(e) => {
+            eprintln!("[bridge-watcher] BTC_NETWORK: {e}");
+            std::process::exit(2);
+        }
+    };
     if matches!(net, bitcoin::Network::Testnet | bitcoin::Network::Testnet4) {
         eprintln!("[bridge-watcher] BTC_NETWORK testnet: served with the SIGNET safety profile (no regtest shortcuts)");
     }
@@ -124,6 +132,19 @@ fn main() {
     if let Err(e) = btc_rpc_url_policy(net, &btc_url, allow_public) {
         eprintln!("[bridge-watcher] {e}");
         std::process::exit(2);
+    }
+    // Startup invariant: on a real network the ZCrypt RPC must be the operator's own node
+    // over a private path (see `zc_rpc_url_policy`).
+    let allow_public_zc = matches!(env("ZCRYPT_ZC_RPC_ALLOW_PUBLIC", "0").trim(), "1" | "true" | "yes");
+    if let Err(e) = zc_rpc_url_policy(net, &zc_url, allow_public_zc) {
+        eprintln!("[bridge-watcher] {e}");
+        std::process::exit(2);
+    }
+    if net != bitcoin::Network::Regtest && env("BTC_USER", "zcrypt") == "zcrypt" && env("BTC_PASS", "zcrypt") == "zcrypt" {
+        eprintln!(
+            "[bridge-watcher] WARNING: the bitcoind RPC uses the default zcrypt/zcrypt credentials on {net:?}. \
+             This wallet holds the reserve: set BTC_USER and BTC_PASS to a private, random pair."
+        );
     }
     let wallet = env("BTC_WALLET", "operator");
     let _ = Btc::ensure_wallet(&btc_url, &env("BTC_USER", "zcrypt"), &env("BTC_PASS", "zcrypt"), &wallet);

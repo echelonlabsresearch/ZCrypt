@@ -132,6 +132,49 @@ pub fn parse_rfc3339_secs(s: &str) -> Result<u64, String> {
 
 const B64: base64::engine::general_purpose::GeneralPurpose = base64::engine::general_purpose::STANDARD;
 
+/// The per-tx delivery result codes of a CometBFT `block_results` response, in block order.
+/// A result object with no `code` field is code 0 (the proto3 default); anything that is
+/// not a result object is an error, so a malformed answer never reads as "all succeeded".
+fn delivered_codes(block_results: &Value, height: i64) -> Result<Vec<i64>, String> {
+    if let Some(msg) = block_results["error"]["data"].as_str().or_else(|| block_results["error"]["message"].as_str()) {
+        return Err(format!("block_results {height}: {msg}"));
+    }
+    let Some(results) = block_results["result"]["txs_results"].as_array() else {
+        return Err(format!("block_results {height}: no txs_results in RPC response"));
+    };
+    results
+        .iter()
+        .map(|res| {
+            if !res.is_object() {
+                return Err(format!("block_results {height}: malformed tx result"));
+            }
+            match &res["code"] {
+                Value::Null => Ok(0),
+                c => c.as_i64().ok_or_else(|| format!("block_results {height}: malformed result code")),
+            }
+        })
+        .collect()
+}
+
+/// Decode a block's base64 txs and keep the ones whose delivery code is 0. The two lists
+/// must be the same length and every tx must decode: a mismatch is an error, not a skip.
+fn delivered_txs(raw: &[Value], codes: &[i64], height: i64) -> Result<Vec<Vec<u8>>, String> {
+    if raw.len() != codes.len() {
+        return Err(format!("block {height}: {} txs but {} results", raw.len(), codes.len()));
+    }
+    let mut out = Vec::with_capacity(raw.len());
+    for (t, code) in raw.iter().zip(codes) {
+        let bytes = t
+            .as_str()
+            .and_then(|s| B64.decode(s).ok())
+            .ok_or_else(|| format!("block {height}: undecodable tx in RPC response"))?;
+        if *code == 0 {
+            out.push(bytes);
+        }
+    }
+    Ok(out)
+}
+
 pub struct Zcrypt {
     url: String,
 }
@@ -231,8 +274,14 @@ impl Zcrypt {
             .ok_or_else(|| "no height".to_string())
     }
 
-    /// All raw txs in a block (decoded). Transport/JSON failures return `Err` so callers
-    /// do not treat an unreachable node as an empty block (which would skip settlements).
+    /// The raw txs of a block that consensus DELIVERED SUCCESSFULLY (result code 0), decoded.
+    ///
+    /// A block can also carry txs that failed at delivery. Those changed no state, so
+    /// the bridge reads only the ones consensus applied.
+    ///
+    /// Transport/JSON failures, and a results list that does not line up with the block,
+    /// return `Err`, so callers never treat an unreachable or inconsistent node as an
+    /// empty block (which would skip settlements).
     pub fn block_txs(&self, height: i64) -> Result<Vec<Vec<u8>>, String> {
         let u = format!("{}/block?height={}", self.url, height);
         let b: Value = self
@@ -245,13 +294,20 @@ impl Zcrypt {
         if b["result"]["block"].is_null() {
             return Err(format!("block {height}: missing block in RPC response"));
         }
-        Ok(b["result"]["block"]["data"]["txs"]
-            .as_array()
-            .cloned()
-            .unwrap_or_default()
-            .iter()
-            .filter_map(|t| t.as_str().and_then(|s| B64.decode(s).ok()))
-            .collect())
+        let raw = b["result"]["block"]["data"]["txs"].as_array().cloned().unwrap_or_default();
+        if raw.is_empty() {
+            return Ok(Vec::new());
+        }
+        let ru = format!("{}/block_results?height={}", self.url, height);
+        let r: Value = self
+            .agent()
+            .get(&ru)
+            .call()
+            .map_err(|e| format!("block_results {height}: {e}"))?
+            .into_json()
+            .map_err(|e| format!("block_results {height} json: {e}"))?;
+        let codes = delivered_codes(&r, height)?;
+        delivered_txs(&raw, &codes, height)
     }
 
     /// The BFT time (unix seconds) of ZC block `height`, from the CometBFT block header.
@@ -319,7 +375,31 @@ impl Zcrypt {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_rfc3339_secs;
+    use super::{delivered_codes, delivered_txs, parse_rfc3339_secs, B64};
+    use base64::Engine;
+    use serde_json::json;
+
+    #[test]
+    fn block_txs_keeps_only_delivered_txs() {
+        let raw = vec![json!(B64.encode([0x64, 1])), json!(B64.encode([0x64, 2])), json!(B64.encode([0x64, 3]))];
+        // The middle tx failed at delivery; the last has no `code` field (proto3 default 0).
+        let results = json!({"result": {"txs_results": [{"code": 0}, {"code": 7, "log": "already minted"}, {"log": ""}]}});
+        let codes = delivered_codes(&results, 9).unwrap();
+        assert_eq!(codes, vec![0, 7, 0]);
+        assert_eq!(delivered_txs(&raw, &codes, 9).unwrap(), vec![vec![0x64, 1], vec![0x64, 3]]);
+    }
+
+    #[test]
+    fn block_txs_fails_closed_on_inconsistent_results() {
+        let raw = vec![json!(B64.encode([1])), json!(B64.encode([2]))];
+        // Fewer results than txs: never read as "the rest succeeded".
+        assert!(delivered_txs(&raw, &[0], 9).is_err());
+        assert!(delivered_codes(&json!({"result": {"txs_results": null}}), 9).is_err());
+        assert!(delivered_codes(&json!({"result": {"txs_results": [null]}}), 9).is_err());
+        assert!(delivered_codes(&json!({"result": {"txs_results": [{"code": "0"}]}}), 9).is_err());
+        assert!(delivered_codes(&json!({"error": {"message": "height must be less than current"}}), 9).is_err());
+        assert!(delivered_txs(&[json!("%%%")], &[0], 9).is_err());
+    }
 
     #[test]
     fn rfc3339_parses_cometbft_header_times() {
