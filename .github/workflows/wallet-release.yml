@@ -172,7 +172,7 @@ jobs:
           notes=$(cat <<EOF
           ZCrypt Wallet ${TAG}
 
-          Desktop installers built from this tag. The macOS DMG is Developer ID signed, notarized, and stapled. Windows ships an MSI, Authenticode-signed through Azure Artifact Signing when the release was built with the signing secrets. Linux ships a .deb and an AppImage. Verify every file against SHA256SUMS before opening it.
+          Desktop installers built from this tag. The macOS DMG is Developer ID signed, notarized, and stapled. Windows ships an MSI, Authenticode-signed through Azure Artifact Signing when the release was built with the signing secrets. Linux ships a .deb and an AppImage. Verify every file against SHA256SUMS before opening it. To check that a file was built by this repository's release workflow from this tag: gh attestation verify FILE --repo ${GITHUB_REPOSITORY}
 
           This tag also publishes the ABCI image. The wallet build does not enable the devnet feature.
 
@@ -489,6 +489,10 @@ jobs:
     needs: [prepare, build]
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    permissions:
+      contents: write
+      id-token: write       # Sigstore signing identity for the attestation
+      attestations: write
     steps:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
@@ -549,3 +553,14 @@ jobs:
             fi
           done < SHA256SUMS
           gh release upload "$TAG" SHA256SUMS --clobber
+
+      # Build provenance: a Sigstore-signed statement, recorded in a public
+      # transparency log, that each installer hash in SHA256SUMS came out of this
+      # workflow, in this repository, at this commit. Anyone can check a download:
+      #   gh attestation verify <file> --repo <owner>/<repo>
+      # It says where the file was built and from which commit. It does not make
+      # the build reproducible.
+      - name: Attest the installers
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-checksums: SHA256SUMS

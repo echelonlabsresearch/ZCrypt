@@ -181,6 +181,22 @@ workflow header lists them); an unsigned MSI trips Defender's reputation check, 
 set them before a public release. Publish the draft after checking the assets.
 There is no auto-update channel.
 
+### Checking a download
+
+Each installer carries three separate assurances:
+
+- **Who published it.** The macOS DMG is Developer ID signed and notarized, and the Windows MSI is Authenticode-signed. The operating system checks this when the file is opened.
+- **That the file is intact.** `SHA256SUMS` on the release lists the hash of every installer: `shasum -a 256 -c SHA256SUMS`.
+- **Where it was built, and from which commit.** For releases after 0.2.7, the release workflow records a build provenance attestation for every hash in `SHA256SUMS`. It is signed through Sigstore with the workflow's own identity and written to a public transparency log. With the GitHub CLI:
+
+  ```bash
+  gh attestation verify ZCrypt.Wallet_X.Y.Z_aarch64.dmg --repo echelonlabsresearch/ZCrypt
+  ```
+
+  The output names the workflow file, the tag, and the commit the file was built from.
+
+The attestation proves the installer came out of GitHub's runner for that commit. It is not a reproducible build: compiling the same commit on another machine does not give a byte-identical file, because the macOS and Windows signatures and the notarization ticket are part of it.
+
 A release that already went out with an unstapled image can be repaired without a
 rebuild. Stapling changes the file, so the repair rewrites the DMG lines in
 `SHA256SUMS`:
