@@ -2332,6 +2332,34 @@ mod scan_tests {
     }
 
     #[test]
+    fn change_that_is_not_a_leaf_yet_counts_as_confirming_not_as_missing() {
+        // A bearer file first spends the largest coin for its 0.01 gas coin. The change is
+        // nearly the whole coin; until it is a leaf the send that follows must wait for it.
+        let (acct, _m) = keys::new_account();
+        let settled = acct.own_coin(102_743, keys::random_blind());
+        let change = acct.own_coin(93_012, keys::random_blind());
+        let old_phantom = acct.own_coin(7, keys::random_blind());
+        let mut spent_change = CoinRec::new(acct.own_coin(11, keys::random_blind()), 5_000);
+        spent_change.spent = true;
+        let coins = vec![
+            CoinRec::observed(settled, Some(0), 10),
+            CoinRec::new(change, 5_000),
+            CoinRec::new(old_phantom, 5_000 - RECONCILE_GRACE_BLOCKS),
+            spent_change,
+        ];
+        let before = vec![settled.commitment()];
+        let asset = zcrypt_shield::ASSET_ZCRYPT;
+        assert_eq!(confirming_asset_value(&coins, &before, asset, 5_000), 93_012);
+        // Another asset has nothing on its way.
+        assert_eq!(confirming_asset_value(&coins, &before, asset + 1, 5_000), 0);
+        // Once the change is a leaf it is ordinary balance.
+        let after = vec![settled.commitment(), change.commitment()];
+        assert_eq!(confirming_asset_value(&coins, &after, asset, 5_000), 0);
+        // Past the grace window an absent coin is a phantom, not money on its way.
+        assert_eq!(confirming_asset_value(&coins, &before, asset, 5_000 + RECONCILE_GRACE_BLOCKS), 0);
+    }
+
+    #[test]
     fn claim_counters_do_not_double_advance_across_gap_walk_passes() {
         // N2: two passes over the SAME blocks, both seeded from the pre-scan snapshot, must
         // agree; seeding pass 2 from pass 1's output (the old behaviour) doubles the counter.
@@ -2364,6 +2392,45 @@ mod scan_tests {
         // wallet reconstruct later claims at the wrong indices.
         let p2_bug = scan_pass(&blocks, &keys, &leaves, &known, &own_nf, &[], &p1.claim_counters, &p1.fee_claim_counters, &|_| {});
         assert!(p2_bug.claim_counters.get(&key).copied().unwrap() > chunks.len() as u64);
+    }
+
+    #[test]
+    fn a_seed_restore_finds_reward_coins_claimed_with_the_indexed_form() {
+        // The wallet sends CLAIM as pk, amount, claim index (80 bytes). The scan used to
+        // match the 72-byte form only, so a restore from the seed found none of these coins.
+        use std::collections::{BTreeMap, HashMap, HashSet};
+        let (acct, _m) = keys::new_account();
+        let pk = acct.pubkey();
+        let claim = |amount: u64, index: u64| {
+            let mut tx = vec![0x58u8];
+            tx.extend_from_slice(&pk64(&pk));
+            tx.extend_from_slice(&amount.to_le_bytes());
+            tx.extend_from_slice(&index.to_le_bytes());
+            tx
+        };
+        let first = 5 * zcrypt_core::emission::ATOMIC;
+        let second = 3 * zcrypt_core::emission::ATOMIC;
+        let first_chunks = keys::claim_chunks(first, true);
+        let n1 = first_chunks.len() as u64;
+        let second_chunks = keys::claim_chunks(second, false);
+        let mut leaves: Vec<zcrypt_shield::Commitment> =
+            first_chunks.iter().enumerate().map(|(k, c)| acct.reward_coin(*c, k as u64).commitment()).collect();
+        leaves.extend(second_chunks.iter().enumerate().map(|(k, c)| acct.reward_coin(*c, n1 + k as u64).commitment()));
+        // A claim that failed at delivery (stale index) is still in its block. It minted
+        // nothing, so it must add no coin and must not move the counter.
+        let failed = claim(7 * zcrypt_core::emission::ATOMIC, 40);
+        let blocks = vec![(1i64, vec![claim(first, 0)]), (2i64, vec![failed]), (3i64, vec![claim(second, n1)])];
+        let mut by_pk = HashMap::new();
+        by_pk.insert(pk64(&pk), 0usize);
+        let keys = ScanKeys { accounts: vec![(None, acct)], by_pk, by_reward: HashMap::new(), by_delegator: HashMap::new() };
+        let seed = BTreeMap::new();
+        let out = scan_pass(&blocks, &keys, &leaves, &HashSet::new(), &HashMap::new(), &[], &seed, &seed, &|_| {});
+        let total: u64 = out.coins.iter().map(|(c, _)| c.value).sum();
+        assert_eq!(out.coins.len(), first_chunks.len() + second_chunks.len());
+        assert_eq!(total, first + second);
+        assert!(out.coins.iter().all(|(_, kind)| *kind == "reward"));
+        let key = hex::encode(pk64(&pk));
+        assert_eq!(out.claim_counters.get(&key).copied(), Some(n1 + second_chunks.len() as u64));
     }
 }
 
@@ -3383,6 +3450,31 @@ fn onchain_asset_values(w: &Wallet, leaves: &[zcrypt_shield::Commitment], asset_
         .collect()
 }
 
+/// How long `ensure_spendable` waits for the wallet's own fresh coins to show up as leaves:
+/// 20 tries, 1.5 s apart (30 blocks at 1 s blocks).
+const CONFIRM_WAIT_TRIES: u32 = 20;
+const CONFIRM_WAIT_MS: u64 = 1_500;
+
+/// Value of `asset_id` this wallet created itself and has not yet seen as a leaf: unspent,
+/// absent from the leaf snapshot, never observed, and younger than the reconcile grace
+/// window. These are the change and self-sent coins of a transaction that just committed.
+/// An older coin that is still not a leaf is a phantom the reconcile will drop, not money
+/// on its way, so it does not count.
+fn confirming_asset_value(coins: &[CoinRec], leaves: &[zcrypt_shield::Commitment], asset_id: u64, tip: i64) -> u64 {
+    coins
+        .iter()
+        .filter(|c| {
+            !c.spent
+                && c.coin.asset_id == asset_id
+                && c.value <= MAX_COIN
+                && c.leaf_index.is_none()
+                && !stale_droppable(c, tip)
+                && chain::find_index(leaves, &c.coin.commitment()).is_none()
+        })
+        .map(|c| c.value)
+        .sum()
+}
+
 /// Reshape a wallet's coins so a send of `amount` of `asset_id` can succeed, by running
 /// automatic self-transfers (split/consolidate) until the shape is right. The user never
 /// sees this — it just runs before the actual send. Bounded so it can never loop forever;
@@ -3394,7 +3486,9 @@ fn ensure_spendable(asset_id: u64, amount: u64, state: &State<AppState>) -> Resu
         let w = g.as_ref().ok_or("locked")?;
         w.account.normal_address().to_bech32()
     };
-    for _ in 0..12 {
+    let mut reshapes = 0u32;
+    let mut waits = 0u32;
+    loop {
         let url = node_url(state)?;
         let leaves = chain::fetch_leaves(&url)?;
         // Non-ZCRYPT sends need a separate ZCRYPT coin for gas — check it exists.
@@ -3418,7 +3512,31 @@ fn ensure_spendable(asset_id: u64, amount: u64, state: &State<AppState>) -> Resu
         match reshape_plan(&vals, is_zcrypt, amount, GAS_FEE) {
             ReshapePlan::Ready => return Ok(()),
             ReshapePlan::Insufficient => {
+                // A send that ran a moment ago (the gas coin of a bearer file is one) spends
+                // the largest coin and returns nearly all of it as change. Until that change
+                // is in the leaf snapshot it does not count above, so the balance looks short
+                // by the size of the wallet's biggest coin. Wait for it instead of refusing.
+                let confirming = {
+                    let tip = chain::node_height(&url).unwrap_or(i64::MAX);
+                    let g = state.wallet.lock().unwrap();
+                    let w = g.as_ref().ok_or("locked")?;
+                    confirming_asset_value(&w.coins, &leaves, asset_id, tip)
+                };
+                if confirming > 0 && waits < CONFIRM_WAIT_TRIES {
+                    waits += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(CONFIRM_WAIT_MS));
+                    continue;
+                }
                 let total: u64 = vals.iter().sum();
+                if confirming > 0 {
+                    return Err(format!(
+                        "{:.6} of this asset from your last transaction is still confirming, and the {:.6} \
+                         already confirmed does not cover this transfer{}. Nothing is lost. Refresh, then retry.",
+                        confirming as f64 / 1e6,
+                        total as f64 / 1e6,
+                        if is_zcrypt { " (including the 0.01 gas)" } else { "" }
+                    ));
+                }
                 return Err(format!(
                     "insufficient balance: you have {:.6} of this asset on-chain but the transfer{} \
                      needs more. Receive or fund more, then retry.",
@@ -3430,6 +3548,10 @@ fn ensure_spendable(asset_id: u64, amount: u64, state: &State<AppState>) -> Resu
             // Uses the RAW send (no nested reshape) — the plan guarantees this self-send
             // is already coverable by the current coins.
             ReshapePlan::SelfSend(s) => {
+                if reshapes == 12 {
+                    break;
+                }
+                reshapes += 1;
                 do_shield_send_raw(&self_addr, s, asset_id, state, false, true)?;
                 // Pick up the self-sent coin (its note is on-chain, addressed to us).
                 if state.index_job.lock().unwrap_or_else(|e| e.into_inner()).running {
@@ -4145,6 +4267,32 @@ fn scan_pass(
                             add_coin(&mut out, &mut known, &mut own_nf, coin, "reward", true);
                         }
                         out.claim_counters.insert(key, start + chunks.len() as u64);
+                        seen_idx(&mut out, pk_at(i));
+                    }
+                }
+                // claim with its nonce: pk(64) amount(8) claim_index(8). This is the form
+                // the wallet has sent since the index was added. Consensus refuses an index
+                // that is not the key's next reward-coin index, so a claim that landed
+                // minted its coins at exactly `index..`. A claim that failed at delivery is
+                // still in its block: its coins are not leaves, and it moves nothing here.
+                0x58 if body.len() == 80 => {
+                    let pk: [u8; 64] = body[0..64].try_into().unwrap();
+                    if let Some(&i) = keys.by_pk.get(&pk) {
+                        let amount = u64::from_le_bytes(body[64..72].try_into().unwrap());
+                        let start = u64::from_le_bytes(body[72..80].try_into().unwrap());
+                        let chunks = keys::claim_chunks(amount, start == 0);
+                        let mut landed = false;
+                        for (k, chunk) in chunks.iter().enumerate() {
+                            let coin = keys.accounts[i].1.reward_coin(*chunk, start.saturating_add(k as u64));
+                            landed |= leaf_set.contains(&coin.commitment());
+                            add_coin(&mut out, &mut known, &mut own_nf, coin, "reward", true);
+                        }
+                        if landed {
+                            let key = hex::encode(pk);
+                            let next = start.saturating_add(chunks.len() as u64);
+                            let counter = out.claim_counters.entry(key).or_insert(0);
+                            *counter = (*counter).max(next);
+                        }
                         seen_idx(&mut out, pk_at(i));
                     }
                 }

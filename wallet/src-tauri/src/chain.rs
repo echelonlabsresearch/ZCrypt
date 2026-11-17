@@ -654,8 +654,27 @@ fn node_leaf_at(url: &str, idx: usize) -> Option<Commitment> {
 pub fn fetch_leaves(url: &str) -> Result<Vec<Commitment>, String> {
     use std::sync::Mutex;
     static CACHE: Mutex<Vec<Commitment>> = Mutex::new(Vec::new());
-    let count = commitment_count(url).unwrap_or(0);
+    // The size query is retried: one throttled or dropped request must not decide what
+    // the wallet believes is on chain.
+    let mut count = commitment_count(url);
+    for pause_ms in [400u64, 1_200] {
+        if count.is_ok() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(pause_ms));
+        count = commitment_count(url);
+    }
     let mut cache = CACHE.lock().map_err(|_| "leaf cache lock".to_string())?;
+    let count = match count {
+        Ok(n) => n,
+        // Nothing cached (first use, or an old node without the size query): the full
+        // dump below is the fallback.
+        Err(_) if cache.is_empty() => 0,
+        // With a cache in hand, a failed size query used to return the cache as if it were
+        // the current tree. A coin created since the last sync then looked absent from the
+        // chain, and a send was refused as "insufficient balance". Say what happened.
+        Err(e) => return Err(format!("could not read the commitment tree size from the node: {e}")),
+    };
     // Drop a stale cache. The tree is append-only, so a committed leaf never changes; the
     // cache is invalid if either the tree shrank (count < cached length), OR the node's leaf
     // at our last cached index no longer matches ours. The second case catches a devnet reset
