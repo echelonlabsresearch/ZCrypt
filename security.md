@@ -122,7 +122,7 @@ ids bind the escrow kind and refund key, timed-out escrows expire in consensus,
 and every escrow transaction's delivery rules are mirrored at mempool admission. The full product surface runs as an
 end-to-end test against a live 3-validator network in CI.
 
-## Audit history and how to report
+## Reporting a vulnerability
 
 * **Reporting.** Send vulnerability reports to security@zcrypt.network
   or open a private security advisory on the repository. Please do not file 

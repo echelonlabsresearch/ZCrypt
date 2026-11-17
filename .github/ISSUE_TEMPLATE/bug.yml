@@ -1,0 +1,41 @@
+name: Bug report
+description: Something in the node, the wallet, the bridge, or the explorer does not work as documented.
+labels: [bug]
+body:
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      options:
+        - Wallet (desktop)
+        - Wallet (phone)
+        - Node or validator
+        - Bridge or Buy
+        - Explorer
+        - Docs
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Wallet version from Settings, or the commit or image digest of the node.
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened, and what you expected
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: Never paste a seed phrase, a password, a coin file, or a key.
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: Operating system

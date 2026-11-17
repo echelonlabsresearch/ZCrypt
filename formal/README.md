@@ -103,7 +103,7 @@ guards over cleartext witness values, modeled at N_IN = N_OUT = 2).
 > ZCRYPT gas burn of a native transfer). The Lean model and the Charon extract still fix
 > two outputs. The conservation and range arguments do not depend on the output count
 > (they sum over the slots), but the models have not been re-run at three; re-deriving
-> them is open work, recorded in `FORMAL-VERIFICATION-SCOPE.md`.
+> them is open work, recorded in `../docs/FORMAL-VERIFICATION-SCOPE.md`.
 
 - `no_inflation`: an accepted transfer never outputs more value than it consumed.
 - `conservation_exact`: acceptance is exactly integer conservation (no axioms at all).
@@ -131,7 +131,7 @@ These theorems formalize the MATHEMATICS of the constraints (the soundness argum
 the audit made informally). They are a hand-model of the Rust, not an automatic
 extraction of it. Linking this model to the actual Rust source automatically is the
 separate Charon (Rust to LLBC) then Aeneas (LLBC to Lean) step described in
-`../FORMAL-VERIFICATION-SCOPE.md`. That extraction is a from-source, multi-hour toolchain
+`../docs/FORMAL-VERIFICATION-SCOPE.md`. That extraction is a from-source, multi-hour toolchain
 build that then meets the documented limitation: the shield AIR and even the VM helpers
 (`commit_asset`, `nullifier_asset`, `spend_pubkey`) call Poseidon2 from an external crate
 and are heavily generic over the `AirBuilder` trait, which the current extractors do not

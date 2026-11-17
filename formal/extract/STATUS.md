@@ -85,5 +85,5 @@ Aeneas stdlib. Reproduce: `cd proof && ~/.elan/bin/lake build Proof`.
 
 `charon cargo` on `impl/shield` still stack-overflows on the Plonky3 generic/external code.
 Extracting the AIR itself needs that code refactored or Hax's annotation-driven path: the
-scoped engagement in `../../FORMAL-VERIFICATION-SCOPE.md`. The value-integrity spec, which
+scoped engagement in `../../docs/FORMAL-VERIFICATION-SCOPE.md`. The value-integrity spec, which
 is what the soundness theorems are about, is fully covered above.

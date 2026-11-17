@@ -1,0 +1,40 @@
+# Dependabot.
+#
+# Actions are pinned by commit SHA, so they only move when something bumps them:
+# a weekly grouped pull request into testnet does that.
+#
+# Cargo and npm version bumps are not opened automatically (limit 0). A dependency
+# change in the node can be consensus-relevant and is made by hand. With the limit
+# at 0 Dependabot still opens pull requests for security advisories, once
+# "Dependabot security updates" is on in the repository settings.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    target-branch: testnet
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]
+
+  - package-ecosystem: cargo
+    directory: /impl
+    target-branch: testnet
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 0
+
+  - package-ecosystem: cargo
+    directory: /wallet/src-tauri
+    target-branch: testnet
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 0
+
+  - package-ecosystem: npm
+    directory: /wallet
+    target-branch: testnet
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 0
