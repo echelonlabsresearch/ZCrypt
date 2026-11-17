@@ -87,7 +87,7 @@ The watcher refuses a plain-http `BTC_URL` to a public address; that is intended
 ```sh
 ssh root@<vps>
 cd /root/ZCrypt
-git fetch && git checkout main && git pull            # must include native gas (b46455d or later)
+git fetch && git checkout mainnet && git pull            # must include native gas (b46455d or later)
 cd chain
 cp .env .env.zcrypt-1.bak                             # keep the old values for reference
 chown 10001:10001 secrets/reserve.key && chmod 600 secrets/reserve.key   # the watcher's uid
@@ -166,9 +166,11 @@ curl -s https://rpc.zcrypt.network/status | grep -o '"network":"[^"]*"'
 
 ## 7. Publish for joiners
 
-Validators run the node image by digest, so after the relaunch:
+After the relaunch:
 
-1. Tag a release (`git tag v0.1.2-alpha && git push origin v0.1.2-alpha`). The tag builds
+1. Tag a release on the `mainnet` commit that shipped, after the `testnet` pull request
+   has merged (`git checkout mainnet && git pull && git tag -a vX.Y.Z -m vX.Y.Z && git push origin vX.Y.Z`).
+   The release workflow refuses a tag that is not on `mainnet`. The tag builds
    the wallet installers as a draft release and publishes the ABCI image to ghcr with a
    cosign signature.
 2. Publish the wallet draft once the installers are checked.

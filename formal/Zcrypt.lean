@@ -22,7 +22,7 @@
 
   These formalize the MATHEMATICS of the constraints (the soundness argument). Linking
   this model to the actual Rust automatically is the separate Charon/Aeneas extraction
-  step (see FORMAL-VERIFICATION-SCOPE.md).
+  step (see docs/FORMAL-VERIFICATION-SCOPE.md).
 -/
 import Zcrypt.Spec
 import Zcrypt.Air.Field

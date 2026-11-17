@@ -30,7 +30,6 @@ __pycache__/
 # OS / editor / local tooling
 .DS_Store
 .tmp/
-.claude/
 .vscode/
 .idea/
 

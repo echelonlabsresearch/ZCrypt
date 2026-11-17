@@ -1,5 +1,9 @@
 # ZCrypt
 
+[![CI](https://github.com/echelonlabsresearch/ZCrypt/actions/workflows/ci.yml/badge.svg?branch=mainnet)](https://github.com/echelonlabsresearch/ZCrypt/actions/workflows/ci.yml?query=branch%3Amainnet)
+[![Latest release](https://img.shields.io/github/v/release/echelonlabsresearch/ZCrypt)](https://github.com/echelonlabsresearch/ZCrypt/releases/latest)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 ZCrypt is a shielded chain you can use without a centralized exchange.
 
 The native coin is ZCRYPT. On top of it, anyone can issue an asset into the same pool, swap that asset for ZCRYPT or for any other asset on the chain, and hand the result to someone as a file. A payment does not publish who paid whom, which asset moved, or how much. The market for those assets is part of the protocol. It does not live on a website that can delist you.
@@ -90,4 +94,4 @@ The desktop wallet is in [`wallet/`](wallet/). On Receive, drop a bearer file or
 | Run a node or a validator | [running.md](running.md), [chain/README-validator.md](chain/README-validator.md) |
 | The explorer | [impl/explorer/README.md](impl/explorer/README.md) |
 
-License: MIT (`impl/Cargo.toml`). Vulnerability reports go to security@zcrypt.network.
+License: [MIT](LICENSE). Vulnerability reports go to security@zcrypt.network.
