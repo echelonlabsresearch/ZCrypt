@@ -157,9 +157,37 @@ jobs:
           node-version: 20
       - name: npm audit (wallet frontend)
         working-directory: wallet
+        # A high or critical advisory fails the job unless it is listed here with a reason,
+        # the same way deny.toml lists the cargo ones. Remove an entry once a fixed release
+        # exists.
+        #   GHSA-fc5q-39xc-vjpf: picomatch ReDoS on a crafted glob. No fixed release yet
+        #   (every version up to 4.0.7 is affected). It is a build-time dependency of Vite,
+        #   which only globs this repository's own files, and it is not in the shipped app.
+        #   The other way out, Vite 6.2, brings back the dev-server file-read advisories.
+        env:
+          NPM_AUDIT_IGNORE: GHSA-fc5q-39xc-vjpf
         run: |
           npm ci --ignore-scripts
-          npm audit --audit-level=high
+          npm audit --omit=dev --audit-level=high
+          npm audit --json > "$RUNNER_TEMP/npm-audit.json" || true
+          node -e '
+            const report = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"));
+            if (!report.vulnerabilities) { console.error("npm audit gave no report"); process.exit(1); }
+            const ignore = new Set((process.env.NPM_AUDIT_IGNORE || "").split(/[\s,]+/).filter(Boolean));
+            const found = new Map();
+            for (const v of Object.values(report.vulnerabilities))
+              for (const a of v.via)
+                if (typeof a === "object" && ["high", "critical"].includes(a.severity))
+                  found.set(a.url.split("/").pop(), `${a.severity}: ${a.name} ${a.range}: ${a.title}`);
+            let bad = 0;
+            for (const [id, line] of found) {
+              const skip = ignore.has(id);
+              console.log(`${skip ? "ignored" : "FAIL   "} ${id} ${line}`);
+              if (!skip) bad++;
+            }
+            for (const id of ignore) if (!found.has(id)) console.log(`stale ignore entry: ${id} is no longer reported, remove it`);
+            process.exit(bad ? 1 : 0);
+          ' "$RUNNER_TEMP/npm-audit.json"
 
   wallet:
     name: Wallet (frontend build + backend test)
