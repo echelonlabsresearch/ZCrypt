@@ -59,6 +59,9 @@ Point the wallet at your node in **Settings → Consensus Node** (default
   other asset goes as a `0x55` bundle with a separate ZCRYPT gas note.
 - **Refresh** → scans new blocks, trial-decrypts on-chain notes to find incoming
   coins, and marks spent coins by checking the nullifier registry.
+  On the phone a restore shows the first sync full screen and resumes it if the
+  connection drops; Home says when a scan stopped short, and every payment first brings
+  the wallet up to date so a coin spent from another device is not offered again.
 
 Verified end-to-end against the live chain: fund → hidden send → scan/receive →
 double-spend rejection (see `scratchpad/onchain-e2e`). Requires the node to be
@@ -132,6 +135,13 @@ password is a random device secret that is kept sealed under the PIN in `pin.jso
 biometrics are on, in the iOS Keychain. The Face ID sheet is raised from Rust
 (`tauri-plugin-biometric`), so the webview never sees the secret. Five wrong PINs start a
 30 s lockout that doubles. Opening the app, and every payment, needs Face ID or the PIN.
+On iOS two Keychain items back this up. `pin.json` is encrypted a second time under a
+random key that stays on the device, so a copy of the file (a backup, a file dump) cannot
+be used to try all one million PINs. The Face ID copy of the secret is bound to the
+enrolled biometrics: the system asks for Face ID when the item is read and refuses
+otherwise, and enrolling a new face or finger voids it until the PIN switches it on again.
+A backup restored onto another phone therefore opens with the recovery phrase, not the
+PIN. Android does not have the second layer on `pin.json` yet.
 A wallet created with a password by an earlier build is adopted on first launch: the
 password is asked once and replaced by the PIN. Commands: `mobile_auth_status`,
 `mobile_create`, `mobile_adopt`, `mobile_unlock`, `mobile_confirm`, `mobile_set_biometric`,

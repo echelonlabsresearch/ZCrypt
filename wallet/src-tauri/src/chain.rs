@@ -215,6 +215,143 @@ pub fn node_height(url: &str) -> Result<i64, String> {
         .unwrap_or(0))
 }
 
+/// A scan of fewer blocks than this dates what it finds with the phone's clock.
+pub const CLOCK_MIN_RANGE: i64 = 600;
+/// A stretch longer than this is always split, however even the chain's pace looks.
+const CLOCK_ALWAYS_SPLIT: i64 = 100_000;
+/// A stretch this short is not split further.
+const CLOCK_MIN_SPAN: i64 = 300;
+/// Split a stretch when its midpoint is further than this from a straight line, seconds.
+const CLOCK_TOLERANCE_S: u64 = 60;
+/// The most headers one clock reads.
+const CLOCK_MAX_READS: usize = 64;
+
+/// Block times over a height range, for dating coins a scan finds in old blocks.
+///
+/// Asking the node for the header of each block that paid this wallet would tell it which
+/// blocks those are. The clock reads the two ends of the range and then midpoints, splitting
+/// wherever the chain did not run at an even pace, so the heights it asks for depend only on
+/// the chain. Times in between are interpolated.
+#[derive(Default)]
+pub struct HeightClock {
+    /// (height, Unix seconds), ascending by height.
+    anchors: Vec<(i64, u64)>,
+}
+
+impl HeightClock {
+    /// The time of the block at `height`, or `None` when the clock has nothing to go on.
+    pub fn at(&self, height: i64) -> Option<u64> {
+        let (first, last) = (self.anchors.first()?, self.anchors.last()?);
+        if height <= first.0 {
+            return Some(first.1);
+        }
+        if height >= last.0 {
+            return Some(last.1);
+        }
+        let i = self.anchors.partition_point(|(h, _)| *h <= height);
+        let ((a, ta), (b, tb)) = (self.anchors[i - 1], self.anchors[i]);
+        Some(clock_between(a, ta, b, tb, height))
+    }
+}
+
+/// The time at `h` on the straight line from (`a`, `ta`) to (`b`, `tb`), `a <= h <= b`.
+fn clock_between(a: i64, ta: u64, b: i64, tb: u64, h: i64) -> u64 {
+    if b <= a || tb <= ta {
+        return ta;
+    }
+    ta + ((u128::from(tb - ta) * (h - a) as u128) / (b - a) as u128) as u64
+}
+
+/// Build a clock for `[lo, hi]` with `read(height)`. If either end cannot be read the
+/// clock is empty; a midpoint that cannot be read just leaves its stretch unsplit.
+fn clock_from(lo: i64, hi: i64, read: &mut dyn FnMut(i64) -> Option<u64>) -> HeightClock {
+    let lo = lo.max(1);
+    if hi < lo {
+        return HeightClock::default();
+    }
+    let (Some(t_lo), Some(t_hi)) = (read(lo), read(hi)) else {
+        return HeightClock::default();
+    };
+    let mut anchors = vec![(lo, t_lo), (hi, t_hi)];
+    let mut reads = 2usize;
+    // Widest stretches first, so a spent budget leaves even coverage.
+    let mut queue = std::collections::VecDeque::from([(lo, t_lo, hi, t_hi)]);
+    while let Some((a, ta, b, tb)) = queue.pop_front() {
+        if b - a <= CLOCK_MIN_SPAN || reads >= CLOCK_MAX_READS {
+            continue;
+        }
+        let m = a + (b - a) / 2;
+        reads += 1;
+        let Some(tm) = read(m) else { continue };
+        anchors.push((m, tm));
+        if b - a > CLOCK_ALWAYS_SPLIT || tm.abs_diff(clock_between(a, ta, b, tb, m)) > CLOCK_TOLERANCE_S {
+            queue.push_back((a, ta, m, tm));
+            queue.push_back((m, tm, b, tb));
+        }
+    }
+    anchors.sort_unstable();
+    HeightClock { anchors }
+}
+
+/// Block times for `[lo, hi]`, read from the node. Never fails: an unreachable node gives
+/// an empty clock and the caller falls back to the time of the scan.
+pub fn height_clock(url: &str, lo: i64, hi: i64) -> HeightClock {
+    clock_from(lo, hi, &mut |h| {
+        let u = format!("{}/header?height={h}", base(url));
+        let v: Value = agent().get(&u).call().ok()?.into_json().ok()?;
+        rfc3339_unix(v["result"]["header"]["time"].as_str()?)
+    })
+}
+
+/// Unix seconds of a UTC RFC 3339 time as CometBFT writes it (`2026-11-19T12:34:56.789Z`).
+/// Fractions are dropped; anything that is not UTC is refused.
+fn rfc3339_unix(s: &str) -> Option<u64> {
+    let b = s.as_bytes();
+    if b.len() < 20 || b[4] != b'-' || b[7] != b'-' || b[10] != b'T' || b[13] != b':' || b[16] != b':' || !s.ends_with('Z') {
+        return None;
+    }
+    let n = |r: std::ops::Range<usize>| s.get(r)?.parse::<i64>().ok();
+    let (y, mo, d, h, mi, sec) = (n(0..4)?, n(5..7)?, n(8..10)?, n(11..13)?, n(14..16)?, n(17..19)?);
+    if !(1..=12).contains(&mo) || !(1..=31).contains(&d) || h > 23 || mi > 59 || sec > 60 {
+        return None;
+    }
+    // Days since 1970-01-01 in the proleptic Gregorian calendar.
+    let y = if mo <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y.rem_euclid(400);
+    let doy = (153 * (if mo > 2 { mo - 3 } else { mo + 9 }) + 2) / 5 + d - 1;
+    let days = era * 146_097 + yoe * 365 + yoe / 4 - yoe / 100 + doy - 719_468;
+    u64::try_from(days * 86_400 + h * 3_600 + mi * 60 + sec).ok()
+}
+
+#[test]
+fn rfc3339_times_parse_to_unix_seconds() {
+    assert_eq!(rfc3339_unix("1970-01-01T00:00:00Z"), Some(0));
+    assert_eq!(rfc3339_unix("2026-11-19T12:34:56.123456789Z"), Some(1_795_091_696));
+    assert_eq!(rfc3339_unix("2024-02-29T23:59:59Z"), Some(1_709_251_199));
+    assert_eq!(rfc3339_unix("2026-11-19T12:34:56+01:00"), None);
+    assert_eq!(rfc3339_unix("yesterday"), None);
+}
+
+#[test]
+fn the_clock_asks_the_same_heights_whatever_the_wallet_holds_and_finds_a_halt() {
+    // One block a second, except a two-hour halt after height 700,000.
+    let time = |h: i64| 1_000_000 + h as u64 + if h > 700_000 { 7_200 } else { 0 };
+    let mut asked = Vec::new();
+    let clock = clock_from(1, 1_000_000, &mut |h| {
+        asked.push(h);
+        Some(time(h))
+    });
+    assert!(asked.len() <= CLOCK_MAX_READS);
+    for h in [1, 5_000, 350_000, 699_000, 760_000, 999_999, 1_000_000] {
+        assert!(clock.at(h).unwrap().abs_diff(time(h)) <= 120, "height {h}");
+    }
+    // Outside the range the nearest end is used; an unreadable end gives no clock.
+    assert_eq!(clock.at(2_000_000), Some(time(1_000_000)));
+    assert!(clock_from(1, 100, &mut |_| None).at(50).is_none());
+    assert!(HeightClock::default().at(5).is_none());
+}
+
 /// CometBFT genesis chain id (`status.node_info.network`), used to bind shield proofs
 /// and staking signatures. Prefer this over a compile-time constant so multi-network
 /// binaries and genesis renames stay consistent with the node.
@@ -853,7 +990,11 @@ type IndexedTx = (i64, u32, Vec<u8>);
 
 /// Ask the node's transaction index for every transaction in `[from, to]`. `Err` means the
 /// index could not answer at all (so the caller should walk headers instead); a failure
-/// after the first page returns `Ok` with a partial, contiguous prefix and `error` set.
+/// after the first window returns `Ok` with a partial, contiguous prefix and `error` set.
+///
+/// The range is asked for in height windows, not as one query. The node answers a page by
+/// loading every transaction the query matches and then cutting the page out, so one
+/// query over the whole chain costs the whole chain again on every page.
 fn scan_blocks_indexed(url: &str, from: i64, to: i64, progress: &dyn Fn(i64, i64)) -> Result<ScanFetch, String> {
     let tip = to;
     let to = to - INDEX_LAG_BLOCKS;
@@ -861,38 +1002,93 @@ fn scan_blocks_indexed(url: &str, from: i64, to: i64, progress: &dyn Fn(i64, i64
         progress(tip, tip);
         return Ok(ScanFetch::empty(from - 1));
     }
-    // Shielded transactions are ~4 MB each on the wire (two proofs), so a page is kept
-    // to about 40 MB and given a long timeout: a page of 100 ran past 45 s and was cut
-    // off mid-body, which made the whole index look unavailable.
-    const PER_PAGE: usize = 10;
-    const PAGE_TIMEOUT_S: u64 = 240;
+    scan_windows(from, to, &mut |lo, hi| index_window(url, lo, hi), &|at| progress(at, tip))
+}
+
+/// Shielded transactions are ~4 MB each on the wire (two proofs), so a page is kept to
+/// about 40 MB and given a long timeout: a page of 100 ran past 45 s and was cut off
+/// mid-body, which made the whole index look unavailable.
+const INDEX_PER_PAGE: usize = 10;
+const INDEX_PAGE_TIMEOUT_S: u64 = 240;
+/// Window sizes, in blocks. Most blocks are empty, so the first window is wide; each next
+/// one is sized to hold about one page at the density just seen.
+const INDEX_FIRST_WINDOW: i64 = 20_000;
+const INDEX_MIN_WINDOW: i64 = 200;
+const INDEX_MAX_WINDOW: i64 = 1_000_000;
+
+/// What one window fetch failed with: the rows that did arrive, and the error.
+type WindowError = (Vec<IndexedTx>, String);
+
+/// The next window size after a window of `win` blocks returned `got` transactions: aim
+/// for one page, moving at most a factor of four per step.
+fn next_window(win: i64, got: usize) -> i64 {
+    let want = INDEX_PER_PAGE as i64;
+    let sized = win.saturating_mul(want) / (got as i64).max(1);
+    sized.clamp(win / 4, win.saturating_mul(4)).clamp(INDEX_MIN_WINDOW, INDEX_MAX_WINDOW)
+}
+
+/// Walk `[from, to]` window by window with `fetch(lo, hi)`. The first window failing is
+/// `Err` (the index is not usable). A later failure keeps every finished window, plus the
+/// whole blocks of the failed one, and stops the cursor there.
+fn scan_windows(
+    from: i64,
+    to: i64,
+    fetch: &mut dyn FnMut(i64, i64) -> Result<Vec<IndexedTx>, WindowError>,
+    progress: &dyn Fn(i64),
+) -> Result<ScanFetch, String> {
+    let mut rows: Vec<IndexedTx> = Vec::new();
+    let mut win = INDEX_FIRST_WINDOW;
+    let mut lo = from;
+    while lo <= to {
+        let hi = lo.saturating_add(win - 1).min(to);
+        match fetch(lo, hi) {
+            Ok(got) => {
+                win = next_window(win, got.len());
+                rows.extend(got);
+                progress(hi);
+                lo = hi + 1;
+            }
+            Err((_, e)) if lo == from => return Err(e),
+            Err((partial, e)) => {
+                let mut out = indexed_prefix(partial, lo, Some(format!("tx index from height {lo}: {e}")));
+                let mut blocks = group_indexed_txs(rows);
+                blocks.append(&mut out.blocks);
+                out.blocks = blocks;
+                return Ok(out);
+            }
+        }
+    }
+    let mut out = ScanFetch::empty(to);
+    out.blocks = group_indexed_txs(rows);
+    Ok(out)
+}
+
+/// Every transaction the node's index holds for heights `[lo, hi]`, page by page.
+fn index_window(url: &str, lo: i64, hi: i64) -> Result<Vec<IndexedTx>, WindowError> {
     let mut rows: Vec<IndexedTx> = Vec::new();
     let mut page = 1usize;
     loop {
         let u = format!(
-            "{}/tx_search?query=%22tx.height%3E%3D{from}%20AND%20tx.height%3C%3D{to}%22&per_page={PER_PAGE}&page={page}&order_by=%22asc%22",
+            "{}/tx_search?query=%22tx.height%3E%3D{lo}%20AND%20tx.height%3C%3D{hi}%22&per_page={INDEX_PER_PAGE}&page={page}&order_by=%22asc%22",
             base(url)
         );
-        let v = match get_json_retry_with(&u, PAGE_TIMEOUT_S) {
+        let v = match get_json_retry_with(&u, INDEX_PAGE_TIMEOUT_S) {
             Ok(v) => v,
-            Err(e) if page == 1 => return Err(e),
-            Err(e) => return Ok(indexed_prefix(rows, from, Some(format!("tx index page {page}: {e}")))),
+            Err(e) => return Err((rows, format!("page {page}: {e}"))),
         };
         if let Some(err) = v.get("error") {
             let msg = err["message"].as_str().unwrap_or("error");
             let data = err["data"].as_str().unwrap_or("");
-            let text = format!("{msg} {data}").trim().to_string();
-            if page == 1 {
-                return Err(text);
-            }
-            return Ok(indexed_prefix(rows, from, Some(format!("tx index page {page}: {text}"))));
+            return Err((rows, format!("page {page}: {}", format!("{msg} {data}").trim())));
         }
         let res = &v["result"];
-        let total: usize = res["total_count"]
+        let total = res["total_count"]
             .as_str()
-            .and_then(|s| s.parse().ok())
-            .or_else(|| res["total_count"].as_u64().map(|n| n as usize))
-            .ok_or_else(|| "tx_search: no total_count".to_string())?;
+            .and_then(|s| s.parse::<usize>().ok())
+            .or_else(|| res["total_count"].as_u64().map(|n| n as usize));
+        let Some(total) = total else {
+            return Err((rows, "tx_search: no total_count".to_string()));
+        };
         let txs = res["txs"].as_array().cloned().unwrap_or_default();
         let got = txs.len();
         for t in txs {
@@ -902,16 +1098,11 @@ fn scan_blocks_indexed(url: &str, from: i64, to: i64, progress: &dyn Fn(i64, i64
                 rows.push((h, t["index"].as_u64().unwrap_or(0) as u32, raw));
             }
         }
-        let at = rows.iter().map(|(h, _, _)| *h).max().unwrap_or(0);
-        progress(at, tip);
-        if got == 0 || page * PER_PAGE >= total {
-            break;
+        if got == 0 || page * INDEX_PER_PAGE >= total {
+            return Ok(rows);
         }
         page += 1;
     }
-    let mut out = ScanFetch::empty(to);
-    out.blocks = group_indexed_txs(rows);
-    Ok(out)
 }
 
 /// Group index rows into per-block transaction lists, ascending by height and by position
@@ -1039,6 +1230,52 @@ mod scan_index_tests {
         let f = indexed_prefix(Vec::new(), 10, Some("boom".into()));
         assert!(f.blocks.is_empty());
         assert_eq!(f.covered_to, 9);
+    }
+
+    #[test]
+    fn windows_cover_the_range_once_and_follow_the_density() {
+        // 25 transactions at heights 1..=25, then nothing up to 3,000,000.
+        let calls = std::cell::RefCell::new(Vec::new());
+        let mut fetch = |lo: i64, hi: i64| -> Result<Vec<IndexedTx>, WindowError> {
+            calls.borrow_mut().push((lo, hi));
+            Ok((lo..=hi.min(25)).map(|h| row(h, 0, h as u8)).collect())
+        };
+        let f = scan_windows(1, 3_000_000, &mut fetch, &|_| {}).unwrap();
+        assert_eq!(f.covered_to, 3_000_000);
+        assert!(f.error.is_none());
+        assert_eq!(f.blocks.len(), 25);
+        let calls = calls.into_inner();
+        // Contiguous, no overlap, no gap.
+        assert_eq!(calls[0].0, 1);
+        assert_eq!(calls.last().unwrap().1, 3_000_000);
+        for w in calls.windows(2) {
+            assert_eq!(w[1].0, w[0].1 + 1);
+        }
+        // A dense first window narrows the next one; empty windows widen up to the cap.
+        assert!(calls[1].1 - calls[1].0 < calls[0].1 - calls[0].0);
+        assert_eq!(calls.iter().map(|(lo, hi)| hi - lo + 1).max(), Some(INDEX_MAX_WINDOW));
+        assert!(calls.len() < 20, "{} requests for an almost empty chain", calls.len());
+    }
+
+    #[test]
+    fn a_window_that_fails_keeps_the_finished_ones_and_its_own_whole_blocks() {
+        let mut n = 0;
+        let mut fetch = |lo: i64, _hi: i64| -> Result<Vec<IndexedTx>, WindowError> {
+            n += 1;
+            if n == 1 {
+                return Ok(vec![row(lo, 0, 1), row(lo + 5, 0, 2)]);
+            }
+            // Second window: heights lo+1 and lo+3 arrived, then a page was lost.
+            Err((vec![row(lo + 1, 0, 3), row(lo + 3, 0, 4)], "boom".into()))
+        };
+        let f = scan_windows(10, 5_000_000, &mut fetch, &|_| {}).unwrap();
+        let second = 10 + INDEX_FIRST_WINDOW;
+        assert_eq!(f.blocks.iter().map(|(h, _)| *h).collect::<Vec<_>>(), vec![10, 15, second + 1]);
+        assert_eq!(f.covered_to, second + 2);
+        assert!(f.error.as_deref().unwrap().contains("boom"));
+        // The very first window failing means the index cannot be used at all.
+        let mut dead = |_: i64, _: i64| -> Result<Vec<IndexedTx>, WindowError> { Err((Vec::new(), "no index".into())) };
+        assert_eq!(scan_windows(10, 50, &mut dead, &|_| {}).err().as_deref(), Some("no index"));
     }
 
     #[test]

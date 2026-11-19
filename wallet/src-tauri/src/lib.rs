@@ -599,6 +599,14 @@ impl Wallet {
     fn push_hist(&mut self, kind: &str, amount: i64, counterparty: String, asset_id: u64) {
         self.push_hist_id(kind, amount, counterparty, asset_id);
     }
+    /// A row for something that happened at a known earlier time (a coin found by a scan
+    /// of old blocks). `None` dates it now.
+    fn push_hist_at(&mut self, kind: &str, amount: i64, counterparty: String, asset_id: u64, at: Option<u64>) {
+        self.push_hist_id(kind, amount, counterparty, asset_id);
+        if let (Some(at), Some(row)) = (at, self.history.first_mut()) {
+            row.at = at;
+        }
+    }
     /// Like [`Wallet::push_hist`] but returns the row's `tx_id`, so a later event (a BTC
     /// claim landing) can update the row's label instead of leaving it "awaiting" forever.
     fn push_hist_id(&mut self, kind: &str, amount: i64, counterparty: String, asset_id: u64) -> String {
@@ -2425,10 +2433,10 @@ mod scan_tests {
         let keys = ScanKeys { accounts: vec![(None, acct)], by_pk, by_reward: HashMap::new(), by_delegator: HashMap::new() };
         let seed = BTreeMap::new();
         let out = scan_pass(&blocks, &keys, &leaves, &HashSet::new(), &HashMap::new(), &[], &seed, &seed, &|_| {});
-        let total: u64 = out.coins.iter().map(|(c, _)| c.value).sum();
+        let total: u64 = out.coins.iter().map(|(c, _, _)| c.value).sum();
         assert_eq!(out.coins.len(), first_chunks.len() + second_chunks.len());
         assert_eq!(total, first + second);
-        assert!(out.coins.iter().all(|(_, kind)| *kind == "reward"));
+        assert!(out.coins.iter().all(|(_, kind, _)| *kind == "reward"));
         let key = hex::encode(pk64(&pk));
         assert_eq!(out.claim_counters.get(&key).copied(), Some(n1 + second_chunks.len() as u64));
     }
@@ -4040,7 +4048,8 @@ struct ScanKeys {
 }
 
 struct ScanOut {
-    coins: Vec<(Coin, &'static str)>,
+    /// Each coin found, what it is, and the height of the block that created it.
+    coins: Vec<(Coin, &'static str, i64)>,
     spent: std::collections::HashSet<zcrypt_shield::Commitment>,
     actions: Vec<ActionKey>,
     escrows: Vec<EscrowRec>,
@@ -4193,6 +4202,7 @@ fn scan_pass(
             o.max_index_seen = Some(o.max_index_seen.map_or(i, |m| m.max(i)));
         }
     };
+    let at_height = std::cell::Cell::new(0i64);
     let add_coin = |o: &mut ScanOut, known: &mut HashSet<_>, own_nf: &mut HashMap<_, _>, coin: Coin, kind: &'static str, require_leaf: bool| {
         let com = coin.commitment();
         if !known.insert(com) {
@@ -4202,10 +4212,11 @@ fn scan_pass(
             return;
         }
         own_nf.insert(shield_tx::nf_registry_key(&coin.nullifier()), com);
-        o.coins.push((coin, kind));
+        o.coins.push((coin, kind, at_height.get()));
     };
     let pk_at = |i: usize| keys.accounts[i].0;
     for (h, txs) in blocks {
+        at_height.set(*h);
         on_block(*h);
         for tx in txs {
             let tag = match tx.first() {
@@ -4813,6 +4824,18 @@ fn index_bar_fills_forward() {
 /// Returns at once. Poll [`index_job`] for the bar; leaving Settings does not stop it.
 #[tauri::command]
 async fn rescan_from_genesis(app: tauri::AppHandle, state: State<'_, AppState>) -> R<IndexJob> {
+    start_index_job(app, state, true)
+}
+
+/// The same background scan with the same bar, but from the saved cursor: a first sync
+/// after a restore starts at genesis anyway, and a sync that paused resumes where it
+/// stopped instead of reading the chain again.
+#[tauri::command]
+async fn sync_from_cursor(app: tauri::AppHandle, state: State<'_, AppState>) -> R<IndexJob> {
+    start_index_job(app, state, false)
+}
+
+fn start_index_job(app: tauri::AppHandle, state: State<'_, AppState>, from_genesis: bool) -> R<IndexJob> {
     // Check and mark under one lock. Two clicks before the button disables must
     // not start two scans; the second call just returns the job already running.
     {
@@ -4838,9 +4861,11 @@ async fn rescan_from_genesis(app: tauri::AppHandle, state: State<'_, AppState>) 
         {
             let _gate = state.scan_gate.lock().unwrap_or_else(|e| e.into_inner());
             match with_wallet(&state, |w| {
-                w.scan_height = 0;
-                w.claim_counters.clear();
-                w.fee_claim_counters.clear();
+                if from_genesis {
+                    w.scan_height = 0;
+                    w.claim_counters.clear();
+                    w.fee_claim_counters.clear();
+                }
                 Ok(())
             }) {
                 Err(e) => guard.result = Some(Err(e)),
@@ -4949,6 +4974,13 @@ fn scan_onchain_inner(state: State<AppState>) -> R<usize> {
     };
     let covered_to = fetched.covered_to;
     let blocks = fetched.blocks;
+    // When each block was made, so a coin found by a restore or after days away is dated
+    // by its block and not by this scan. A short catch-up keeps the phone's own clock.
+    let clock = if scan_notes && tip - from > chain::CLOCK_MIN_RANGE {
+        chain::height_clock(&url, from + 1, tip)
+    } else {
+        chain::HeightClock::default()
+    };
 
     let mut found = 0usize;
     let mut spent_seen: HashSet<zcrypt_shield::Commitment> = HashSet::new();
@@ -5014,7 +5046,7 @@ fn scan_onchain_inner(state: State<AppState>) -> R<usize> {
         {
             let mut g = state.wallet.lock().unwrap();
             let w = g.as_mut().ok_or("locked")?;
-            for (coin, kind) in res.coins {
+            for (coin, kind, height) in res.coins {
                 let com = coin.commitment();
                 if !w.coins.iter().any(|c| c.coin.commitment() == com) {
                     let (v, asset) = (coin.value, coin.asset_id);
@@ -5030,7 +5062,7 @@ fn scan_onchain_inner(state: State<AppState>) -> R<usize> {
                             "escrow" => "escrow settled",
                             _ => "incoming",
                         };
-                        w.push_hist(kind, v as i64, label.into(), asset);
+                        w.push_hist_at(kind, v as i64, label.into(), asset, clock.at(height));
                     }
                 }
             }
@@ -10845,6 +10877,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             rescan_from_genesis,
+            sync_from_cursor,
             index_job,
             buy_quote,
             buy_order,
@@ -10940,6 +10973,7 @@ pub fn run() {
             mobile_auth::mobile_confirm,
             mobile_auth::mobile_set_biometric,
             mobile_auth::mobile_change_pin,
+            mobile_auth::mobile_forget_copied,
             mobile_auth::mobile_adopt,
             mobile_auth::mobile_reveal_phrase,
         ])

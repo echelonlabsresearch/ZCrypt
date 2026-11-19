@@ -1,9 +1,11 @@
 import { useRef, useState } from "react";
 import { call, copySensitive, saveFile } from "../lib/api";
-import { authError, Btn, Icon, Logo, PinPad, shareFile, Spinner, isAndroid } from "./ui";
+import { authError, Btn, Icon, Logo, PinPad, shareFile, isAndroid } from "./ui";
 import { bioName, useAuth } from "./MobileApp";
+import SyncScreen from "./SyncScreen";
+import Waiting from "./Waiting";
 
-type Step = "welcome" | "restore" | "password" | "pin" | "pin2" | "bio" | "working" | "seed";
+type Step = "welcome" | "restore" | "password" | "pin" | "pin2" | "bio" | "working" | "sync" | "seed";
 
 /**
  * First run. New wallet or restore, then a 6-digit PIN, then Face ID, then (for a new
@@ -11,7 +13,7 @@ type Step = "welcome" | "restore" | "password" | "pin" | "pin2" | "bio" | "worki
  * password by an earlier build: the password is asked once and replaced by the PIN.
  */
 export default function Onboarding({ adopt, onDone }: { adopt: boolean; onDone: () => void }) {
-  const { status, toast } = useAuth();
+  const { status } = useAuth();
   const [step, setStep] = useState<Step>(adopt ? "password" : "welcome");
   const [restoring, setRestoring] = useState(false);
   const [mnemonic, setMnemonic] = useState("");
@@ -68,9 +70,7 @@ export default function Onboarding({ adopt, onDone }: { adopt: boolean; onDone: 
         biometric,
       });
       if (restoring) {
-        const found = await call<number>("scan_onchain").catch(() => -1);
-        toast("Wallet restored", found > 0 ? `${found} coin${found === 1 ? "" : "s"} recovered from the chain.` : "Your coins appear once the chain has been scanned.");
-        onDone();
+        setStep("sync");
       } else {
         setSeed(r.seed_phrase);
         setStep("seed");
@@ -171,14 +171,14 @@ export default function Onboarding({ adopt, onDone }: { adopt: boolean; onDone: 
     );
   }
 
+  if (step === "sync") return <SyncScreen onDone={onDone} />;
+
   if (step === "working") {
-    return (
-      <div className="m-gate">
-        <div className="fill" />
-        <Spinner />
-        <p className="m-sub" style={{ marginTop: 18 }}>{adopt ? "Securing your wallet…" : restoring ? "Restoring your wallet…" : "Generating your keys…"}</p>
-        <div className="fill" />
-      </div>
+    // A restore goes straight on to the sync screen, so it starts as that screen at 0%.
+    return restoring && !adopt ? (
+      <Waiting title="Restoring your wallet" subtitle="Rebuilding your keys from the recovery phrase." hint="Keep the app open. A full restore reads the whole chain and takes a few minutes." pct={0} caption="syncing" />
+    ) : (
+      <Waiting icon="shield" title={adopt ? "Securing your wallet" : "Creating your wallet"} subtitle={adopt ? "Sealing the wallet under your new PIN." : "Generating your post-quantum keys on this phone."} hint="Keep the app open. This takes a few seconds." />
     );
   }
 

@@ -11,6 +11,8 @@ import HistoryScreen from "./HistoryScreen";
 
 export interface AuthStatus {
   wallet: boolean;
+  /** The files came from another phone: the PIN cannot open them here, only the phrase. */
+  copied?: boolean;
   pin: boolean;
   biometric: boolean;
   biometry_available: boolean;
@@ -250,7 +252,7 @@ export default function MobileApp() {
       <div className="m-app">
         {phase === "loading" && <div className="m-gate" />}
         {(phase === "onboard" || phase === "adopt") && <Onboarding adopt={phase === "adopt"} onDone={unlocked} />}
-        {phase === "lock" && <Lock onUnlocked={unlocked} />}
+        {phase === "lock" && <Lock onUnlocked={unlocked} onForgotten={() => refreshStatus().catch(() => {}).then(() => setPhase("onboard"))} />}
 
         {phase === "ready" && (
           <>

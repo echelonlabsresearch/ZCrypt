@@ -39,6 +39,7 @@ function QrFull({ text, onClose }: { text: string; onClose: () => void }) {
   );
 }
 import Success from "./Success";
+import Waiting from "./Waiting";
 import { useAuth } from "./MobileApp";
 
 type Which = "normal" | "stealth";
@@ -174,15 +175,15 @@ export default function ReceiveScreen({
 
   if (busy) {
     return (
-      <Success
-        tone="busy"
+      <Waiting
+        icon="receive"
+        hint="Keep the app open."
         title={receiving === "receipt" ? "Checking receipt" : "Receiving payment"}
         subtitle={
           receiving === "receipt"
             ? "Looking the payment up on the chain."
             : "Checking the chain and building the claim proof on this phone. This takes a few seconds."
         }
-        onDone={() => {}}
       />
     );
   }

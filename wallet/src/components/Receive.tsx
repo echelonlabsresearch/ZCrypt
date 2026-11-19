@@ -3,6 +3,7 @@ import QRCode from "qrcode";
 import { call, copySensitive, fmtAsset } from "../lib/api";
 import { CopyButton } from "./Share";
 import Success from "../mobile/Success";
+import Waiting from "../mobile/Waiting";
 
 export interface ReceivedInfo {
   amount: number;
@@ -274,15 +275,15 @@ export default function Receive({
 
   if (phase.kind === "busy") {
     return (
-      <Success
-        tone="busy"
+      <Waiting
+        icon="receive"
+        hint="Keep the wallet open."
         title={phase.what === "receipt" ? "Checking receipt" : "Receiving payment"}
         subtitle={
           phase.what === "receipt"
             ? "Looking the payment up on the chain."
             : "Checking the chain and building the claim proof on this computer. This takes a few seconds."
         }
-        onDone={() => {}}
       />
     );
   }

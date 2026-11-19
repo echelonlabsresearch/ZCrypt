@@ -26,6 +26,8 @@ export default function Home({ refreshTick, onSend, onReceive }: { refreshTick: 
   const [node, setNode] = useState<NodeStatus | null>(null);
   const [secrets, setSecrets] = useState<PendingSecret[]>([]);
   const [spinning, setSpinning] = useState(false);
+  // The last scan did not reach the tip: the balance below may be out of date.
+  const [syncErr, setSyncErr] = useState("");
   const [settings, setSettings] = useState(false);
   const [openSecret, setOpenSecret] = useState<PendingSecret | null>(null);
   // Pull to refresh: how far the finger has dragged down from the top of the screen.
@@ -53,9 +55,17 @@ export default function Home({ refreshTick, onSend, onReceive }: { refreshTick: 
     await loadLocal();
     call<NodeStatus>("node_status").then(setNode).catch(() => setNode({ connected: false, height: 0, error: "" }));
     // Scan the chain for new coins in the background, then show them.
+    // A scan that stops early keeps what it found and says so; hiding that would show
+    // an out-of-date balance as if it were current.
     call("scan_onchain")
-      .then(loadLocal)
-      .catch(() => {})
+      .then(() => {
+        setSyncErr("");
+        return loadLocal();
+      })
+      .catch((e) => {
+        setSyncErr(String(e instanceof Error ? e.message : e));
+        return loadLocal();
+      })
       .finally(() => setSpinning(false));
   }, [loadLocal]);
 
@@ -75,6 +85,8 @@ export default function Home({ refreshTick, onSend, onReceive }: { refreshTick: 
   // Whitelisted tickers not held yet: the names the network reserves for its own pegged assets.
   const upcoming = whitelist.filter((t) => !others.some((a) => a.ticker.toUpperCase() === t.toUpperCase()));
   const [whole, frac] = fmtAsset(native.balance, native.decimals).split(".");
+
+  const behind = !!node?.connected && syncErr !== "" && !/locked/i.test(syncErr);
 
   const PULL_ARM = 72;
   function pullStart(e: React.TouchEvent) {
@@ -127,8 +139,8 @@ export default function Home({ refreshTick, onSend, onReceive }: { refreshTick: 
           {frac && <span style={{ color: "var(--text-2)" }}>.{frac}</span>}
         </div>
         <div className="m-hero-foot">
-          <span className={`m-dot ${node?.connected ? "" : "off"}`} />
-          {node === null ? "Connecting…" : node.connected ? `Synced · block ${node.height.toLocaleString()}` : "Offline · last synced balance"}
+          <span className={`m-dot ${!node?.connected ? "off" : behind ? "warn" : ""}`} />
+          {node === null ? "Connecting…" : !node.connected ? "Offline · last synced balance" : behind ? "Sync incomplete · balance may be out of date" : spinning ? "Syncing…" : `Synced · block ${node.height.toLocaleString()}`}
           <span style={{ marginLeft: "auto" }}>{coins} coin{coins === 1 ? "" : "s"}</span>
         </div>
       </div>
@@ -141,6 +153,17 @@ export default function Home({ refreshTick, onSend, onReceive }: { refreshTick: 
           <Icon name="receive" size={20} stroke={2.2} /> Receive
         </button>
       </div>
+
+      {behind && (
+        <div className="m-banner warn" style={{ alignItems: "center" }}>
+          <Icon name="warn" size={20} />
+          <div style={{ flex: 1 }}>
+            <b>Sync incomplete</b>
+            <div style={{ fontSize: 13, opacity: 0.85 }}>The wallet could not read the chain to the end, so this balance may be out of date. Nothing is lost.</div>
+          </div>
+          <button className="m-tag" disabled={spinning} onClick={refresh}>{spinning ? "Syncing…" : "Retry"}</button>
+        </div>
+      )}
 
       {secrets.length > 0 && (
         <div className="m-banner warn" style={{ alignItems: "center" }}>

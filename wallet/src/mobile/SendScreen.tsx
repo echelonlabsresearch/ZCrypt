@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useState } from "react";
 import { call, copySensitive, fmtAsset, HeldAsset, saveFile, toBaseAsset } from "../lib/api";
-import { Btn, dismissKeyboard, Field, Icon, Segmented, Sheet, shareFile, short, Spinner } from "./ui";
+import { Btn, dismissKeyboard, Field, Icon, Segmented, Sheet, shareFile, short } from "./ui";
 import ScanOverlay, { addressFromQr } from "./ScanOverlay";
 import Success from "./Success";
+import Waiting from "./Waiting";
 import { useAuth } from "./MobileApp";
 
 type Mode = "address" | "bearer";
@@ -18,7 +19,9 @@ interface Result {
 /**
  * Send: pick an asset, an amount and either a zc1… address (a stealth address is detected
  * and paid with an encrypted note) or a bearer file. The review sheet asks for Face ID or
- * the PIN, then the proof is built on the phone.
+ * the PIN. Then a full-screen ring takes over: the wallet is first brought up to date
+ * with the chain (a coin spent from another device must not be offered again), and only
+ * then is the proof built on the phone and sent.
  */
 export default function SendScreen({ active, onSent }: { active: boolean; onSent: () => void }) {
   const { confirm, toast } = useAuth();
@@ -29,7 +32,8 @@ export default function SendScreen({ active, onSent }: { active: boolean; onSent
   const [amount, setAmount] = useState("");
   const [err, setErr] = useState("");
   const [review, setReview] = useState(false);
-  const [busy, setBusy] = useState<"" | "checking" | "proving">("");
+  const [busy, setBusy] = useState<"" | "checking">("");
+  const [stage, setStage] = useState<{ step: 1 | 2; pretty: string; bearer: boolean } | null>(null);
   const [result, setResult] = useState<Result | null>(null);
   const [shared, setShared] = useState("");
   const [copied, setCopied] = useState(false);
@@ -98,7 +102,23 @@ export default function SendScreen({ active, onSent }: { active: boolean; onSent
       }
       const ok = await confirm(`Send ${pretty}`);
       if (!ok) return;
-      setBusy("proving");
+      setReview(false);
+      const bearer = mode === "bearer";
+      setStage({ step: 1, pretty, bearer });
+      // Step 1: spend only from an up-to-date view. A first sync still running, or a
+      // scan that cannot finish, stops the payment here with nothing sent.
+      const job = await call<{ running: boolean }>("index_job").catch(() => ({ running: false }));
+      if (job.running) throw new Error("Your wallet is still syncing with the chain. Nothing was sent; try again when the sync has finished.");
+      try {
+        await call("scan_onchain");
+      } catch {
+        throw new Error("Could not bring this wallet up to date with the chain, so nothing was sent. Check your connection and try again.");
+      }
+      const fresh = await call<HeldAsset[]>("held_assets");
+      setAssets(fresh);
+      const have = fresh.find((a) => a.asset_id === asset.asset_id)?.balance ?? 0;
+      if (base > have) throw new Error(`Your ${asset.ticker} balance changed: part of it was spent from another device. Nothing was sent.`);
+      setStage({ step: 2, pretty, bearer });
       if (mode === "bearer") {
         const file = await call<string>("create_bearer", { amount: base, assetId: asset.asset_id });
         setResult({ kind: "bearer", pretty, file });
@@ -115,10 +135,16 @@ export default function SendScreen({ active, onSent }: { active: boolean; onSent
       onSent();
       load();
     } catch (e) {
-      setErr(String(e instanceof Error ? e.message : e));
+      const msg = String(e instanceof Error ? e.message : e);
+      if (/already spent|double-spend/i.test(msg)) {
+        // The node refused a coin this wallet still thought it held. Refresh, and say so.
+        setErr("This wallet was out of date: a coin it tried to use was already spent. Nothing was sent. The balance is being refreshed; try again in a moment.");
+        onSent();
+      } else setErr(msg);
       setReview(false);
     } finally {
       setBusy("");
+      setStage(null);
     }
   }
 
@@ -237,23 +263,31 @@ export default function SendScreen({ active, onSent }: { active: boolean; onSent
 
       {scanning && <ScanOverlay onResult={scanned} onClose={() => setScanning(false)} onError={(m) => { setScanning(false); toast("Could not open the camera", m); }} />}
 
-      <Sheet open={review} onClose={() => !busy && setReview(false)} title={busy === "proving" ? "Sending" : "Review"}>
-        {busy === "proving" ? (
-          <div className="m-center" style={{ padding: "22px 0 10px" }}>
-            <div style={{ display: "inline-flex" }}><Spinner /></div>
-            <p className="m-sub" style={{ marginTop: 16 }}>Building the zero-knowledge proof on this phone. A few seconds.</p>
-          </div>
-        ) : (
-          <>
-            <div className="m-kv"><span>Amount</span><span className="m-num">{amount} {asset.ticker}</span></div>
-            <div className="m-kv"><span>{mode === "bearer" ? "Delivery" : "To"}</span><span>{mode === "bearer" ? "Bearer file" : short(to.trim(), 12, 8)}</span></div>
-            <div className="m-kv"><span>Network fee</span><span className="m-num">{mode === "bearer" ? "0.03" : "0.01"} ZCRYPT</span></div>
-            <Btn full style={{ marginTop: 16 }} disabled={busy !== ""} onClick={send}>
-              {busy === "checking" ? "Checking…" : <><Icon name="faceid" size={20} /> Confirm</>}
-            </Btn>
-          </>
-        )}
+      <Sheet open={review} onClose={() => !busy && setReview(false)} title="Review">
+        <div className="m-kv"><span>Amount</span><span className="m-num">{amount} {asset.ticker}</span></div>
+        <div className="m-kv"><span>{mode === "bearer" ? "Delivery" : "To"}</span><span>{mode === "bearer" ? "Bearer file" : short(to.trim(), 12, 8)}</span></div>
+        <div className="m-kv"><span>Network fee</span><span className="m-num">{mode === "bearer" ? "0.03" : "0.01"} ZCRYPT</span></div>
+        <Btn full style={{ marginTop: 16 }} disabled={busy !== ""} onClick={send}>
+          {busy === "checking" ? "Checking…" : <><Icon name="faceid" size={20} /> Confirm</>}
+        </Btn>
       </Sheet>
+
+      {stage && (
+        <Waiting
+          title={stage.bearer ? `Preparing ${stage.pretty}` : `Sending ${stage.pretty}`}
+          subtitle={
+            stage.step === 1
+              ? "Checking your wallet against the chain."
+              : stage.bearer
+                ? "Building the zero-knowledge proofs on this phone and minting the coin."
+                : "Building the zero-knowledge proof on this phone and sending it to the network."
+          }
+          hint="Keep the app open. This takes a few seconds."
+          pct={stage.step === 1 ? 25 : 70}
+          icon="send"
+          caption={`Step ${stage.step} of 2`}
+        />
+      )}
     </>
   );
 }
