@@ -24,7 +24,7 @@ p3-symmetric = "0.6"
 p3-uni-stark = "0.6"
 p3-util = "0.6"
 rand = { version = "0.10.2", default-features = false, features = ["sys_rng", "chacha"] }
-postcard = { version = "1", features = ["alloc"] }
+postcard = { version = "1", default-features = false, features = ["alloc"] }
 serde = { version = "1", features = ["derive"] }
 sha3.workspace = true
 
