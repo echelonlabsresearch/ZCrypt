@@ -25,8 +25,7 @@ pub enum AppendError {
 /// production circuit: the tall trace is 128 rows and the path rows of both inputs
 /// (2 + 2·DEPTH = 126) fit inside them, so proof size, proving time and verification
 /// are unchanged from the depth-32 launch parameter (see the whitepaper, "Tree
-/// Capacity"). Only the private witness (siblings and direction bits) and the
-/// test-only wide reference circuit grow.
+/// Capacity"). Only the private witness (siblings and direction bits) grows.
 pub const DEPTH: usize = 62;
 
 /// An append-only Merkle tree of coin commitments.
