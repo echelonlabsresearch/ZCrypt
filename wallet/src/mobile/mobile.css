@@ -1381,3 +1381,196 @@
   background: var(--warn);
   box-shadow: 0 0 0 4px rgba(255, 181, 71, 0.16);
 }
+
+/* ---------- receive: the desktop stage, sized for a phone ---------- */
+.m-rx {
+  min-height: calc(var(--vvh, 100vh) - var(--tabbar) - var(--sat) - var(--sab) - 40px);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  padding: 18px 4px 10px;
+  background: radial-gradient(520px 380px at 50% 34%, rgba(53, 224, 255, 0.1), transparent 70%);
+}
+.m-rx-kicker {
+  font-family: var(--zc-font-mono);
+  font-size: 12px;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--text-2);
+}
+.m-rx-mark {
+  width: 72px;
+  height: 72px;
+  margin-top: 12px;
+  border-radius: 22px;
+  background: var(--surface);
+  border: 1px solid var(--line-strong);
+  color: var(--accent);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+.m-rx h2 {
+  margin: 20px 0 0;
+  font-size: 27px;
+  font-weight: 750;
+  letter-spacing: -0.035em;
+  line-height: 1.1;
+}
+.m-rx-lead {
+  margin: 12px auto 0;
+  max-width: 330px;
+  font-size: 16px;
+  line-height: 1.45;
+  color: var(--text-2);
+}
+.m-rx-paste {
+  width: 100%;
+  max-width: 420px;
+  margin-top: 22px;
+}
+.m-rx-paste textarea {
+  font-family: var(--zc-font-mono);
+  font-size: 14px;
+}
+.m-rx-fine {
+  margin: 12px 0 0;
+  font-size: 13px;
+  color: var(--text-2);
+}
+.m-rx-dock {
+  display: flex;
+  gap: 10px;
+  margin-top: 24px;
+  padding: 8px;
+  border-radius: 26px;
+  background: var(--surface);
+  border: 1px solid var(--line-strong);
+}
+.m-rx-tile {
+  width: 118px;
+  padding: 14px 8px 12px;
+  border-radius: 20px;
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  color: var(--text);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  font: inherit;
+}
+.m-rx-tile:active {
+  background: var(--surface-3);
+  border-color: var(--accent);
+}
+.m-rx-glyph {
+  width: 42px;
+  height: 42px;
+  border-radius: 13px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-weight: 800;
+  font-size: 20px;
+}
+.m-rx-glyph.z {
+  background: var(--zc-signal);
+  color: var(--accent-ink);
+}
+.m-rx-glyph.s {
+  background: rgba(109, 124, 255, 0.18);
+  color: #b7c0ff;
+  border: 1px solid rgba(109, 124, 255, 0.45);
+}
+.m-rx-name {
+  font-size: 14px;
+  font-weight: 650;
+  letter-spacing: -0.02em;
+}
+.m-rx-sub {
+  font-family: var(--zc-font-mono);
+  font-size: 11px;
+  color: var(--text-2);
+}
+/* The full-screen code is on white: its address and buttons are drawn for that. */
+.m-qrfull-addr {
+  margin-top: -6px;
+  font-family: var(--zc-font-mono);
+  font-size: 15px;
+  color: #111;
+}
+.m-qrfull-actions {
+  width: min(360px, calc(100% - 48px));
+}
+.m-qrfull-actions .m-btn.secondary {
+  background: #f1f3f7;
+  border-color: #d5d9e2;
+  color: #111;
+}
+.m-qrfull-actions .m-btn.ghost {
+  color: #2a55d6;
+}
+@media (max-height: 700px) {
+  .m-rx-mark {
+    width: 56px;
+    height: 56px;
+    border-radius: 18px;
+  }
+  .m-rx h2 {
+    font-size: 23px;
+    margin-top: 14px;
+  }
+  .m-rx-paste,
+  .m-rx-dock {
+    margin-top: 16px;
+  }
+}
+
+/* Part of an asset that a restore from the recovery phrase would not find yet. */
+.m-unbacked {
+  margin-top: 3px;
+  font-size: 12.5px;
+  line-height: 1.35;
+  color: var(--zc-warn, #ffb547);
+}
+
+/* One shielded address in the list: its code, and its private key behind Face ID or the PIN. */
+.m-keyrow {
+  padding: 14px 16px;
+  border-bottom: 1px solid var(--line);
+}
+.m-keyrow:last-child {
+  border-bottom: 0;
+}
+.m-keyrow-head {
+  display: flex;
+  text-align: left;
+  margin-bottom: 10px;
+}
+.m-keyrow .primary {
+  font-weight: 650;
+}
+.m-keyrow .secondary {
+  font-size: 13px;
+  color: var(--text-2);
+  margin-top: 2px;
+}
+.m-mono {
+  font-family: var(--zc-font-mono);
+}
+.m-keybox {
+  margin: 10px 0;
+  padding: 12px;
+  border-radius: 12px;
+  background: var(--surface-2);
+  border: 1px solid var(--line-strong);
+  font-family: var(--zc-font-mono);
+  font-size: 13px;
+  line-height: 1.5;
+  word-break: break-all;
+  text-align: left;
+  user-select: all;
+}

@@ -5,28 +5,24 @@ import QRCode from "qrcode";
 function qrText(text: string): string {
   return /^[a-z0-9]+$/.test(text) ? text.toUpperCase() : text;
 }
-/** Largest integer pixels-per-module that fits the code (with its quiet zone) into `px`. */
-function fitScale(text: string, px: number): number {
-  const n = QRCode.create(qrText(text), { errorCorrectionLevel: "L" }).modules.size + 8;
-  return Math.max(1, Math.floor(px / n));
-}
-import { call, copy, fmtAsset, saveFile } from "../lib/api";
-import { Banner, Btn, Icon, overlay, Segmented, shareFile, short, Spinner } from "./ui";
+import { call, copy, copySensitive, fmtAsset, saveFile } from "../lib/api";
+import { authError, Banner, Btn, Icon, overlay, Sheet, shareFile, short, Spinner } from "./ui";
 
 /**
  * Full-screen code for another phone to scan. Sized in DEVICE pixels, not CSS pixels: on a
  * 3x screen the modules can be 8 device pixels each (a third larger than the in-card code,
  * which is held to whole CSS pixels) and still land on the pixel grid the camera sees.
  */
-function QrFull({ text, onClose }: { text: string; onClose: () => void }) {
+function QrFull({ text, onClose, children }: { text: string; onClose: () => void; children?: React.ReactNode }) {
   const [src, setSrc] = useState("");
   const [css, setCss] = useState(0);
   useEffect(() => {
     const dpr = Math.max(1, Math.round(window.devicePixelRatio || 1));
     const n = QRCode.create(qrText(text), { errorCorrectionLevel: "L" }).modules.size + 8;
-    const avail = Math.min(window.innerWidth, window.innerHeight - 150) * dpr;
+    const avail = Math.min(window.innerWidth, window.innerHeight - 230) * dpr;
     const scale = Math.max(1, Math.floor(avail / n));
     setCss((n * scale) / dpr);
+    setSrc("");
     QRCode.toDataURL(qrText(text), { margin: 4, scale, errorCorrectionLevel: "L", color: { dark: "#000000", light: "#ffffff" } })
       .then(setSrc)
       .catch(() => setSrc(""));
@@ -34,7 +30,10 @@ function QrFull({ text, onClose }: { text: string; onClose: () => void }) {
   return overlay(
     <div className="m-qrfull" onClick={onClose} role="button" aria-label="Close">
       {src ? <img src={src} alt="Address QR code" style={{ width: css, height: css }} /> : <Spinner />}
-      <div className="m-qrfull-hint">Turn screen brightness up. Tap to close.</div>
+      <div className="m-qrfull-addr">{short(text, 10, 8)}</div>
+      {/* The buttons act on the address; a tap anywhere else closes the code. */}
+      {children && <div className="m-qrfull-actions" onClick={(e) => e.stopPropagation()}>{children}</div>}
+      <div className="m-qrfull-hint">Turn screen brightness up. Tap the code to close.</div>
     </div>
   );
 }
@@ -46,11 +45,13 @@ type Which = "normal" | "stealth";
 interface Stealth {
   index: number;
   address: string;
+  derived?: boolean;
 }
 
 /**
- * Receive: your address as a QR code, and the place where a payment file lands. A file
- * opened with the app is credited here on its own.
+ * Receive, laid out like the desktop wallet: one centred stage where a payment file or
+ * pasted coin lands, and the addresses as tiles. A tile opens its QR code at full size;
+ * a tap on the code closes it. A file opened with the app is credited here on its own.
  */
 export default function ReceiveScreen({
   active,
@@ -63,12 +64,18 @@ export default function ReceiveScreen({
   onConsumed: () => void;
   onReceived: () => void;
 }) {
-  const { toast } = useAuth();
+  const { toast, status, askPin } = useAuth();
   const [which, setWhich] = useState<Which>("normal");
   const [normal, setNormal] = useState("");
   const [stealth, setStealth] = useState<Stealth[]>([]);
-  const [qr, setQr] = useState("");
-  const [big, setBig] = useState(false);
+  // The shielded address on show (the newest unless one was picked), the list sheet, and
+  // one private key at a time: shown after Face ID or the PIN, dropped when the sheet closes.
+  const [stealthIdx, setStealthIdx] = useState<number | null>(null);
+  const [listOpen, setListOpen] = useState(false);
+  const [key, setKey] = useState<{ index: number; hex: string } | null>(null);
+  const [keyCopied, setKeyCopied] = useState(false);
+  // The address whose code fills the screen, if any.
+  const [full, setFull] = useState<Which | null>(null);
   const [copied, setCopied] = useState(false);
   const [newBusy, setNewBusy] = useState(false);
   const [text, setText] = useState("");
@@ -87,13 +94,9 @@ export default function ReceiveScreen({
     if (active) load();
   }, [active, load]);
 
-  const address = which === "normal" ? normal : stealth[stealth.length - 1]?.address ?? "";
-  useEffect(() => {
-    if (!address) return setQr("");
-    QRCode.toDataURL(qrText(address), { margin: 4, scale: fitScale(address, window.innerWidth - 48), errorCorrectionLevel: "L", color: { dark: "#0b0f19", light: "#ffffff" } })
-      .then(setQr)
-      .catch(() => setQr(""));
-  }, [address]);
+  const shownStealth = stealth.find((x) => x.index === stealthIdx) ?? stealth[stealth.length - 1];
+  const lastStealth = shownStealth?.address ?? "";
+  const address = which === "normal" ? normal : lastStealth;
 
   async function receive(raw: string) {
     const s = raw.trim();
@@ -165,9 +168,12 @@ export default function ReceiveScreen({
     setNewBusy(true);
     try {
       await call("new_stealth_address");
+      setStealthIdx(null); // show the new one
       load();
+      return true;
     } catch (e) {
       toast("Could not create", String(e));
+      return false;
     } finally {
       setNewBusy(false);
     }
@@ -210,81 +216,139 @@ export default function ReceiveScreen({
     );
   }
 
+  // A tile opens its code at full size at once; a tap on the code closes it. The
+  // shielded tile makes the first shielded address when there is none.
+  async function openTile(w: Which) {
+    setWhich(w);
+    if (w === "stealth" && !lastStealth && !(await newStealth())) return;
+    setFull(w);
+  }
+  const oldStealth = which === "stealth" && !!shownStealth && !shownStealth.derived;
+
+  async function showKey(index: number) {
+    try {
+      let hex = "";
+      if (status.biometric) {
+        try {
+          hex = await call<string>("mobile_reveal_stealth", { index, pin: null });
+        } catch (e) {
+          if (authError(e).kind !== "biometric") throw e;
+          // Face ID declined or unavailable: fall through to the PIN.
+        }
+      }
+      if (!hex) {
+        const ok = await askPin("Enter your PIN to show the key", (pin) => call<string>("mobile_reveal_stealth", { index, pin }).then((r) => { hex = r; }));
+        if (!ok) return;
+      }
+      setKeyCopied(false);
+      setKey({ index, hex });
+    } catch (e) {
+      toast("Could not show the key", String(e));
+    }
+  }
+  function closeList() {
+    setListOpen(false);
+    setKey(null);
+  }
+
   return (
     <>
-      <div className="m-head">
-        <h1 className="m-title">Receive</h1>
+      {/* The same stage as the desktop wallet: one centred place where a payment lands,
+          and the addresses as tiles. */}
+      <div className="m-rx">
+        <div className="m-rx-kicker">Receive</div>
+        <div className="m-rx-mark"><Icon name="file" size={30} /></div>
+        <h2>Open a coin file here</h2>
+        <p className="m-rx-lead">A .zcrypt file sent to you opens in this app on its own. Bearer coins, shielded notes and payment receipts all land here.</p>
+        <div className="m-rx-paste">
+          <textarea
+            className="m-textarea compact"
+            value={text}
+            onChange={(e) => setText(e.target.value)}
+            onFocus={(e) => setTimeout(() => e.target.scrollIntoView({ block: "center", behavior: "smooth" }), 250)}
+            placeholder="or paste a coin file, a shielded note, or a receipt"
+            autoCapitalize="none"
+            autoCorrect="off"
+            spellCheck={false}
+          />
+          <Btn full style={{ marginTop: 10 }} onClick={() => (text.trim() ? receive(text) : pasteAndReceive())}>
+            {text.trim() ? "Receive" : pasted ? <><Icon name="check" size={18} /> Pasted</> : <><Icon name="paste" size={18} /> Paste and receive</>}
+          </Btn>
+          {state && <Banner tone={state.tone}>{state.msg}</Banner>}
+          <p className="m-rx-fine">A receipt is only checked. It does not move funds.</p>
+        </div>
+
+        <div className="m-rx-dock">
+          <button className="m-rx-tile" onClick={() => openTile("normal")}>
+            <span className="m-rx-glyph z">Z</span>
+            <span className="m-rx-name">ZCRYPT</span>
+            <span className="m-rx-sub">{normal ? short(normal, 4, 4) : "…"}</span>
+          </button>
+          <button className="m-rx-tile" disabled={newBusy} onClick={() => openTile("stealth")}>
+            <span className="m-rx-glyph s"><Icon name="shield" size={20} /></span>
+            <span className="m-rx-name">Shielded</span>
+            <span className="m-rx-sub">{newBusy ? "creating…" : lastStealth ? short(lastStealth, 4, 4) : "create"}</span>
+          </button>
+        </div>
+        <p className="m-rx-fine">Tap an address to show its code.</p>
       </div>
 
-      <Segmented<Which>
-        value={which}
-        onChange={setWhich}
-        options={[
-          { value: "normal", label: "My address" },
-          { value: "stealth", label: "Stealth" },
-        ]}
-      />
-
-      <div className="m-card" style={{ marginTop: 14, textAlign: "center" }}>
-        {address ? (
-          <>
-            <div className="m-qr" onClick={() => qr && setBig(true)} role="button" aria-label="Show the code full screen">
-              {qr ? <img src={qr} alt="" /> : <Spinner />}
-            </div>
-            <div className="m-hint" style={{ marginTop: -6, marginBottom: 8 }}>Tap the code to enlarge it for another phone's camera</div>
-            {big && <QrFull text={address} onClose={() => setBig(false)} />}
-            <div className="m-addr" title={address}>{short(address, 10, 8)}</div>
-            <div className="m-btnrow">
-              <Btn kind="secondary" onClick={async () => { await copy(address); setCopied(true); setTimeout(() => setCopied(false), 1500); }}>
-                <Icon name={copied ? "check" : "copy"} size={18} /> {copied ? "Copied" : "Copy"}
-              </Btn>
-              <Btn kind="secondary" onClick={share}>
-                <Icon name="share" size={18} /> Share
-              </Btn>
-            </div>
-          </>
-        ) : which === "stealth" ? (
-          <div style={{ padding: "10px 0" }}>
-            <p className="m-sub" style={{ margin: "0 0 14px" }}>No stealth address yet.</p>
-            <Btn full disabled={newBusy} onClick={newStealth}>{newBusy ? "Creating…" : "Create a stealth address"}</Btn>
+      {full && address && (
+        <QrFull text={address} onClose={() => setFull(null)}>
+          <div className="m-btnrow">
+            <Btn kind="secondary" onClick={async () => { await copy(address); setCopied(true); setTimeout(() => setCopied(false), 1500); }}>
+              <Icon name={copied ? "check" : "copy"} size={18} /> {copied ? "Copied" : "Copy"}
+            </Btn>
+            <Btn kind="secondary" onClick={share}>
+              <Icon name="share" size={18} /> Share
+            </Btn>
           </div>
-        ) : (
-          <div style={{ padding: 30 }}><Spinner /></div>
-        )}
-      </div>
-      <p className="m-hint">
-        {which === "normal"
-          ? "Payments to this address settle on the chain and appear after a refresh. The amounts stay hidden from everyone else."
-          : "A stealth payment arrives as an encrypted file, invisible even to your own view key. This address is not restored by your recovery phrase."}
-      </p>
-      {which === "stealth" && address && (
-        <Btn full kind="ghost" small disabled={newBusy} onClick={newStealth}>{newBusy ? "Creating…" : "New stealth address"}</Btn>
+          {which === "stealth" && (
+            <>
+              <Btn full kind="ghost" small disabled={newBusy} onClick={newStealth}>{newBusy ? "Creating…" : oldStealth ? "This older address is not in your phrase: make a new one" : "New shielded address"}</Btn>
+              <Btn full kind="ghost" small onClick={() => { setFull(null); setListOpen(true); }}>
+                All shielded addresses and keys ({stealth.length})
+              </Btn>
+            </>
+          )}
+        </QrFull>
       )}
 
-      <div className="m-section">Open a payment file</div>
-      <div className="m-card">
-        <p className="m-hint" style={{ margin: "0 0 10px" }}>
-          A .zcrypt file sent to you opens in this app on its own. Copied a coin, note or receipt instead? Paste it here.
+      <Sheet open={listOpen} onClose={closeList} title="Shielded addresses">
+        <p className="m-hint" style={{ marginTop: 0 }}>
+          Every address stays in this wallet and keeps receiving after you make a new one. A private key spends what was sent to its address: show it only to back it up.
         </p>
-        <Btn full disabled={busy} onClick={pasteAndReceive}>
-          {busy ? "Claiming…" : pasted ? <><Icon name="check" size={18} /> Pasted</> : <><Icon name="paste" size={18} /> Paste and receive</>}
-        </Btn>
-        <textarea
-          className="m-textarea compact"
-          style={{ marginTop: 10 }}
-          value={text}
-          onChange={(e) => setText(e.target.value)}
-          onFocus={(e) => setTimeout(() => e.target.scrollIntoView({ block: "center", behavior: "smooth" }), 250)}
-          placeholder="or type it: zcrypt-bearer/1 …"
-          autoCapitalize="none"
-          autoCorrect="off"
-          spellCheck={false}
-        />
-        {text.trim() && !busy && (
-          <Btn full kind="secondary" style={{ marginTop: 10 }} onClick={() => receive(text)}>Receive what is typed</Btn>
-        )}
-        {state && <Banner tone={state.tone}>{state.msg}</Banner>}
-      </div>
+        <div className="m-list">
+          {stealth.map((x) => (
+            <div className="m-keyrow" key={x.index}>
+              <div className="m-keyrow-head">
+                <div className="grow">
+                  <div className="primary">Shielded #{x.index} {x.index === shownStealth?.index && <span className="m-whitelisted">shown</span>}</div>
+                  <div className="secondary m-mono">{short(x.address, 10, 8)}</div>
+                  <div className={x.derived ? "secondary" : "m-unbacked"}>{x.derived ? "Restored by your recovery phrase" : "Not in your phrase: back this key up"}</div>
+                </div>
+              </div>
+              <div className="m-btnrow">
+                <Btn kind="secondary" small onClick={() => { setStealthIdx(x.index); setWhich("stealth"); closeList(); setFull("stealth"); }}>
+                  Show code
+                </Btn>
+                <Btn kind="secondary" small onClick={() => (key?.index === x.index ? setKey(null) : showKey(x.index))}>
+                  {key?.index === x.index ? "Hide key" : "Show key"}
+                </Btn>
+              </div>
+              {key?.index === x.index && (
+                <>
+                  <div className="m-keybox">{key.hex}</div>
+                  <Btn full kind="secondary" small onClick={() => { copySensitive(key.hex); setKeyCopied(true); setTimeout(() => setKeyCopied(false), 1800); }}>
+                    <Icon name={keyCopied ? "check" : "copy"} size={16} /> {keyCopied ? "Copied · clears in 60 s" : "Copy key"}
+                  </Btn>
+                </>
+              )}
+            </div>
+          ))}
+        </div>
+        <Btn full kind="ghost" small style={{ marginTop: 10 }} disabled={newBusy} onClick={newStealth}>{newBusy ? "Creating…" : "New shielded address"}</Btn>
+      </Sheet>
     </>
   );
 }

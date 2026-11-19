@@ -48,10 +48,10 @@ const DATA: Record<string, unknown> = {
   unlock_wallet: null,
   lock_wallet: null,
   get_address: ZC,
-  get_balance: { total: 1_234_567_890, coin_count: 3 },
+  get_balance: { total: 1_234_567_890, coin_count: 3, scan_height: 227_510 },
   held_assets: [
     { asset_id: "0", ticker: "ZCRYPT", decimals: 6, balance: 1_234_567_890 },
-    { asset_id: ZBTC, ticker: "zBTC", decimals: 8, balance: 2_500_000 },
+    { asset_id: ZBTC, ticker: "zBTC", decimals: 8, balance: 2_500_000, unbacked: new URLSearchParams(location.search).has("unbacked") ? 1_000_000 : 0 },
   ],
   whitelisted_assets: ["zBTC", "zETH", "zSOL", "zBNB", "zTON", "zDAI", "zUSDT", "zGOLD"],
   scan_onchain: 0,
@@ -59,7 +59,11 @@ const DATA: Record<string, unknown> = {
   list_pending_secrets: [],
   btc_wallet_info: { connected: true, balance: 0.0153, deposit_address: "bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq" },
   btc_deposit_address: "bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq",
-  list_stealth_addresses: [{ index: 1, address: STEALTH }],
+  list_stealth_addresses: [
+    { index: 0, address: STEALTH.slice(0, -6) + "k7m2pq", derived: false },
+    { index: 1, address: STEALTH, derived: true },
+  ],
+  mobile_reveal_stealth: "5f1c0a9e3b7d42c6881e0d4fa2b39c7715e6d08a4c3b2f1e9d7a6b5c4d3e2f10",
   get_view_key: "zcview1q8f2tvdw0s3jn54khce6mua7lmqqqxw5d8rt4hk0x2pv8mrw5v6e7uy3lgwk2fqe8t4u5d7q9k2m3r5xg7m0pzwjsdq3u4l8h",
   get_history: [
     { tx_id: "send-41", kind: "send", amount: -250_000_000, counterparty: "zc1qpzry…l8h", timestamp: 41, at: 1761388200, status: "confirmed", asset_id: "0", decimals: 6, receipt_id: "receipt-42" },

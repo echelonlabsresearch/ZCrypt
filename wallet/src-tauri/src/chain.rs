@@ -627,6 +627,25 @@ pub fn chain_tag(url: &str) -> Result<String, String> {
     Ok(format!("{chain_id}:{genesis}"))
 }
 
+/// Where a wallet created right now may start scanning: a height a few blocks under the
+/// node's tip, and the chain generation tag. One short request, so creating a wallet
+/// offline does not stall; `None` means "start from genesis", which is always correct.
+pub fn birth_point(url: &str) -> Option<(i64, String)> {
+    let u = format!("{}/status", base(url));
+    let b: Value = agent_with_timeout(5).get(&u).call().ok()?.into_json().ok()?;
+    let chain_id = b["result"]["node_info"]["network"].as_str().unwrap_or("");
+    let genesis = b["result"]["sync_info"]["earliest_block_hash"].as_str().unwrap_or("");
+    let tip: i64 = b["result"]["sync_info"]["latest_block_height"].as_str()?.parse().ok()?;
+    if chain_id.is_empty() || genesis.is_empty() || tip <= BIRTH_MARGIN_BLOCKS {
+        return None;
+    }
+    Some((tip - BIRTH_MARGIN_BLOCKS, format!("{chain_id}:{genesis}")))
+}
+/// A new wallet starts this far under the tip the node reported. The scan restarts from
+/// genesis if its cursor is ever above the application's height, and the two heights a
+/// node reports can differ by a block.
+const BIRTH_MARGIN_BLOCKS: i64 = 10;
+
 fn abci_query_hex(url: &str, path: &str) -> Result<String, String> {
     let u = format!("{}/abci_query?path=%22{}%22", base(url), path);
     let b: Value = agent().get(&u).call().map_err(|e| e.to_string())?.into_json().map_err(|e| e.to_string())?;

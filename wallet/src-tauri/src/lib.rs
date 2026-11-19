@@ -1039,11 +1039,20 @@ async fn create_wallet(password: String, state: State<'_, AppState>) -> R<Create
     write_keystore(&dir, &ks)?;
     let address = account.normal_address().to_bech32();
     let out = CreateResult { address, seed_phrase: phrase.to_string() };
+    // These keys did not exist a moment ago, so no block already on the chain can pay
+    // them: the first sync starts at the tip instead of reading the whole chain. A
+    // restore is different and always starts from genesis.
+    let born = node_url(&state).ok().and_then(|u| chain::birth_point(&u));
     {
         let mut wallet = state.wallet.lock().unwrap();
         let mut settler = state.settler.lock().unwrap();
         *settler = None;
-        *wallet = Some(Wallet::fresh(account, phrase));
+        let mut w = Wallet::fresh(account, phrase);
+        if let Some((height, tag)) = born {
+            w.scan_height = height;
+            w.chain_tag = tag;
+        }
+        *wallet = Some(w);
     }
     ok(out)
 }
@@ -1207,25 +1216,51 @@ async fn get_address(state: State<'_, AppState>) -> R<String> {
 struct StealthInfo {
     index: u32,
     address: String,
+    /// The key comes from the recovery phrase (false for an address an earlier build
+    /// made from a random key, or one imported from a backup key).
+    derived: bool,
 }
 
-/// Generate a fresh **stealth** sub-address: a random keypair NOT derived from the
-/// mnemonic. Persisted in this wallet so you can receive on it, but recoverable only
-/// from its backup seed (or this install) — the mnemonic will not restore it. Opaque to
-/// your view key.
+/// Whether `seed` is one of the stealth keys this wallet's phrase derives.
+fn is_derived_stealth(w: &Wallet, seed: &[u8; 32]) -> bool {
+    (0..w.next_stealth).any(|i| derived_stealth_seed(&w.account, i) == *seed)
+}
+
+/// The seed of this wallet's `index`-th receiving stealth address, derived from the
+/// recovery phrase. Its own label keeps these keys apart from the change keys
+/// (`Account::stealth`), so an address handed to a sender is never a change key.
+fn derived_stealth_seed(master: &Account, index: u32) -> [u8; 32] {
+    zcrypt_core::hash::h(b"ZC-RXSTEALTH", &[&master.seed(), &index.to_le_bytes()])
+}
+
+/// How many derived stealth addresses beyond the last known one a restored wallet tries
+/// when a note file does not open with the keys it already holds.
+const STEALTH_GAP: u32 = 20;
+
+/// Generate the next **stealth** sub-address. It is derived from the recovery phrase
+/// (see [`derived_stealth_seed`]), so a restored wallet has the same addresses and can
+/// open a payment file sent to one. It stays opaque to the view key. Addresses made by
+/// earlier builds were random and still need their own backup key.
 ///
-/// The backup seed is a spend secret, so it is NEVER returned here (an unlocked session
-/// alone must not be able to exfiltrate spend keys). Reveal it one at a time, behind a
-/// fresh password check, via [`reveal_stealth_backup`].
+/// The seed is a spend secret, so it is NEVER returned here (an unlocked session alone
+/// must not be able to exfiltrate spend keys).
 #[tauri::command]
 async fn new_stealth_address(state: State<'_, AppState>) -> R<StealthInfo> {
     with_wallet(&state, |w| {
-        let seed = keys::random_seed();
+        let before = (w.stealth_seeds.len(), w.next_stealth);
+        // The next derived index this wallet does not hold yet.
+        let seed = loop {
+            let seed = derived_stealth_seed(&w.account, w.next_stealth);
+            w.next_stealth = w.next_stealth.checked_add(1).ok_or("too many stealth addresses")?;
+            if !w.stealth_seeds.contains(&seed) {
+                break seed;
+            }
+        };
         w.stealth_seeds.push(seed);
-        // H2: the seed is random (not mnemonic-derived); hand out the address only once it is
-        // on disk, otherwise funds sent to it would be unrecoverable after a restart.
+        // Hand out the address only once the counter and the key are on disk.
         if let Err(e) = save_now(&state, w, "create a stealth address") {
-            w.stealth_seeds.pop();
+            w.stealth_seeds.truncate(before.0);
+            w.next_stealth = before.1;
             return Err(e);
         }
         let index = (w.stealth_seeds.len() - 1) as u32;
@@ -1233,6 +1268,7 @@ async fn new_stealth_address(state: State<'_, AppState>) -> R<StealthInfo> {
         Ok(StealthInfo {
             index,
             address: acct.stealth_address().to_bech32(),
+            derived: true,
         })
     })
     .and_then(ok)
@@ -1260,7 +1296,7 @@ async fn import_stealth_backup(seed_hex: String, state: State<'_, AppState>) -> 
                 w.stealth_seeds.len() - 1
             }
         };
-        Ok(StealthInfo { index: index as u32, address: Account::from_seed(seed).stealth_address().to_bech32() })
+        Ok(StealthInfo { index: index as u32, address: Account::from_seed(seed).stealth_address().to_bech32(), derived: is_derived_stealth(w, &seed) })
     })
     .and_then(ok)
 }
@@ -1269,6 +1305,7 @@ async fn import_stealth_backup(seed_hex: String, state: State<'_, AppState>) -> 
 struct StealthEntry {
     index: u32,
     address: String,
+    derived: bool,
 }
 
 /// Every stealth sub-address this wallet has generated, with its address and index. The
@@ -1290,6 +1327,7 @@ async fn list_stealth_addresses(state: State<'_, AppState>) -> R<Vec<StealthEntr
                 StealthEntry {
                     index: i as u32,
                     address: acct.stealth_address().to_bech32(),
+                    derived: is_derived_stealth(w, seed),
                 }
             })
             .collect())
@@ -1319,6 +1357,199 @@ async fn reveal_stealth_backup(index: u32, password: String, state: State<'_, Ap
     .and_then(ok)
 }
 
+/// One asset's worth of coins the recovery phrase cannot bring back yet.
+#[derive(Serialize, Clone, PartialEq, Debug)]
+struct Unbacked {
+    #[serde(with = "u64_str")]
+    asset_id: u64,
+    amount: u64,
+    /// Why they are still waiting: "gas" (no ZCRYPT for the fee), "dust" (a ZCRYPT coin
+    /// no larger than the fee itself) or "retry" (the next sync moves it).
+    waiting_for: String,
+}
+
+#[derive(Serialize)]
+struct SweepReport {
+    /// Coins moved into the phrase-backed balance by this call.
+    swept: usize,
+    /// What is still waiting, per asset.
+    waiting: Vec<Unbacked>,
+}
+
+/// Indices of the unspent coins that were received on a stealth address. Their notes
+/// are not on the chain, so a restore from the recovery phrase cannot find them.
+fn unbacked_coin_indices(w: &Wallet) -> Vec<usize> {
+    if w.stealth_seeds.is_empty() {
+        return Vec::new();
+    }
+    let secrets: Vec<_> = w
+        .stealth_seeds
+        .iter()
+        .map(|seed| Account::from_seed(*seed).own_coin(0, [0u64; 8]).spend_secret)
+        .collect();
+    w.coins
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| !c.spent && c.value > 0 && secrets.contains(&c.coin.spend_secret))
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// Group unbacked coins per asset. `has_gas` is whether the wallet holds ZCRYPT for a fee.
+fn unbacked_report(coins: &[(u64, u64)], has_gas: bool) -> Vec<Unbacked> {
+    let mut out: Vec<Unbacked> = Vec::new();
+    for &(asset_id, value) in coins {
+        let native = asset_id == zcrypt_shield::ASSET_ZCRYPT;
+        let waiting_for = if native {
+            if value <= GAS_FEE { "dust" } else { "retry" }
+        } else if has_gas {
+            "retry"
+        } else {
+            "gas"
+        };
+        match out.iter_mut().find(|u| u.asset_id == asset_id && u.waiting_for == waiting_for) {
+            Some(u) => u.amount = u.amount.saturating_add(value),
+            None => out.push(Unbacked { asset_id, amount: value, waiting_for: waiting_for.to_string() }),
+        }
+    }
+    out
+}
+
+fn wallet_has_gas(w: &Wallet, skip: &[usize]) -> bool {
+    w.coins
+        .iter()
+        .enumerate()
+        .any(|(i, c)| !skip.contains(&i) && !c.spent && c.coin.asset_id == zcrypt_shield::ASSET_ZCRYPT && c.value >= GAS_FEE)
+}
+
+/// What the recovery phrase cannot restore yet. Reads the wallet only.
+#[tauri::command]
+async fn unbacked_coins(state: State<'_, AppState>) -> R<Vec<Unbacked>> {
+    with_wallet(&state, |w| {
+        let idx = unbacked_coin_indices(w);
+        let has_gas = wallet_has_gas(w, &[]);
+        let coins: Vec<(u64, u64)> = idx.iter().map(|&i| (w.coins[i].coin.asset_id, w.coins[i].value)).collect();
+        Ok(unbacked_report(&coins, has_gas))
+    })
+    .and_then(ok)
+}
+
+/// Move every coin received on a stealth address into the phrase-backed balance: one
+/// payment per coin to this wallet's own address, with its note on the chain, so a
+/// restore finds it by scanning. A ZCRYPT coin pays the 0.01 fee out of itself. A coin of
+/// another asset needs 0.01 ZCRYPT from the wallet; with none it waits, and the next call
+/// after ZCRYPT arrives moves it. Called by the screens after each receive and each sync.
+#[tauri::command]
+async fn sweep_stealth(state: State<'_, AppState>) -> R<SweepReport> {
+    sweep_stealth_inner(&state)
+}
+
+/// Unix time of the last sweep that failed for a reason other than "no ZCRYPT yet". A
+/// sweep builds a proof, so a coin that keeps failing is retried every ten minutes, not
+/// on every 20 second sync.
+static SWEEP_FAILED_AT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+const SWEEP_RETRY_S: u64 = 600;
+
+fn sweep_stealth_inner(state: &State<AppState>) -> R<SweepReport> {
+    if state.index_job.lock().unwrap_or_else(|e| e.into_inner()).running {
+        return with_wallet(state, |w| {
+            let idx = unbacked_coin_indices(w);
+            let coins: Vec<(u64, u64)> = idx.iter().map(|&i| (w.coins[i].coin.asset_id, w.coins[i].value)).collect();
+            Ok(SweepReport { swept: 0, waiting: unbacked_report(&coins, wallet_has_gas(w, &[])) })
+        })
+        .and_then(ok);
+    }
+    // Nothing to do is the common case: answer it without touching the network.
+    let pending = with_wallet(state, |w| Ok(unbacked_coin_indices(w).len()))?;
+    if pending == 0 {
+        return ok(SweepReport { swept: 0, waiting: Vec::new() });
+    }
+    let url = node_url(state)?;
+    let leaves = chain::fetch_leaves(&url)?;
+    with_wallet(state, |w| {
+        let mut swept = 0usize;
+        let mut left: Vec<(u64, u64)> = Vec::new();
+        // Coin by coin, by commitment: a sweep appends coins, so indices are looked up fresh.
+        // ZCRYPT first: its change can pay the fee for the coins of other assets after it.
+        let mut order = unbacked_coin_indices(w);
+        order.sort_by_key(|&i| w.coins[i].coin.asset_id != zcrypt_shield::ASSET_ZCRYPT);
+        let targets: Vec<zcrypt_shield::Commitment> = order.iter().map(|&i| w.coins[i].coin.commitment()).collect();
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        let cooling = now.saturating_sub(SWEEP_FAILED_AT.load(std::sync::atomic::Ordering::Relaxed)) < SWEEP_RETRY_S;
+        for com in targets {
+            let Some(i) = w.coins.iter().position(|c| !c.spent && c.coin.commitment() == com) else { continue };
+            let (value, asset_id) = (w.coins[i].value, w.coins[i].coin.asset_id);
+            let native = asset_id == zcrypt_shield::ASSET_ZCRYPT;
+            let amount = if native { value.saturating_sub(GAS_FEE) } else { value };
+            let on_chain = chain::find_index(&leaves, &com).is_some();
+            if amount == 0 || !on_chain || cooling || (!native && !wallet_has_gas(w, &[i])) {
+                left.push((asset_id, value));
+                continue;
+            }
+            let addr = w.account.normal_address();
+            let blind = keys::random_blind();
+            let out = keys::out_asset_coin(&addr, amount, blind, asset_id);
+            let note = kem::ciphertext_to_bytes(&keys::encrypt_note_asset(&addr, amount, blind, asset_id));
+            match shield_pay_from(w, &url, &leaves, asset_id, amount, out, note, Some(i)) {
+                Ok(()) => {
+                    // The new coin is ours and its note is on the chain: hold it now, so the
+                    // balance does not dip until the next scan finds it.
+                    let born = tip_or(&url, w);
+                    w.coins.push(CoinRec::new(w.account.own_asset_coin(amount, blind, asset_id), born));
+                    w.push_hist("fee", -(GAS_FEE as i64), "stealth coin backed up by your phrase".into(), zcrypt_shield::ASSET_ZCRYPT);
+                    swept += 1;
+                }
+                Err(e) => {
+                    eprintln!("[sweep] a stealth coin stays as it is for now: {e}");
+                    SWEEP_FAILED_AT.store(now, std::sync::atomic::Ordering::Relaxed);
+                    left.push((asset_id, value));
+                }
+            }
+        }
+        if swept > 0 {
+            save_now(state, w, "back up a stealth coin")?;
+        }
+        let has_gas = wallet_has_gas(w, &[]);
+        Ok(SweepReport { swept, waiting: unbacked_report(&left, has_gas) })
+    })
+    .and_then(ok)
+}
+
+#[test]
+fn unbacked_coins_are_grouped_per_asset_with_the_reason() {
+    let z = zcrypt_shield::ASSET_ZCRYPT;
+    // No ZCRYPT in the wallet: another asset waits for gas, and a ZCRYPT coin no larger
+    // than the fee is dust.
+    let r = unbacked_report(&[(7, 100), (7, 50), (z, GAS_FEE)], false);
+    assert_eq!(r.len(), 2);
+    assert_eq!(r[0], Unbacked { asset_id: 7, amount: 150, waiting_for: "gas".into() });
+    assert_eq!(r[1], Unbacked { asset_id: z, amount: GAS_FEE, waiting_for: "dust".into() });
+    // With ZCRYPT on hand the same coin is only waiting for the next attempt.
+    assert_eq!(unbacked_report(&[(7, 100)], true)[0].waiting_for, "retry");
+    assert_eq!(unbacked_report(&[(z, GAS_FEE + 1)], false)[0].waiting_for, "retry");
+    assert!(unbacked_report(&[], false).is_empty());
+}
+
+#[test]
+fn derived_stealth_seeds_are_stable_distinct_and_apart_from_change_keys() {
+    let (a, _m) = keys::new_account();
+    let s0 = derived_stealth_seed(&a, 0);
+    assert_eq!(s0, derived_stealth_seed(&a, 0), "the same phrase gives the same address again");
+    assert_ne!(s0, derived_stealth_seed(&a, 1));
+    assert_ne!(Account::from_seed(s0).stealth_address().to_bech32(), a.stealth(0).stealth_address().to_bech32());
+    let (b, _m) = keys::new_account();
+    assert_ne!(s0, derived_stealth_seed(&b, 0));
+    // A note encrypted to a derived address opens with the re-derived account, and the
+    // coin it yields is the one the sender committed to.
+    let acct = Account::from_seed(s0);
+    let addr = acct.stealth_address();
+    let blind = keys::random_blind();
+    let ct = keys::encrypt_note_asset(&addr, 42, blind, 7);
+    let coin = Account::from_seed(derived_stealth_seed(&a, 0)).receive(&ct).expect("re-derived key opens the note");
+    assert_eq!((coin.value, coin.asset_id), (42, 7));
+    assert_eq!(coin.spend_secret, acct.own_coin(0, [0u64; 8]).spend_secret);
+}
+
 /// Export this account's **view key** (hex). It decrypts incoming notes to your NORMAL
 /// address — revealing amounts + assets for selective compliance disclosure — but holds
 /// no spend secret (it can never spend), and it cannot see stealth or bearer coins. Hand
@@ -1333,6 +1564,23 @@ struct Balance {
     spendable: u64,
     total: u64,
     coin_count: usize,
+    /// The block this wallet has read the chain up to. The screens show this, not the
+    /// node's tip, as "synced to".
+    scan_height: i64,
+    /// The block a scan in progress has reached, or 0 when none is reading the chain.
+    scanning_at: i64,
+}
+
+/// How far the scan now running has read (0 when none is). Read by the balance call so a
+/// screen can show "block M of N" while a long catch-up is going on.
+static SCAN_AT: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+/// Clears [`SCAN_AT`] however the scan ends.
+struct ScanAtGuard;
+impl Drop for ScanAtGuard {
+    fn drop(&mut self) {
+        SCAN_AT.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 #[tauri::command]
@@ -1346,6 +1594,8 @@ async fn get_balance(state: State<'_, AppState>) -> R<Balance> {
                 .iter()
                 .filter(|c| !c.spent && c.coin.asset_id == zcrypt_shield::ASSET_ZCRYPT)
                 .count(),
+            scan_height: w.scan_height,
+            scanning_at: SCAN_AT.load(std::sync::atomic::Ordering::Relaxed),
         })
     })
     .and_then(ok)
@@ -1450,11 +1700,29 @@ async fn receive_coin(note: String, state: State<'_, AppState>) -> R<Received> {
         let bytes = un_base64ish(s).ok_or("malformed note")?;
         let ct = kem::ciphertext_from_bytes(&bytes).ok_or("malformed note")?;
         // normal account first, then each stealth sub-account
-        let coin = w
+        let mut coin = w
             .account
             .receive(&ct)
-            .or_else(|| w.stealth_seeds.iter().find_map(|seed| Account::from_seed(*seed).receive(&ct)))
-            .ok_or("this note is not addressed to any of your keys")?;
+            .or_else(|| w.stealth_seeds.iter().find_map(|seed| Account::from_seed(*seed).receive(&ct)));
+        // A restored wallet has not re-created its stealth addresses yet: try the next
+        // ones the phrase derives, and adopt every address up to the one that opens it.
+        if coin.is_none() {
+            let from = w.next_stealth;
+            for i in from..from.saturating_add(STEALTH_GAP) {
+                if let Some(c) = Account::from_seed(derived_stealth_seed(&w.account, i)).receive(&ct) {
+                    for j in from..=i {
+                        let seed = derived_stealth_seed(&w.account, j);
+                        if !w.stealth_seeds.contains(&seed) {
+                            w.stealth_seeds.push(seed);
+                        }
+                    }
+                    w.next_stealth = i + 1;
+                    coin = Some(c);
+                    break;
+                }
+            }
+        }
+        let coin = coin.ok_or("this note is not addressed to any of your keys")?;
         if w.coins.iter().any(|c| c.coin.commitment() == coin.commitment()) {
             return Err("you already have this coin".into());
         }
@@ -3228,6 +3496,23 @@ fn shield_pay(
     recipient_out: zcrypt_shield::OutCoin,
     onchain_note: Vec<u8>,
 ) -> Result<(), String> {
+    shield_pay_from(w, url, leaves, asset_id, amount, recipient_out, onchain_note, None)
+}
+
+/// [`shield_pay`], optionally spending exactly the coin at index `only` and no other
+/// (the sweep of one stealth coin). The coin must cover the amount, and for ZCRYPT the
+/// in-proof gas too.
+#[allow(clippy::too_many_arguments)]
+fn shield_pay_from(
+    w: &mut Wallet,
+    url: &str,
+    leaves: &[zcrypt_shield::Commitment],
+    asset_id: u64,
+    amount: u64,
+    recipient_out: zcrypt_shield::OutCoin,
+    onchain_note: Vec<u8>,
+    only: Option<usize>,
+) -> Result<(), String> {
     let chain_id = chain_id_for(url)?;
     if amount > MAX_COIN {
         return Err(format!("amount too large — must be ≤ {MAX_COIN} base units"));
@@ -3277,7 +3562,15 @@ fn shield_pay(
     }
     // Fewest inputs (up to N_IN) covering the amount (+ the in-proof gas for ZCRYPT).
     let need = need_total as u128;
-    let chosen: Vec<usize> = if w.coins[sel[0]].value as u128 >= need {
+    let chosen: Vec<usize> = if let Some(i) = only {
+        if !sel.contains(&i) {
+            return Err("that coin is not spendable on this chain".into());
+        }
+        if (w.coins[i].value as u128) < need {
+            return Err("that coin is smaller than the amount and its fee".into());
+        }
+        vec![i]
+    } else if w.coins[sel[0]].value as u128 >= need {
         vec![sel[0]]
     } else if sel.len() >= 2 && (w.coins[sel[0]].value as u128 + w.coins[sel[1]].value as u128) >= need {
         vec![sel[0], sel[1]]
@@ -4895,16 +5188,26 @@ async fn index_job(state: State<'_, AppState>) -> R<IndexJob> {
 
 #[tauri::command]
 async fn scan_onchain(state: State<'_, AppState>) -> R<usize> {
-    // A genesis rebuild already holds the gate. Refresh must not sit behind it:
-    // the rebuild finishes by asking the screen to refresh, and that scan is short.
+    // A rebuild or first sync job holds the gate for minutes and reports through
+    // `index_job`; a refresh must not sit behind it, and its screen refreshes when it ends.
+    if state.index_job.lock().unwrap_or_else(|e| e.into_inner()).running {
+        return ok(0);
+    }
+    // Any other holder is another scan. Wait for it and then catch up: answering "done"
+    // while that scan was still reading made the screens say "synced" when they were not,
+    // and let a payment start from a view that was still being built.
     // Clone before locking: the guard borrows `state`, and the scan takes its own handle.
     let scan = state.clone();
-    let gate = match state.scan_gate.try_lock() {
-        Ok(g) => g,
-        Err(std::sync::TryLockError::WouldBlock) => return ok(0),
-        Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
-    };
+    let gate = state.scan_gate.lock().unwrap_or_else(|e| e.into_inner());
     let n = scan_onchain_inner(scan);
+    // Coins received on a stealth address move into the phrase-backed balance as soon as
+    // the wallet can pay for it; this is what makes one "sweep on its own" after ZCRYPT
+    // arrives. A failure here never fails the sync.
+    if n.is_ok() {
+        if let Err(e) = sweep_stealth_inner(&state) {
+            eprintln!("[sweep] skipped: {e:?}");
+        }
+    }
     drop(gate);
     n
 }
@@ -4963,7 +5266,11 @@ fn scan_onchain_inner(state: State<AppState>) -> R<usize> {
     // Transient node errors (429 rate limits, timeouts) are retried with backoff; if they
     // persist, the scan keeps what it fetched, records how far it got, and resumes from
     // there next time instead of starting over.
-    let progress = |at: i64, total: i64| report_index(state.inner(), "fetching", at, total);
+    let _scan_at = ScanAtGuard;
+    let progress = |at: i64, total: i64| {
+        SCAN_AT.store(at.max(0), std::sync::atomic::Ordering::Relaxed);
+        report_index(state.inner(), "fetching", at, total)
+    };
     if scan_notes {
         progress(from.max(0), tip.max(0));
     }
@@ -6753,6 +7060,9 @@ struct HeldAsset {
     ticker: String,
     decimals: u8,
     balance: u64, // on-chain unspent, base units
+    /// Part of `balance` received on a stealth address and not yet moved into the
+    /// phrase-backed balance: a restore from the recovery phrase would not find it.
+    unbacked: u64,
 }
 
 /// Shielded assets this wallet can spend (on-chain unspent), with balances + tickers
@@ -6765,17 +7075,22 @@ async fn held_assets(state: State<'_, AppState>) -> R<Vec<HeldAsset>> {
     // hand are coins that have not landed yet left out.
     let leaves = chain::fetch_leaves(&url).ok();
     let mut bal: std::collections::BTreeMap<u64, u64> = std::collections::BTreeMap::new();
+    let mut unbacked: std::collections::BTreeMap<u64, u64> = std::collections::BTreeMap::new();
     bal.insert(zcrypt_shield::ASSET_ZCRYPT, 0);
     {
         let g = state.wallet.lock().unwrap();
         let w = g.as_ref().ok_or("locked")?;
-        for c in w.coins.iter().filter(|c| !c.spent) {
+        let stealth = unbacked_coin_indices(w);
+        for (i, c) in w.coins.iter().enumerate().filter(|(_, c)| !c.spent) {
             let on_chain = match &leaves {
                 Some(l) => chain::find_index(l, &c.coin.commitment()).is_some(),
                 None => c.leaf_index.is_some(),
             };
             if on_chain {
                 *bal.entry(c.coin.asset_id).or_insert(0) += c.value;
+                if stealth.contains(&i) {
+                    *unbacked.entry(c.coin.asset_id).or_insert(0) += c.value;
+                }
             }
         }
     }
@@ -6797,7 +7112,7 @@ async fn held_assets(state: State<'_, AppState>) -> R<Vec<HeldAsset>> {
                 },
             }
         };
-        out.push(HeldAsset { asset_id, ticker, decimals, balance });
+        out.push(HeldAsset { asset_id, ticker, decimals, balance, unbacked: unbacked.get(&asset_id).copied().unwrap_or(0) });
     }
     if !learned.is_empty() {
         // Remember the registry's answer so the next offline start still names the asset.
@@ -10785,37 +11100,52 @@ fn ingest_opened_file(app: &tauri::AppHandle, url: &url::Url) {
     }
 }
 
+/// Read every payment file waiting in `dir` (bounded), append its text to `out`, and delete
+/// it: a bearer coin must not linger in a folder other apps or a backup can see.
+#[cfg(any(target_os = "android", target_os = "ios"))]
+fn drain_inbox(dir: &std::path::Path, out: &mut Vec<String>) {
+    const MAX: u64 = 256 * 1024;
+    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    let mut paths: Vec<_> = rd.flatten().map(|e| e.path()).collect();
+    paths.sort();
+    for p in paths {
+        if let Ok(m) = std::fs::metadata(&p) {
+            if m.is_file() && m.len() <= MAX {
+                if let Ok(t) = std::fs::read_to_string(&p) {
+                    let t = t.trim().to_string();
+                    if !t.is_empty() && !out.contains(&t) {
+                        out.push(t);
+                    }
+                }
+            }
+        }
+        let _ = std::fs::remove_file(&p);
+    }
+}
+
 /// Files the OS opened with the app that the UI has not consumed yet (drained).
 ///
 /// Android has no "opened" event: `MainActivity` copies a file handed to the app into
 /// `<app data>/inbox`, and this drains that folder too (the UI calls it on every return to
 /// the foreground). Each file is read once, bounded, and deleted.
+///
+/// iOS has the event only while the app is running. A file that STARTS the app arrives in
+/// the scene's connection options, which the windowing layer does not turn into an event,
+/// so it never reached the wallet. iOS has already copied the file into `Documents/Inbox`
+/// by then, so that folder is drained here as well.
 #[tauri::command]
 async fn take_opened_files(state: State<'_, AppState>) -> R<Vec<String>> {
     let mut v = std::mem::take(&mut *state.opened_files.lock().unwrap());
     #[cfg(target_os = "android")]
     {
-        const MAX: u64 = 256 * 1024;
         let inbox = state.inbox_dir.lock().unwrap().clone();
         if let Some(dir) = inbox {
-            if let Ok(rd) = std::fs::read_dir(&dir) {
-                let mut paths: Vec<_> = rd.flatten().map(|e| e.path()).collect();
-                paths.sort();
-                for p in paths {
-                    if let Ok(m) = std::fs::metadata(&p) {
-                        if m.is_file() && m.len() <= MAX {
-                            if let Ok(t) = std::fs::read_to_string(&p) {
-                                let t = t.trim().to_string();
-                                if !t.is_empty() {
-                                    v.push(t);
-                                }
-                            }
-                        }
-                    }
-                    let _ = std::fs::remove_file(&p);
-                }
-            }
+            drain_inbox(&dir, &mut v);
         }
+    }
+    #[cfg(target_os = "ios")]
+    if let Ok(home) = std::env::var("HOME") {
+        drain_inbox(&std::path::Path::new(&home).join("Documents").join("Inbox"), &mut v);
     }
     ok(v)
 }
@@ -10878,6 +11208,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             rescan_from_genesis,
             sync_from_cursor,
+        unbacked_coins,
+        sweep_stealth,
             index_job,
             buy_quote,
             buy_order,
@@ -10976,6 +11308,7 @@ pub fn run() {
             mobile_auth::mobile_forget_copied,
             mobile_auth::mobile_adopt,
             mobile_auth::mobile_reveal_phrase,
+            mobile_auth::mobile_reveal_stealth,
         ])
         .on_window_event(|_window, _event| {
             // iOS: the view reaches its final size during the view-controller transition;
@@ -11138,7 +11471,8 @@ mod live_3node {
         println!("[wallet] bearer coin created by Alice, claimed by Bob, double-claim rejected; Bob holds {} base units", after_sweep);
 
         // Stealth: Bob makes a stealth address; Alice sends; the note travels out of band.
-        // Done AFTER the sweep so the stealth receipt stays unspent for the restore check.
+        // Bob's next sync moves the coin into his phrase-backed balance (0.01 ZCRYPT, paid
+        // by the coin itself), which the restore check at the end relies on.
         let stealth = v(new_stealth_address(bob.st())).expect("stealth address");
         assert_eq!(v(address_kind(stealth.address.clone())).unwrap(), "stealth");
         let s = v(send_stealth(stealth.address.clone(), ZC, "0".into(), alice.st())).expect("stealth send");
@@ -11146,9 +11480,11 @@ mod live_3node {
         assert!(note.starts_with("zct1"));
         let got = wait_until("stealth note on chain", 60, || v(receive_coin(note.clone(), bob.st())).ok());
         assert_eq!(got.amount, ZC);
+        assert_eq!(v(unbacked_coins(bob.st())).unwrap().iter().map(|u| u.amount).sum::<u64>(), ZC, "the stealth coin is not phrase-backed yet");
         v(scan_onchain(bob.st())).expect("scan");
-        assert_eq!(v(get_balance(bob.st())).unwrap().total, after_sweep + ZC);
-        println!("[wallet] Alice -> Bob stealth 1 ZCRYPT via out-of-band note: received");
+        assert_eq!(v(get_balance(bob.st())).unwrap().total, after_sweep + ZC - GAS_FEE);
+        assert!(v(unbacked_coins(bob.st())).unwrap().is_empty(), "the sync backed the stealth coin up");
+        println!("[wallet] Alice -> Bob stealth 1 ZCRYPT via out-of-band note: received and backed up by the phrase");
 
         // Receipts. Alice stored one per payment. She checks her own. Bob checks the
         // same files and the normal and stealth ones name an address in his wallet.
@@ -11649,10 +11985,10 @@ mod live_3node {
         let b2 = v(get_balance(bob2.st())).unwrap();
         let b1 = v(get_balance(bob.st())).unwrap();
         // The normal receipt, the swept bearer coin and the sweep's HD change are all found
-        // again by trial decryption; the stealth receipt used a RANDOM seed that a mnemonic
-        // cannot recover, which is the documented property of stealth addresses.
-        assert_eq!(b2.total, b1.total - ZC, "restore recovers everything except the stealth receipt");
-        println!("[wallet] Bob restored from his phrase: {} of {} ZCRYPT recovered (stealth receipt is by design not derivable)", b2.total / ZC, b1.total / ZC);
+        // again by trial decryption, and so is the stealth receipt: Bob's wallet moved it
+        // to his own address with its note on the chain right after receiving it.
+        assert_eq!(b2.total, b1.total, "restore recovers everything, the stealth receipt included");
+        println!("[wallet] Bob restored from his phrase: {} of {} base units recovered", b2.total, b1.total);
 
         println!("\nWALLET BACKEND against the live 3-node chain: GREEN");
     }

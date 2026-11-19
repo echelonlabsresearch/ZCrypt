@@ -572,6 +572,22 @@ pub async fn mobile_reveal_phrase(pin: Option<String>, app: tauri::AppHandle, st
     ok(super::SecretString(Zeroizing::new(phrase.to_string())))
 }
 
+/// Show the private key of ONE shielded (stealth) address, after Face ID or the PIN: the
+/// phone's form of `reveal_stealth_backup`, which asks for the wallet password a phone
+/// user never types. One key per check, never the whole list.
+#[tauri::command]
+pub async fn mobile_reveal_stealth(index: u32, pin: Option<String>, app: tauri::AppHandle, state: State<'_, AppState>) -> R<super::SecretString> {
+    if state.wallet.lock().unwrap().is_none() {
+        return Err("wallet is locked".into());
+    }
+    let dir = state.data_dir.lock().unwrap().clone();
+    authenticate(app, &dir, pin, "Show this address's private key").await?;
+    let g = state.wallet.lock().unwrap();
+    let w = g.as_ref().ok_or("wallet is locked")?;
+    let seed = w.stealth_seeds.get(index as usize).ok_or("no such shielded address")?;
+    ok(super::SecretString(Zeroizing::new(hex::encode(seed))))
+}
+
 /// Switch Face ID unlock on (needs the PIN to release the secret) or off.
 #[tauri::command]
 pub async fn mobile_set_biometric(enabled: bool, pin: Option<String>, app: tauri::AppHandle, state: State<'_, AppState>) -> R<bool> {
