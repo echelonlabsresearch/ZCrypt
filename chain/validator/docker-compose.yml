@@ -32,7 +32,7 @@ services:
     networks: [vnet]
 
   validator-cometbft:
-    image: cometbft/cometbft:v0.38.17
+    image: cometbft/cometbft:v0.38.26
     container_name: zcrypt-validator-cometbft
     restart: unless-stopped
     depends_on:
