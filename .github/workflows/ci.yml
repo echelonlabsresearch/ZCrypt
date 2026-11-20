@@ -7,13 +7,22 @@
 #     new class fails the build (tighten the list as classes are cleaned up);
 #   * supply chain: cargo audit, cargo deny (advisories, licenses, sources, bans) on both
 #     lockfiles, npm audit on the wallet frontend;
-#   * the wallet frontend build + backend tests.
+#   * the wallet frontend build + backend tests;
+#   * the Lean proofs in formal/: every proof is machine-checked again, and an axiom audit
+#     fails the build on an unfinished proof or a new axiom.
+# A newer push to the same branch or pull request cancels the run it replaces. Runs on
+# mainnet and the nightly are never cancelled.
 # The live 3-node job is in this same workflow. It builds Docker images and real STARK
 # proofs, so it runs on a push to testnet or mainnet, on a pull request into either
 # branch, nightly at 06:00 UTC, or when someone starts the workflow by hand. A pull
 # request into testnet is where new code is tested. A pull request into mainnet must
-# come from that branch; the gate job fails any other head. Merging re-runs the same
-# tests on mainnet.
+# come from that branch; the gate job fails any other head.
+# A release takes the same files through three events: the push to testnet, the pull
+# request into mainnet, and the merge. The live job runs in full on the first. On the
+# others it looks for a full, successful run of itself on a commit with exactly the same
+# tree, made in the last seven days, and if there is one it reports that run and stops.
+# The nightly and manual runs always execute in full, which is what catches a change
+# outside the repository (a base image, a package).
 # Every cargo invocation is --locked: Cargo.lock is authoritative. Actions are pinned by
 # commit SHA (the tag is in the comment) so a moved tag cannot change what runs.
 # Publishing the ABCI image is not a test; that stays in image.yml.
@@ -28,6 +37,10 @@ on:
 
 permissions:
   contents: read
+
+concurrency:
+  group: ci-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'schedule' && github.ref != 'refs/heads/mainnet' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -69,13 +82,18 @@ jobs:
       matrix:
         shard:
           - name: shield + core unit
+            key: unit
             cmd: cargo test --locked -p zcrypt-shield -p zcrypt-core --lib
+          # --test '*' is the integration tests only: the core unit tests already ran in
+          # the shard above.
           - name: core integration + abci
+            key: integration
             cmd: >-
-              cargo test --locked -p zcrypt-core --tests --examples &&
+              cargo test --locked -p zcrypt-core --test '*' --examples &&
               cargo test --locked -p zcrypt-abci-node &&
               cargo test --locked -p zcrypt-abci-node --features devnet
           - name: bridge + explorer + cli
+            key: bridge
             cmd: cargo test --locked -p zcrypt-bridge -p zcrypt-explorer -p zcrypt-cli
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -93,7 +111,10 @@ jobs:
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: impl
-          shared-key: impl-tests
+          # One cache per shard. The shards build different dependency sets (only two of
+          # them build RocksDB, about eight minutes of C++), and a shared key keeps only
+          # the first shard's.
+          shared-key: impl-tests-${{ matrix.shard.key }}
       - name: Show toolchain
         working-directory: impl
         run: rustup show
@@ -220,6 +241,25 @@ jobs:
         working-directory: wallet/src-tauri
         run: cargo test --locked
 
+  formal:
+    name: Lean proofs (formal/)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # Installs the Lean version pinned in formal/lean-toolchain and runs `lake build`,
+      # which checks every proof in the library. The project has no dependencies.
+      - name: Build (machine-check every proof)
+        uses: leanprover/lean-action@ba3fdfe5c4476c925da13bf11a005ddb47e47aee # v1.7.1
+        with:
+          lake-package-directory: formal
+          use-github-cache: false
+      # A proof left as `sorry` still builds (with a warning). This is what turns it, a
+      # native_decide or a new axiom into a failure.
+      - name: Axiom audit (no sorry, no axiom beyond Lean's standard three)
+        working-directory: formal
+        run: lake env lean Axioms.lean
+
   mainnet-from-testnet:
     name: Only testnet merges to mainnet
     if: github.event_name == 'pull_request' && github.base_ref == 'mainnet'
@@ -246,13 +286,56 @@ jobs:
       (github.event_name == 'pull_request' && (github.base_ref == 'mainnet' || github.base_ref == 'testnet'))
     runs-on: ubuntu-latest
     timeout-minutes: 120
+    permissions:
+      contents: read
+      checks: read    # read this job's earlier results on the same tree
+      actions: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 2   # the parents: a merge commit has the tree of the branch it merged
+      # Same files, same result: skip when this job already ran IN FULL and passed on a
+      # commit whose tree is identical to this one (this commit, or a parent of a merge).
+      # Only a run whose e2e step itself succeeded counts, so a skipped run is never the
+      # evidence for another skip. Any doubt (no match, an API error) runs the job.
+      - name: Has this exact code already passed this job?
+        id: prior
+        if: github.event_name == 'push' || github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          JOB_NAME: 3-node network + all live drivers
+        run: |
+          tree=$(git rev-parse 'HEAD^{tree}')
+          now=$(date +%s)
+          for c in HEAD HEAD^1 HEAD^2; do
+            sha=$(git rev-parse --verify -q "$c^{commit}") || continue
+            [ "$(git rev-parse "$sha^{tree}")" = "$tree" ] || continue
+            ids=$(gh api -X GET "repos/$GITHUB_REPOSITORY/commits/$sha/check-runs" \
+                    -f check_name="$JOB_NAME" -f status=completed -f filter=all -F per_page=100 \
+                    --jq '.check_runs[] | select(.conclusion == "success" and .app.slug == "github-actions") | .id') || continue
+            for id in $ids; do
+              row=$(gh api "repos/$GITHUB_REPOSITORY/actions/jobs/$id" \
+                      --jq '[([.steps[] | select(.name | startswith("Full live e2e")) | .conclusion] | first // "none"), .completed_at, .html_url] | @tsv') || continue
+              IFS=$'\t' read -r e2e done url <<<"$row"
+              [ "$e2e" = "success" ] || continue
+              age=$(( now - $(date -d "$done" +%s) )) || continue
+              [ "$age" -lt 604800 ] || continue
+              echo "The full job passed on commit $sha (tree $tree), finished $done:"
+              echo "  $url"
+              echo "Identical files, so it is not run again."
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+              echo "Skipped: the full run on identical files passed at $done: $url" >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            done
+          done
+          echo "No full, passing run on this tree ($tree) in the last seven days: running the job."
       - name: Free runner disk space (images + prover build need it)
+        if: steps.prior.outputs.skip != 'true'
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
           df -h /
       - name: Native build deps (drivers build the prover locally, wallet test links Tauri)
+        if: steps.prior.outputs.skip != 'true'
         run: |
           sudo apt-get -o Acquire::Retries=3 update
           sudo apt-get -o Acquire::Retries=3 install -y --no-install-recommends \
@@ -260,6 +343,7 @@ jobs:
             libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev \
             libayatana-appindicator3-dev
       - name: Cache cargo build
+        if: steps.prior.outputs.skip != 'true'
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: |
@@ -267,8 +351,10 @@ jobs:
             wallet/src-tauri
           shared-key: live-e2e
       - name: Show toolchain
+        if: steps.prior.outputs.skip != 'true'
         working-directory: impl
         run: rustup show
       # Docker + docker compose + python3 + curl are preinstalled on ubuntu-latest.
       - name: Full live e2e (fresh 3-node net -> all drivers -> teardown)
+        if: steps.prior.outputs.skip != 'true'
         run: KEEP=0 ./chain/e2e/run-all.sh

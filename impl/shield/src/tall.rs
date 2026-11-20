@@ -700,6 +700,52 @@ pub fn verify_tall(
 mod tests {
     use super::*;
 
+    /// The Lean model (formal/Zcrypt/Air/Layout.lean) is written by hand at this circuit's
+    /// compiled geometry. This test reads the model's constants and row ranges and compares
+    /// them with the constants this file compiles with, so a relayout here that is not
+    /// carried into the model fails the build instead of leaving the proofs about an old
+    /// circuit.
+    #[test]
+    fn the_lean_model_has_this_circuits_geometry() {
+        let lean = include_str!("../../../formal/Zcrypt/Air/Layout.lean");
+        let lines: Vec<&str> = lean.lines().map(|l| l.split("--").next().unwrap_or("").trim()).collect();
+        let fee_i = N_OUT * 8;
+        let nf_off = fee_i + 1;
+        let root_off = nf_off + N_IN * 8;
+        let p0_last = PATH_FIRST + DEPTH - 1;
+        let p1_first = PATH_FIRST + DEPTH;
+        let path_end = PATH_FIRST + PATH_ROWS;
+        let p1_last = path_end - 1;
+        // The model writes out two inputs (two path segments); more needs a new model.
+        assert_eq!(N_IN, 2, "the Lean model is written for two inputs");
+        let want = [
+            format!("def HEIGHT : Nat := {HEIGHT}"),
+            format!("def DEPTH : Nat := {DEPTH}"),
+            format!("def S : Nat := {S}"),
+            format!("def N_IN : Nat := {N_IN}"),
+            format!("def CORE : Nat := {CORE}"),
+            format!("def TAG_COMMIT : Int := {TAG_COMMIT}"),
+            format!("def TAG_NF : Int := {TAG_NF}"),
+            format!("def TAG_PK : Int := {TAG_PK}"),
+            format!("def B : Int := {}", 1u64 << BITS),
+            "def outOff : Nat := 0".to_string(),
+            format!("def feeIdx : Nat := {fee_i}"),
+            format!("def nfOff : Nat := {nf_off}"),
+            format!("def rootOff : Nat := {root_off}"),
+            format!("def isInner (r : Nat) : Prop := r = {ROW_INNER}"),
+            format!("def isCore (r : Nat) : Prop := r = {ROW_CORE}"),
+            format!("def isPath (r : Nat) : Prop := {PATH_FIRST} ≤ r ∧ r < {path_end}"),
+            format!("def isChain (r : Nat) : Prop := ({PATH_FIRST} ≤ r ∧ r < {p0_last}) ∨ ({p1_first} ≤ r ∧ r < {p1_last})"),
+            format!("def isP1First (r : Nat) : Prop := r = {p1_first}"),
+            format!("def isP0Last (r : Nat) : Prop := r = {p0_last}"),
+            format!("def isP1Last (r : Nat) : Prop := r = {p1_last}"),
+            format!("def pathFirst (i : Nat) : Nat := {PATH_FIRST} + {DEPTH} * i"),
+        ];
+        for w in &want {
+            assert!(lines.contains(&w.as_str()), "formal/Zcrypt/Air/Layout.lean does not say `{w}`: the Lean model and tall.rs disagree");
+        }
+    }
+
     const CHAIN: &[u8] = b"zcrypt-devnet";
     /// Hex of `postcard(preprocessed vk commitment)`; update ONLY with a deliberate,
     /// coordinated circuit change (it is a proof-format change).
