@@ -165,7 +165,7 @@ fn shield_rows(prefix: &str, tx: &ShieldTx, out: &mut Vec<Value>) {
     };
     out.push(row(format!("{prefix}.outputs"), out_label, outs));
     out.push(row(format!("{prefix}.root"), "anchor root (whole-pool Merkle root)", short(&tx.root)));
-    out.push(row(format!("{prefix}.fee"), "in-tx fee field — 0 by design in a bundle: the 0.01 gas is burned as gas.outputs[0] (verified via the public gas blind), not via this field", zcry(tx.fee)));
+    out.push(row(format!("{prefix}.fee"), "in-tx fee field, 0 by design in a bundle: the 0.01 gas is burned as gas.outputs[0] (verified via the public gas blind), not via this field", zcry(tx.fee)));
     out.push(row(format!("{prefix}.enc_notes"), "encrypted notes (ML-KEM-768)", format!("{} note(s)", tx.enc_notes.len())));
     out.push(row(format!("{prefix}.proof"), "STARK proof", format!("{} bytes", tx.proof.len())));
 }
@@ -182,7 +182,7 @@ fn payload_layout(tag: u8, body: &[u8]) -> Option<Vec<Value>> {
 GAS note that provably burns the 0.01 fee, and the MAIN transfer that moves the (hidden) value. \
 Both carry their own STARK proof; consensus accepts or rejects them atomically.".into()));
             r.push(row("[1..65]".into(), "gas blind: the PUBLIC opening of the gas burn. Every node recomputes \
-commit(0.01 ZCRYPT, this blind, BURN_PK) and requires it to equal gas.outputs[0] — proving exactly 0.01 was \
+commit(0.01 ZCRYPT, this blind, BURN_PK) and requires it to equal gas.outputs[0], proving exactly 0.01 was \
 burned, while every other output stays hidden", hex_at(0, BB)));
             let gas_len = rd_u32(body, BB)? as usize;
             r.push(row("[65..69]".into(), "gas tx length (u32 LE)", format!("{gas_len}")));
@@ -194,8 +194,8 @@ burned, while every other output stays hidden", hex_at(0, BB)));
             r.push(row("".into(), "STRUCTURE", "a 0x6A NATIVE ZCRYPT transfer is ONE shield tx. Its output[0] is a \
 revealed ZCRYPT burn coin (≥ 0.01): every node recomputes commit_asset(burn value, burn blind, BURN_PK, ZCRYPT) \
 and requires it to equal output[0]. A spend is single-asset, so the revealed burn pins every hidden input and \
-output to ZCRYPT — the gas is ZCRYPT with no second coin and no second proof.".into()));
-            r.push(row("[1..9]".into(), "burn value (u64 LE, atomic ZCRYPT) — the gas; must be ≥ MIN_FEE", rd_u64(body, 0).map(zcry)?));
+output to ZCRYPT: the gas is ZCRYPT with no second coin and no second proof.".into()));
+            r.push(row("[1..9]".into(), "burn value (u64 LE, atomic ZCRYPT): the gas; must be ≥ MIN_FEE", rd_u64(body, 0).map(zcry)?));
             r.push(row("[9..73]".into(), "burn blind: the PUBLIC opening of output[0]", hex_at(8, BB)));
             let (_, _, tx) = parse_zcrypt_transfer(body)?;
             shield_rows("[73..] transfer", &tx, &mut r);
@@ -203,7 +203,7 @@ output to ZCRYPT — the gas is ZCRYPT with no second coin and no second proof."
         0x6B => {
             let aid = rd_u64(body, 8 + BB)?;
             r.push(row("".into(), "STRUCTURE", "a 0x6B NATIVE swap lock is the 0x62 escrow header, then a 32-byte \
-SPONSOR reference, the claim and refund openings, and the asset spend — with NO gas prefix. A ZCRYPT lock burns \
+SPONSOR reference, the claim and refund openings, and the asset spend, with NO gas prefix. A ZCRYPT lock burns \
 its gas as the spend's in-tx fee (0.01, or 0.02 when it also pays for the counter-lock it names); a lock of any \
 other asset pays nothing and is admitted only if the ZCRYPT swap lock it names is open, is the other leg of this \
 swap (same hashlock, keys crossed), named exactly this lock, and has not sponsored before.".into()));
@@ -234,7 +234,7 @@ swap (same hashlock, keys crossed), named exactly this lock, and has not sponsor
             }
         }
         0x58 => {
-            r.push(row("[1..65]".into(), "recipient shield pubkey (8 x u64 LE) — PUBLIC by design: a claim is \
+            r.push(row("[1..65]".into(), "recipient shield pubkey (8 x u64 LE), PUBLIC by design: a claim is \
 transparent income (auditable rewards / foundation vesting). Privacy begins at the coin's first SPEND, \
 which hides among the whole pool", hex_at(0, 64)));
             r.push(row("[65..73]".into(), "amount (u64 LE) -> Ctx.amount", rd_u64(body, 64).map(zcry)?));
@@ -384,20 +384,20 @@ whose output[0] is the locked-value burn coin.".into()));
             let n = body.len() / 80;
             r.push(row(
                 "[1..]".into(),
-                "raw Bitcoin block headers (80 bytes each) — every validator verifies linkage, proof-of-work, difficulty rules, and heaviest-chain fork choice",
+                "raw Bitcoin block headers (80 bytes each): every validator verifies linkage, proof-of-work, difficulty rules, and heaviest-chain fork choice",
                 format!("{n} header(s); first: {}", hex_at(0, 80.min(body.len()))),
             ));
         }
         0x64 => {
             let aid = rd_u64(body, 0)?;
             r.push(row("[1..9]".into(), "asset id (u64 LE)", format!("{aid}")));
-            r.push(row("[9..17]".into(), "escrow value (u64 LE, base units — must be ≤ the proven locked sats)", asset_amt(rd_u64(body, 8)?, Some(aid), None, None)));
+            r.push(row("[9..17]".into(), "escrow value (u64 LE, base units; must be ≤ the proven locked sats)", asset_amt(rd_u64(body, 8)?, Some(aid), None, None)));
             r.push(row("[17..49]".into(), "hashlock (SHA-256) -> Ctx.hashlock", hex_at(16, 32)));
             r.push(row("[49..57]".into(), "timeout height (u64 LE) -> Ctx.timeout", format!("{}", rd_u64(body, 48)?)));
             r.push(row("[57..121]".into(), "claimer shield pubkey", hex_at(56, 64)));
             r.push(row(
                 "[121..185]".into(),
-                "open_auth (64-byte ECDSA): binds the escrow, the claim commitment, and the note bind — not a Bitcoin reserve key",
+                "open_auth (64-byte ECDSA): binds the escrow, the claim commitment, and the note bind, not a Bitcoin reserve key",
                 hex_at(120, 64),
             ));
             // 184-byte header, then one opening, then MintProof consumed exactly.
@@ -610,7 +610,7 @@ pub fn describe_tx(b: &[u8], chain_id: &[u8], with_rules: bool, height: u64) -> 
         Some(0x63) => json!({
             "type": "Bitcoin header relay", "tag": tag_hex,
             "headers": body.len() / 80,
-            "explains": "Raw Bitcoin block headers feeding the consensus SPV chain — the trustless zBTC mint gate. Anyone may relay; each header proves itself by its proof-of-work, so the relayer is untrusted.",
+            "explains": "Raw Bitcoin block headers feeding the consensus SPV chain: the trustless zBTC mint gate. Anyone may relay; each header proves itself by its proof-of-work, so the relayer is untrusted.",
         }),
         Some(0x64) => {
             // Header is 184 bytes (claim pk, then open_auth). The reserve key is
@@ -776,7 +776,7 @@ fn gate_program(tag: u8, prog: &[u8], body: &[u8], chain_id: &[u8], height: u64)
 
 fn gate_op_result(tag: u8, op: u8, body: &[u8], chain_id: &[u8], height: u64) -> Option<Value> {
     let ran = |ok: bool, note: String| json!({ "ok": ok, "note": note });
-    let state = json!({ "ok": Value::Null, "note": "checked at consensus over chain state at the time (not reproducible now — the state has moved)" });
+    let state = json!({ "ok": Value::Null, "note": "checked at consensus over chain state at the time (not reproducible now: the state has moved)" });
     match op {
         0x00 => None, // HALT
         0x10 => {
