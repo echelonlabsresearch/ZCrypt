@@ -26,6 +26,17 @@ echo 'import Zcrypt
 The full build, including the kernel-checked primality of the BabyBear modulus, takes
 about 15 seconds.
 
+To audit every theorem at once (this is what CI runs after the build; it fails on any
+axiom outside those three, which includes `sorry` and `native_decide`):
+
+```sh
+~/.elan/bin/lake env lean Axioms.lean
+```
+
+CI also keeps the model tied to the code: a test in `impl/shield/src/tall.rs`
+(`the_lean_model_has_this_circuits_geometry`) reads `Zcrypt/Air/Layout.lean` and compares
+its constants and row ranges with the ones the circuit compiles with.
+
 ## What is proved
 
 Hand-modeled faithfully from the Rust, with `file:line` provenance in each file.

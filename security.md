@@ -124,9 +124,48 @@ end-to-end test against a live 3-validator network in CI.
 
 ## Reporting a vulnerability
 
-* **Reporting.** Send vulnerability reports to security@zcrypt.network
-  or open a private security advisory on the repository. Please do not file 
-  public issues for exploitable bugs. There is no bounty programme yet.
+Send reports to security@zcrypt.network, or open a private security advisory on the
+repository. Please do not file a public issue for an exploitable bug, and do not
+disclose it before a fix has shipped. We aim to acknowledge a report within 3 days.
+
+## Bug bounty
+
+Valid reports are rewarded in ZCRYPT, paid by the foundation to a ZCrypt address you
+give us. The amounts are maximums; the reward within a tier depends on impact and on
+the quality of the report.
+
+| Severity | Examples | Reward (ZCRYPT) |
+|---|---|---|
+| Critical | Creating coins from nothing or spending a coin twice; taking another user's funds; minting zBTC that is not backed by a Bitcoin deposit; linking a shielded payment to its sender, its recipient or its amount from public data | up to 25,000 |
+| High | Halting the chain or splitting consensus; destroying or freezing another user's funds or staking rewards; taking funds from the bridge or sale daemons | up to 5,000 |
+| Medium | Leaking wallet secrets from a device; a loss that needs unusual conditions or the victim's cooperation; denial of service against a single node that survives a restart | up to 1,000 |
+| Low | A real security weakness with limited impact | 100 |
+
+**In scope.** The code in this repository as it runs on mainnet (`zcrypt-1`): the shield
+circuit and its verifier (`impl/shield`), the state machine (`impl/core`), the ABCI node,
+the bridge, watcher and sale daemons (`impl/bridge`), the wallet (desktop, iOS, Android),
+and the Lean proofs in `formal/` (a theorem that is false, or one that does not say what
+its description claims, counts).
+
+**Out of scope.** Builds with the `devnet` feature; findings that need a compromised
+device, a malicious validator majority or physical access; weaknesses in third-party
+software, unless ZCrypt uses it in an unsafe way; rate limiting and volumetric denial of
+service against public endpoints; the website's content; anything this document already
+lists as a known limitation.
+
+**Rules.**
+
+* Test on your own node or network. `chain/e2e/run-all.sh` builds a private 3-validator
+  network with a regtest Bitcoin. Do not test on mainnet, and do not touch funds that are
+  not yours.
+* Report privately and give us time to fix it. We aim to ship the fix for a Critical or
+  High finding within 14 days, and we will credit you in the release notes if you want.
+* A report needs enough detail to reproduce the problem: the affected code, the steps,
+  and a proof of concept where one is possible.
+* The first report of an issue is the one rewarded. Issues we already know about are not
+  eligible.
+* Severity and the reward are decided by the foundation. We will explain the decision.
+* We cannot pay anyone we are legally barred from paying.
 
 ## What we will not pretend
 
