@@ -69,7 +69,7 @@ services:
 
   # ---- one-shot: generate the shared 3-validator testnet config ----
   cometbft-init:
-    image: cometbft/cometbft:v0.38.17
+    image: cometbft/cometbft:v0.38.26
     container_name: zcrypt-cometbft-init
     user: "0"
     environment:
@@ -91,7 +91,7 @@ services:
 
   # ---- CometBFT validators ----
   cometbft0:
-    image: cometbft/cometbft:v0.38.17
+    image: cometbft/cometbft:v0.38.26
     container_name: zcrypt-cometbft0
     user: "0"
     restart: unless-stopped
@@ -111,7 +111,7 @@ services:
     networks: [zcrypt-net]
 
   cometbft1:
-    image: cometbft/cometbft:v0.38.17
+    image: cometbft/cometbft:v0.38.26
     container_name: zcrypt-cometbft1
     user: "0"
     restart: unless-stopped
@@ -131,7 +131,7 @@ services:
     networks: [zcrypt-net]
 
   cometbft2:
-    image: cometbft/cometbft:v0.38.17
+    image: cometbft/cometbft:v0.38.26
     container_name: zcrypt-cometbft2
     user: "0"
     restart: unless-stopped

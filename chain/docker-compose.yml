@@ -40,7 +40,7 @@ services:
       - zcrypt-net
 
   cometbft:
-    image: cometbft/cometbft:v0.38.17
+    image: cometbft/cometbft:v0.38.26
     container_name: zcrypt-cometbft
     restart: unless-stopped
     depends_on:
