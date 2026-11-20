@@ -97,6 +97,19 @@ export interface HeldAsset {
   ticker: string;
   decimals: number;
   balance: number;
+  /** Part of the balance received on a stealth address that a restore from the recovery
+   *  phrase would not find yet. The wallet moves it on its own when it can pay the fee. */
+  unbacked?: number;
+}
+
+/** The line shown under an asset while part of it is not restorable from the phrase. */
+export function unbackedNote(a: HeldAsset, hasZcrypt: boolean): string {
+  if (!a.unbacked) return "";
+  const part = a.unbacked < a.balance ? `${fmtAsset(a.unbacked, a.decimals)} ` : "";
+  if (a.asset_id === "0") return `${part}not yet backed up by your phrase`;
+  return hasZcrypt
+    ? `${part}not yet backed up by your phrase · backing up on the next sync`
+    : `${part}not yet backed up by your phrase · needs 0.01 ZCRYPT, then it backs up on its own`;
 }
 
 export const trunc = (a: string, head = 18, tail = 8): string =>

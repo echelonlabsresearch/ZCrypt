@@ -33,7 +33,7 @@ A change that talks to a node over RPC also needs the live 3-node run (Docker): 
 
 ## Changes that need more than a pull request
 
-- The transfer statement exists three times: the wide circuit, the tall circuit, and the VM program. A rule change goes into all three, and a relayout of the tall circuit also updates the Lean model in `formal/`.
+- The transfer statement exists twice in code: the tall circuit and the VM program. A rule change goes into both, and a relayout of the tall circuit also updates the Lean model in `formal/`.
 - Anything that alters the proof format, commitments, nullifiers, the `app_hash`, or a transaction's validity rules is consensus-breaking. Say so in the pull request. It needs a coordinated validator upgrade.
 - `Node` state is serialized positionally. A new or reordered persisted field needs a snapshot version bump and a migration.
 

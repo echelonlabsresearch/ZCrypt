@@ -1,10 +1,10 @@
 import { useEffect, useRef, useState } from "react";
 import { call } from "../lib/api";
-import { authError, Icon, lockMessage, Logo, PinPad } from "./ui";
+import { authError, Btn, Icon, lockMessage, Logo, PinPad } from "./ui";
 import { bioName, useAuth } from "./MobileApp";
 
 /** The lock screen: Face ID straight away when it is on, the keypad underneath. */
-export default function Lock({ onUnlocked }: { onUnlocked: () => void }) {
+export default function Lock({ onUnlocked, onForgotten }: { onUnlocked: () => void; onForgotten: () => void }) {
   const { status, refreshStatus } = useAuth();
   const [err, setErr] = useState("");
   const [busy, setBusy] = useState(false);
@@ -65,6 +65,41 @@ export default function Lock({ onUnlocked }: { onUnlocked: () => void }) {
     } finally {
       setBusy(false);
     }
+  }
+
+  // A backup restored onto another phone: the key that guards the PIN stayed on the old
+  // one, so the PIN cannot open these files. The recovery phrase restores the wallet.
+  if (status.copied) {
+    return (
+      <div className="m-gate">
+        <div className="fill" />
+        <Logo />
+        <h1 className="m-title small">Restore this wallet</h1>
+        <p className="m-sub">This wallet was copied from another phone, for example by a backup. For your safety the PIN only works on the phone it was set on. Enter your 24-word recovery phrase to use the wallet here.</p>
+        {err && <p className="m-sub" style={{ color: "var(--bad)" }}>{err}</p>}
+        <div className="fill" />
+        <div className="wide">
+          <Btn
+            full
+            disabled={busy}
+            onClick={async () => {
+              setBusy(true);
+              setErr("");
+              try {
+                await call("mobile_forget_copied");
+                onForgotten();
+              } catch (e) {
+                setErr(String(e instanceof Error ? e.message : e));
+              } finally {
+                setBusy(false);
+              }
+            }}
+          >
+            I have my recovery phrase
+          </Btn>
+        </div>
+      </div>
+    );
   }
 
   const locked = lockedFor > 0;

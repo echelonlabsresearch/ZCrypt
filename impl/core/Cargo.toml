@@ -23,7 +23,7 @@ rand.workspace = true
 rand_core.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-postcard = { version = "1", features = ["alloc"] }
+postcard = { version = "1", default-features = false, features = ["alloc"] }
 hex.workspace = true
 zcrypt-shield = { path = "../shield", default-features = false }
 ml-dsa = "0.1.1"

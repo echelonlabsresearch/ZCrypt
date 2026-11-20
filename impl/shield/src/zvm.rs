@@ -104,7 +104,7 @@ pub fn execute(bytecode: &[u8], inputs: &[SpendWitness], outputs: &[OutCoin], fe
             OP_CHECK_MEMBERSHIP => {
                 // Every active input's authentication path must recompute to ONE
                 // shared tree root — the same check the circuit enforces in-circuit
-                // (see the Merkle-path blocks in `CoinsAir`). The leaf is derived from
+                // (see the Merkle-path blocks in `CoinsAirTall`). The leaf is derived from
                 // `spend_pubkey(spend_secret)`, so recomputing the correct leaf also
                 // proves ownership: hold the wrong secret and your leaf isn't in the
                 // pool, so the recomputed root won't agree.

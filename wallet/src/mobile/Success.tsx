@@ -22,8 +22,8 @@ export default function Success({
   /** Override the foot button. The coin handoff uses a quiet "Back to send" under the real actions. */
   doneKind?: "primary" | "secondary";
   /** "bad" is the red twin of this screen: no confetti, a cross instead of the check.
-   *  "busy" is the waiting form: a spinner in the circle and no button. */
-  tone?: "ok" | "bad" | "busy";
+   *  The waiting form of these moments is `Waiting`. */
+  tone?: "ok" | "bad";
 }) {
   const canvas = useRef<HTMLCanvasElement>(null);
 
@@ -89,17 +89,15 @@ export default function Success({
       <canvas ref={canvas} className="m-confetti" />
       <div className="m-done-body">
         <div className="m-done-check">
-          {tone === "busy" ? <span className="m-done-spin" /> : <Icon name={tone === "ok" ? "check" : "close"} size={52} stroke={2.6} />}
+          <Icon name={tone === "ok" ? "check" : "close"} size={52} stroke={2.6} />
         </div>
         <h1 className="m-done-title">{title}</h1>
         {subtitle && <p className="m-done-sub">{subtitle}</p>}
         {children && <div className="m-done-extra">{children}</div>}
       </div>
-      {tone !== "busy" && (
-        <div className="m-done-foot">
-          <Btn full kind={doneKind ?? (tone === "ok" ? "primary" : "secondary")} onClick={onDone}>{doneLabel}</Btn>
-        </div>
-      )}
+      <div className="m-done-foot">
+        <Btn full kind={doneKind ?? (tone === "ok" ? "primary" : "secondary")} onClick={onDone}>{doneLabel}</Btn>
+      </div>
     </div>
   );
 }

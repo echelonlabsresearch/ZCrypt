@@ -12,6 +12,7 @@ import {
   toBaseAsset,
 } from "../lib/api";
 import Success from "../mobile/Success";
+import Waiting from "../mobile/Waiting";
 import { Btn } from "../mobile/ui";
 
 type Deliver = "normal" | "stealth" | "bearer";
@@ -307,7 +308,7 @@ export default function Send({
 
   if (phase.kind === "busy") {
     const copy = BUSY_COPY[phase.what];
-    return <Success tone="busy" title={copy.title} subtitle={copy.subtitle} onDone={() => {}} />;
+    return <Waiting icon="send" title={copy.title} subtitle={copy.subtitle} hint="Keep the wallet open." />;
   }
   if (phase.kind === "failed") {
     return (

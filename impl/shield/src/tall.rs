@@ -1,13 +1,14 @@
-//! HYBRID TALL-SKINNY shield circuit — a smaller-proof twin of the wide [`CoinsAir`].
+//! HYBRID TALL-SKINNY shield circuit: the one transfer circuit of this crate.
 //!
-//! Same statement, same witness, same public outputs (nullifiers, output commitments,
-//! anchor root, chain domain) — but a far smaller proof, because the trace is reshaped
-//! from wide-and-short to (mostly) tall-and-skinny. STARK proof size is ~linear in
-//! trace WIDTH but only log in height, so this shrinks it substantially.
+//! It replaced an earlier wide-and-short circuit (every Poseidon2 block side by side in
+//! one row) that proved the same statement with the same witness and public outputs.
+//! STARK proof size is ~linear in trace WIDTH but only log in height, so the tall shape
+//! gives a far smaller proof. The wide circuit was kept as a test-only reference until it
+//! was retired; its public outputs for two fixed transfers are pinned in the tests below.
 //!
 //! **Design (hybrid, chosen for safety):**
 //!   * ROW 1 (the CORE row) holds the 9 outer Poseidon2 blocks (commit×S, nf×N_IN,
-//!     pk×N_IN) side by side, and its constraints mirror the audited wide AIR
+//!     pk×N_IN) side by side, with the constraints of the earlier wide AIR
 //!     (nullifier construction, conservation, range, active/dummy, single-asset,
 //!     published nullifiers/outputs). Only the row gating changes.
 //!   * ROW 0 (the INNER row) holds the S + N_IN inner blocks of the two-block commitment
@@ -22,8 +23,8 @@
 //!
 //! This keeps the dangerous value-semantics in row 0 identical to the reviewed circuit
 //! and confines the new soundness surface to the (spike-de-risked) path chain + carries.
-//! This is the production circuit: `prove`/`verify` in lib.rs route here, with the
-//! wide circuit retained as the differential-tested reference twin.
+//! This is the production circuit: `prove`/`verify` in lib.rs route here. It is checked
+//! against the transparent VM (`zvm`), the mutation tests below and the Lean model in `formal/`.
 
 use core::borrow::Borrow;
 
@@ -45,10 +46,10 @@ use std::sync::OnceLock;
 use super::*;
 
 // ---- layout -------------------------------------------------------------------
-// Core blocks in the core row's column groups 0..CORE, in the SAME order as the wide AIR:
+// Core blocks in the core row's column groups 0..CORE, in this order:
 //   [commit_0..commit_S) ‖ [nf_0..nf_N_IN) ‖ [pk_0..pk_N_IN)  (S + 2·N_IN = 9 groups).
 const CORE: usize = S + 2 * N_IN;
-// Inner blocks in the inner row's column groups 0..INNER, in the wide AIR's order:
+// Inner blocks in the inner row's column groups 0..INNER, in this order:
 //   [inner_commit_0..inner_commit_S) ‖ [inner_nf_0..inner_nf_N_IN)  (S + N_IN = 7 groups).
 const INNER: usize = S + N_IN;
 const _: () = assert!(INNER <= CORE, "inner blocks must fit the core row's column groups");
@@ -107,7 +108,7 @@ impl BaseAir<BabyBear> for CoinsAirTall {
         TALL_W
     }
     fn num_public_values(&self) -> usize {
-        // Identical to the wide circuit: outputs ‖ fee ‖ nullifiers ‖ root ‖ chain ‖ enc_digest.
+        // outputs ‖ fee ‖ nullifiers ‖ root ‖ chain ‖ enc_digest.
         // The trailing 8-limb enc_notes digest is observed into the transcript (Fiat-Shamir), not
         // constrained by the AIR — it binds the tx's encrypted notes to the proof so a relayer
         // can't strip/replace them and lock the recipient out of a valid on-chain coin.
@@ -247,8 +248,7 @@ impl<AB: AirBuilder<F = BabyBear>> Air<AB> for CoinsAirTall {
         }
 
         // ============================================================
-        // CORE ROW (gated by P_CORE == ROW_CORE). Mirrors the wide AIR.
-        // Column group g in the core row == wide block g, so all indexing matches.
+        // CORE ROW (gated by P_CORE == ROW_CORE). Column group g is core block g.
         // ============================================================
         // helper: assert `expr == 0` only on the core row.
         macro_rules! core_zero {
@@ -413,8 +413,8 @@ impl<AB: AirBuilder<F = BabyBear>> Air<AB> for CoinsAirTall {
 
 // ---- trace generation ---------------------------------------------------------
 
-/// Build the hybrid tall trace + public values for a (validated) spend. Mirrors the
-/// wide `prove` block/aux computation exactly, then arranges it in the tall layout.
+/// Build the hybrid tall trace + public values for a (validated) spend: compute every
+/// hash block and auxiliary column, then arrange them in the tall layout.
 #[allow(clippy::type_complexity)]
 fn tall_trace(
     inputs: &[SpendWitness],
@@ -621,8 +621,8 @@ pub fn preprocessed_commitment_bytes() -> Vec<u8> {
     postcard::to_allocvec(&preprocessed().1.commitment).expect("commitment serializes")
 }
 
-/// Prove a shielded-pool spend with the tall circuit. Same return shape as the wide
-/// [`super::prove`]: `(output commitments, nullifiers, anchor root, proof bytes)`.
+/// Prove a shielded-pool spend with the tall circuit ([`super::prove`] calls this).
+/// Returns `(output commitments, nullifiers, anchor root, proof bytes)`.
 pub fn prove_tall(
     inputs: &[SpendWitness],
     outputs: &[OutCoin],
@@ -639,7 +639,7 @@ pub fn prove_tall(
     Some((out_commits, nullifiers, root, bytes))
 }
 
-/// Verify a tall-circuit proof. Same signature as the wide [`super::verify`].
+/// Verify a tall-circuit proof ([`super::verify`] calls this).
 pub fn verify_tall(
     output_commits: &[Commitment],
     nullifiers: &[Commitment],
@@ -741,34 +741,42 @@ mod tests {
         (inputs, root)
     }
 
+    /// FNV-1a over the public outputs of a transfer, limb by limb (little endian).
+    fn kat(outs: &[Commitment], nfs: &[Commitment], root: &Commitment) -> u64 {
+        let mut h = 0xcbf2_9ce4_8422_2325u64;
+        for limb in outs.iter().chain(nfs).chain(core::iter::once(root)).flatten() {
+            for b in limb.to_le_bytes() {
+                h = (h ^ b as u64).wrapping_mul(0x0000_0100_0000_01b3);
+            }
+        }
+        h
+    }
+
+    // Known answers for the public outputs (commitments, nullifiers, anchor root) of two
+    // fixed transfers. They were taken from the original wide reference circuit, which
+    // agreed with this one bit for bit, immediately before that circuit was retired. A
+    // change here is a change to the commitment or nullifier function: consensus-breaking.
+    const KAT_TWO_INPUTS: u64 = 0x4ff4_ba2a_deb6_b189;
+    const KAT_ONE_INPUT: u64 = 0xd1fa_c06b_128b_745f;
+
     #[test]
-    fn tall_two_input_parity_verifies_and_is_smaller() {
+    fn two_input_transfer_matches_the_pinned_outputs_and_verifies() {
         let (ins, root) = with_tree(vec![inp(100, 11, 7), inp(50, 22, 8)]);
         let outs = [oc(90, 33, 1), oc(55, 44, 2), oc(0, 0xE1, 0xE2)];
-
-        // WIDE reference (the retained circuit; production `prove` now routes to tall).
-        let (wo, wn, wr, wp) = prove_wide(&ins, &outs, 5, CHAIN, &[0u64; 8]).expect("wide prove");
-        assert!(verify_wide(&wo, &wn, 5, &wr, &wp, CHAIN, &[0u64; 8]), "wide verifies");
-
-        // TALL.
         let (to, tn, tr, tp) = prove_tall(&ins, &outs, 5, CHAIN, &[0u64; 8]).expect("tall prove");
-        // Bit-exact PUBLIC OUTPUT PARITY with the wide circuit.
-        assert_eq!(to, wo, "output commitments match wide");
-        assert_eq!(tn, wn, "nullifiers match wide");
-        assert_eq!(tr, wr, "anchor root matches wide");
+        assert_eq!(kat(&to, &tn, &tr), KAT_TWO_INPUTS, "public outputs match the pinned reference");
         assert_eq!(tr, root);
+        // Each public output is the native function of the witness, not merely self-consistent.
+        for (c, o) in to.iter().zip(&outs) {
+            assert_eq!(*c, commit_asset(o.0, &o.1, &o.2, o.3));
+        }
+        for (n, i) in tn.iter().zip(&ins) {
+            assert_eq!(*n, nullifier_asset(&i.spend_secret, i.value, &i.blind, i.asset_id));
+        }
         assert!(verify_tall(&to, &tn, 5, &tr, &tp, CHAIN, &[0u64; 8]), "tall verifies");
-
-        eprintln!(
-            "[tall] full 2-in/3-out shield: WIDE proof {} bytes ({:.0} KB) | TALL proof {} bytes ({:.0} KB) | {:.2}x smaller",
-            wp.len(), wp.len() as f64 / 1024.0, tp.len(), tp.len() as f64 / 1024.0,
-            wp.len() as f64 / tp.len() as f64,
-        );
-        assert!(tp.len() < wp.len(), "tall proof must be smaller");
-
-        // Cross-circuit sanity: each verifier rejects the other's proof.
-        assert!(!verify_tall(&wo, &wn, 5, &wr, &wp, CHAIN, &[0u64; 8]), "tall verify rejects a wide proof");
-        assert!(!verify_wide(&to, &tn, 5, &tr, &tp, CHAIN, &[0u64; 8]), "wide verify rejects a tall proof");
+        // About 2.1 MB today. The bound only catches an accidental blow-up of the proof.
+        eprintln!("[tall] full 2-in/3-out shield proof: {} bytes ({:.0} KB)", tp.len(), tp.len() as f64 / 1024.0);
+        assert!(tp.len() < 3 * 1024 * 1024, "the proof has not grown unexpectedly");
     }
 
     #[test]
@@ -809,21 +817,21 @@ mod tests {
     }
 
     #[test]
-    fn tall_single_input_parity() {
+    fn single_input_transfer_matches_the_pinned_outputs_and_verifies() {
         // 1-input spend: the 2nd slot is a value-0 dummy (arity fix) with a dummy path.
-        let (ins, _root) = with_tree(vec![inp(100, 11, 7)]);
+        let (ins, root) = with_tree(vec![inp(100, 11, 7)]);
         let outs = [oc(90, 33, 1), oc(5, 44, 2), oc(0, 0xE1, 0xE2)];
-        let (wo, wn, wr, _wp) = prove_wide(&ins, &outs, 5, CHAIN, &[0u64; 8]).expect("wide");
         let (to, tn, tr, tp) = prove_tall(&ins, &outs, 5, CHAIN, &[0u64; 8]).expect("tall");
-        assert_eq!((to.clone(), tn.clone(), tr), (wo, wn, wr), "single-input parity with wide");
+        assert_eq!(kat(&to, &tn, &tr), KAT_ONE_INPUT, "public outputs match the pinned reference");
+        assert_eq!(tr, root);
+        assert_eq!(tn[0], nullifier_asset(&ins[0].spend_secret, 100, &ins[0].blind, ASSET_ZCRYPT));
         assert!(verify_tall(&to, &tn, 5, &tr, &tp, CHAIN, &[0u64; 8]), "single-input tall verifies");
     }
 
     #[test]
     fn tall_equals_vm_outputs() {
         // The transparent VM twin computes the public outputs the circuit must commit
-        // to. The tall circuit must reproduce them exactly (VM ≡ tall, transitively via
-        // VM ≡ wide ≡ tall, asserted directly here).
+        // to. The circuit must reproduce them exactly.
         let (ins, _root) = with_tree(vec![inp(100, 11, 7), inp(50, 22, 8)]);
         let outs = [oc(90, 33, 1), oc(55, 44, 2), oc(0, 0xE1, 0xE2)];
         let vm = zvm::run_shield_transfer(&ins, &outs, 5);
@@ -834,22 +842,19 @@ mod tests {
     }
 
     #[test]
-    fn tall_rejects_invalid_shapes_like_wide() {
-        // Invalid witnesses are rejected identically (shape_ok is shared): non-conserving,
-        // over the per-coin cap, and a corrupted authentication path (no shared root).
-        let mk = |ins: &[SpendWitness], o: [OutCoin; 3], fee: u64| {
-            (
-                prove_wide(ins, &o, fee, CHAIN, &[0u64; 8]).is_none(),
-                prove_tall(ins, &o, fee, CHAIN, &[0u64; 8]).is_none(),
-            )
+    fn invalid_shapes_are_refused_by_the_prover_and_the_vm() {
+        // An invalid witness gets no proof, and the VM twin refuses the same transfer:
+        // non-conserving, over the per-coin cap, and a corrupted authentication path.
+        let refused = |ins: &[SpendWitness], o: [OutCoin; 3], fee: u64| {
+            (prove_tall(ins, &o, fee, CHAIN, &[0u64; 8]).is_none(), !zvm::run_shield_transfer(ins, &o, fee).accept)
         };
         let (nc, _) = with_tree(vec![inp(100, 1, 1), inp(1, 2, 2)]);
-        assert_eq!(mk(&nc, [oc(100, 3, 1), oc(1, 4, 2), oc(0, 0xE1, 0xE2)], 5), (true, true), "non-conserving");
+        assert_eq!(refused(&nc, [oc(100, 3, 1), oc(1, 4, 2), oc(0, 0xE1, 0xE2)], 5), (true, true), "non-conserving");
         let (oc_ov, _) = with_tree(vec![inp(MAX_COIN_VALUE + 1, 1, 1), inp(0, 2, 2)]);
-        assert_eq!(mk(&oc_ov, [oc(0, 3, 1), oc(0, 4, 2), oc(0, 0xE1, 0xE2)], 0), (true, true), "over cap");
+        assert_eq!(refused(&oc_ov, [oc(0, 3, 1), oc(0, 4, 2), oc(0, 0xE1, 0xE2)], 0), (true, true), "over cap");
         let (mut corrupt, _) = with_tree(vec![inp(100, 11, 7), inp(50, 22, 8)]);
         corrupt[0].path_siblings[0][0] ^= 1;
-        assert_eq!(mk(&corrupt, [oc(90, 33, 1), oc(55, 44, 2), oc(0, 0xE1, 0xE2)], 5), (true, true), "corrupted path");
+        assert_eq!(refused(&corrupt, [oc(90, 33, 1), oc(55, 44, 2), oc(0, 0xE1, 0xE2)], 5), (true, true), "corrupted path");
     }
 
     #[test]

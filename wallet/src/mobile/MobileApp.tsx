@@ -11,6 +11,8 @@ import HistoryScreen from "./HistoryScreen";
 
 export interface AuthStatus {
   wallet: boolean;
+  /** The files came from another phone: the PIN cannot open them here, only the phrase. */
+  copied?: boolean;
   pin: boolean;
   biometric: boolean;
   biometry_available: boolean;
@@ -161,20 +163,28 @@ export default function MobileApp() {
   // credited under Receive once unlocked. Android hands a file over by relaunching or
   // resuming the activity, so the queue is drained again on every return to the foreground.
   useEffect(() => {
-    const drain = () =>
-      call<string[]>("take_opened_files")
-        .then((f) => f.length && setIncoming((q) => [...q, ...f]))
-        .catch(() => {});
+    // One file can arrive twice (the event and the folder both carry it): take it once.
+    const seen = new Map<string, number>();
+    const add = (files: string[]) => {
+      const now = Date.now();
+      const fresh = files.filter((f) => f && now - (seen.get(f) ?? 0) > 60_000);
+      fresh.forEach((f) => seen.set(f, now));
+      if (fresh.length) setIncoming((q) => [...q, ...fresh.filter((f) => !q.includes(f))]);
+    };
+    const drain = () => call<string[]>("take_opened_files").then(add).catch(() => {});
     drain();
+    // A file that started the app can land a moment after the first drain.
+    const late = [600, 2000].map((ms) => window.setTimeout(drain, ms));
     const onVisible = () => {
       if (document.visibilityState === "visible") drain();
     };
     document.addEventListener("visibilitychange", onVisible);
     let un: (() => void) | null = null;
-    listen<string>("zcrypt-open", (e) => setIncoming((q) => [...q, e.payload]))
+    listen<string>("zcrypt-open", (e) => add([e.payload]))
       .then((u) => (un = u))
       .catch(() => {});
     return () => {
+      late.forEach((t) => window.clearTimeout(t));
       document.removeEventListener("visibilitychange", onVisible);
       if (un) un();
     };
@@ -250,7 +260,7 @@ export default function MobileApp() {
       <div className="m-app">
         {phase === "loading" && <div className="m-gate" />}
         {(phase === "onboard" || phase === "adopt") && <Onboarding adopt={phase === "adopt"} onDone={unlocked} />}
-        {phase === "lock" && <Lock onUnlocked={unlocked} />}
+        {phase === "lock" && <Lock onUnlocked={unlocked} onForgotten={() => refreshStatus().catch(() => {}).then(() => setPhase("onboard"))} />}
 
         {phase === "ready" && (
           <>

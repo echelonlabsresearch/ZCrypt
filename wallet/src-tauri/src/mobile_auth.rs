@@ -4,12 +4,18 @@
 //! password with Argon2id + ChaCha20-Poly1305. On a phone that password is a random
 //! 32-byte *device secret* the user never sees. The secret is kept in two places:
 //!
-//! * `pin.json`: the secret sealed under the PIN (same Argon2id cost as the keystore,
-//!   so a copied file still costs 64 MiB per guess), plus the failure counter and the
-//!   lockout clock. Five wrong PINs start a 30 s lockout that doubles each time.
-//! * The iOS Keychain (device-only item): read only after the OS has confirmed the
-//!   owner with Face ID / Touch ID. The prompt is raised from Rust, so the JavaScript
-//!   side never holds the secret and cannot skip the check.
+//! * `pin.json`: the secret sealed under the PIN (same Argon2id cost as the keystore),
+//!   plus the failure counter and the lockout clock. Five wrong PINs start a 30 s lockout
+//!   that doubles each time. A 6-digit PIN has only a million values, so on iOS the
+//!   sealed secret is encrypted once more under a random key that lives in the Keychain
+//!   and never leaves this device: a copy of `pin.json` (a backup, a file dump) gives
+//!   nothing to test a guess against. The price is that a backup restored onto another
+//!   phone cannot be opened with the PIN there; it needs the recovery phrase.
+//! * The iOS Keychain item holding the secret for Face ID / Touch ID: device-only and
+//!   bound to the biometrics enrolled when it was written. The system itself asks for
+//!   Face ID when the item is read and refuses the read without it, so no code path in
+//!   the app, and no file or Keychain dump, gets the secret without the owner's face or
+//!   finger. Enrolling a new face or finger voids the item; the PIN switches it on again.
 //! * On Android, `bio.key`: the secret encrypted under an Android Keystore AES-GCM key
 //!   (hardware-backed, non-exportable, usable only inside a strong-biometric prompt and
 //!   voided by a new fingerprint enrollment). The prompt and the decryption are one
@@ -34,6 +40,10 @@ const MAX_LOCKOUT_S: u64 = 60 * 60;
 #[derive(Serialize, Deserialize)]
 struct PinFile {
     sealed: Keystore, // device secret under the PIN
+    /// Set when `sealed.ct` is encrypted again under this device's Keychain key: the
+    /// nonce of that outer layer. Absent in files written before the key existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    wrap: Option<String>,
     #[serde(default)]
     fails: u32,
     #[serde(default)]
@@ -44,6 +54,9 @@ struct PinFile {
 pub struct AuthStatus {
     /// A keystore exists on this device.
     pub wallet: bool,
+    /// The wallet files came from another phone (a restored backup): the key that
+    /// protects the PIN is not on this one, so only the recovery phrase can open it.
+    pub copied: bool,
     /// A PIN protects it (false on a wallet created by the desktop flow).
     pub pin: bool,
     /// Face ID / Touch ID unlock is switched on for this wallet.
@@ -73,8 +86,57 @@ fn read_pin_file(dir: &str) -> Result<PinFile, String> {
 }
 
 fn write_pin_file(dir: &str, f: &PinFile) -> Result<(), String> {
-    let json = serde_json::to_string(f).map_err(|e| e.to_string())?;
+    // A file that is not under the device key yet goes under it now. If the Keychain
+    // cannot give a key the file is written as it is: a wallet that opens is worth more
+    // than the extra layer, and the next write tries again.
+    let wrapped = match (&f.wrap, keychain::wrap_key(true)) {
+        (None, Ok(Some(key))) => wrap_pin_file(f, &key),
+        _ => None,
+    };
+    let json = serde_json::to_string(wrapped.as_ref().unwrap_or(f)).map_err(|e| e.to_string())?;
     super::privfs::write_private(&pin_path(dir), json.as_bytes()).map_err(|e| e.to_string())
+}
+
+const COPIED: &str = "this wallet was copied from another phone; restore it with the recovery phrase";
+
+/// The outer layer: `sealed.ct` encrypted under the device key. Salt and nonce of the
+/// inner layer stay readable; without the inner ciphertext they verify nothing.
+fn wrap_pin_file(f: &PinFile, key: &[u8; 32]) -> Option<PinFile> {
+    use chacha20poly1305::aead::{Aead, KeyInit};
+    use chacha20poly1305::{ChaCha20Poly1305, Nonce};
+    let inner = hex::decode(&f.sealed.ct).ok()?;
+    let nonce = keys::random_seed();
+    let ct = ChaCha20Poly1305::new_from_slice(key).ok()?.encrypt(Nonce::from_slice(&nonce[..12]), inner.as_ref()).ok()?;
+    Some(PinFile {
+        sealed: Keystore { salt: f.sealed.salt.clone(), nonce: f.sealed.nonce.clone(), ct: hex::encode(ct) },
+        wrap: Some(hex::encode(&nonce[..12])),
+        fails: f.fails,
+        locked_until: f.locked_until,
+    })
+}
+
+/// What the PIN is checked against: `sealed` as it is, or with the outer layer taken
+/// off. `key` is the device key, `None` when this device has none.
+fn pin_sealed(f: &PinFile, key: Option<&[u8; 32]>) -> Result<Keystore, String> {
+    use chacha20poly1305::aead::{Aead, KeyInit};
+    use chacha20poly1305::{ChaCha20Poly1305, Nonce};
+    let mut ct = f.sealed.ct.clone();
+    if let Some(nonce) = &f.wrap {
+        let open = || -> Option<String> {
+            let nonce = hex::decode(nonce).ok().filter(|n| n.len() == 12)?;
+            let outer = hex::decode(&f.sealed.ct).ok()?;
+            let inner = ChaCha20Poly1305::new_from_slice(key?).ok()?.decrypt(Nonce::from_slice(&nonce), outer.as_ref()).ok()?;
+            Some(hex::encode(inner))
+        };
+        ct = open().ok_or(COPIED)?;
+    }
+    Ok(Keystore { salt: f.sealed.salt.clone(), nonce: f.sealed.nonce.clone(), ct })
+}
+
+/// True when `pin.json` is under a device key this phone does not have. A Keychain that
+/// cannot be read right now is not that: only a clean "no such item" counts.
+fn is_copied(f: &PinFile) -> bool {
+    f.wrap.is_some() && matches!(keychain::wrap_key(false), Ok(None))
 }
 
 fn valid_pin(pin: &str) -> Result<(), String> {
@@ -89,7 +151,7 @@ fn new_device_secret() -> Zeroizing<String> {
 }
 
 fn seal_secret(pin: &str, secret: &str) -> PinFile {
-    PinFile { sealed: super::seal(pin, secret), fails: 0, locked_until: 0 }
+    PinFile { sealed: super::seal(pin, secret), wrap: None, fails: 0, locked_until: 0 }
 }
 
 /// Check the PIN against `pin.json`, applying and recording the lockout policy.
@@ -104,7 +166,9 @@ fn open_with_pin(dir: &str, pin: &str) -> Result<Zeroizing<String>, String> {
     if f.locked_until > t {
         return Err(format!("locked:{}", f.locked_until - t));
     }
-    match unseal(pin, &f.sealed) {
+    let key = keychain::wrap_key(false)?;
+    let sealed = pin_sealed(&f, key.as_ref())?;
+    match unseal(pin, &sealed) {
         Some(secret) => {
             if f.fails != 0 || f.locked_until != 0 {
                 f.fails = 0;
@@ -135,28 +199,113 @@ fn open_with_pin(dir: &str, pin: &str) -> Result<Zeroizing<String>, String> {
 
 #[cfg(target_os = "ios")]
 mod keychain {
+    use security_framework::access_control::{ProtectionMode, SecAccessControl};
+    use security_framework::base::Error;
+    use security_framework::passwords::{
+        delete_generic_password, get_generic_password, set_generic_password, set_generic_password_options, AccessControlOptions,
+        PasswordOptions,
+    };
+    use security_framework_sys::base::errSecItemNotFound;
+
     const SERVICE: &str = "io.zcrypt.wallet";
+    /// The device secret, readable only through Face ID / Touch ID.
     const ACCOUNT: &str = "device-secret";
-    pub fn store(secret: &str) -> Result<(), String> {
-        security_framework::passwords::set_generic_password(SERVICE, ACCOUNT, secret.as_bytes())
-            .map_err(|e| format!("keychain: {e}"))
+    /// Says that `ACCOUNT` is the protected kind. It is written before the protected item
+    /// and holds nothing secret; it lets the app know biometrics are on without reading
+    /// the protected item, which would raise the Face ID sheet.
+    const MARKER: &str = "device-secret-protected";
+    /// The key `pin.json` is wrapped under.
+    const WRAP: &str = "pin-wrap-key";
+
+    fn missing(e: &Error) -> bool {
+        e.code() == errSecItemNotFound
     }
-    pub fn load() -> Result<Option<Vec<u8>>, String> {
-        match security_framework::passwords::get_generic_password(SERVICE, ACCOUNT) {
+    fn get(account: &str) -> Result<Option<Vec<u8>>, Error> {
+        match get_generic_password(SERVICE, account) {
             Ok(v) => Ok(Some(v)),
-            Err(e) if e.code() == security_framework_sys::base::errSecItemNotFound => Ok(None),
+            Err(e) if missing(&e) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+    fn remove(account: &str) -> Result<(), String> {
+        match delete_generic_password(SERVICE, account) {
+            Ok(()) => Ok(()),
+            Err(e) if missing(&e) => Ok(()),
             Err(e) => Err(format!("keychain: {e}")),
+        }
+    }
+    /// Add an item that stays on this device, with `flags` as its access control. The
+    /// old item goes first: an update cannot change the protection of an existing one.
+    fn add(account: &str, value: &[u8], mode: ProtectionMode, flags: AccessControlOptions) -> Result<(), String> {
+        remove(account)?;
+        let mut options = PasswordOptions::new_generic_password(SERVICE, account);
+        options.set_access_control(SecAccessControl::create_with_protection(Some(mode), flags.bits()).map_err(|e| format!("keychain: {e}"))?);
+        set_generic_password_options(value, options).map_err(|e| format!("keychain: {e}"))
+    }
+
+    pub fn store(secret: &str) -> Result<(), String> {
+        set_generic_password(SERVICE, MARKER, b"1").map_err(|e| format!("keychain: {e}"))?;
+        let stored = add(
+            ACCOUNT,
+            secret.as_bytes(),
+            ProtectionMode::AccessibleWhenPasscodeSetThisDeviceOnly,
+            AccessControlOptions::BIOMETRY_CURRENT_SET,
+        );
+        if stored.is_err() {
+            let _ = remove(MARKER);
+        }
+        stored
+    }
+    /// Reads the protected item: the system shows Face ID / Touch ID and blocks until the
+    /// owner answers, so this must not run on the main thread. Anything but success is a
+    /// `biometric:` error, which the screens answer by asking for the PIN.
+    pub fn load() -> Result<Option<Vec<u8>>, String> {
+        match get(ACCOUNT) {
+            Ok(Some(v)) => Ok(Some(v)),
+            Ok(None) => {
+                // Voided by a new face or finger, or never written.
+                let _ = remove(MARKER);
+                Ok(None)
+            }
+            Err(e) => Err(format!("biometric:{e}")),
         }
     }
     pub fn delete() -> Result<(), String> {
-        match security_framework::passwords::delete_generic_password(SERVICE, ACCOUNT) {
-            Ok(()) => Ok(()),
-            Err(e) if e.code() == security_framework_sys::base::errSecItemNotFound => Ok(()),
-            Err(e) => Err(format!("keychain: {e}")),
+        remove(ACCOUNT)?;
+        remove(MARKER)
+    }
+    /// Whether biometric unlock is on. Never raises the Face ID sheet. An item written by
+    /// a build that did not protect it is read here (that one needs no Face ID) and put
+    /// back protected.
+    pub fn exists() -> bool {
+        if matches!(get(MARKER), Ok(Some(_))) {
+            return true;
+        }
+        match get(ACCOUNT) {
+            Ok(Some(old)) => match String::from_utf8(old) {
+                Ok(secret) => store(&secret).is_ok(),
+                Err(_) => false,
+            },
+            _ => false,
         }
     }
-    pub fn exists() -> bool {
-        matches!(load(), Ok(Some(_)))
+    /// The key `pin.json` is wrapped under: `Ok(None)` when this device has none and
+    /// `create` is off. It stays on this device and is readable while it is unlocked.
+    pub fn wrap_key(create: bool) -> Result<Option<[u8; 32]>, String> {
+        let as_key = |v: Vec<u8>| <[u8; 32]>::try_from(v.as_slice()).map_err(|_| "keychain: the PIN key has the wrong size".to_string());
+        if let Some(v) = get(WRAP).map_err(|e| format!("keychain: {e}"))? {
+            return as_key(v).map(Some);
+        }
+        if !create {
+            return Ok(None);
+        }
+        let key = zcrypt_core::keys::random_seed();
+        add(WRAP, &key, ProtectionMode::AccessibleWhenUnlockedThisDeviceOnly, AccessControlOptions::empty())?;
+        // Use the key only if the Keychain really kept it.
+        match get(WRAP).map_err(|e| format!("keychain: {e}"))? {
+            Some(v) => as_key(v).map(Some),
+            None => Err("keychain: the PIN key was not kept".into()),
+        }
     }
 }
 
@@ -172,6 +321,7 @@ mod keychain {
     pub fn store(secret: &str) -> Result<(), String> {
         super::super::privfs::write_private(&path(), secret.as_bytes()).map_err(|e| e.to_string())
     }
+    #[cfg_attr(not(target_os = "android"), allow(dead_code))]
     pub fn load() -> Result<Option<Vec<u8>>, String> {
         match std::fs::read(path()) {
             Ok(v) => Ok(Some(v)),
@@ -188,6 +338,10 @@ mod keychain {
     }
     pub fn exists() -> bool {
         path().exists()
+    }
+    /// No device key here: `pin.json` stays as the PIN sealed it.
+    pub fn wrap_key(_create: bool) -> Result<Option<[u8; 32]>, String> {
+        Ok(None)
     }
 }
 
@@ -224,33 +378,6 @@ fn biometry(app: &tauri::AppHandle) -> (bool, String) {
 #[cfg(not(mobile))]
 fn biometry(_app: &tauri::AppHandle) -> (bool, String) {
     (false, "none".to_string())
-}
-
-/// Raise the system Face ID / Touch ID sheet and wait for the answer. The app's own PIN
-/// is the fallback, so the device passcode is deliberately not offered here.
-#[cfg(target_os = "ios")]
-async fn prompt(app: tauri::AppHandle, reason: &str) -> Result<(), String> {
-    use tauri_plugin_biometric::{AuthOptions, BiometricExt};
-    let reason = reason.to_string();
-    tauri::async_runtime::spawn_blocking(move || {
-        app.biometric()
-            .authenticate(
-                reason,
-                AuthOptions {
-                    allow_device_credential: false,
-                    cancel_title: Some("Cancel".into()),
-                    fallback_title: Some("Use PIN".into()),
-                    ..Default::default()
-                },
-            )
-            .map_err(|e| format!("biometric:{e}"))
-    })
-    .await
-    .map_err(|e| e.to_string())?
-}
-#[cfg(not(mobile))]
-async fn prompt(_app: tauri::AppHandle, _reason: &str) -> Result<(), String> {
-    Err("biometric:not available on this device".into())
 }
 
 /// Put the device secret behind the phone's biometric. iOS: a Keychain item. Android: the
@@ -306,11 +433,20 @@ async fn load_bio(app: tauri::AppHandle, reason: &str) -> Result<Zeroizing<Strin
     .map_err(|e| e.to_string())??;
     Ok(Zeroizing::new(out.data))
 }
-#[cfg(not(target_os = "android"))]
-async fn load_bio(app: tauri::AppHandle, reason: &str) -> Result<Zeroizing<String>, String> {
-    prompt(app, reason).await?;
-    let bytes = keychain::load()?.ok_or("biometric:not enabled")?;
+/// iOS: reading the Keychain item IS the Face ID check. The system raises the sheet and
+/// releases the secret only to the enrolled owner, so there is no separate prompt whose
+/// answer the app could ignore.
+#[cfg(target_os = "ios")]
+async fn load_bio(_app: tauri::AppHandle, _reason: &str) -> Result<Zeroizing<String>, String> {
+    let bytes = tauri::async_runtime::spawn_blocking(keychain::load)
+        .await
+        .map_err(|e| e.to_string())??
+        .ok_or("biometric:not enabled")?;
     String::from_utf8(bytes).map(Zeroizing::new).map_err(|_| "keychain item is corrupt".to_string())
+}
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+async fn load_bio(_app: tauri::AppHandle, _reason: &str) -> Result<Zeroizing<String>, String> {
+    Err("biometric:not available on this device".into())
 }
 
 /// Either the PIN (`Some`) or the biometric sheet (`None`) → the device secret.
@@ -340,8 +476,13 @@ pub async fn mobile_auth_status(app: tauri::AppHandle, state: State<'_, AppState
     let pin = read_pin_file(&dir).ok();
     let locked_for_s = pin.as_ref().map(|f| f.locked_until.saturating_sub(now())).unwrap_or(0);
     let (biometry_available, biometry_type) = biometry(&app);
+    // A PIN file from before the device key existed is put under it on this launch.
+    if let Some(f) = pin.as_ref().filter(|f| f.wrap.is_none()) {
+        let _ = write_pin_file(&dir, f);
+    }
     ok(AuthStatus {
         wallet,
+        copied: wallet && pin.as_ref().is_some_and(is_copied),
         pin: pin.is_some(),
         biometric: keychain::exists(),
         biometry_available,
@@ -431,6 +572,22 @@ pub async fn mobile_reveal_phrase(pin: Option<String>, app: tauri::AppHandle, st
     ok(super::SecretString(Zeroizing::new(phrase.to_string())))
 }
 
+/// Show the private key of ONE shielded (stealth) address, after Face ID or the PIN: the
+/// phone's form of `reveal_stealth_backup`, which asks for the wallet password a phone
+/// user never types. One key per check, never the whole list.
+#[tauri::command]
+pub async fn mobile_reveal_stealth(index: u32, pin: Option<String>, app: tauri::AppHandle, state: State<'_, AppState>) -> R<super::SecretString> {
+    if state.wallet.lock().unwrap().is_none() {
+        return Err("wallet is locked".into());
+    }
+    let dir = state.data_dir.lock().unwrap().clone();
+    authenticate(app, &dir, pin, "Show this address's private key").await?;
+    let g = state.wallet.lock().unwrap();
+    let w = g.as_ref().ok_or("wallet is locked")?;
+    let seed = w.stealth_seeds.get(index as usize).ok_or("no such shielded address")?;
+    ok(super::SecretString(Zeroizing::new(hex::encode(seed))))
+}
+
 /// Switch Face ID unlock on (needs the PIN to release the secret) or off.
 #[tauri::command]
 pub async fn mobile_set_biometric(enabled: bool, pin: Option<String>, app: tauri::AppHandle, state: State<'_, AppState>) -> R<bool> {
@@ -442,6 +599,29 @@ pub async fn mobile_set_biometric(enabled: bool, pin: Option<String>, app: tauri
     } else {
         keychain::delete()?;
     }
+    ok(true)
+}
+
+/// A wallet copied from another phone cannot be opened here with its PIN. Put its files
+/// aside (renamed, not deleted) so the recovery phrase can restore the wallet on this
+/// phone. Refused for a wallet this phone can open.
+#[tauri::command]
+pub async fn mobile_forget_copied(state: State<'_, AppState>) -> R<bool> {
+    let dir = state.data_dir.lock().unwrap().clone();
+    set_dir(&dir);
+    if !is_copied(&read_pin_file(&dir)?) {
+        return Err("this wallet belongs to this phone; it is not removed".into());
+    }
+    *state.wallet.lock().unwrap() = None;
+    let stamp = now();
+    for path in [keystore_path(&dir), pin_path(&dir), super::coins_path(&dir)] {
+        if path.exists() {
+            let mut aside = path.clone().into_os_string();
+            aside.push(format!(".copied-{stamp}"));
+            std::fs::rename(&path, &aside).map_err(|e| format!("could not put {} aside: {e}", path.display()))?;
+        }
+    }
+    let _ = keychain::delete();
     ok(true)
 }
 
@@ -501,6 +681,30 @@ mod tests {
         assert!(open_with_pin(&dir, "000000").unwrap_err().starts_with("locked:"));
         assert!(open_with_pin(&dir, "123456").unwrap_err().starts_with("locked:"));
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn a_wrapped_pin_file_opens_only_with_the_device_key() {
+        let plain = seal_secret("123456", "s3cret");
+        let key = [7u8; 32];
+        let wrapped = wrap_pin_file(&plain, &key).expect("wrap");
+        assert!(wrapped.wrap.is_some());
+        assert_ne!(wrapped.sealed.ct, plain.sealed.ct);
+        // With the key the PIN opens it, and a wrong PIN is still just a wrong PIN.
+        let sealed = pin_sealed(&wrapped, Some(&key)).expect("unwrap");
+        assert_eq!(unseal("123456", &sealed).unwrap().as_str(), "s3cret");
+        assert!(unseal("000000", &sealed).is_none());
+        // Without the key, or with another phone's key, there is nothing to try a PIN on.
+        assert_eq!(pin_sealed(&wrapped, None).err().as_deref(), Some(COPIED));
+        assert_eq!(pin_sealed(&wrapped, Some(&[8u8; 32])).err().as_deref(), Some(COPIED));
+        // The inner ciphertext is not in the file: the right PIN fails against the outer one.
+        assert!(unseal("123456", &wrapped.sealed).is_none());
+        // A file from before the device key reads as it always did, and survives a round trip.
+        let old: PinFile = serde_json::from_str(&serde_json::to_string(&plain).unwrap()).unwrap();
+        assert!(old.wrap.is_none());
+        assert_eq!(unseal("123456", &pin_sealed(&old, None).unwrap()).unwrap().as_str(), "s3cret");
+        let back: PinFile = serde_json::from_str(&serde_json::to_string(&wrapped).unwrap()).unwrap();
+        assert_eq!(unseal("123456", &pin_sealed(&back, Some(&key)).unwrap()).unwrap().as_str(), "s3cret");
     }
 
     #[test]

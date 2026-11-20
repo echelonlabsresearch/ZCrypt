@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
-import { call, fmt, fmtAsset, HeldAsset, isWhitelisted, whitelistName } from "../lib/api";
+import { call, fmt, fmtAsset, HeldAsset, isWhitelisted, unbackedNote, whitelistName } from "../lib/api";
 
 interface BtcWallet {
   connected: boolean;
@@ -105,6 +105,9 @@ export default function Balance({ balance, onRefresh }: { balance: number; onRef
           <div className="asset-sub">
             {count} coin{count === 1 ? "" : "s"} · all spendable{scanning && " · scanning the chain…"}
           </div>
+          {assets.filter((a) => a.asset_id === "0" && !!a.unbacked).map((a) => (
+            <div className="asset-sub" key="unbacked" style={{ color: "var(--zc-warn)" }}>{unbackedNote(a, true)}</div>
+          ))}
         </div>
 
         {shielded.map((a) => (
@@ -117,6 +120,7 @@ export default function Balance({ balance, onRefresh }: { balance: number; onRef
             </div>
             {assetsBusy ? spin : <div className="asset-amount">{fmtAsset(a.balance, a.decimals)}</div>}
             <div className="asset-sub">private · anonymous among the whole pool{scanning && " · scanning…"}</div>
+            {!!a.unbacked && <div className="asset-sub" style={{ color: "var(--zc-warn)" }}>{unbackedNote(a, balance >= 10_000)}</div>}
           </div>
         ))}
 

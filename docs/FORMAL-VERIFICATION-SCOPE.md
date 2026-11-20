@@ -21,7 +21,7 @@ code with trait bounds, external-crate calls, complex loops, unsafe).
 
 ZCrypt has one structural advantage most projects lack: it already ships two independent
 implementations of the transfer statement (the ZK circuit and a transparent bytecode VM),
-plus a wide/tall circuit pair, cross-checked today by differential *tests*. Formal
+cross-checked today by differential *tests*. Formal
 verification turns those differential tests into differential *theorems*.
 
 ## Tractability map (with file:line)
@@ -71,8 +71,8 @@ path; ownership (a valid leaf forces pk = P2(spend_secret)).
 This is exactly the bucket the RV post flags as unsupported today. It is the deepest and
 most valuable target, and the least tractable with current extraction tools.
 
-- `shield/src/lib.rs:449` `impl<AB: AirBuilder<F = BabyBear>> Air<AB> for CoinsAir::eval`
-  and the tall production equivalent (`CoinsAirTall` in `shield/src/tall.rs`): the AIR
+- `CoinsAirTall::eval` in `shield/src/tall.rs` (the production circuit; the earlier wide
+  `CoinsAir` in `lib.rs` has been retired): the AIR
   constraint system. Generic over the `AirBuilder` trait, calls Plonky3, loops over the
   Merkle path and Poseidon2 rounds.
 - Poseidon2 round constraints `eval_sbox`/`eval_full`/`eval_partial`/`recompose`/`pow2`

@@ -3,6 +3,7 @@ import QRCode from "qrcode";
 import { call, copySensitive, fmtAsset } from "../lib/api";
 import { CopyButton } from "./Share";
 import Success from "../mobile/Success";
+import Waiting from "../mobile/Waiting";
 
 export interface ReceivedInfo {
   amount: number;
@@ -13,6 +14,8 @@ export interface ReceivedInfo {
 interface Stealth {
   index: number;
   address: string;
+  /** The recovery phrase derives this address's key (false for older, random ones). */
+  derived?: boolean;
 }
 
 const QR_COLOR = { dark: "#0b0f19", light: "#ffffff" };
@@ -86,7 +89,7 @@ function KeyCopy({ text }: { text: string }) {
 
 /**
  * Receive: the whole screen accepts a coin file. The three receive addresses sit in a
- * dock on the right. A shielded address is not in the recovery phrase; its key is shown
+ * dock on the right. A new shielded address comes from the recovery phrase (older ones do not); its key is shown
  * only after the wallet password.
  */
 export default function Receive({
@@ -274,15 +277,15 @@ export default function Receive({
 
   if (phase.kind === "busy") {
     return (
-      <Success
-        tone="busy"
+      <Waiting
+        icon="receive"
+        hint="Keep the wallet open."
         title={phase.what === "receipt" ? "Checking receipt" : "Receiving payment"}
         subtitle={
           phase.what === "receipt"
             ? "Looking the payment up on the chain."
             : "Checking the chain and building the claim proof on this computer. This takes a few seconds."
         }
-        onDone={() => {}}
       />
     );
   }
@@ -402,9 +405,9 @@ export default function Receive({
 
         {open === "shield" && (
           <div className="rx-sheet">
-            <div className="eyebrow">Not in your phrase · zc1</div>
+            <div className="eyebrow">{shown && !shown.derived ? "Not in your phrase · zc1" : "From your phrase · zc1"}</div>
             <h3>Shielded address</h3>
-            <p>A payment arrives as an encrypted file. Nothing readable is left on-chain.</p>
+            <p>A payment arrives as an encrypted file. Nothing readable is left on-chain. Once received, the wallet moves the coin into your phrase-backed balance on its own (0.01 ZCRYPT).</p>
             {shown ? (
               <>
                 {stealth.length > 1 && (
@@ -431,7 +434,11 @@ export default function Receive({
                       <KeyCopy text={key} />
                       <button className="ghost" type="button" onClick={() => hideKey(shown.index)}>Hide</button>
                     </div>
-                    <div className="rx-fine">Write this down. Your 24-word phrase will not restore it. Losing the key and this wallet loses anything sent here.</div>
+                    <div className="rx-fine">
+                      {shown.derived
+                        ? "Your recovery phrase restores this key. Keep the payment files sent here until they are received."
+                        : "Write this down. Your 24-word phrase will not restore it. Losing the key and this wallet loses anything sent here."}
+                    </div>
                   </>
                 ) : pwFor === shown.index ? (
                   <>
@@ -452,7 +459,11 @@ export default function Receive({
                   </>
                 ) : (
                   <>
-                    <p>Your recovery phrase does not restore this address. Recover its private key with your wallet password, then store the key yourself.</p>
+                    <p>
+                      {shown.derived
+                        ? "Your recovery phrase restores this address. A payment file sent here still has to be opened in the wallet once; keep it until then."
+                        : "Your recovery phrase does not restore this address. Recover its private key with your wallet password, then store the key yourself."}
+                    </p>
                     <button className="rx-recover" type="button" onClick={() => { setPwFor(shown.index); setPw(""); setRevealErr(""); }}>
                       Recover private key
                     </button>
@@ -466,7 +477,7 @@ export default function Receive({
               </>
             ) : (
               <>
-                <p>You do not have a shielded address yet. Creating one makes a key your recovery phrase cannot restore.</p>
+                <p>You do not have a shielded address yet. Its key comes from your recovery phrase, so a restored wallet has the same address.</p>
                 <button className="rx-recover" type="button" disabled={stealthBusy} onClick={newStealth}>
                   {stealthBusy ? "Creating…" : "Create a shielded address"}
                 </button>

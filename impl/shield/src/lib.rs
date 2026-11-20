@@ -20,9 +20,7 @@
 //! genuine tree coin — without revealing *which* leaf. Built with the pinned
 //! toolchain in rust-toolchain.toml.
 
-use core::borrow::Borrow;
-
-use p3_air::{Air, AirBuilder, BaseAir, WindowAccess};
+use p3_air::AirBuilder;
 use p3_baby_bear::{
     default_babybear_poseidon2_16, BabyBear, GenericPoseidon2LinearLayersBabyBear,
     BABYBEAR_POSEIDON2_RC_16_EXTERNAL_FINAL as RC_EF,
@@ -36,11 +34,10 @@ use p3_field::extension::BinomialExtensionField;
 use p3_field::{PrimeCharacteristicRing, PrimeField64};
 use p3_fri::{FriParameters, HidingFriPcs};
 use p3_keccak::{Keccak256Hash, KeccakF};
-use p3_matrix::dense::RowMajorMatrix;
 use p3_merkle_tree::MerkleTreeHidingMmcs;
 use p3_poseidon2::GenericPoseidon2LinearLayers;
 use p3_poseidon2_air::{
-    generate_trace_rows, num_cols, FullRound, PartialRound, Poseidon2Cols, RoundConstants, SBox,
+    num_cols, FullRound, PartialRound, SBox,
 };
 use p3_symmetric::{
     CompressionFunctionFromHasher, PaddingFreeSponge, Permutation, SerializingHasher,
@@ -260,7 +257,7 @@ const S: usize = N_IN + N_OUT;
 /// Commitment-tree depth the in-circuit Merkle path is proven against. MUST equal
 /// [`tree::DEPTH`] so the circuit's recomputed root matches the node's tree root.
 pub const DEPTH: usize = tree::DEPTH;
-// Blocks per row: S commit blocks (inputs then outputs), N_IN nullifier blocks,
+// Hash blocks per transfer: S commit blocks (inputs then outputs), N_IN nullifier blocks,
 // N_IN spend-pubkey blocks (pk_i = Poseidon2(spend_secret_i), bound into the
 // input commitment so ownership is enforced and the nullifier is canonical), then
 // N_IN·DEPTH Merkle-path compression blocks (one Poseidon2 per tree level per
@@ -275,22 +272,9 @@ const INNER_C_BASE: usize = S + 2 * N_IN;
 const INNER_NF_BASE: usize = INNER_C_BASE + S;
 const PATH_BASE: usize = INNER_NF_BASE + N_IN;
 const NBLK: usize = PATH_BASE + N_IN * DEPTH;
-// Range-check columns: 2 limbs per coin, one limb for the fee, plus the carry.
+// The conservation carry (the tall circuit lays the range-check columns out itself).
 const CARRY_BITS: usize = 4; // carry E, offset so E+8 ∈ [0,16) ⇒ E ∈ [-8,7]
 const CARRY_OFFSET: u64 = 8;
-const BITS_OFF: usize = NBLK * BLK;
-const VAL_BITS: usize = S * 2 * BITS; // two limbs (lo,hi) per coin
-const FEE_OFF: usize = BITS_OFF + VAL_BITS; // fee's BITS range bits
-const CARRY_OFF: usize = FEE_OFF + BITS; // carry's CARRY_BITS bits
-// Merkle path witness: per input, DEPTH sibling commitments (8 limbs each) and
-// DEPTH direction bits (1 = the running node is the right child at that level).
-const PATH_SIB_OFF: usize = CARRY_OFF + CARRY_BITS;
-const PATH_DIR_OFF: usize = PATH_SIB_OFF + N_IN * DEPTH * 8;
-// Per-input `active` flag: 1 = a real coin is spent here, 0 = canonical-null
-// padding (value forced 0, nullifier forced to NULL_NF). Lets a spend use FEWER
-// than N_IN real inputs (e.g. spend a single coin) without a fixed 2-input floor.
-const ACT_OFF: usize = PATH_DIR_OFF + N_IN * DEPTH;
-const W: usize = ACT_OFF + N_IN;
 type LL = GenericPoseidon2LinearLayersBabyBear;
 
 /// Conjectured soundness bits from the active FRI parameters:
@@ -365,7 +349,7 @@ fn field_bits() -> f64 {
 }
 
 /// The compiled consensus proof parameters (see [`ProofParams`]).
-/// The shapes of the two transfer circuits and their shared public-input vector, derived
+/// The shape of the transfer circuit and its public-input vector, derived
 /// from the compiled constants (`N_IN`, `N_OUT`, `DEPTH`). Printed by the shield benchmark so
 /// documentation quotes the circuit that is actually compiled.
 #[derive(Clone, Debug, serde::Serialize)]
@@ -377,8 +361,6 @@ pub struct CircuitDims {
     /// Poseidon2 permutations one transfer proves (commitments, nullifiers, keys, inner
     /// blocks and the two Merkle paths).
     pub poseidon2_permutations: usize,
-    pub wide_rows: usize,
-    pub wide_cols: usize,
     pub tall_rows: usize,
     pub tall_cols: usize,
     pub tall_selector_cols: usize,
@@ -391,8 +373,6 @@ pub fn circuit_dims() -> CircuitDims {
         n_out: N_OUT,
         public_inputs: N_OUT * 8 + 1 + N_IN * 8 + 8 + CHAIN_DOMAIN_LIMBS + 8,
         poseidon2_permutations: NBLK,
-        wide_rows: 32,
-        wide_cols: W,
         tall_rows,
         tall_cols,
         tall_selector_cols,
@@ -621,222 +601,13 @@ fn pow2<AB: AirBuilder<F = BabyBear>>(k: usize) -> AB::Expr {
     x
 }
 
-struct CoinsAir;
-impl BaseAir<BabyBear> for CoinsAir {
-    fn width(&self) -> usize { W }
-    fn num_public_values(&self) -> usize {
-        // output commits + fee + nullifiers + Merkle-anchor root + chain domain + enc_digest.
-        // The spent coins are NOT public — they are hidden leaves proven via the
-        // in-circuit path. chain_domain binds the proof to a consensus chain_id; the trailing
-        // 8-limb enc_notes digest binds the tx's encrypted notes (observed into the transcript,
-        // not constrained) so they can't be stripped/replaced in the mempool.
-        N_OUT * 8 + 1 + N_IN * 8 + 8 + CHAIN_DOMAIN_LIMBS + 8
-    }
-}
-
-impl<AB: AirBuilder<F = BabyBear>> Air<AB> for CoinsAir {
-    fn eval(&self, builder: &mut AB) {
-        let main = builder.main();
-        let row = main.current_slice();
-        let pis: Vec<AB::Expr> = builder.public_values().iter().map(|x| (*x).into()).collect();
-        let out_off = 0;
-        let fee_i = N_OUT * 8;
-        let nf_off = fee_i + 1;
-        let root_off = nf_off + N_IN * 8; // public Merkle anchor root (8 limbs)
-        let fee_pub = pis[fee_i].clone();
-
-        // Run every Poseidon2 block. The digest is the feed-forward compression
-        // Trunc_8(P(x) + x), the same function as `native_commit`.
-        let mut outs: Vec<[AB::Expr; 8]> = Vec::with_capacity(NBLK);
-        for d in 0..NBLK {
-            let base = d * BLK;
-            let cols: &Poseidon2Cols<AB::Var, WIDTH, SD, SR, HFR, PR> = row[base..base + BLK].borrow();
-            let mut state: [AB::Expr; WIDTH] = core::array::from_fn(|k| cols.inputs[k].into());
-            LL::external_linear_layer(&mut state);
-            for r in 0..HFR { eval_full::<AB>(&mut state, &cols.beginning_full_rounds[r], &RC_EI[r], builder); }
-            for r in 0..PR { eval_partial::<AB>(&mut state, &cols.partial_rounds[r], &RC_I[r], builder); }
-            for r in 0..HFR { eval_full::<AB>(&mut state, &cols.ending_full_rounds[r], &RC_EF[r], builder); }
-            outs.push(core::array::from_fn(|k| feed_forward::<AB>(cols.ending_full_rounds[HFR - 1].post[k], cols.inputs[k])));
-        }
-
-        // Layouts (WIDTH=16):
-        //   inner commit  [0..8]=pk(8)  [8..16]=blind(8)                       (tagless)
-        //   outer commit  [0]=value_lo [1]=value_hi [2..10]=inner_c(8) [10..14]=0 [14]=asset [15]=TAG_COMMIT
-        //   inner nf      [0..8]=spend_secret(8)  [8..16]=inner_c(8)           (tagless)
-        //   outer nf      [0..8]=inner_nf(8) [8]=value_lo [9]=value_hi [10..14]=0 [14]=asset [15]=TAG_NF
-        //   pk            [0..8]=spend_secret(8), [8..15)=0, [15]=TAG_PK
-        // Block indices: commit i -> i (0..S); nullifier j -> S+j; pk j -> S+N_IN+j;
-        // inner commit i -> INNER_C_BASE+i; inner nullifier j -> INNER_NF_BASE+j.
-
-        // SINGLE-ASSET: every coin (inputs + outputs) carries the same asset_id
-        // (commit input[14]); with the per-asset conservation below you cannot turn
-        // asset A into asset B.
-        for i in 1..S {
-            builder.assert_eq(row[i * BLK + 14], row[14]);
-        }
-
-        // per coin: range-check BOTH value limbs; inputs prove ownership + tree
-        // membership, outputs are exposed.
-        for i in 0..S {
-            let lo = recompose::<AB>(builder, row, BITS_OFF + i * 2 * BITS, BITS);
-            let hi = recompose::<AB>(builder, row, BITS_OFF + i * 2 * BITS + BITS, BITS);
-            builder.assert_eq(lo, row[i * BLK].into()); // value_lo = commit input[0]
-            builder.assert_eq(hi, row[i * BLK + 1].into()); // value_hi = commit input[1]
-            // Outer commit lanes [2..10] carry the inner block's digest of (pk ‖ blind);
-            // lanes [10..14] are zero, so the commitment has one canonical preimage layout.
-            for t in 0..8 {
-                builder.assert_eq(row[i * BLK + 2 + t], outs[INNER_C_BASE + i][t].clone());
-            }
-            for t in 10..14 {
-                builder.assert_zero(row[i * BLK + t].into());
-            }
-
-            if i < N_IN {
-                let pk_blk = S + N_IN + i; // pk_i = Poseidon2(spend_secret_i)
-                let nf_blk = S + i;
-                // ACTIVE flag: 1 = a real coin spent here, 0 = canonical-null padding.
-                let act: AB::Expr = row[ACT_OFF + i].into();
-                builder.assert_zero(act.clone() * (act.clone() - AB::Expr::ONE)); // boolean
-                // Inactive ⇒ value forced to 0 (both limbs), so it contributes 0 to
-                // conservation. Contrapositive: any non-zero value ⇒ act = 1 ⇒ the
-                // ownership/membership/nullifier constraints below all bind — so value
-                // can never be created by an unbacked "padding" input.
-                let one_minus_act = AB::Expr::ONE - act.clone();
-                builder.assert_zero(one_minus_act.clone() * Into::<AB::Expr>::into(row[i * BLK]));
-                builder.assert_zero(one_minus_act * Into::<AB::Expr>::into(row[i * BLK + 1]));
-                // Role tag: the input commitment's lane [15] is the commit tag, mirroring
-                // the output-coin constraint below (kept in parity with the tall production
-                // AIR). Real leaves are always built with lane[15]=TAG_COMMIT.
-                builder.assert_eq(row[i * BLK + 15], konst::<AB>(TAG_COMMIT));
-                let ic_blk = INNER_C_BASE + i;
-                let inf_blk = INNER_NF_BASE + i;
-                // OWNERSHIP: the pk absorbed by the inner commit block == Poseidon2(ss).
-                // Kept unconditional (a pad still binds pk = Poseidon2(ss), trivially).
-                // Together with the Merkle path below, this proves the prover knows the
-                // spend secret of a genuine tree leaf `outs[i]` — no ring needed, the
-                // spent coin hides among the ENTIRE pool.
-                for t in 0..8 {
-                    builder.assert_eq(row[ic_blk * BLK + t], outs[pk_blk][t].clone());
-                }
-                for t in 8..WIDTH - 1 {
-                    builder.assert_zero(row[pk_blk * BLK + t].into());
-                }
-                builder.assert_eq(row[pk_blk * BLK + WIDTH - 1], konst::<AB>(TAG_PK));
-                // CANONICAL nullifier, two blocks. Inner: [ss(8) ‖ inner_c(8)]: the same
-                // spend secret as the pk block, and the inner commit DIGEST (which binds the
-                // blind). The blind itself is never a lane of this block, so no sender-chosen
-                // blind can make it collide with the pk block [ss ‖ 0×7 ‖ TAG_PK]
-                // (review 2026-10-26, M1).
-                for t in 0..8 {
-                    builder.assert_eq(row[inf_blk * BLK + t], row[pk_blk * BLK + t]);
-                    builder.assert_eq(row[inf_blk * BLK + 8 + t], outs[ic_blk][t].clone());
-                }
-                // Outer: [inner_nf(8), value_lo, value_hi, 0×4, asset, TAG_NF].
-                for t in 0..8 {
-                    builder.assert_eq(row[nf_blk * BLK + t], outs[inf_blk][t].clone());
-                }
-                builder.assert_eq(row[nf_blk * BLK + 8], row[i * BLK]);       // value_lo
-                builder.assert_eq(row[nf_blk * BLK + 9], row[i * BLK + 1]);   // value_hi
-                for t in 10..14 {
-                    builder.assert_zero(row[nf_blk * BLK + t].into());
-                }
-                builder.assert_eq(row[nf_blk * BLK + 14], row[i * BLK + 14]); // asset_id
-                builder.assert_eq(row[nf_blk * BLK + 15], konst::<AB>(TAG_NF));
-                // MERKLE MEMBERSHIP: prove the spent coin commitment `outs[i]` is a
-                // real leaf under the public anchor root, by recomputing the root
-                // from an in-circuit authentication path. This is what lets a
-                // verifier that sees ONLY the proof (a light client) trust the coin
-                // exists — membership is no longer a trusted node-side check.
-                //
-                // Chain `cur` from the leaf up: at each level the running node and
-                // its sibling are ordered by a boolean direction bit (a conditional
-                // swap), then compressed with one Poseidon2 block. Gated by `act`:
-                // an inactive padding input proves nothing (it spends no real coin).
-                let mut cur: [AB::Expr; 8] = core::array::from_fn(|j| outs[i][j].clone());
-                for lvl in 0..DEPTH {
-                    let pblk = PATH_BASE + i * DEPTH + lvl;
-                    let dir: AB::Expr = row[PATH_DIR_OFF + i * DEPTH + lvl].into();
-                    builder.assert_zero(dir.clone() * (dir.clone() - AB::Expr::ONE)); // boolean
-                    // Constrain this compression block's 16 input lanes to the
-                    // conditional swap of (cur, sibling): dir=0 ⇒ [cur ‖ sib] (cur is
-                    // the left child); dir=1 ⇒ [sib ‖ cur] (cur is the right child).
-                    for j in 0..8 {
-                        let sibj: AB::Expr = row[PATH_SIB_OFF + (i * DEPTH + lvl) * 8 + j].into();
-                        let curj = cur[j].clone();
-                        let left = curj.clone() + dir.clone() * (sibj.clone() - curj.clone());
-                        let right = sibj.clone() + dir.clone() * (curj.clone() - sibj.clone());
-                        builder.assert_eq(row[pblk * BLK + j], left);
-                        builder.assert_eq(row[pblk * BLK + 8 + j], right);
-                    }
-                    cur = core::array::from_fn(|j| outs[pblk][j].clone());
-                }
-                // Active ⇒ the recomputed root equals the public anchor.
-                for j in 0..8 {
-                    builder.assert_zero(act.clone() * (cur[j].clone() - pis[root_off + j].clone()));
-                }
-
-                // Published nullifier = the computed Poseidon2 nullifier for EVERY
-                // input, real or padding. A padding input has its value forced to 0
-                // (above) and its Merkle membership left unproven (gated off by `act`),
-                // but it still publishes a genuine nullifier of a value-0 DUMMY coin
-                // under a fresh pseudo-random spend key. So a spend using FEWER than
-                // N_IN real coins is indistinguishable on-chain from a full one — there
-                // is no all-zero NULL_NF sentinel to give the input count away (the
-                // arity-leak fix). The dummy nullifier is a Poseidon2 image of a hidden
-                // key, so it is unique and unforgeable; recording it as spent blocks no
-                // real coin (it corresponds to a value-0 phantom nobody else can name).
-                let mut wf = builder.when_first_row();
-                for k in 0..8 {
-                    wf.assert_eq(outs[nf_blk][k].clone(), pis[nf_off + i * 8 + k].clone());
-                }
-            } else {
-                // output coin: [14]=asset, [15] the commit role tag.
-                builder.assert_eq(row[i * BLK + 15], konst::<AB>(TAG_COMMIT));
-                let mut wf = builder.when_first_row();
-                for j in 0..8 { wf.assert_eq(outs[i][j].clone(), pis[out_off + (i - N_IN) * 8 + j].clone()); }
-            }
-        }
-
-        // FEE range-check (its own BITS bits) — bounds fee so conservation can't wrap.
-        let fee_re = recompose::<AB>(builder, row, FEE_OFF, BITS);
-        builder.assert_eq(fee_re, fee_pub.clone());
-
-        // CONSERVATION (multi-limb with carry). value = value_lo + value_hi·2^SHIFT.
-        //   D = Σin_lo − Σout_lo − fee     E = Σout_hi − Σin_hi  (the carry)
-        //   require D == 2^SHIFT · E, with E range-checked small (via CARRY_OFF bits)
-        //   so neither D, E, nor 2^SHIFT·E can wrap the field. That makes the field
-        //   equality imply the true 2·BITS-bit integer equality Σin_value = Σout+fee.
-        let lo = |i: usize| -> AB::Expr { row[i * BLK].into() };
-        let hi = |i: usize| -> AB::Expr { row[i * BLK + 1].into() };
-        let mut sum_in_lo = AB::Expr::ZERO;
-        let mut sum_in_hi = AB::Expr::ZERO;
-        for i in 0..N_IN {
-            sum_in_lo += lo(i);
-            sum_in_hi += hi(i);
-        }
-        let mut sum_out_lo = AB::Expr::ZERO;
-        let mut sum_out_hi = AB::Expr::ZERO;
-        for i in N_IN..S {
-            sum_out_lo += lo(i);
-            sum_out_hi += hi(i);
-        }
-        let d = sum_in_lo - sum_out_lo - fee_pub;
-        let e = sum_out_hi - sum_in_hi;
-        // range-check (E + CARRY_OFFSET) ∈ [0, 2^CARRY_BITS) ⇒ E ∈ [-8, 7]
-        let e_shifted = recompose::<AB>(builder, row, CARRY_OFF, CARRY_BITS);
-        builder.assert_eq(e_shifted, e.clone() + pow2::<AB>(3)); // CARRY_OFFSET = 8 = 2^3
-        // D == 2^SHIFT · E
-        builder.assert_zero(d - pow2::<AB>(SHIFT) * e);
-    }
-}
-
 const LIMB_MASK: u64 = (1u64 << SHIFT) - 1;
 
 /// Role tags pinned into lane 15 of every core Poseidon2 preimage, so the three hash
 /// domains (coin commitment, nullifier, spend pubkey) can never coincide for any choice
 /// of the other lanes. Before this, `pk_input(ss) == nf_input(ss, 0, [0; 4], 0)`, so a
 /// zero-value zero-blind coin's nullifier equalled its owner's public key. The AIR
-/// constrains lane 15 of each block to the matching tag (see `CoinsAir` / `CoinsAirTall`).
+/// constrains lane 15 of each block to the matching tag (see `CoinsAirTall`).
 pub const TAG_COMMIT: u64 = 1;
 pub const TAG_NF: u64 = 2;
 pub const TAG_PK: u64 = 3;
@@ -1086,181 +857,6 @@ fn shape_ok(inputs: &[SpendWitness], outputs: &[OutCoin], fee: u64) -> bool {
     si == so
 }
 
-/// The original **wide** prover (48 blocks in one logical row). Retained as the
-/// reference twin of the production tall circuit (bit-exact output parity is tested)
-/// and as an instant-revert path. Production [`prove`] routes to the smaller tall
-/// circuit; both prove the SAME statement and agree with the transparent VM.
-pub fn prove_wide(
-    inputs: &[SpendWitness],
-    outputs: &[OutCoin],
-    fee: u64,
-    chain_id: &[u8],
-    enc_digest: &[u64; 8],
-) -> Option<(Vec<Commitment>, Vec<Commitment>, Commitment, Vec<u8>)> {
-    if !shape_ok(inputs, outputs, fee) { return None; }
-    let n_real = inputs.len();
-    // The single tree root all active inputs prove membership against (shape_ok
-    // guaranteed they agree). Bound as a public input so the verifier — including a
-    // light client — is assured every spent coin is a real tree leaf.
-    let root = shared_root(&inputs[..n_real])?;
-
-    // Pad the real inputs (1..=N_IN) up to N_IN circuit slots with canonical-null
-    // inputs. A padding slot is INACTIVE: value 0, a NULL_NF published nullifier the
-    // node ignores, and an all-zero (unconstrained) path — so a spend can use as few
-    // as one real coin without a fixed 2-input floor.
-    let asset = inputs[0].asset_id;
-    // Pad empty slots with deterministic value-0 DUMMY inputs (see `dummy_witness`),
-    // derived from the real inputs so the padding slot still publishes a genuine,
-    // unpredictable nullifier — a short spend is then indistinguishable on-chain from a
-    // full one (the arity-leak fix). The dummy's value is 0 and its membership is left
-    // unproven (gated off by `active` below).
-    let real_inputs: Vec<SpendWitness> = inputs.to_vec();
-    let mut padded: Vec<SpendWitness> = inputs.to_vec();
-    while padded.len() < N_IN {
-        let j = padded.len();
-        padded.push(dummy_witness(&real_inputs, j, asset));
-    }
-    let active: Vec<bool> = (0..N_IN).map(|i| i < n_real).collect();
-    let inputs: &[SpendWitness] = &padded;
-
-    // commit blocks: inputs bind pk_i = Poseidon2(spend_secret_i); outputs bind the
-    // recipient's pk (given in the output tuple). Coin values (for range bits).
-    let in_pks: Vec<PubKey> = inputs.iter().map(|i| spend_pubkey(&i.spend_secret)).collect();
-    let coin_values: Vec<u64> = inputs.iter().map(|i| i.value)
-        .chain(outputs.iter().map(|&(v, _, _, _)| v)).collect();
-    let (inner_c_states, commit_states): (Vec<[BabyBear; WIDTH]>, Vec<[BabyBear; WIDTH]>) = inputs.iter().enumerate()
-        .map(|(i, inp)| coin_blocks(inp.value, &inp.blind, &in_pks[i], inp.asset_id))
-        .chain(outputs.iter().map(|(v, b, pk, a)| coin_blocks(*v, b, pk, *a)))
-        .unzip();
-    let out_commits: Vec<Commitment> = commit_states[N_IN..].iter().map(native_commit).collect();
-    let (inner_nf_states, nf_states): (Vec<[BabyBear; WIDTH]>, Vec<[BabyBear; WIDTH]>) =
-        inputs.iter().map(|i| nf_blocks(&i.spend_secret, i.value, &i.blind, i.asset_id)).unzip();
-    // Every slot — real or dummy — publishes its genuine Poseidon2 nullifier (matching
-    // the unconditional `nf == pis` constraint in the AIR), so the input count is not
-    // revealed by an all-zero sentinel.
-    let nullifiers: Vec<Commitment> = nf_states.iter().map(native_commit).collect();
-    let pk_states: Vec<[BabyBear; WIDTH]> = inputs.iter().map(|i| pk_input(&i.spend_secret)).collect();
-
-    // Merkle-path blocks: for each input, chain its coin commitment up DEPTH levels.
-    // Level `lvl`'s block input is the conditional swap of (running node, sibling)
-    // by the direction bit — exactly what the AIR re-derives and constrains. Its
-    // output is the parent, fed to the next level. Padding inputs use a zero path.
-    let leaf_commits: Vec<Commitment> = commit_states[..N_IN].iter().map(native_commit).collect();
-    let mut path_states: Vec<[BabyBear; WIDTH]> = Vec::with_capacity(N_IN * DEPTH);
-    for i in 0..N_IN {
-        let mut cur = leaf_commits[i];
-        for lvl in 0..DEPTH {
-            let sib = inputs[i].path_siblings.get(lvl).copied().unwrap_or([0u64; 8]);
-            let dir = inputs[i].path_dirs.get(lvl).copied().unwrap_or(false);
-            let (left, right) = if dir { (sib, cur) } else { (cur, sib) };
-            let mut st = [BabyBear::ZERO; WIDTH];
-            for j in 0..8 {
-                st[j] = BabyBear::from_u64(left[j]);
-                st[8 + j] = BabyBear::from_u64(right[j]);
-            }
-            path_states.push(st);
-            cur = compress2(&left, &right);
-        }
-    }
-
-    // block order must match the AIR: commits (S) ‖ nullifiers (N_IN) ‖ pk (N_IN)
-    // ‖ inner commits (S) ‖ inner nullifiers (N_IN) ‖ path (N_IN·DEPTH).
-    let block_inputs: Vec<[BabyBear; WIDTH]> = commit_states.iter().chain(&nf_states).chain(&pk_states)
-        .chain(&inner_c_states).chain(&inner_nf_states).chain(&path_states).copied().collect();
-    let constants = RoundConstants::<BabyBear, WIDTH, HFR, PR>::new(RC_EI, RC_I, RC_EF);
-    let n = 32usize;
-    let blocks: Vec<RowMajorMatrix<BabyBear>> = block_inputs.iter()
-        .map(|st| generate_trace_rows::<BabyBear, LL, WIDTH, SD, SR, HFR, PR>(vec![*st; n], &constants, 0))
-        .collect();
-    // Carry witness: E = Σout_hi − Σin_hi (∈ small range for a conserving tx).
-    let sum_in_hi: u64 = inputs.iter().map(|i| i.value >> SHIFT).sum();
-    let sum_out_hi: u64 = outputs.iter().map(|&(v, _, _, _)| v >> SHIFT).sum();
-    let ecarry: u64 = (sum_out_hi as i64 - sum_in_hi as i64 + CARRY_OFFSET as i64) as u64;
-    let mut vals = Vec::with_capacity(n * W);
-    for row_i in 0..n {
-        for blk in &blocks { for c in 0..BLK { vals.push(blk.values[row_i * BLK + c]); } }
-        // per coin: BITS bits of value_lo, then BITS bits of value_hi
-        for &v in &coin_values {
-            let vlo = v & LIMB_MASK;
-            let vhi = v >> SHIFT;
-            for j in 0..BITS { vals.push(BabyBear::from_u64((vlo >> j) & 1)); }
-            for j in 0..BITS { vals.push(BabyBear::from_u64((vhi >> j) & 1)); }
-        }
-        for j in 0..BITS { vals.push(BabyBear::from_u64((fee >> j) & 1)); } // fee bits
-        for j in 0..CARRY_BITS { vals.push(BabyBear::from_u64((ecarry >> j) & 1)); } // carry bits
-        // Merkle path sibling limbs (i-major, then level, then 8 limbs).
-        for i in 0..N_IN {
-            for lvl in 0..DEPTH {
-                let sib = inputs[i].path_siblings.get(lvl).copied().unwrap_or([0u64; 8]);
-                for j in 0..8 { vals.push(BabyBear::from_u64(sib[j])); }
-            }
-        }
-        // Merkle path direction bits (i-major, then level).
-        for i in 0..N_IN {
-            for lvl in 0..DEPTH {
-                let dir = inputs[i].path_dirs.get(lvl).copied().unwrap_or(false);
-                vals.push(if dir { BabyBear::ONE } else { BabyBear::ZERO });
-            }
-        }
-        // active flags (one per input slot).
-        for i in 0..N_IN {
-            vals.push(if active[i] { BabyBear::ONE } else { BabyBear::ZERO });
-        }
-    }
-    let trace = RowMajorMatrix::new(vals, W);
-
-    let mut pis: Vec<BabyBear> = Vec::new();
-    for c in &out_commits { for &x in c { pis.push(BabyBear::from_u64(x)); } }
-    pis.push(BabyBear::from_u64(fee));
-    for nf in &nullifiers { for &x in nf { pis.push(BabyBear::from_u64(x)); } }
-    for &x in &root { pis.push(BabyBear::from_u64(x)); }
-    for &x in &chain_domain(chain_id) { pis.push(BabyBear::from_u64(x)); }
-    for &x in enc_digest { pis.push(BabyBear::from_u64(x)); }
-
-    let config = prover_config();
-    let proof = p3_prove(&config, &CoinsAir, trace, &pis);
-    let bytes = postcard::to_allocvec(&proof).ok()?;
-    Some((out_commits, nullifiers, root, bytes))
-}
-
-/// The original **wide** verifier — the reference twin / revert path for the
-/// production tall [`verify`]. See [`prove_wide`].
-pub fn verify_wide(
-    output_commits: &[Commitment],
-    nullifiers: &[Commitment],
-    fee: u64,
-    root: &Commitment,
-    proof_bytes: &[u8],
-    chain_id: &[u8],
-    enc_digest: &[u64; 8],
-) -> bool {
-    if output_commits.len() != N_OUT || nullifiers.len() != N_IN { return false; }
-    // CANONICAL-ENCODING GATE (defense in depth for the SMT-key double-spend, C2):
-    // every public commitment/nullifier limb must be a canonical field element, and
-    // the fee must be in range. Otherwise a non-canonical limb (x+P) would verify
-    // against a proof for the reduced value x while hashing to a distinct nullifier
-    // key. The prover always emits canonical limbs; reject anything that isn't.
-    if fee >= MAX_FEE { return false; }
-    let all_canonical = output_commits.iter().chain(nullifiers).chain([root]).all(limbs_canonical);
-    if !all_canonical { return false; }
-    let proof: Proof<ZkConfig> = match decode_proof(proof_bytes) { Some(p) => p, None => return false };
-    let mut pis: Vec<BabyBear> = Vec::new();
-    for c in output_commits { for &x in c { pis.push(BabyBear::from_u64(x)); } }
-    pis.push(BabyBear::from_u64(fee));
-    for nf in nullifiers { for &x in nf { pis.push(BabyBear::from_u64(x)); } }
-    for &x in root { pis.push(BabyBear::from_u64(x)); }
-    for &x in &chain_domain(chain_id) { pis.push(BabyBear::from_u64(x)); }
-    for &x in enc_digest { pis.push(BabyBear::from_u64(x)); }
-
-    // `catch_unwind` alone contains a verifier panic on a malformed proof; the process
-    // panic hook is deliberately left untouched (swapping it is process-global state and
-    // races with any concurrent verifier).
-    std::panic::catch_unwind(|| {
-        let config = verifier_config();
-        p3_verify(&config, &CoinsAir, &proof, &pis).is_ok()
-    }).unwrap_or(false)
-}
-
 /// Strict proof decoding: the proof must consume EXACTLY `bytes`. `postcard::from_bytes`
 /// ignores trailing data, which let a relayer append junk to a tx's proof field and
 /// change its `txbind` while the proof still verified (a malleable tx identity).
@@ -1271,9 +867,8 @@ pub(crate) fn decode_proof(bytes: &[u8]) -> Option<Proof<ZkConfig>> {
     }
 }
 
-/// Prove a shielded-pool spend. **Production entry point** — routes to the
-/// tall-skinny circuit ([`tall::prove_tall`]), which produces a ~4.8× smaller proof
-/// than [`prove_wide`] for the identical statement, witness, and public outputs.
+/// Prove a shielded-pool spend. **Production entry point**: the tall-skinny circuit
+/// ([`tall::prove_tall`]), the one transfer circuit this crate has.
 /// Returns `(output commitments, nullifiers, anchor root, proof bytes)`.
 pub fn prove(
     inputs: &[SpendWitness],
@@ -1286,8 +881,7 @@ pub fn prove(
 }
 
 /// Verify a shielded-pool proof. **Production entry point** — the tall-circuit
-/// verifier ([`tall::verify_tall`]). Same public inputs and guarantees as
-/// [`verify_wide`]; a proof made by [`prove`] must be checked here.
+/// verifier ([`tall::verify_tall`]). A proof made by [`prove`] must be checked here.
 pub fn verify(
     output_commits: &[Commitment],
     nullifiers: &[Commitment],
