@@ -1,85 +1,139 @@
+<div align="center">
+
+<img src="brand/png/logo-tile-192.png" width="76" alt="ZCrypt logo">
+
 # ZCrypt
 
-[![CI](https://github.com/echelonlabsresearch/ZCrypt/actions/workflows/ci.yml/badge.svg?branch=mainnet)](https://github.com/echelonlabsresearch/ZCrypt/actions/workflows/ci.yml?query=branch%3Amainnet)
-[![Latest release](https://img.shields.io/github/v/release/echelonlabsresearch/ZCrypt)](https://github.com/echelonlabsresearch/ZCrypt/releases/latest)
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+**Send money as a message.**
 
-ZCrypt is a shielded chain you can use without a centralized exchange.
+A payment is a tiny file. Send it in any chat. They tap it, and it's theirs in seconds.
 
-The native coin is ZCRYPT. On top of it, anyone can issue an asset into the same pool, swap that asset for ZCRYPT or for any other asset on the chain, and hand the result to someone as a file. A payment does not publish who paid whom, which asset moved, or how much. The market for those assets is part of the protocol. It does not live on a website that can delist you.
+[Website](https://zcrypt.network) · [Get the wallet](https://zcrypt.network/wallet.html) · [Get ZCRYPT](https://zcrypt.network/get-zcrypt.html) · [Explorer](https://explorer.zcrypt.network) · [Whitepaper](whitepaper/whitepaper.pdf) · [Docs](https://zcrypt.network/docs.html)
 
-The paper is [Cash Is a File](whitepaper/whitepaper.pdf). The rest of this page is the plain version.
+[![CI](https://github.com/echelonlabsresearch/ZCrypt/actions/workflows/ci.yml/badge.svg?branch=mainnet)](https://github.com/echelonlabsresearch/ZCrypt/actions/workflows/ci.yml?query=branch%3Amainnet) [![Latest release](https://img.shields.io/github/v/release/echelonlabsresearch/ZCrypt)](https://github.com/echelonlabsresearch/ZCrypt/releases/latest) [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-## Privacy coins died at the door
+<a href="https://zcrypt.network"><img src="docs/readme/demo.webp" width="100%" alt="The wallet sending Bitcoin, USDT and ZCRYPT as a payment file: choose an amount, confirm, share the file in a chat, and the other person opens it and is paid."></a>
 
-A privacy coin can hide a payment perfectly and still be useless. For years the way to buy one, sell one, or trade it for anything else was a centralized exchange. The exchange sees both sides, keeps the order book, and can close the market whenever it wants. When the listing goes, the coin is still private and nobody can get in or out. The privacy survived. The economy did not.
+<sub>Wallet screens with sample data, recorded from <a href="https://zcrypt.network">zcrypt.network</a>.</sub>
 
-ZCrypt is built so that door is not required. ZCRYPT is the native coin, and it is private in the strong sense: every coin of every asset sits in one pool, and a spend hides among every coin that pool has ever held. The part that makes the chain more than another private coin is the layer above ZCRYPT. Issuing an asset, sending it, and exchanging it are protocol actions. They use the same pool, the same proofs, and the same rules as the native coin. An asset you create does not need to be wrapped onto another chain, listed on an exchange, or routed through someone else's swap contract before another person can hold it and trade it.
+</div>
 
-Bitcoin can still come in, as shielded zBTC, when you want a door to Bitcoin. An asset issued on ZCrypt does not need that door.
+## What is ZCrypt
 
-## The exchange is the chain
+ZCrypt is private money you can send like a message.
 
-On Ethereum, Solana, and Bitcoin, the coin and the market are different things. The chain moves the coin. A separate service, a centralized exchange or a swap contract deployed by someone else, is where one asset becomes another. That service is a third party. It can go offline, change the rules, freeze a pool, or simply refuse the asset.
+It is its own blockchain. The coin is called ZCRYPT and there will only ever be 21 million of them. When you pay someone, nobody else can see who paid, who got paid, which coin it was or how much. The network still checks every payment and throws out anything that breaks the rules.
 
-On ZCrypt the trade is two escrows in the protocol. Two people agree on an exchange. Each locks what they are offering, under one shared secret. Revealing the secret settles both sides together. If the time runs out first, each side gets its own coins back. One side can be ZCRYPT. The other side can be ZCRYPT, or any asset someone has issued. There is no order book to host, no router, and no outside chain that has to accept the asset first.
+You can pay to an address like on any other chain. You can also turn a payment into a small file and send it over WhatsApp, email or AirDrop. Whoever opens the file first gets the money. They don't need an address and they don't need to own any ZCRYPT first. Think of it as handing someone cash.
 
-The escrow record names the amount and the asset of that particular trade, because the two people have to be able to see what they are locking. Where those coins came from, and where the coins they receive go after the trade, is an ordinary payment in the shared pool. Finding someone to trade with can happen in any chat. The settlement itself does not leave ZCrypt, and it does not depend on an exchange staying online.
+It also works for other coins. You can bring Bitcoin in as zBTC, create your own coin with a ticker and a supply cap, and swap any coin for any other coin directly on the chain, with no exchange in the middle. All of them live in the same pool, so all of them get the same privacy.
 
-## Your asset gets the coin's protection
+## Under the hood
 
-ZCRYPT is the gas and the native money. The unusual layer is the one above it.
+<table>
+<tr><td width="190"><b>One shielded pool</b></td><td>Every coin of every asset sits in one pool. To spend, you prove you own a coin in the pool without saying which one. Your payment hides among every coin ever made on the chain.</td></tr>
+<tr><td><b>STARK proofs</b></td><td>Each payment carries a STARK, built with Plonky3 over the BabyBear field with Poseidon2 hashing. No trusted setup and no elliptic curves. Your own device makes the proof, so your keys and amounts never leave it.</td></tr>
+<tr><td><b>Quantum resistant</b></td><td>STARKs rely only on hash functions. Payment notes are encrypted with ML-KEM and coin issuers sign with ML-DSA, both NIST post-quantum standards. Block signing (CometBFT) and the Bitcoin side still use today's signatures. Breaking those would not let anyone forge a coin.</td></tr>
+<tr><td><b>Consensus</b></td><td>CometBFT proof of stake with one second blocks. The chain logic is a native Rust state machine behind ABCI. There is no smart contract VM to exploit.</td></tr>
+<tr><td><b>Bitcoin</b></td><td>The chain runs a Bitcoin light client (SPV) inside consensus. zBTC is minted when validators have checked the Bitcoin deposit proof themselves.</td></tr>
+<tr><td><b>Coins and swaps</b></td><td>Creating a coin and swapping two coins are built-in transaction types. A swap is two escrows locked under one secret: both sides settle, or both get refunded.</td></tr>
+<tr><td><b>Rules you can read</b></td><td>Every transaction type has a short bytecode program. The one for a payment is 7 instructions. The program and the STARK circuit are tested against each other, and the <a href="https://explorer.zcrypt.network">explorer</a> replays the program for every transaction.</td></tr>
+<tr><td><b>Machine-checked math</b></td><td>The rule that a payment can never create money is proved in Lean 4, including that the field arithmetic cannot wrap around. See <a href="formal/README.md">formal/README.md</a> for exactly what is and isn't covered.</td></tr>
+</table>
 
-You register a ticker, a precision, and a supply cap. From then on that asset is minted, sent, swapped, and turned into a bearer file under the same rules as ZCRYPT. The asset identifier sits inside the coin, hidden. A transfer of your asset and a transfer of ZCRYPT publish the same shape of data. The proof checks that a payment does not turn one asset into another, so hiding the type is not a way to print a different coin.
+What an outside observer can and cannot see is in [privacy.md](privacy.md). The assumptions and known limits are in [security.md](security.md).
 
-The cap is fixed when you register. Minting more requires an authorization over that exact mint, signed with a post-quantum signature. The wallet's own flow uses a single key from your seed. zBTC is the exception: nobody's signature mints it. A Bitcoin deposit proof does.
+## Get the wallet
 
-So the security you get for a coin you invent is the security of the pool, not a weaker token standard bolted on beside it.
+Download it for [macOS, Windows or Linux](https://github.com/echelonlabsresearch/ZCrypt/releases/latest), or for [iPhone](https://apps.apple.com/app/id6826877444). It connects to the public node out of the box. Then see [how to get ZCRYPT](https://zcrypt.network/get-zcrypt.html).
 
-## A bearer coin is a file
+## For developers
 
-This is the part no other chain gives you, for the native coin and for every asset you issue.
+### The live network
 
-A bearer payment is a small text file. You send it the way you send a photo: WhatsApp, email, a USB stick, a piece of paper. The receiver opens their wallet, drops the file onto the receive page, and the value is credited. They can paste it instead. They do not need an address, and they do not need a balance already. The file carries the fee that spends it.
+| | |
+|---|---|
+| Chain id | `zcrypt-1` |
+| RPC | <https://rpc.zcrypt.network> |
+| Explorer | <https://explorer.zcrypt.network> |
 
-There is no recipient on the chain. The chain learns that two new coins exist in the pool, and later that someone swept them. It does not learn who handed the file to whom. Because every asset shares that pool, the sweep also does not reveal which asset moved or how much. A ZCRYPT bearer and a bearer of an asset you issued are indistinguishable on the wire.
+### What's in the repo
 
-The file is the money until it is claimed. The first sweep takes it. A copy you kept, or a copy a chat app kept, can still spend it until that sweep is in a block. Send it the way you would hand over cash, then delete your copy. A 24-word restore does not bring the file back. The wallet writes it for you as `zcrypt-bearer.txt`, with a coin line and a gas line. A loose coin string on its own is not a payment.
+| Folder | What it holds |
+|---|---|
+| [`impl/shield`](impl/shield) | Commitments, the STARK circuit, the commitment tree |
+| [`impl/core`](impl/core) | The state machine: every transaction type, staking, assets, the Bitcoin light client |
+| [`impl/abci-node`](impl/abci-node) | The node binary that runs under CometBFT |
+| [`impl/bridge`](impl/bridge) | Everything that touches Bitcoin: swaps, the bridge daemons, the sale desk |
+| [`impl/explorer`](impl/explorer) | The block explorer |
+| [`wallet`](wallet) | The desktop and phone wallet (Tauri 2 and React) |
+| [`formal`](formal) | The Lean 4 proofs |
+| [`chain`](chain) | Docker stacks: a node, a validator, and a 3-node test network |
 
-## The money was built to survive a quantum computer
+There are two Cargo projects, `impl/` and `wallet/src-tauri/`, each with its own lockfile. Both pin a Rust nightly in `rust-toolchain.toml`, and rustup installs it for you.
 
-Most chains add privacy, and hope to add quantum resistance later, on top of signatures a quantum computer is expected to forge. ZCrypt was designed the other way. The parts that create value, hold value, and move value inside the pool are hash-based or lattice-based from the start.
+### Build the wallet
 
-A spend is not a signature. It is knowledge of a secret, proved inside a STARK. STARKs are built from hash functions. There is no trusted setup and no elliptic curve under the coin. Notes are encrypted to ML-KEM keys, the lattice encryption standardized so that a ciphertext recorded today stays closed if a quantum computer arrives later. Issuing and rotating an asset authority uses ML-DSA, the matching lattice signature.
+You need Node.js 20 or newer and rustup. On Linux you also need `libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev libayatana-appindicator3-dev`.
 
-Two edges stay classical, and both are outside the pool. Ordering blocks uses the consensus signatures of CometBFT. The Bitcoin reserve uses Bitcoin's own signatures, because a lock on Bitcoin cannot use anything else. Neither of those can forge a shielded coin or mint an issued asset.
+```bash
+cd wallet
+npm ci
+npm run tauri:dev      # run it (the first build compiles the prover, give it a few minutes)
+npm run tauri:build    # make an installer
+```
 
-## Hidden payments still have a public rulebook
+To work on the UI without a chain, `npm run dev` and open <http://localhost:1420/?mock=1>.
 
-A private chain asks you to trust a proof you cannot read. That trust has gone wrong before. A bug in a zero-knowledge circuit can mint coins in a pool that, by design, nobody can audit by eye. The math is hard, the implementations are easy to get wrong, and an inflation bug is invisible until it is too late.
+### Run the tests
 
-ZCrypt keeps a second, readable copy of the rules. Every kind of transaction has one short program, a handful of named checks. The shielded payment's program is seven lines: each amount is in range, every coin in the payment is the same asset, what comes out equals what went in plus the fee, the spent coins are marked spent, the new coins are exactly the commitments that were published, each spent coin really is in the pool, and then stop. The proof is a proof that this program passed. It is not a proof of some other statement written beside it.
+```bash
+cd impl
+cargo test --locked -p zcrypt-shield -p zcrypt-core --lib
+cargo test --locked -p zcrypt-core --tests --examples
+cargo test --locked -p zcrypt-abci-node
+cargo test --locked -p zcrypt-bridge -p zcrypt-explorer -p zcrypt-cli
 
-The wallet runs that plain program on the real values before it will broadcast, and it refuses to send if the program and the proof disagree. A test suite feeds the same good and bad payments to the program and to the circuit and requires the same answer from both. For every other action that moves value, bonds, claims, mints, swaps, the chain runs the program itself. A failed check is a rejected transaction.
+cd ../wallet/src-tauri
+cargo test --locked
+```
 
-The [explorer](https://explorer.zcrypt.network) shows this on every transaction. Open one and you get the program, step by step. You do not get the sender, the receiver, the asset, or the amount. On a shielded payment the explorer checks the proof and shows the checks that proof covers. On everything else it walks the same program the chain ran and re-runs the checks it can re-run from the public data. The point of the page is that the rules are visible even though the money is not.
+The tests make real STARK proofs, so they take minutes. Don't run the whole workspace at once on a small machine: it needs a lot of memory.
 
-## The no-inflation rule is machine-checked
+### Run a local network
 
-The check that matters most in a hidden pool is the one that says value cannot appear from nowhere. ZCrypt has a machine-checked proof of that check, written in Lean and accepted by Lean's kernel with no unfinished holes.
+You only need Docker. This starts three validators and a regtest Bitcoin node:
 
-In plain terms the proof says two things. A payment the rules accept never pays out more than it took in. And the arithmetic inside the proof, which is done in a small finite field rather than ordinary integers, cannot wrap around in a way that invents a coin. That wraparound is a known way hidden ledgers have been inflated. Here it is a theorem, not a comment.
+```bash
+cd chain
+docker compose -f e2e/docker-compose.3node.yml up --build -d
+```
 
-The proofs cover that arithmetic. They are a careful model of the rules, checked by a theorem prover. They are not a claim that every line of the system has been proved, and they do not prove that the hash function itself is unbreakable. What they take off the table is the specific failure where a payment creates money. The boundary is written down in [formal/README.md](formal/README.md).
+The node RPCs are on `localhost:46657`, `46667` and `46677`. Point the wallet at one of them in Settings.
 
-## See it
+To run every real flow against a fresh network (payments, payment files, coins, staking, Bitcoin swaps in both directions):
 
-The reference network is chain id `zcrypt-1`.
+```bash
+KEEP=0 ./chain/e2e/run-all.sh
+```
 
-- Explorer: <https://explorer.zcrypt.network>
-- RPC: <https://rpc.zcrypt.network>
+That takes about 50 minutes.
 
-The desktop wallet is in [`wallet/`](wallet/). On Receive, drop a bearer file or paste it. On Send, choose "bearer coin" and the wallet writes the file. Building and running it is [wallet/README.md](wallet/README.md). Running a node is [running.md](running.md).
+### Run a node on the live network
+
+```bash
+cd chain/validator
+cp .env.example .env    # paste the VALIDATOR_KEY line from your wallet first
+docker compose up -d
+```
+
+This gives you a full node on `zcrypt-1`. It starts producing blocks once you bond stake from the wallet. The full walkthrough is in [chain/README-validator.md](chain/README-validator.md), and [running.md](running.md) covers operating a node.
+
+### Contributing
+
+Work lands on `testnet`, which is a branch and not a separate network. `mainnet` is what ships and only takes pull requests from `testnet`. Open yours against `testnet`. The rest is in [CONTRIBUTING.md](CONTRIBUTING.md).
+
+Found a vulnerability? Email security@zcrypt.network and please don't open a public issue.
 
 ## Read next
 
@@ -94,4 +148,4 @@ The desktop wallet is in [`wallet/`](wallet/). On Receive, drop a bearer file or
 | Run a node or a validator | [running.md](running.md), [chain/README-validator.md](chain/README-validator.md) |
 | The explorer | [impl/explorer/README.md](impl/explorer/README.md) |
 
-License: [MIT](LICENSE). Vulnerability reports go to security@zcrypt.network.
+License: [MIT](LICENSE).
