@@ -2594,6 +2594,17 @@ mod scan_tests {
     }
 
     #[test]
+    fn a_scan_from_genesis_that_was_cut_short_does_not_revive_a_spent_coin() {
+        // The wallet spent a coin at height 900; a scan from genesis only got to 500.
+        assert!(!saw_every_nullifier(true, 500, 1_000));
+        assert!(!revivable(true, false, false, saw_every_nullifier(true, 500, 1_000)));
+        // The same scan, complete, is the authority on what is spent.
+        assert!(saw_every_nullifier(true, 1_000, 1_000));
+        // A catch-up scan never is, however far it got.
+        assert!(!saw_every_nullifier(false, 1_000, 1_000));
+    }
+
+    #[test]
     fn fresh_coins_survive_a_racing_reconcile_but_observed_or_old_ones_do_not() {
         // N3: a coin born at (or after) the scan's starting tip is never dropped.
         let (acct, _m) = keys::new_account();
@@ -4926,6 +4937,14 @@ fn revivable(spent: bool, dropped_stale: bool, nullifier_seen: bool, full_rescan
     spent && !nullifier_seen && (dropped_stale || full_rescan)
 }
 
+/// Did this scan read every block from genesis to the tip it started from? Only then is
+/// "no nullifier seen" evidence that a coin was never spent. A scan from genesis that was
+/// cut short (rate limits, a dropped connection) has not seen the later blocks, and a coin
+/// this wallet spent in one of them must stay spent.
+fn saw_every_nullifier(full_rescan: bool, covered_to: i64, tip: i64) -> bool {
+    full_rescan && covered_to >= tip
+}
+
 /// May the reconcile drop `c` (unspent, absent from the leaf snapshot, not pending)? Only a
 /// coin this wallet has already seen as a leaf (so its absence means a chain reset), or one
 /// older than the grace window (so its inclusion could not have raced this scan).
@@ -5436,7 +5455,7 @@ fn scan_onchain_inner(state: State<AppState>) -> R<usize> {
             let com = c.coin.commitment();
             if let Some(&i) = leaf_pos.get(&com) {
                 c.leaf_index = Some(i);
-                if revivable(c.spent, c.dropped_stale, spent_seen.contains(&com), full_rescan) {
+                if revivable(c.spent, c.dropped_stale, spent_seen.contains(&com), saw_every_nullifier(full_rescan, covered_to, tip)) {
                     c.spent = false;
                     c.dropped_stale = false;
                     revived += 1;
